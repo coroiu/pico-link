@@ -15,10 +15,11 @@ render_scene.png
 # host-surface parity verification) — an artifact, not source.
 headless_scene.png
 
-# Beads task tracking: .beads/ has its own .gitignore that ignores the
-# ephemeral bits (sqlite db/WAL, daemon, socket) while keeping issues.jsonl
-# and config tracked, so task history is shared via git. Do NOT blanket-ignore
-# .beads/ here — it would override that and make the board local-only.
+# Beads task tracking: .beads/ has its own .gitignore. As of beads 1.2.2 the
+# board itself lives in an embedded Dolt DB at .beads/embeddeddolt/, which that
+# file ignores — so the board is NOT shared via git. Share it with `bd dolt
+# push` (refs/dolt/data on the git remote). Only config, hooks and the
+# knowledge/interaction logs are tracked here. Do NOT blanket-ignore .beads/.
 .mcp.json
 
 # local git worktrees for bead work

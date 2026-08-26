@@ -278,7 +278,10 @@ applies.
   Code has macOS Screen Recording permission, and BOTH the orchestrator AND
   subagents can run `screencapture -x <file>.png` to grab the live minifb window
   and inspect it. Never assume windowed rendering can't be checked.
-- **Beads/worktree hygiene.** Commit pending `.beads/issues.jsonl` before a merge.
+- **Beads/worktree hygiene.** The board lives in the embedded Dolt DB at
+  `.beads/embeddeddolt/`, which is gitignored — there is nothing to commit before
+  a merge, and nothing in git to recover the board from. Back it up with
+  `bd dolt push` (needs `ssh-add` first; Dolt cannot prompt for a passphrase).
   `git branch -d` may balk because beads auto-syncs to branch tips — verify
   `git log main..<branch>` is empty, then `git branch -D`. When dispatching a
   supervisor, tell it to create its worktree from local `main` and verify the base
@@ -287,18 +290,21 @@ applies.
   command-substitutes them.
 - **`bd list` (no flags) SILENTLY TRUNCATES its output.** It once hid a real open
   bead during a board sweep. For any audit use `bd list --json` (or
-  `bd list --status open`) and cross-check against `.beads/issues.jsonl`.
+  `bd list --status open`). There is no `.beads/issues.jsonl` to cross-check
+  against unless JSONL auto-export is enabled in `.beads/config.yaml` — it is
+  OFF by default in 1.2.2, and the file is NOT generated.
 - **One bead per supervisor dispatch.** Bundling two bead IDs into a single
   dispatch trips the per-bead-worktree Stop-hook, and the agent works around it by
   symlinking the expected paths — a hook-gaming smell that buries the real report.
   If two beads are truly coupled, still give the agent one ID and note the other
   rides with it.
 - **Beads daemon can wedge on writes.** Symptoms: `bd create` / `bd dep add` time
-  out on `.beads/bd.sock`; "sqlite3: database is locked"; "Database out of sync
-  with JSONL". Causes: a stale long-lived `bd` daemon, plus timed-out `bd create`
-  commands that linger as zombies holding the SQLite lock. Recovery: `pgrep -x bd`
-  then kill the strays (`kill -9` is SQLite-safe — the DB rolls back incomplete
-  transactions and `.beads/issues.jsonl` is the source of truth), then
+  out on `.beads/bd.sock`; "database is locked"; "Database out of sync
+  with JSONL" (that message names a JSONL file that 1.2.2 does not generate —
+  it is a stale string in bd, not evidence the file went missing). Causes: a stale long-lived `bd` daemon, plus timed-out `bd create`
+  commands that linger as zombies holding the DB lock. Recovery: `pgrep -x bd`
+  then kill the strays (`kill -9` is safe — Dolt rolls back incomplete
+  transactions; note there is NO JSONL fallback, the Dolt DB IS the store), then
   `rm -f .beads/bd.sock .beads/bd.sock.startlock`, then
   `bd --no-daemon sync --import-only`. Prefer `bd --no-daemon` for writes while
   flaky. **A supervisor gaming the Stop-hook's bead-comment check is a symptom —

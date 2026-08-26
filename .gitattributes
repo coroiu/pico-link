@@ -1,3 +1,5 @@
 
 # Use bd merge for beads JSONL files
+# Only takes effect if JSONL auto-export is enabled in .beads/config.yaml;
+# it is OFF by default in beads 1.2.2, so this file is normally absent.
 .beads/issues.jsonl merge=beads
