@@ -1,0 +1,137 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/enforce-concise-response.sh",
+            "type": "command"
+          },
+          {
+            "command": ".claude/hooks/log-dispatch-prompt.sh",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Task"
+      },
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/memory-capture.sh",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/nudge-claude-md-update.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/block-orchestrator-tools.sh",
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/enforce-bead-for-supervisor.sh",
+            "type": "command"
+          },
+          {
+            "command": ".claude/hooks/enforce-sequential-dispatch.sh",
+            "type": "command"
+          },
+          {
+            "command": ".claude/hooks/remind-inprogress.sh",
+            "type": "command"
+          },
+          {
+            "command": ".claude/hooks/inject-discipline-reminder.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Task"
+      },
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/enforce-branch-before-edit.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit"
+      },
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/enforce-branch-before-edit.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Write"
+      },
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/validate-epic-close.sh",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/session-start.sh",
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "bd prime --hook-json",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/validate-completion.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": ".claude/hooks/clarify-vague-request.sh",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

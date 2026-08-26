@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["core", "emulator"]
+
+# Profiles are workspace-level-only in Cargo; defined here so both the
+# firmware and emulator crates share them without duplication.
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # Symbols are nice and they don't increase the size on Flash
+opt-level = "z"

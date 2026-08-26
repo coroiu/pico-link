@@ -1,0 +1,39 @@
+[package]
+name = "pico-link-core"
+version = "0.1.0"
+authors = ["Andreas Coroiu <andreas.coroiu@gmail.com>"]
+edition = "2021"
+rust-version = "1.77"
+
+# Platform-free application core. This crate MUST NOT depend on pico-sdk
+# bindings, minifb, tiny_http, st7789, or any other platform-specific crate. That
+# constraint is enforced by the absence of such dependencies below, not by
+# convention: if a platform crate ever creeps in here, both `firmware` and
+# `emulator` still build against this same code, so drift becomes visible
+# immediately instead of failing silently on one target.
+#
+# See: .planning/decisions/2026-08-11-portability-boundary-and-workspace-split.md
+
+[dependencies]
+embedded-graphics = "0.8.2"
+embedded-graphics-framebuf = "0.5.0"
+serde = { version = "1.0", features = ["derive"] }
+u8g2-fonts = { version = "0.5.2", features = ["embedded_graphics_textstyle"] }
+# `run::run` always logs persistently-failing `DisplaySurface::flush`
+# calls (rate-limited, see `run.rs`'s `FlushErrorTracker`) -- a permanent
+# robustness property, not a diagnostic opt-in like `frame-timing` below,
+# which still uses this same dependency.
+log = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+
+[features]
+# TEMPORARY diagnostic aid, OFF by default: logs per-frame
+# render/flush timing and a rolling-average FPS
+# in `run::run`'s loop, to measure where the ~33ms frame budget actually
+# goes on real hardware (render? flush/SPI? something else?) rather than
+# guessing. See `run.rs`'s `FrameTiming` for the exact measurement
+# points. Not meant to be a permanent feature -- revisit once the
+# refresh-rate investigation concludes.
+frame-timing = []

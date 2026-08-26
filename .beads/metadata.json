@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pico_link",
+  "project_id": "4fca9aa5-02a7-489f-88c7-f1288a801dd3"
+}
