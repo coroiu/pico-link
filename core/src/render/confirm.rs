@@ -213,8 +213,12 @@ mod tests {
     fn render_draws_the_headline_above_the_rows_without_panicking() {
         let mut view = ConfirmView::new("Clear all 3 items?", rows()).with_subline("This can't be undone.");
         view.on_focus(FocusEvent::Gained);
-        let mut fb = FrameBuffer565::new(320, 136);
-        let area = Rectangle::new(Point::new(0, 0), Size::new(320, 136));
+        // 206: content-area height on the 240x240 Pico Plus 2 W panel
+        // (Epic B2) -- screen height minus TITLE_BAR_HEIGHT (16) and
+        // HINT_BAR_HEIGHT (18), recomputed rather than scaled from the
+        // retired 320x170 panel's own 136.
+        let mut fb = FrameBuffer565::new(240, 206);
+        let area = Rectangle::new(Point::new(0, 0), Size::new(240, 206));
         view.render(area, &mut fb).unwrap();
 
         let any_headline_ink = fb.pixels().any(|p| p.1 == palette::TEXT_PRIMARY);
@@ -227,8 +231,8 @@ mod tests {
     fn render_with_no_subline_still_fits_the_rows_below_the_headline() {
         let mut view = ConfirmView::new("Nothing here yet", vec![MenuItem::new("Back")]);
         view.on_focus(FocusEvent::Gained);
-        let mut fb = FrameBuffer565::new(320, 136);
-        let area = Rectangle::new(Point::new(0, 0), Size::new(320, 136));
+        let mut fb = FrameBuffer565::new(240, 206);
+        let area = Rectangle::new(Point::new(0, 0), Size::new(240, 206));
         view.render(area, &mut fb).unwrap();
 
         let any_selection_ink = fb.pixels().any(|p| p.1 == palette::SURFACE_ELEVATED);

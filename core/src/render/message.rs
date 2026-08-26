@@ -195,11 +195,15 @@ mod tests {
     use super::*;
     use crate::render::FrameBuffer565;
 
-    const AREA: Rectangle = Rectangle::new(Point::new(0, 0), Size::new(320, 150));
+    // Content-area height: screen height minus `chrome::TITLE_BAR_HEIGHT`
+    // (16) and `chrome::HINT_BAR_HEIGHT` (18) on the 240x240 Pico Plus 2 W
+    // panel (Epic B2) -- recomputed, not scaled, from the retired
+    // 320x170 panel's own title/hint subtraction.
+    const AREA: Rectangle = Rectangle::new(Point::new(0, 0), Size::new(240, 206));
 
     #[test]
     fn a_headline_only_message_draws_ink_in_its_default_color() {
-        let mut fb = FrameBuffer565::new(320, 170);
+        let mut fb = FrameBuffer565::new(240, 240);
         MessageView::new("Waiting for sync...").render(AREA, &mut fb).unwrap();
 
         let any_headline_ink = fb.pixels().any(|p| p.1 == palette::TEXT_PRIMARY);
@@ -208,7 +212,7 @@ mod tests {
 
     #[test]
     fn an_overridden_headline_color_draws_in_that_color_instead() {
-        let mut fb = FrameBuffer565::new(320, 170);
+        let mut fb = FrameBuffer565::new(240, 240);
         MessageView::new("Sync error").with_headline_color(palette::STATUS_ERROR).render(AREA, &mut fb).unwrap();
 
         let any_error_ink = fb.pixels().any(|p| p.1 == palette::STATUS_ERROR);
@@ -219,10 +223,10 @@ mod tests {
 
     #[test]
     fn a_subline_is_optional_and_changes_the_rendered_output_when_present() {
-        let mut fb_without = FrameBuffer565::new(320, 170);
+        let mut fb_without = FrameBuffer565::new(240, 240);
         MessageView::new("Nothing here yet").render(AREA, &mut fb_without).unwrap();
 
-        let mut fb_with = FrameBuffer565::new(320, 170);
+        let mut fb_with = FrameBuffer565::new(240, 240);
         MessageView::new("Nothing here yet").with_subline("Check back later").render(AREA, &mut fb_with).unwrap();
 
         let without: Vec<Rgb565> = fb_without.pixels().map(|p| p.1).collect();

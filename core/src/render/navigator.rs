@@ -274,7 +274,7 @@ mod tests {
         // every row). This is exactly the scenario `App`/the unified run
         // loop hit in practice, since they render into one long-lived
         // `FrameBuffer565` rather than allocating a fresh one per frame.
-        let mut fb = FrameBuffer565::new(320, 170);
+        let mut fb = FrameBuffer565::new(240, 240);
         let mut nav = Navigator::new(list_screen("List", 3));
 
         nav.render(&mut fb).unwrap();
@@ -294,10 +294,10 @@ mod tests {
 
     #[test]
     fn render_works_end_to_end_on_a_fresh_navigator() {
-        let mut fb = FrameBuffer565::new(320, 170);
+        let mut fb = FrameBuffer565::new(240, 240);
         let nav = Navigator::new(list_screen("List", 3));
         nav.render(&mut fb).unwrap();
-        assert_eq!(fb.size(), Size::new(320, 170));
+        assert_eq!(fb.size(), Size::new(240, 240));
         // Sanity: the title bar's surface fill was drawn somewhere, i.e.
         // rendering actually did something (not just the background clear).
         let any_title_bar_surface = fb.pixels().any(|p| p.1 == palette::SURFACE);

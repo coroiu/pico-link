@@ -44,8 +44,8 @@ use pico_link_core::{run, App};
 use embedded_graphics::prelude::RgbColor;
 use emulator::platform::{FileStorage, HostPlatform, HttpInput, RecordingPowerControl, SharedHeadlessSurface};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 170;
+const WIDTH: u32 = 240;
+const HEIGHT: u32 = 240;
 
 /// Short enough that a test loop can wait it out in real milliseconds;
 /// see the module doc for why this isn't `pico_link_core::DEFAULT_IDLE_TIMEOUT`.
@@ -88,7 +88,10 @@ fn driving_to_idle_blanks_the_headless_screenshot_and_an_injected_intent_restore
     let mut app = App::new(WIDTH, HEIGHT);
 
     let row0_y = TITLE_BAR_HEIGHT + 2;
-    let sample_x = 250;
+    // x=200: clear of the row's chip/text on this short label, and inside
+    // the 240px-wide (Epic B2) panel -- see the identical comment in
+    // `headless_http_drive.rs`.
+    let sample_x = 200;
     let highlight = palette::SURFACE_ELEVATED;
     let highlight_rgb8 = image::Rgb([highlight.r() << 3, highlight.g() << 2, highlight.b() << 3]);
 

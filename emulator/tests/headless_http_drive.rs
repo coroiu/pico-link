@@ -27,8 +27,8 @@ use embedded_graphics::prelude::RgbColor;
 use emulator::desktop::HttpServer;
 use emulator::platform::{FileStorage, HostPlatform, HttpInput, RecordingPowerControl, SharedHeadlessSurface};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 170;
+const WIDTH: u32 = 240;
+const HEIGHT: u32 = 240;
 
 /// Sends a minimal HTTP/1.1 request over a raw socket and returns
 /// `(status_code, body)`. Sends `Connection: close`, which `tiny_http`
@@ -114,15 +114,16 @@ fn injecting_a_navintent_over_http_moves_the_selection_and_is_observable_in_the_
     // (`TITLE_BAR_HEIGHT` is the content area's top). `+2` samples safely
     // inside the row, away from its edges.
     //
-    // x=250 (not x=2): the app's placeholder list paints a chip at the
+    // x=200 (not x=2): the app's placeholder list paints a chip at the
     // left edge of a selected row in a different color than the row's
     // plain fill, and draws row text starting a bit further in -- either
-    // of which x=2/x=6 could land on depending on the label. x=250 is
+    // of which x=2/x=6 could land on depending on the label. x=200 is
     // comfortably past both of these short labels' text and well clear of
-    // the chip, landing on the plain fill/background every time.
+    // the chip, landing on the plain fill/background every time, and
+    // still inside the 240px-wide (Epic B2) panel.
     let row0_y = TITLE_BAR_HEIGHT + 2;
     let row1_y = TITLE_BAR_HEIGHT + ROW_HEIGHT + 2;
-    let sample_x = 250;
+    let sample_x = 200;
     let highlight = palette::SURFACE_ELEVATED;
     let highlight_rgb8 = image::Rgb([highlight.r() << 3, highlight.g() << 2, highlight.b() << 3]);
 

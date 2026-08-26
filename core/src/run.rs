@@ -573,7 +573,7 @@ mod tests {
             storage: StubStorage,
             power: RecordingPower::new(false),
         };
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         // The absence of a panic across every one of these iterations
@@ -621,7 +621,7 @@ mod tests {
             storage: StubStorage,
             power: RecordingPower::new(false),
         };
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {
@@ -764,7 +764,7 @@ mod tests {
         let idle_timeout = Duration::from_secs(120);
         // Never any input at all -- every poll returns empty.
         let RecordingSetup { mut platform, clock, power_calls, flush_count } = recording_platform(vec![Vec::new(); 3]);
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), Some(idle_timeout), None, || {
@@ -795,7 +795,7 @@ mod tests {
         // `Next` intent arrives while Asleep -> should wake (On) and be
         // dropped, NOT reach `app.handle_input`.
         let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(), Vec::new(), vec![NavIntent::Next]]);
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), Some(idle_timeout), None, || {
@@ -811,7 +811,7 @@ mod tests {
         // Row 0's selection-highlight pixel: still selected proves the
         // `Next` that woke the display was NOT forwarded to the
         // navigator -- if it had been, row 0 would no longer be selected.
-        let row0_still_selected = app.render().pixel(embedded_graphics::prelude::Point::new(250, 18));
+        let row0_still_selected = app.render().pixel(embedded_graphics::prelude::Point::new(200, 18));
         assert_eq!(
             row0_still_selected,
             crate::render::theme::palette::SURFACE_ELEVATED,
@@ -830,7 +830,7 @@ mod tests {
         });
 
         assert!(power_calls2.borrow().is_empty(), "already-Active state must not call set_power again just because a fresh `run` call started");
-        let row0_after_second_next = app.render().pixel(embedded_graphics::prelude::Point::new(250, 18));
+        let row0_after_second_next = app.render().pixel(embedded_graphics::prelude::Point::new(200, 18));
         assert_ne!(
             row0_after_second_next,
             crate::render::theme::palette::SURFACE_ELEVATED,
@@ -845,7 +845,7 @@ mod tests {
         // matter) -- with `idle_timeout: None`, none of that may ever
         // result in a `set_power` call.
         let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(); 10]);
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {
@@ -920,7 +920,7 @@ mod tests {
     fn deep_sleep_fires_once_idle_past_tb_while_off_external_power() {
         let deep_sleep_timeout = Duration::from_secs(600);
         let (mut platform, clock, power) = power_test_platform(3, false);
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), None, Some(deep_sleep_timeout), || {
@@ -938,7 +938,7 @@ mod tests {
     fn deep_sleep_never_fires_while_on_external_power() {
         let deep_sleep_timeout = Duration::from_secs(600);
         let (mut platform, clock, power) = power_test_platform(3, true);
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), None, Some(deep_sleep_timeout), || {
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn deep_sleep_timeout_none_never_fires_no_matter_how_much_time_passes() {
         let (mut platform, clock, power) = power_test_platform(5, false);
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {

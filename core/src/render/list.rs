@@ -79,10 +79,12 @@ impl ListItem {
 /// consecutive rows (the bottom padding of row N plus the top padding of
 /// row N+1 is what a user perceives as "space between rows"). Chosen to
 /// visibly loosen both without shrinking the list to fewer than ~3 full
-/// rows + a scroll peek on the 320x170 panel — see `ROW_HEIGHT`'s doc
-/// comment for the resulting row budget. (This budget is computed against
-/// today's 320x170 panel; it needs recomputing once the 240x240 Pico Plus
-/// 2 W retarget, Epic B2, lands.)
+/// rows + a scroll peek — see `ROW_HEIGHT`'s doc comment for the
+/// resulting row budget. (Epic B2 recomputed that budget for the 240x240
+/// Pico Plus 2 W panel: unchanged padding still lands 5 full rows + a
+/// 6px peek in the taller content area — see `ROW_HEIGHT`'s doc comment
+/// for the arithmetic and the reasoning behind leaving these constants
+/// alone rather than loosening them.)
 const ROW_PADDING: i32 = 3;
 const LINE_GAP: i32 = 2;
 
@@ -116,15 +118,28 @@ const USERNAME_LINE_FOOTPRINT: i32 = 15;
 ///
 /// Grew from `FONT_6X10`'s 23px to accommodate the larger, proportional
 /// `helvB12`/`helvR10` theme fonts, then grew again (35px -> 40px) for
-/// `ROW_PADDING`/`LINE_GAP`'s "more vertical air" bump. On the 320x170
-/// panel this settles at 3 full rows visible plus a partial fourth ("a
-/// scroll peek") in the content area below the title/hint bars, rather
-/// than the tighter 4-rows-plus-a-sliver the original, denser padding
-/// gave — a deliberate trade-off from design review. (This row count is
-/// specific to today's 320x170 panel and needs recomputing once the
-/// 240x240 Pico Plus 2 W retarget, Epic B2, lands.) Still derived so
-/// the two lines' worst-case ink always fits entirely inside
-/// `[0, ROW_HEIGHT)`, the same guarantee the
+/// `ROW_PADDING`/`LINE_GAP`'s "more vertical air" bump.
+///
+/// **Epic B2 (240x240 retarget) row budget, recomputed:** the content
+/// area (screen height minus `chrome::TITLE_BAR_HEIGHT` and
+/// `chrome::HINT_BAR_HEIGHT`) was 136px on the retired 320x170 panel,
+/// giving 3 full rows (120px) plus a 16px partial-row "scroll peek". On
+/// the 240x240 panel the same subtraction gives 206px of content — `206 /
+/// 40 = 5` full rows (200px) plus a 6px peek. That is a deliberate
+/// choice, not an accident of leaving the formula alone: the panel lost
+/// 80px of *width* (a 25% cut to the already-tight chip+text+caret row
+/// layout) while gaining 70px of *height*, so the extra vertical room
+/// goes to showing more rows outright — cheaper scrolling through
+/// device/codec lists on a screen that's already asking a user to read
+/// more compressed row text — rather than to loosening rows further,
+/// which would only spend the gain on whitespace the wider panel already
+/// had enough of. `ROW_PADDING`/`LINE_GAP` (and therefore this constant's
+/// formula) are unchanged from the design-reviewed 320x170 values; only
+/// the resulting row *count* for the new panel is documented here. The
+/// smaller 6px peek is still a real partial row (clipped, not hidden —
+/// see `VerticalList::render`), just a less generous one than the old
+/// panel's 16px. Still derived so the two lines' worst-case ink always
+/// fits entirely inside `[0, ROW_HEIGHT)`, the same guarantee the
 /// original `ROW_HEIGHT` doc comment describes and `render_png_dump.rs`'s
 /// `text_never_bleeds_past_a_rows_bottom_padding` test still enforces.
 pub const ROW_HEIGHT: u32 =
@@ -712,8 +727,8 @@ mod tests {
         let mut list = VerticalList::new(items(10));
         let visible_rows = 3;
         let viewport_height = visible_rows as u32 * ROW_HEIGHT; // fits 3 rows
-        let area = Rectangle::new(Point::new(0, 0), Size::new(320, viewport_height));
-        let mut fb = FrameBuffer565::new(320, viewport_height);
+        let area = Rectangle::new(Point::new(0, 0), Size::new(240, viewport_height));
+        let mut fb = FrameBuffer565::new(240, viewport_height);
 
         // Selection within the first screenful: no scroll needed.
         list.render(area, &mut fb).unwrap();
@@ -747,8 +762,8 @@ mod tests {
         let mut list = VerticalList::new(items(10));
         let visible_rows = 3;
         let viewport_height = visible_rows as u32 * ROW_HEIGHT;
-        let area = Rectangle::new(Point::new(0, 0), Size::new(320, viewport_height));
-        let mut fb = FrameBuffer565::new(320, viewport_height);
+        let area = Rectangle::new(Point::new(0, 0), Size::new(240, viewport_height));
+        let mut fb = FrameBuffer565::new(240, viewport_height);
 
         for _ in 0..4 {
             list.on_intent(NavIntent::Next);

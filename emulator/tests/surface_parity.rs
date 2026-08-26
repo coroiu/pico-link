@@ -57,7 +57,7 @@ fn unpack_argb(pixel: u32) -> (u8, u8, u8) {
 #[test]
 fn headless_png_and_minifb_buffer_agree_on_every_pixel() {
     let navigator = build_scene();
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
 
     // Headless side: flush, encode, decode back to RGB8 pixels.
@@ -65,17 +65,17 @@ fn headless_png_and_minifb_buffer_agree_on_every_pixel() {
     headless.flush(&framebuffer).expect("HeadlessSurface::flush is Infallible");
     let png_bytes = headless.encode_png().expect("frame was flushed");
     let decoded = image::load_from_memory(&png_bytes).expect("PNG we just wrote must decode").to_rgb8();
-    assert_eq!(decoded.width(), 320);
-    assert_eq!(decoded.height(), 170);
+    assert_eq!(decoded.width(), 240);
+    assert_eq!(decoded.height(), 240);
 
     // Windowed side: the same rasterize_scaled MinifbSurface::flush calls.
-    let scaled_width = 320 * PARITY_TEST_SCALE;
-    let mut minifb_buffer = vec![0u32; (scaled_width * 170 * PARITY_TEST_SCALE) as usize];
+    let scaled_width = 240 * PARITY_TEST_SCALE;
+    let mut minifb_buffer = vec![0u32; (scaled_width * 240 * PARITY_TEST_SCALE) as usize];
     rasterize_scaled(&framebuffer, PARITY_TEST_SCALE, &mut minifb_buffer);
 
     let mut mismatches = Vec::new();
-    for y in 0..170u32 {
-        for x in 0..320u32 {
+    for y in 0..240u32 {
+        for x in 0..240u32 {
             let png_pixel = decoded.get_pixel(x, y);
             let expected = (png_pixel[0], png_pixel[1], png_pixel[2]);
 
@@ -97,7 +97,7 @@ fn headless_png_and_minifb_buffer_agree_on_every_pixel() {
         "{} of {} pixels differed between HeadlessSurface's PNG and MinifbSurface's buffer; \
          first mismatch: {:?}",
         mismatches.len(),
-        320 * 170,
+        240 * 240,
         mismatches.first()
     );
 }
@@ -110,14 +110,14 @@ fn known_chrome_colors_match_between_surfaces_at_scale_one() {
     // same way). Mirrors the assertions in `core/tests/render_png_dump.rs`.
 
     let navigator = build_scene();
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).unwrap();
 
     let mut headless = HeadlessSurface::new();
     headless.flush(&framebuffer).unwrap();
     let decoded = image::load_from_memory(&headless.encode_png().unwrap()).unwrap().to_rgb8();
 
-    let mut minifb_buffer = vec![0u32; (320 * 170) as usize];
+    let mut minifb_buffer = vec![0u32; (240 * 240) as usize];
     rasterize_scaled(&framebuffer, 1, &mut minifb_buffer);
 
     let title_bar = palette::SURFACE;
@@ -148,7 +148,7 @@ fn headless_and_windowed_both_blank_to_black_when_powered_off() {
     // so that expected buffer is reproduced directly here rather than
     // exercised through a live window.
     let navigator = build_scene();
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
 
     // Headless: flush a real (non-blank) frame first, then power off --
@@ -160,21 +160,21 @@ fn headless_and_windowed_both_blank_to_black_when_powered_off() {
 
     let png_bytes = headless.encode_png().expect("a frame was flushed before powering off");
     let decoded = image::load_from_memory(&png_bytes).expect("PNG we just wrote must decode").to_rgb8();
-    assert_eq!(decoded.width(), 320);
-    assert_eq!(decoded.height(), 170);
+    assert_eq!(decoded.width(), 240);
+    assert_eq!(decoded.height(), 240);
 
     // Windowed: the exact all-zero buffer `MinifbSurface::set_power(Off)`
     // pushes to the real window.
-    let windowed_off_buffer = vec![0u32; (320 * 170) as usize];
+    let windowed_off_buffer = vec![0u32; (240 * 240) as usize];
 
     let mut mismatches = Vec::new();
-    for y in 0..170u32 {
-        for x in 0..320u32 {
+    for y in 0..240u32 {
+        for x in 0..240u32 {
             let png_pixel = decoded.get_pixel(x, y);
             let headless_off = (png_pixel[0], png_pixel[1], png_pixel[2]);
             assert_eq!(headless_off, (0, 0, 0), "headless pixel ({x},{y}) should be black while powered off");
 
-            let index = (y * 320 + x) as usize;
+            let index = (y * 240 + x) as usize;
             let windowed_off = unpack_argb(windowed_off_buffer[index]);
             if headless_off != windowed_off {
                 mismatches.push((x, y, headless_off, windowed_off));
@@ -186,7 +186,7 @@ fn headless_and_windowed_both_blank_to_black_when_powered_off() {
         mismatches.is_empty(),
         "{} of {} pixels differed between headless-off and windowed-off; first mismatch: {:?}",
         mismatches.len(),
-        320 * 170,
+        240 * 240,
         mismatches.first()
     );
 }

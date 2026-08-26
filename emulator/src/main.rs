@@ -38,8 +38,10 @@ use emulator::desktop::HttpServer;
 use emulator::platform::{FileStorage, HeadlessSurface, HostPlatform, HttpInput, MinifbSurface, RecordingPowerControl, SharedHeadlessSurface, WindowedInput};
 use minifb::{Window, WindowOptions};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 170;
+/// Pico Plus 2 W + Waveshare Pico-LCD-1.3 panel geometry (Epic B2's
+/// 240x240 retarget). Previously 320x170 (the T-Embed reference panel).
+const WIDTH: u32 = 240;
+const HEIGHT: u32 = 240;
 const WINDOW_SCALE: u32 = 3;
 /// ~30fps: light on CPU for a background/agent-driven headless run.
 const FRAME_BUDGET: Duration = Duration::from_millis(33);

@@ -25,8 +25,8 @@ use pico_link_core::platform::DisplaySurface;
 use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, Screen, VerticalList};
 use emulator::platform::{HeadlessSurface, MinifbSurface};
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 170;
+const WIDTH: u32 = 240;
+const HEIGHT: u32 = 240;
 const WINDOW_SCALE: u32 = 3;
 
 fn build_scene() -> Navigator {
