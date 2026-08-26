@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "firmware-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+embassy-rp = { version = "0.10", features = ["rp235xb", "time-driver", "critical-section-impl"] }
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"] }
+embassy-time = "0.5"
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "1.0"
+cyw43 = { version = "0.7.0", features = ["bluetooth"] }
+cyw43-pio = "0.10.0"
+cyw43-firmware = { version = "0.1.0", features = ["bluetooth"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+debug = true
+lto = true
