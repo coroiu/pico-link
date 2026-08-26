@@ -403,27 +403,40 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 ## Current State
 
-- **2026-08-26 — project founded by pivot.** Repo went from a Bitwarden hardware
-  key to Pico Link. Merged to `main`: the strip (9 crates + 9 core modules,
-  -27,996 lines), the docs rewrite (new roadmap, README, this file), removal of
-  all ESP32/xtensa build config, a doc-comment sweep, the `bhk-core` ->
-  `pico-link-core` crate rename, hook fixes, and agent model retiering.
-  `cargo build` / `cargo test` green at the repo root, 137 tests, no `--target`
-  needed.
-- **Epic A is NOT finished.** Remaining, in order:
-  1. Bead `pico-link-dii` — rewrite `.claude/agents/*.md` and
-     `.claude/skills/vision-session/SKILL.md`, which still describe the Bitwarden
-     project. **Must land before the squash.**
-  2. The orphan squash — one initial commit pushed to
-     `github.com/coroiu/pico-link` (created, private, still empty). Repoint
-     `origin`; keep the old `bitwarden-hw-key` as remote `archive`, never
-     force-pushed.
-  3. Outside a running session: `mv esp32-bluetooth-tx pico-link` and restart
-     Claude Code there. Renaming the cwd mid-session breaks worktree
-     registrations. The orchestrator's memory directory is keyed to the old path
-     and must be moved to match.
-- **Next real work** is Epic B (core `no_std` port, 240x240 retarget, d-pad input
-  model) and Epic C1 — flash stock USBPods on a Pico 2 W, pair headphones,
-  confirm LDAC, record the codec/bitrate. C1 is Andreas's task; it is the
-  baseline every later firmware change is diffed against. See
-  `.planning/roadmap.md`.
+**2026-08-26 — Epics A and B complete. All host-side work is done; everything
+remaining is firmware and needs hardware.** See `.planning/progress.md` for
+detail and `.planning/decisions/` for the architecture ADR.
+
+- **Epic A done.** Repo squashed to one orphan commit, pushed to
+  `github.com/coroiu/pico-link`. Old remote dropped; prehistory stays at
+  `coroiu/bitwarden-hw-key`. Local tag `pre-squash-archive` pins it here.
+  **One step left:** outside a running session, `mv esp32-bluetooth-tx pico-link`
+  and restart Claude Code there — renaming the cwd mid-session breaks worktree
+  registrations, and the memory directory is keyed to the old path.
+- **Epic B done.** `core` is `no_std` + `alloc` and cross-compiles for
+  `thumbv8m.main-none-eabihf`; 240x240 retarget with the row budget recomputed
+  (5 rows + peek); joystick + 4-button `NavIntent` replacing the encoder
+  vocabulary; all three run modes verified at 240x240. 137 tests green.
+- **THE FIRMWARE PLAN CHANGED — there is no USBPods fork.** Rust owns the
+  binary; BTstack, libldac and TinyUSB link in as C static libraries. Verified
+  in a real ELF (76 BTstack symbols, zero undefined, `cortex_m_rt` owns the
+  vector table, no pico-sdk runtime). USBPods is a reference to READ — copying
+  its code would inherit GPL-3, reading it does not. Any doc still describing a
+  fork is stale; trust the ADR.
+- **Next:** `pico-link-8v3.2` — first real execution on hardware. The spike in
+  `firmware-spike/` links but has never run: `hal_time_ms()` returns 0, the HCI
+  transport is a stub, and the RP2350 USB device controller is not linked.
+
+### Environment gotchas learned this session
+
+- **GitHub SSH port 22 is blocked here** (0/10; port 443 is 10/10). Push with
+  `git push ssh://git@ssh.github.com:443/coroiu/pico-link.git main`. Bare
+  `ssh -T git@github.com` can succeed a few times while `git fetch` fails
+  seconds later — measure with a loop, don't conclude from one probe.
+- **The beads board has NO remote backup.** It lives only in
+  `.beads/embeddeddolt/` (gitignored). `bd dolt push` fails for the same port-22
+  reason.
+- **The auto-mode classifier did NOT block `.claude/hooks/` or
+  `.claude/agents/` edits** this session, contrary to the note above — it
+  appears to gate files that actually grant permissions. Attempt the edit rather
+  than pre-emptively declaring it blocked.

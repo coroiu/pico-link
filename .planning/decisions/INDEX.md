@@ -7,4 +7,4 @@ Superseded entries are marked Deprecated, never deleted.
 
 | Date | Decision | Status |
 |------|----------|--------|
-| _(none yet)_ | | |
+| 2026-08-26 | [Rust owns the firmware binary; C libraries are linked in, not forked](2026-08-26-rust-owns-the-binary-no-usbpods-fork.md) | Accepted |
