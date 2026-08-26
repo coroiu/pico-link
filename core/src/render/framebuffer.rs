@@ -16,7 +16,9 @@
 //!
 //! See: .planning/decisions/2026-08-11-presentation-surface-run-mode-seam.md
 
-use std::convert::Infallible;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::convert::Infallible;
 
 use embedded_graphics::{
     draw_target::DrawTarget,

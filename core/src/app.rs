@@ -10,6 +10,10 @@
 //! push/pop them, and hand `App` whatever live state those screens need to
 //! read.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::input::NavIntent;
 use crate::render::{FrameBuffer565, ListItem, Navigator, Screen, VerticalList};
 

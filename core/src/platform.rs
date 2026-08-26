@@ -11,8 +11,11 @@
 //! it's re-exported here only so this module's signatures stay meaningful
 //! without a second definition.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::input::NavIntent;
-use std::time::Instant;
+use core::time::Duration;
 
 pub use crate::render::FrameBuffer565;
 
@@ -61,12 +64,87 @@ pub trait InputSource {
     fn poll(&mut self) -> Vec<NavIntent>;
 }
 
+/// A monotonic timestamp, expressed as microseconds since some
+/// implementation-chosen reference point (e.g. "device boot" on real
+/// hardware, or whatever epoch `std::time::Instant` uses on the host).
+///
+/// This crate is `no_std` (see `lib.rs`), and `core` has no `Instant` type
+/// of its own — only `core::time::Duration`, which measures a span, not a
+/// point in time. Every concrete [`Clock`] impl (the emulator's
+/// `std::time::Instant`-backed one today, a future RP2350 impl reading a
+/// hardware timer) converts its native clock reading into this type at the
+/// `Clock::now` boundary, so the app core and `crate::run::run` never see a
+/// platform-specific time type.
+///
+/// Two `Instant`s are only meaningfully comparable (via
+/// [`Instant::duration_since`]/[`Instant::saturating_duration_since`]) if
+/// they came from the same [`Clock`] implementation -- exactly like
+/// `std::time::Instant`, whose cross-process/cross-clock-source comparisons
+/// are similarly meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Instant(u64);
+
+impl Instant {
+    /// Builds an `Instant` directly from a microsecond count. The only
+    /// constructor: every `Clock` impl is expected to produce its readings
+    /// this way (e.g. a hardware timer's tick count converted to
+    /// microseconds, or `std::time::Instant::duration_since` a fixed
+    /// reference point taken at startup).
+    #[must_use]
+    pub const fn from_micros(micros: u64) -> Self {
+        Self(micros)
+    }
+
+    /// The raw microsecond count this `Instant` was built from.
+    #[must_use]
+    pub const fn as_micros(self) -> u64 {
+        self.0
+    }
+
+    /// The elapsed [`Duration`] since `earlier`, saturating to
+    /// [`Duration::ZERO`] rather than panicking or wrapping if `earlier` is
+    /// actually later than `self` (e.g. a non-monotonic clock source, or
+    /// two `Instant`s from different `Clock` impls compared by mistake) --
+    /// mirroring `std::time::Instant::saturating_duration_since`'s
+    /// contract, which every call site in `crate::run` already assumes.
+    #[must_use]
+    pub const fn saturating_duration_since(self, earlier: Self) -> Duration {
+        Duration::from_micros(self.0.saturating_sub(earlier.0))
+    }
+}
+
+impl core::ops::Add<Duration> for Instant {
+    type Output = Self;
+
+    /// Saturates at `u64::MAX` microseconds rather than panicking on
+    /// overflow -- unreachable in practice (that's over 584,000 years of
+    /// microseconds) but keeps this operator total rather than partial.
+    fn add(self, rhs: Duration) -> Self {
+        let rhs_micros = u64::try_from(rhs.as_micros()).unwrap_or(u64::MAX);
+        Self(self.0.saturating_add(rhs_micros))
+    }
+}
+
+impl core::ops::AddAssign<Duration> for Instant {
+    fn add_assign(&mut self, rhs: Duration) {
+        *self = *self + rhs;
+    }
+}
+
 /// Wall-clock access, injected so the app core never calls platform time
-/// APIs directly. `std::time::Instant` is available on the host today, and
-/// the RP2350 side will supply an equivalent via its own `Clock` impl, so
-/// no custom time type is needed yet.
+/// APIs directly. Returns this crate's own [`Instant`] rather than
+/// `std::time::Instant` (unavailable under `no_std`) -- see `Instant`'s
+/// doc comment. Also owns the sleep primitive; see [`Clock::sleep`]'s doc
+/// comment for why that lives here now instead of being a bare
+/// `std::thread::sleep` call in `crate::run::run`.
 pub trait Clock {
     fn now(&self) -> Instant;
+
+    /// Blocks the calling thread/core for approximately `duration`. The
+    /// sole caller is `crate::run::run`'s frame-budget wait at the bottom
+    /// of its loop; see that module's doc comment ("Why sleeping is a
+    /// `Clock` method") for the full rationale.
+    fn sleep(&self, duration: Duration);
 }
 
 /// Persistent key/value storage. Implementations: native filesystem
@@ -126,8 +204,8 @@ pub struct OutputRequest {
     pub body: OutputRequestBody,
 }
 
-impl std::fmt::Debug for OutputRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for OutputRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("OutputRequest").field("body", &self.body).finish()
     }
 }
@@ -173,11 +251,11 @@ pub enum OutputStep {
     Key(HidKey),
 }
 
-impl std::fmt::Debug for OutputStep {
+impl core::fmt::Debug for OutputStep {
     /// Redacts `Type`'s payload exactly like [`OutputRequestBody::TypeText`]'s
     /// existing redaction (character count only); `Key` carries no secret
     /// (see [`HidKey`]'s doc comment) so it's rendered literally.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Type(text) => write!(f, "Type(<redacted, {} chars>)", text.chars().count()),
             Self::Key(key) => write!(f, "Key({key:?})"),
@@ -196,13 +274,13 @@ pub enum OutputRequestBody {
     Sequence(Vec<OutputStep>),
 }
 
-impl std::fmt::Debug for OutputRequestBody {
+impl core::fmt::Debug for OutputRequestBody {
     /// Redacts `TypeText`'s carried text exactly as before; `Sequence`
     /// delegates to `Vec<OutputStep>`'s own (derived) `Debug`, which in
     /// turn calls each [`OutputStep`]'s hand-written, redacting `Debug` —
     /// see [`OutputRequest`]'s doc comment on why `Debug` is hand-written
     /// here instead of derived.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::TypeText(text) => write!(f, "TypeText(<redacted, {} chars>)", text.chars().count()),
             Self::Sequence(steps) => f.debug_tuple("Sequence").field(steps).finish(),

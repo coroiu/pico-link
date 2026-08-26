@@ -29,6 +29,26 @@
 //!   built once over a placeholder root screen.
 //! - [`run::run`]: the unified, `Platform`-generic main loop that drives
 //!   an `App` — the one loop shared by every run mode.
+//!
+//! # `no_std` + `alloc`
+//!
+//! This crate is `no_std` (heap-allocating via `alloc`, e.g. `Vec`/`Box`/
+//! `String`, but no OS/libc dependency) everywhere except its own `#[cfg(test)]`
+//! modules, which compile against `std` as usual so `cargo test` needs no
+//! special target or allocator setup. The `not(test)` gate is what makes
+//! that possible: `cargo test` sets `cfg(test)` for this crate's own unit
+//! tests, so those keep using `std::{rc, cell, time}` etc. unmodified, while
+//! every other consumer (the `emulator` crate today building this as a
+//! plain dependency, and eventually the RP2350 firmware) gets the real
+//! `no_std` build -- which is exactly the build that must work on a target
+//! with no OS. A future firmware binary supplies the global allocator (a
+//! `#[global_allocator]`, likely backed by the RP2350's PSRAM) and this
+//! crate's own `Instant`/`Clock`/sleep seam (see `platform.rs`); nothing
+//! else in this file changes for that.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
 
 pub mod app;
 pub mod input;

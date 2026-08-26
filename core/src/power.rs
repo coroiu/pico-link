@@ -22,7 +22,8 @@
 //! these methods compute, mirroring the existing `idle_timeout:
 //! Option<Duration>` seam.
 
-use std::time::Duration;
+use alloc::vec;
+use core::time::Duration;
 
 use crate::platform::Storage;
 
@@ -159,7 +160,7 @@ fn deep_sleep_timeout_for(enabled: bool, armed: bool) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
+    use core::convert::Infallible;
 
     #[derive(Default)]
     struct StubStorage {

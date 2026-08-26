@@ -17,7 +17,13 @@ rust-version = "1.77"
 [dependencies]
 embedded-graphics = "0.8.2"
 embedded-graphics-framebuf = "0.5.0"
-serde = { version = "1.0", features = ["derive"] }
+# `default-features = false` -- this crate is `no_std` + `alloc` (see
+# `lib.rs`); serde's default `std` feature would otherwise pull `std` back
+# in as a transitive dependency. `derive` (the proc-macro impls) doesn't
+# need `std`. No serialized type here needs heap types (`NavIntent` is
+# plain enum variants, see `input.rs`), so serde's `alloc` feature isn't
+# needed either -- add it if that ever changes.
+serde = { version = "1.0", default-features = false, features = ["derive"] }
 u8g2-fonts = { version = "0.5.2", features = ["embedded_graphics_textstyle"] }
 # `run::run` always logs persistently-failing `DisplaySurface::flush`
 # calls (rate-limited, see `run.rs`'s `FlushErrorTracker`) -- a permanent

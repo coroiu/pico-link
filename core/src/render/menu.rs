@@ -27,7 +27,10 @@
     clippy::cast_sign_loss
 )]
 
-use std::convert::Infallible;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::convert::Infallible;
 
 use embedded_graphics::draw_target::{DrawTarget, DrawTargetExt};
 use embedded_graphics::pixelcolor::Rgb565;
