@@ -60,6 +60,7 @@ mod st7789 {
     const SLPOUT: u8 = 0x11;
     const DISPON: u8 = 0x29;
     const SWRESET: u8 = 0x01;
+    const INVON: u8 = 0x21;
 
     pub const WIDTH: u16 = 240;
     pub const HEIGHT: u16 = 240;
@@ -83,17 +84,20 @@ mod st7789 {
             Self { spi, dc, cs, rst, bl }
         }
 
-        fn write_cmd(&mut self, cmd: u8) {
+        // A single CS-low window covers the command byte AND its parameter
+        // bytes (DC toggled low-then-high in between, CS held throughout).
+        // The ST7789 datasheet's write sequences show CSX staying asserted
+        // for the whole command+parameter transaction; raising CS between
+        // the command and its data (the original bug here) makes many
+        // panels discard the command or ignore the parameters that follow.
+        fn command(&mut self, cmd: u8, params: &[u8]) {
+            self.cs.set_low();
             self.dc.set_low();
-            self.cs.set_low();
             let _ = self.spi.blocking_write(&[cmd]);
-            self.cs.set_high();
-        }
-
-        fn write_data(&mut self, data: &[u8]) {
-            self.dc.set_high();
-            self.cs.set_low();
-            let _ = self.spi.blocking_write(data);
+            if !params.is_empty() {
+                self.dc.set_high();
+                let _ = self.spi.blocking_write(params);
+            }
             self.cs.set_high();
         }
 
@@ -107,34 +111,44 @@ mod st7789 {
             self.rst.set_high();
             delay.delay_ms(120);
 
-            self.write_cmd(SWRESET);
+            self.command(SWRESET, &[]);
             delay.delay_ms(150);
 
-            self.write_cmd(SLPOUT);
+            self.command(SLPOUT, &[]);
             delay.delay_ms(120);
 
-            self.write_cmd(COLMOD);
-            self.write_data(&[0x55]); // 16 bits/pixel, RGB565
+            self.command(COLMOD, &[0x55]); // 16 bits/pixel, RGB565
+            self.command(MADCTL, &[0x00]);
+            // The Waveshare Pico-LCD-1.3 panel needs display inversion on,
+            // or colours render photo-negative. Wrong colour alone wouldn't
+            // explain an all-white screen, but it will bite the moment the
+            // fill itself is fixed, so it goes in now.
+            self.command(INVON, &[]);
 
-            self.write_cmd(MADCTL);
-            self.write_data(&[0x00]);
+            // CASET/RASET addresses are INCLUSIVE start/end column and row,
+            // so the end value for a 240px axis is 239 (0x00EF), not 240 -
+            // 240 (0x00F0) programs a 241px window on a 240px panel.
+            let x_end = WIDTH - 1;
+            let y_end = HEIGHT - 1;
+            self.command(CASET, &[0x00, 0x00, (x_end >> 8) as u8, (x_end & 0xff) as u8]);
+            self.command(RASET, &[0x00, 0x00, (y_end >> 8) as u8, (y_end & 0xff) as u8]);
 
-            self.write_cmd(CASET);
-            self.write_data(&[0x00, 0x00, (WIDTH >> 8) as u8, (WIDTH & 0xff) as u8]);
-
-            self.write_cmd(RASET);
-            self.write_data(&[0x00, 0x00, (HEIGHT >> 8) as u8, (HEIGHT & 0xff) as u8]);
-
-            self.write_cmd(RAMWR);
-            let px = [(color >> 8) as u8, (color & 0xff) as u8];
-            self.dc.set_high();
+            // RAMWR's pixel stream is itself parameter data to the command,
+            // so it must stay inside the same CS-low window as the command
+            // byte too - same fix as above, just with a big params buffer
+            // instead of a few register bytes. Written directly rather than
+            // through `command()` to avoid building a 115200-byte buffer.
             self.cs.set_low();
+            self.dc.set_low();
+            let _ = self.spi.blocking_write(&[RAMWR]);
+            self.dc.set_high();
+            let px = [(color >> 8) as u8, (color & 0xff) as u8];
             for _ in 0..(WIDTH as u32 * HEIGHT as u32) {
                 let _ = self.spi.blocking_write(&px);
             }
             self.cs.set_high();
 
-            self.write_cmd(DISPON);
+            self.command(DISPON, &[]);
             delay.delay_ms(20);
 
             // Backlight on. The panel is otherwise driven correctly with the
@@ -155,10 +169,12 @@ fn main() -> ! {
     let bl = Output::new(p.PIN_13, Level::Low);
 
     let mut spi_config = SpiConfig::default();
-    // Conservative first-bring-up clock; ST7789 tops out far higher, but
-    // this is unverified hardware and there is nothing to lose by starting
-    // slow. Bump once the fill is confirmed on screen.
-    spi_config.frequency = 20_000_000;
+    // 20MHz on the first attempt produced a solid white screen (backlight
+    // on, panel never actually initialised - see the CS-framing fix above,
+    // the most likely cause). Dropping this further removes clock speed as
+    // a variable while that fix is being verified; 1MHz is nowhere near
+    // ST7789's ~62.5MHz ceiling. Bump back up once the fill is confirmed.
+    spi_config.frequency = 1_000_000;
     let spi = Spi::new_blocking_txonly(p.SPI1, p.PIN_10, p.PIN_11, spi_config);
 
     let mut display = st7789::St7789::new(spi, dc, cs, rst, bl);
