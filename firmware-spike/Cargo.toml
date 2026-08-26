@@ -15,6 +15,7 @@ panic-halt = "1.0"
 cyw43 = { version = "0.7.0", features = ["bluetooth"] }
 cyw43-pio = "0.10.0"
 cyw43-firmware = { version = "0.1.0", features = ["bluetooth"] }
+embedded-hal = "1.0.0"
 
 [build-dependencies]
 cc = "1"
