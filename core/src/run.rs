@@ -568,7 +568,7 @@ mod tests {
         const ITERATIONS: usize = 10;
         let mut platform = FailingStubPlatform {
             display: FailingStubDisplay,
-            input: QueuedInput(vec![vec![NavIntent::Next]; ITERATIONS]),
+            input: QueuedInput(vec![vec![NavIntent::Down]; ITERATIONS]),
             clock: StubClock,
             storage: StubStorage,
             power: RecordingPower::new(false),
@@ -616,7 +616,7 @@ mod tests {
         let flush_count = Rc::new(RefCell::new(0));
         let mut platform = StubPlatform {
             display: StubDisplay { flush_count: Rc::clone(&flush_count) },
-            input: QueuedInput(vec![vec![], vec![NavIntent::Next], vec![]]),
+            input: QueuedInput(vec![vec![], vec![NavIntent::Down], vec![]]),
             clock: StubClock,
             storage: StubStorage,
             power: RecordingPower::new(false),
@@ -794,7 +794,7 @@ mod tests {
         // the clock jumps past the timeout first -> Off. Iteration 3: a
         // `Next` intent arrives while Asleep -> should wake (On) and be
         // dropped, NOT reach `app.handle_input`.
-        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(), Vec::new(), vec![NavIntent::Next]]);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(), Vec::new(), vec![NavIntent::Down]]);
         let mut app = App::new(240, 240);
 
         let mut iterations = 0;
@@ -822,7 +822,7 @@ mod tests {
         // where the first call left off) with one more `Next` proves input
         // delivery still works normally once Active: this time the intent
         // reaches `app.handle_input` and moves the selection.
-        let RecordingSetup { mut platform, clock: _, power_calls: power_calls2, flush_count: _ } = recording_platform(vec![vec![NavIntent::Next]]);
+        let RecordingSetup { mut platform, clock: _, power_calls: power_calls2, flush_count: _ } = recording_platform(vec![vec![NavIntent::Down]]);
         let mut iterations2 = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), Some(idle_timeout), None, || {
             iterations2 += 1;

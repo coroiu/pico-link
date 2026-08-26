@@ -28,7 +28,7 @@ fn build_scene() -> Navigator {
         ListItem::new("Device info").with_sublabel("Pico Plus 2 W"),
     ];
     let list = VerticalList::new(items);
-    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Next/Prev  Select  Back");
+    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back");
     Navigator::new(root)
 }
 
@@ -68,7 +68,7 @@ fn scene_renders_expected_chrome_colors() {
 #[test]
 fn dispatching_next_moves_the_selection_highlight_down_one_row() {
     let mut navigator = build_scene();
-    navigator.dispatch(NavIntent::Next);
+    navigator.dispatch(NavIntent::Down);
 
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
@@ -140,13 +140,13 @@ fn text_never_bleeds_past_a_rows_bottom_padding() {
 #[test]
 fn an_unselected_rows_pixels_do_not_depend_on_which_other_row_is_selected() {
     let mut selecting_row1 = build_scene();
-    selecting_row1.dispatch(NavIntent::Next);
+    selecting_row1.dispatch(NavIntent::Down);
     let mut frame_row1_selected = FrameBuffer565::new(240, 240);
     selecting_row1.render(&mut frame_row1_selected).unwrap();
 
     let mut selecting_row2 = build_scene();
-    selecting_row2.dispatch(NavIntent::Next);
-    selecting_row2.dispatch(NavIntent::Next);
+    selecting_row2.dispatch(NavIntent::Down);
+    selecting_row2.dispatch(NavIntent::Down);
     let mut frame_row2_selected = FrameBuffer565::new(240, 240);
     selecting_row2.render(&mut frame_row2_selected).unwrap();
 

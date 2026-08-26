@@ -14,7 +14,7 @@
 //! production code, just exercised without the window I/O side effect.
 //!
 //! Builds the identical scene `core/tests/render_png_dump.rs` uses (titled
-//! screen + 3-item vertical list, one `NavIntent::Next` dispatched so the
+//! screen + 3-item vertical list, one `NavIntent::Down` dispatched so the
 //! selection highlight isn't just sitting on row 0 by coincidence), for the
 //! same reason that test gives: proves real widget rendering, not a blank
 //! or synthetic frame.
@@ -39,9 +39,9 @@ fn build_scene() -> Navigator {
         ListItem::new("Device info").with_sublabel("Pico Plus 2 W"),
     ];
     let list = VerticalList::new(items);
-    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Next/Prev  Select  Back");
+    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back");
     let mut navigator = Navigator::new(root);
-    navigator.dispatch(NavIntent::Next);
+    navigator.dispatch(NavIntent::Down);
     navigator
 }
 

@@ -34,18 +34,17 @@ use super::framebuffer::FrameBuffer565;
 use super::screen::Screen;
 
 /// High-level focus state transitions, decoupled from whatever transport
-/// triggered them (encoder, keyboard, headless HTTP injection — see
-/// `.planning/decisions/2026-08-11-rotary-encoder-input-model.md`). The
-/// `Navigator` fires these on a widget when its focus state changes or when
-/// it is activated while focused.
+/// triggered them (joystick, button, keyboard, headless HTTP injection —
+/// see `crate::input::NavIntent`). The `Navigator` fires these on a widget
+/// when its focus state changes or when it is activated while focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusEvent {
     /// The widget gained focus (e.g. the user navigated to it).
     Gained,
     /// The widget lost focus (e.g. the user navigated away).
     Lost,
-    /// The widget was activated while focused (encoder short press, Enter,
-    /// headless `Activate` intent).
+    /// The widget was activated while focused (joystick press, button A,
+    /// Enter, headless `Select` intent).
     Activated,
 }
 
@@ -183,12 +182,13 @@ pub trait Widget {
         Action::None
     }
 
-    /// Called by the `Navigator` with `Next`/`Prev`/`NextN` while this
-    /// widget is focused, giving it a chance to react internally (e.g. a
-    /// list moving its selected row) before/alongside the `Navigator`'s
-    /// own top-level focus cycling — see `Navigator::dispatch` for the
-    /// exact interleaving and its known limitation for multi-widget
-    /// screens.
+    /// Called by the `Navigator` with `Up`/`Down`/`JumpBy` (and, for
+    /// widgets that care about the horizontal axis, `Left`/`Right`) while
+    /// this widget is focused, giving it a chance to react internally
+    /// (e.g. a list moving its selected row) before/alongside the
+    /// `Navigator`'s own top-level focus cycling — see
+    /// `Navigator::dispatch` for the exact interleaving and its known
+    /// limitation for multi-widget screens.
     fn on_intent(&mut self, _intent: NavIntent) -> Action {
         Action::None
     }

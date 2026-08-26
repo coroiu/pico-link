@@ -6,7 +6,7 @@
 //! [`super::message::MessageView`] stacked above a [`MenuList`]: a
 //! `Screen`'s widget list stacks vertically via `Widget::measure`, which
 //! works fine for two *independent* widgets, but per-screen focus memory
-//! and long-press-Back-cancels are simplest to reason about with exactly
+//! and button-B-Back-cancels are simplest to reason about with exactly
 //! one focusable widget per pushed screen (see `Navigator::dispatch`'s
 //! "known simplification" doc comment for the general hazard of more than
 //! one). `ConfirmView` instead *wraps* a [`MenuList`] internally (the same
@@ -15,10 +15,10 @@
 //! top slice of its assigned area and delegating everything else
 //! (selection, activation, the row drawing itself) to the wrapped list.
 //!
-//! Long-press Back "cancels" for free: `Navigator::dispatch(NavIntent::
-//! Back)` always pops the current screen unconditionally (see that
-//! module's doc comment) — popping a pushed `ConfirmView` back to Settings
-//! is exactly what "Cancel" does too, so no special-cased Back handling is
+//! Back "cancels" for free: `Navigator::dispatch(NavIntent::
+//! Back)` (button B) always pops the current screen unconditionally (see
+//! that module's doc comment) — popping a pushed `ConfirmView` back to
+//! Settings is exactly what "Cancel" does too, so no special-cased Back handling is
 //! needed here.
 
 #![allow(
@@ -191,7 +191,7 @@ mod tests {
             assert_eq!(index, 1, "activation must report the selected row's index");
             Action::PopView
         });
-        view.on_intent(NavIntent::Next); // Cancel -> Clear everything
+        view.on_intent(NavIntent::Down); // Cancel -> Clear everything
         let action = view.on_focus(FocusEvent::Activated);
         assert!(matches!(action, Action::PopView));
     }
@@ -200,7 +200,7 @@ mod tests {
     fn cancel_is_index_zero_the_default_selection() {
         // Uma's design: Cancel must be default-focused (the safe row) —
         // proven the same way `MenuList`'s own tests prove default
-        // selection: activating with no prior `Next`/`Prev` reports index 0.
+        // selection: activating with no prior `Down`/`Up` reports index 0.
         let mut view = ConfirmView::new("Clear all 3 items?", rows()).on_activate_index(|index| {
             assert_eq!(index, 0, "Cancel (row 0) must be selected by default, with no navigation");
             Action::PopView

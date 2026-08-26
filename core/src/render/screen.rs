@@ -251,8 +251,10 @@ impl Screen {
     }
 
     /// Forwards a navigation intent to the currently focused widget (if
-    /// any), for `Next`/`Prev`/`NextN` — see `Navigator::dispatch` for how
-    /// this interacts with `focus_next`/`focus_previous`.
+    /// any), for `Up`/`Down`/`JumpBy` (and `Left`/`Right`/`ShortcutX`/
+    /// `ShortcutY`, forwarded but with no top-level effect) — see
+    /// `Navigator::dispatch` for how this interacts with
+    /// `focus_next`/`focus_previous`.
     pub(super) fn forward_to_focused(&mut self, intent: NavIntent) -> Action {
         match self.focused_index {
             Some(index) => self.widgets[index].on_intent(intent),
@@ -260,7 +262,7 @@ impl Screen {
         }
     }
 
-    /// Activates the currently focused widget (`NavIntent::Activate`).
+    /// Activates the currently focused widget (`NavIntent::Select`).
     pub(super) fn activate_focused(&mut self) -> Action {
         match self.focused_index {
             Some(index) => self.widgets[index].on_focus(FocusEvent::Activated),
