@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn regions_stack_vertically_and_fill_the_screen_exactly() {
-        let chrome = compute_chrome(Size::new(320, 170));
+        let chrome = compute_chrome(Size::new(240, 240));
         assert_eq!(chrome.title.top_left, Point::new(0, 0));
         assert_eq!(chrome.content.top_left.y, chrome.title.size.height as i32);
         assert_eq!(
@@ -82,7 +82,7 @@ mod tests {
         );
         let total_height =
             chrome.title.size.height + chrome.content.size.height + chrome.hint.size.height;
-        assert_eq!(total_height, 170);
+        assert_eq!(total_height, 240);
     }
 
     #[test]

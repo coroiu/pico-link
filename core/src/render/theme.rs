@@ -2,9 +2,12 @@
 //! `u8g2-fonts` accessors, `open_iconic` icon codepoints, and two shared
 //! drawing primitives (a chip and a full-width selection block).
 //!
-//! Approved for the T-Embed's 320x170 ST7789 color panel (the current
-//! target; the 240x240 Pico Plus 2 W retarget is Epic B2, not yet done).
-//! This module is the *foundation* only — it swaps the render core's
+//! Approved originally for the T-Embed's 320x170 ST7789 color panel;
+//! carried over unchanged onto the 240x240 Pico Plus 2 W panel (Epic B2)
+//! — this module's palette/font choices are resolution-independent, only
+//! layout (`list.rs`'s row budget, `screen.rs`'s chrome) needed
+//! recomputing for the new panel. This module is the *foundation* only —
+//! it swaps the render core's
 //! fonts/colors and provides primitives for later views (list chrome,
 //! detail views, and similar) to compose; it does not itself restyle
 //! spacing/layout.

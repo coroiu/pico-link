@@ -23,7 +23,7 @@ fn main() {
     // dispatch actually affects what gets rendered.
     navigator.dispatch(pico_link_core::NavIntent::Next);
 
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
 
     let path = "render_scene.png";

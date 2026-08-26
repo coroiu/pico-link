@@ -444,8 +444,8 @@ mod tests {
     fn render_does_not_panic_and_writes_into_the_provided_chrome_regions() {
         let mut screen = list_screen(5);
         screen.initialize_focus();
-        let chrome = super::super::chrome::compute_chrome(Size::new(320, 170));
-        let mut fb = FrameBuffer565::new(320, 170);
+        let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
+        let mut fb = FrameBuffer565::new(240, 240);
         screen.render(&chrome, &mut fb).unwrap();
         // Title bar was filled with its background color.
         assert_eq!(fb.pixel(Point::new(0, 0)), palette::SURFACE);
@@ -482,18 +482,18 @@ mod tests {
         screen
     }
 
-    /// Renders `screen` into a fresh 320x170 framebuffer and reports
-    /// whether `color` appears anywhere in the rightmost 20 columns of the
-    /// title bar -- the glyph's drawing region when (per `ble_screen`)
-    /// there is no status dot/readout ahead of it, so it lands flush
-    /// against the title bar's right margin. Narrow and right-aligned
-    /// enough to never collide with the "T" title text or the shield mark,
-    /// both drawn from the left edge.
+    /// Renders `screen` into a fresh 240x240 framebuffer (the Pico Plus 2
+    /// W panel, Epic B2) and reports whether `color` appears anywhere in
+    /// the rightmost 20 columns of the title bar -- the glyph's drawing
+    /// region when (per `ble_screen`) there is no status dot/readout
+    /// ahead of it, so it lands flush against the title bar's right
+    /// margin. Narrow and right-aligned enough to never collide with the
+    /// "T" title text or the shield mark, both drawn from the left edge.
     fn any_pixel_near_the_right_title_edge(screen: &Screen, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
-        let chrome = super::super::chrome::compute_chrome(Size::new(320, 170));
-        let mut fb = FrameBuffer565::new(320, 170);
+        let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
+        let mut fb = FrameBuffer565::new(240, 240);
         screen.render(&chrome, &mut fb).unwrap();
-        (300..320).any(|x| (0..super::super::chrome::TITLE_BAR_HEIGHT as i32).any(|y| fb.pixel(Point::new(x, y)) == color))
+        (220..240).any(|x| (0..super::super::chrome::TITLE_BAR_HEIGHT as i32).any(|y| fb.pixel(Point::new(x, y)) == color))
     }
 
     #[test]

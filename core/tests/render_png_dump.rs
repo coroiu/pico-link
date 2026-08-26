@@ -41,20 +41,20 @@ fn row_top(index: i32) -> i32 {
 #[test]
 fn scene_renders_expected_chrome_colors() {
     let navigator = build_scene();
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
 
     // Title bar background, per Screen::render.
     assert_eq!(framebuffer.pixel(Point::new(0, 0)), palette::SURFACE);
-    assert_eq!(framebuffer.pixel(Point::new(319, 0)), palette::SURFACE);
+    assert_eq!(framebuffer.pixel(Point::new(239, 0)), palette::SURFACE);
 
     // First row is selected by default (initialize_focus + selected == 0):
     // its background should be the selected-row elevated fill, not the
-    // plain screen background. x=300: clear of the left selection accent
+    // plain screen background. x=200: clear of the left selection accent
     // bar *and* clear of the row's (proportional-font, so
     // variable-width) name/username text, so this samples the row's
     // plain fill rather than the accent stripe or a glyph pixel.
-    let sample_x = 300;
+    let sample_x = 200;
     let first_row_background = framebuffer.pixel(Point::new(sample_x, row_top(0) + 2));
     assert_eq!(first_row_background, palette::SURFACE_ELEVATED);
 
@@ -70,13 +70,13 @@ fn dispatching_next_moves_the_selection_highlight_down_one_row() {
     let mut navigator = build_scene();
     navigator.dispatch(NavIntent::Next);
 
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
 
-    // x=300: clear of the left selection accent bar and of any row text,
+    // x=200: clear of the left selection accent bar and of any row text,
     // so this samples the plain elevated fill rather than the accent
     // stripe or a glyph pixel.
-    let sample_x = 300;
+    let sample_x = 200;
     // Row 0's background is no longer highlighted...
     assert_ne!(framebuffer.pixel(Point::new(sample_x, row_top(0) + 2)), palette::SURFACE_ELEVATED);
     // ...row 1's is.
@@ -101,7 +101,7 @@ const BOTTOM_PADDING_PX: i32 = 1;
 #[test]
 fn text_never_bleeds_past_a_rows_bottom_padding() {
     let navigator = build_scene();
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
 
     for index in 0..ITEM_COUNT {
@@ -141,13 +141,13 @@ fn text_never_bleeds_past_a_rows_bottom_padding() {
 fn an_unselected_rows_pixels_do_not_depend_on_which_other_row_is_selected() {
     let mut selecting_row1 = build_scene();
     selecting_row1.dispatch(NavIntent::Next);
-    let mut frame_row1_selected = FrameBuffer565::new(320, 170);
+    let mut frame_row1_selected = FrameBuffer565::new(240, 240);
     selecting_row1.render(&mut frame_row1_selected).unwrap();
 
     let mut selecting_row2 = build_scene();
     selecting_row2.dispatch(NavIntent::Next);
     selecting_row2.dispatch(NavIntent::Next);
-    let mut frame_row2_selected = FrameBuffer565::new(320, 170);
+    let mut frame_row2_selected = FrameBuffer565::new(240, 240);
     selecting_row2.render(&mut frame_row2_selected).unwrap();
 
     let row0_top = row_top(0);
@@ -168,7 +168,7 @@ fn an_unselected_rows_pixels_do_not_depend_on_which_other_row_is_selected() {
 #[test]
 fn framebuffer_round_trips_through_a_real_png_encoder() {
     let navigator = build_scene();
-    let mut framebuffer = FrameBuffer565::new(320, 170);
+    let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
 
     let mut image = image::RgbImage::new(framebuffer.width(), framebuffer.height());

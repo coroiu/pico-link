@@ -117,13 +117,13 @@ mod tests {
 
     #[test]
     fn a_fresh_app_is_dirty_and_renders_the_initial_screen() {
-        let app = App::new(320, 170);
+        let app = App::new(240, 240);
         assert!(app.dirty());
     }
 
     #[test]
     fn render_clears_the_dirty_flag() {
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
         assert!(app.dirty());
         app.render();
         assert!(!app.dirty());
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn mark_dirty_sets_the_flag_even_with_no_screen_state_change() {
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
         app.render();
         assert!(!app.dirty());
 
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn handle_input_with_no_intents_does_not_mark_dirty() {
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
         app.render();
         assert!(!app.dirty());
         app.handle_input(vec![]);
@@ -153,24 +153,24 @@ mod tests {
         use crate::render::theme::palette;
         use embedded_graphics::prelude::Point;
 
-        let mut app = App::new(320, 170);
+        let mut app = App::new(240, 240);
 
-        // x=250: past the chip/accent area and these short labels' text,
+        // x=200: past the chip/accent area and these short labels' text,
         // so it samples the row's plain elevated fill rather than a glyph
-        // pixel.
-        let frame_0 = app.render().pixel(Point::new(250, 18));
+        // pixel, and still inside the 240px-wide (Epic B2) panel.
+        let frame_0 = app.render().pixel(Point::new(200, 18));
         assert_eq!(frame_0, palette::SURFACE_ELEVATED, "row 0 should start selected");
 
         app.handle_input(vec![NavIntent::Next]);
         assert!(app.dirty(), "moving selection should mark the app dirty");
 
-        let frame_1_row_0 = app.render().pixel(Point::new(250, 18));
+        let frame_1_row_0 = app.render().pixel(Point::new(200, 18));
         assert_ne!(frame_1_row_0, palette::SURFACE_ELEVATED, "row 0 should no longer be selected");
     }
 
     #[test]
     fn navigator_starts_at_depth_one_with_the_placeholder_root_screen() {
-        let app = App::new(320, 170);
+        let app = App::new(240, 240);
         assert_eq!(app.navigator_depth(), 1);
     }
 }
