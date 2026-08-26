@@ -113,7 +113,7 @@ fn driving_to_idle_blanks_the_headless_screenshot_and_an_injected_intent_restore
 
             // The wake-triggering input: queued now, so the very next
             // iteration's `poll()` (this one, about to run) sees it.
-            input_queue.lock().unwrap().push_back(NavIntent::Next);
+            input_queue.lock().unwrap().push_back(NavIntent::Down);
         }
 
         iterations <= TOTAL_ITERATIONS

@@ -57,9 +57,19 @@ pub trait DisplaySurface {
 }
 
 /// Polls for input, already resolved to the semantic `NavIntent` level
-/// (see `crate::input`). Per the ADR, raw platform events (encoder ticks,
-/// keycodes) stay driver-local and are mapped to `NavIntent` before
-/// reaching this trait.
+/// (see `crate::input`). Raw platform events (joystick GPIO edges, button
+/// presses, keycodes) stay driver-local and are mapped to `NavIntent`
+/// before reaching this trait.
+///
+/// # Firmware note: pull-ups, not pull-downs
+///
+/// The real joystick/button GPIOs (RP2350, see the hardware pinout in the
+/// project's `CLAUDE.md`) must be wired with pull-**ups**, not pull-downs
+/// — RP2350 erratum E9 affects pull-downs on GPIO inputs. This doesn't
+/// change this trait's shape (it's already resolved past raw GPIO state
+/// by the time a `NavIntent` reaches `poll`), but it's the thing a future
+/// real-target `InputSource` implementation needs to get right at the
+/// pin-configuration layer underneath it.
 pub trait InputSource {
     fn poll(&mut self) -> Vec<NavIntent>;
 }

@@ -30,7 +30,7 @@ fn placeholder_root_screen() -> Screen {
         ListItem::new("Device info").with_sublabel("Pico Plus 2 W"),
     ];
     let list = VerticalList::new(items);
-    Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Rotate to move")
+    Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back")
 }
 
 /// The application core: a [`Navigator`] built once over a placeholder
@@ -161,7 +161,7 @@ mod tests {
         let frame_0 = app.render().pixel(Point::new(200, 18));
         assert_eq!(frame_0, palette::SURFACE_ELEVATED, "row 0 should start selected");
 
-        app.handle_input(vec![NavIntent::Next]);
+        app.handle_input(vec![NavIntent::Down]);
         assert!(app.dirty(), "moving selection should mark the app dirty");
 
         let frame_1_row_0 = app.render().pixel(Point::new(200, 18));

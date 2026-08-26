@@ -209,8 +209,8 @@ pub(crate) const fn username_top_offset() -> i32 {
 ///
 /// # Why this runs at render time, not in `on_intent`
 ///
-/// `on_intent` only knows the selection *delta* (`NavIntent::Next`/
-/// `Prev`/`NextN`) — it has no idea how many rows the viewport can
+/// `on_intent` only knows the selection *delta* (`NavIntent::Down`/
+/// `Up`/`JumpBy`) — it has no idea how many rows the viewport can
 /// currently show (`area.size.height` is a render-time input, passed to
 /// `Widget::render`, never to `Widget::on_intent`). This function is
 /// therefore called from `render`, fed whatever `top_index` was
@@ -402,7 +402,7 @@ type OnActivate = Box<dyn Fn(&ListItem) -> Action>;
 type OnActivateIndex = Box<dyn Fn(usize) -> Action>;
 
 /// A focusable, scrollable vertical list of [`ListItem`]s. Moves its
-/// internal selection in response to `NavIntent::{Next,Prev,NextN}` via
+/// internal selection in response to `NavIntent::{Up,Down,JumpBy}` via
 /// `Widget::on_intent`, auto-scrolling to keep the selection visible (only
 /// at the viewport edges — see [`reconcile_top_index`]); fires its
 /// `on_activate`/`on_activate_index` callback (if any) when activated
@@ -435,7 +435,7 @@ impl VerticalList {
     }
 
     /// Registers a callback invoked with the selected `ListItem` when the
-    /// list is activated (encoder short press / `NavIntent::Activate`)
+    /// list is activated (joystick press, button A / `NavIntent::Select`)
     /// while focused. Typically used to return `Action::PushView(...)`.
     #[must_use]
     pub fn on_activate(mut self, callback: impl Fn(&ListItem) -> Action + 'static) -> Self {
@@ -546,10 +546,10 @@ impl Widget for VerticalList {
 
     fn on_intent(&mut self, intent: NavIntent) -> Action {
         match intent {
-            NavIntent::Next => self.move_selection(1),
-            NavIntent::Prev => self.move_selection(-1),
-            NavIntent::NextN(n) => self.move_selection(i32::from(n)),
-            NavIntent::Activate | NavIntent::Back => {}
+            NavIntent::Down => self.move_selection(1),
+            NavIntent::Up => self.move_selection(-1),
+            NavIntent::JumpBy(n) => self.move_selection(i32::from(n)),
+            NavIntent::Select | NavIntent::Back | NavIntent::Left | NavIntent::Right | NavIntent::ShortcutX | NavIntent::ShortcutY => {}
         }
         Action::None
     }
@@ -631,33 +631,33 @@ mod tests {
         let mut list = VerticalList::new(items(3));
         assert_eq!(list.selected_index(), 0);
 
-        list.on_intent(NavIntent::Prev); // clamp below zero
+        list.on_intent(NavIntent::Up); // clamp below zero
         assert_eq!(list.selected_index(), 0);
 
-        list.on_intent(NavIntent::Next);
+        list.on_intent(NavIntent::Down);
         assert_eq!(list.selected_index(), 1);
-        list.on_intent(NavIntent::Next);
+        list.on_intent(NavIntent::Down);
         assert_eq!(list.selected_index(), 2);
-        list.on_intent(NavIntent::Next); // clamp at the end
+        list.on_intent(NavIntent::Down); // clamp at the end
         assert_eq!(list.selected_index(), 2);
 
-        list.on_intent(NavIntent::Prev);
+        list.on_intent(NavIntent::Up);
         assert_eq!(list.selected_index(), 1);
     }
 
     #[test]
     fn next_n_jumps_and_clamps() {
         let mut list = VerticalList::new(items(10));
-        list.on_intent(NavIntent::NextN(4));
+        list.on_intent(NavIntent::JumpBy(4));
         assert_eq!(list.selected_index(), 4);
-        list.on_intent(NavIntent::NextN(20));
+        list.on_intent(NavIntent::JumpBy(20));
         assert_eq!(list.selected_index(), 9);
     }
 
     #[test]
     fn intent_on_empty_list_does_not_panic() {
         let mut list = VerticalList::new(vec![]);
-        let action = list.on_intent(NavIntent::Next);
+        let action = list.on_intent(NavIntent::Down);
         assert!(matches!(action, Action::None));
     }
 
@@ -674,7 +674,7 @@ mod tests {
             assert_eq!(item.label, "item-1");
             Action::PopView
         });
-        list.on_intent(NavIntent::Next); // select index 1
+        list.on_intent(NavIntent::Down); // select index 1
         let action = list.on_focus(FocusEvent::Activated);
         assert!(matches!(action, Action::PopView));
     }
@@ -690,7 +690,7 @@ mod tests {
             assert_eq!(index, 1, "the callback must receive the selected row's index");
             Action::PopView
         });
-        list.on_intent(NavIntent::Next); // select index 1
+        list.on_intent(NavIntent::Down); // select index 1
         let action = list.on_focus(FocusEvent::Activated);
         assert!(matches!(action, Action::PopView));
     }
@@ -739,7 +739,7 @@ mod tests {
         // row (top=2: rows 2,3,4 visible), not "selected's own bottom
         // pinned to the viewport bottom" (the old, buggy rule).
         for _ in 0..4 {
-            list.on_intent(NavIntent::Next);
+            list.on_intent(NavIntent::Down);
         }
         list.render(area, &mut fb).unwrap();
         assert_eq!(list.top_index.get(), 2);
@@ -766,13 +766,13 @@ mod tests {
         let mut fb = FrameBuffer565::new(240, viewport_height);
 
         for _ in 0..4 {
-            list.on_intent(NavIntent::Next);
+            list.on_intent(NavIntent::Down);
         }
         list.render(area, &mut fb).unwrap(); // selected=4, top settles at 2
         let top_after_scrolling_down = list.top_index.get();
         assert_eq!(top_after_scrolling_down, 2);
 
-        list.on_intent(NavIntent::Prev); // selected=3, still within [2, 5)
+        list.on_intent(NavIntent::Up); // selected=3, still within [2, 5)
         list.render(area, &mut fb).unwrap();
         assert_eq!(
             list.top_index.get(),
@@ -790,7 +790,7 @@ mod tests {
 
         #[test]
         fn a_big_jump_scrolls_down_just_enough_to_reveal_the_new_selection() {
-            // NextN(20) from top=0, visible_rows=3, 10 items clamps
+            // JumpBy(20) from top=0, visible_rows=3, 10 items clamps
             // selection to the last item (9), and top should land at 7
             // (rows 7,8,9 visible -- 9 is the new last visible row).
             assert_eq!(reconcile_top_index(0, 9, 3, 10), 7);
@@ -843,9 +843,9 @@ mod tests {
             // `moving_up_while_still_visible_does_not_re_pin_to_the_
             // viewport_edge` above): the selection moves down far enough
             // that the window has to scroll (top advances from 0 to 2 as
-            // selected goes 0->4, one `Next` at a time, mirroring what
+            // selected goes 0->4, one `Down` at a time, mirroring what
             // `VerticalList::render` actually does on every frame), then
-            // Prev moves the selection back up ONE row that is still
+            // Up moves the selection back up ONE row that is still
             // inside that window -- top must stay exactly where it was,
             // not recompute a fresh position from the new `selected`
             // alone (the retired `scroll_offset_for_selection`'s bug:

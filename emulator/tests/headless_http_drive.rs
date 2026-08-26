@@ -136,10 +136,10 @@ fn injecting_a_navintent_over_http_moves_the_selection_and_is_observable_in_the_
     assert_eq!(*before.get_pixel(sample_x, row0_y), highlight_rgb8, "row 0 starts selected");
     assert_ne!(*before.get_pixel(sample_x, row1_y), highlight_rgb8, "row 1 is not selected before any input");
 
-    // --- Inject NavIntent::Next over HTTP -- the exact wire shape
+    // --- Inject NavIntent::Down over HTTP -- the exact wire shape
     // `pico_link_core::input::NavIntent`'s derived `Deserialize` expects for a
     // unit variant. ---
-    let (status, body) = post(addr, "/api/input", b"\"Next\"");
+    let (status, body) = post(addr, "/api/input", b"\"Down\"");
     assert_eq!(status, 200, "POST /api/input did not succeed: {}", String::from_utf8_lossy(&body));
 
     // --- Frame 2: the render loop's `HttpInput::poll()` drains the queued
@@ -152,12 +152,12 @@ fn injecting_a_navintent_over_http_moves_the_selection_and_is_observable_in_the_
     assert_ne!(
         *after.get_pixel(sample_x, row0_y),
         highlight_rgb8,
-        "row 0's highlight must not still be showing after the injected Next moved the selection away"
+        "row 0's highlight must not still be showing after the injected Down moved the selection away"
     );
     assert_eq!(
         *after.get_pixel(sample_x, row1_y),
         highlight_rgb8,
-        "row 1 must become selected once the HTTP-injected Next reaches the running App"
+        "row 1 must become selected once the HTTP-injected Down reaches the running App"
     );
 }
 

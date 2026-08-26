@@ -15,13 +15,13 @@ fn main() {
         ListItem::new("Device info").with_sublabel("Pico Plus 2 W"),
     ];
     let list = VerticalList::new(items);
-    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Next/Prev  Select  Back");
+    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back");
     let mut navigator = Navigator::new(root);
 
     // Move selection once, so the PNG visibly shows the selection highlight
     // on a row other than the first — cheap extra proof that on_intent
     // dispatch actually affects what gets rendered.
-    navigator.dispatch(pico_link_core::NavIntent::Next);
+    navigator.dispatch(pico_link_core::NavIntent::Down);
 
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");

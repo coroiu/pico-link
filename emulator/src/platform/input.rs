@@ -5,9 +5,15 @@
 //! minimal placeholder `InputSource` for callers/tests that need *some*
 //! implementation without wiring up either of the above).
 //!
-//! Mapping (per the bead): arrow up / scroll up -> `Prev`, arrow down /
-//! scroll down -> `Next`, Enter -> `Activate`, Backspace or Escape ->
-//! `Back`.
+//! Mapping (per the bead): the four arrow keys stand in for the real
+//! joystick's four directions (arrow up -> `Up`, arrow down / scroll down
+//! -> `Down`, scroll up -> `Up`, arrow left -> `Left`, arrow right ->
+//! `Right`); Enter or the `A` key stand in for the joystick's center press
+//! / button A -> `Select`; Backspace, Escape, or the `B` key stand in for
+//! button B -> `Back` (a real dedicated back key, not a long-press timer);
+//! the `X`/`Y` keys stand in for buttons X/Y -> `ShortcutX`/`ShortcutY`
+//! (unbound today, same as the buttons themselves — see
+//! `pico_link_core::input::NavIntent`).
 //!
 //! [`WindowedInput::poll`] also calls `minifb::Window::update()` before
 //! reading any input state. `pico_link_core::run`'s loop calls `input.poll()`
@@ -36,13 +42,21 @@ use pico_link_core::platform::InputSource;
 use minifb::{Key, Window};
 
 /// The fixed set of keys this project maps to a `NavIntent`, and which
-/// intent each maps to on press.
+/// intent each maps to on press. Mirrors the real hardware: four
+/// directions, a center-press/A `Select`, a dedicated B `Back`, and two
+/// unbound shortcut buttons (X/Y) — see the module doc comment.
 const KEY_INTENTS: &[(Key, NavIntent)] = &[
-    (Key::Up, NavIntent::Prev),
-    (Key::Down, NavIntent::Next),
-    (Key::Enter, NavIntent::Activate),
+    (Key::Up, NavIntent::Up),
+    (Key::Down, NavIntent::Down),
+    (Key::Left, NavIntent::Left),
+    (Key::Right, NavIntent::Right),
+    (Key::Enter, NavIntent::Select),
+    (Key::A, NavIntent::Select),
     (Key::Backspace, NavIntent::Back),
     (Key::Escape, NavIntent::Back),
+    (Key::B, NavIntent::Back),
+    (Key::X, NavIntent::ShortcutX),
+    (Key::Y, NavIntent::ShortcutY),
 ];
 
 /// Pure edge-detection: given the current down/up state of each mapped
@@ -101,9 +115,9 @@ impl InputSource for WindowedInput {
 
         let scroll_dy = self.window.borrow().get_scroll_wheel().map_or(0.0, |(_, dy)| dy);
         if scroll_dy > SCROLL_DEADZONE {
-            intents.push(NavIntent::Prev);
+            intents.push(NavIntent::Up);
         } else if scroll_dy < -SCROLL_DEADZONE {
-            intents.push(NavIntent::Next);
+            intents.push(NavIntent::Down);
         }
 
         intents
@@ -169,7 +183,7 @@ mod tests {
         let mut down = HashMap::new();
         down.insert(Key::Down, true);
         let intents = edge_triggered_intents(&down, &mut previous);
-        assert_eq!(intents, vec![NavIntent::Next]);
+        assert_eq!(intents, vec![NavIntent::Down]);
 
         // Held down on the next poll: no repeat.
         let intents_while_held = edge_triggered_intents(&down, &mut previous);
@@ -189,11 +203,11 @@ mod tests {
 
         down.insert(Key::Enter, true);
         let repressed = edge_triggered_intents(&down, &mut previous);
-        assert_eq!(repressed, vec![NavIntent::Activate]);
+        assert_eq!(repressed, vec![NavIntent::Select]);
     }
 
     #[test]
-    fn all_five_mapped_keys_produce_the_expected_intents() {
+    fn all_mapped_keys_produce_the_expected_intents() {
         let mut previous = HashMap::new();
         let mut down = HashMap::new();
         for (key, _) in KEY_INTENTS {
@@ -203,11 +217,17 @@ mod tests {
         intents.sort_by_key(|intent| format!("{intent:?}"));
 
         let mut expected = vec![
-            NavIntent::Prev,
-            NavIntent::Next,
-            NavIntent::Activate,
-            NavIntent::Back, // Backspace
-            NavIntent::Back, // Escape
+            NavIntent::Up,
+            NavIntent::Down,
+            NavIntent::Left,
+            NavIntent::Right,
+            NavIntent::Select, // Enter
+            NavIntent::Select, // A
+            NavIntent::Back,   // Backspace
+            NavIntent::Back,   // Escape
+            NavIntent::Back,   // B
+            NavIntent::ShortcutX,
+            NavIntent::ShortcutY,
         ];
         expected.sort_by_key(|intent| format!("{intent:?}"));
 
@@ -230,13 +250,13 @@ mod tests {
     #[test]
     fn http_input_drains_queued_intents_in_fifo_order_and_is_empty_after() {
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        queue.lock().unwrap().push_back(NavIntent::Next);
-        queue.lock().unwrap().push_back(NavIntent::Activate);
+        queue.lock().unwrap().push_back(NavIntent::Down);
+        queue.lock().unwrap().push_back(NavIntent::Select);
         let mut input = HttpInput::new(Arc::clone(&queue));
 
         let polled = input.poll();
 
-        assert_eq!(polled, vec![NavIntent::Next, NavIntent::Activate]);
+        assert_eq!(polled, vec![NavIntent::Down, NavIntent::Select]);
         assert!(queue.lock().unwrap().is_empty(), "poll must drain, not just read, the queue");
         assert!(input.poll().is_empty(), "a second poll with nothing new queued is empty");
     }

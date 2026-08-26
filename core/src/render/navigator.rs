@@ -1,8 +1,7 @@
 //! `Navigator`: owns the screen stack. Salvaged from
 //! `simple_gui::document::Document`, reimplemented against `NavIntent`
-//! (Tier 2 semantic input, per
-//! `.planning/decisions/2026-08-11-rotary-encoder-input-model.md`) instead
-//! of raw button `KeyCode`s.
+//! (Tier 2 semantic input, see `crate::input`) instead of raw button
+//! `KeyCode`s.
 //!
 //! Per-screen focus memory falls out of the data structure for free: a
 //! popped screen isn't rebuilt, it's kept on the stack (in `Screen`,
@@ -112,36 +111,54 @@ impl Navigator {
     ///
     /// # Known simplification
     ///
-    /// For `Next`/`Prev`/`NextN`, the intent is forwarded to the focused
+    /// For `Up`/`Down`/`JumpBy`, the intent is forwarded to the focused
     /// widget first (so e.g. a list can move its own internal selection),
     /// and then *also* drives the screen's own top-level focus cycling
     /// (salvaged from `Document::focus_next`/`focus_previous`). On a
     /// screen with exactly one focusable widget — every screen this bead
     /// builds — the top-level cycle is a no-op (there's nothing else to
     /// focus). On a hypothetical future multi-widget screen, this would
-    /// mean every `Next`/`Prev` both moves the focused widget's internal
+    /// mean every `Up`/`Down` both moves the focused widget's internal
     /// selection *and* tries to move top-level focus, with no way for a
     /// widget to say "I consumed that, don't also refocus." Fixing that
     /// needs a "consumed" signal `Widget::on_intent` doesn't have today.
     /// Deferred — flagged here rather than silently shipped as correct.
+    ///
+    /// `Left`/`Right`/`ShortcutX`/`ShortcutY` have no default screen-level
+    /// behavior yet — no widget in this crate today uses the horizontal
+    /// axis or the two unbound buttons — so they're forwarded to the
+    /// focused widget only, with no top-level focus-cycling side effect.
     pub fn dispatch(&mut self, intent: NavIntent) {
         match intent {
-            NavIntent::Next | NavIntent::NextN(_) => {
+            NavIntent::Down => {
                 let action = self.current_mut().forward_to_focused(intent);
                 self.apply_action(action);
                 self.current_mut().focus_next();
             }
-            NavIntent::Prev => {
+            NavIntent::Up => {
                 let action = self.current_mut().forward_to_focused(intent);
                 self.apply_action(action);
                 self.current_mut().focus_previous();
             }
-            NavIntent::Activate => {
+            NavIntent::JumpBy(n) => {
+                let action = self.current_mut().forward_to_focused(intent);
+                self.apply_action(action);
+                if n >= 0 {
+                    self.current_mut().focus_next();
+                } else {
+                    self.current_mut().focus_previous();
+                }
+            }
+            NavIntent::Select => {
                 let action = self.current_mut().activate_focused();
                 self.apply_action(action);
             }
             NavIntent::Back => {
                 self.pop();
+            }
+            NavIntent::Left | NavIntent::Right | NavIntent::ShortcutX | NavIntent::ShortcutY => {
+                let action = self.current_mut().forward_to_focused(intent);
+                self.apply_action(action);
             }
         }
     }
@@ -216,8 +233,8 @@ mod tests {
     #[test]
     fn next_intent_moves_the_focused_lists_selection() {
         let mut nav = Navigator::new(list_screen("root", 5));
-        nav.dispatch(NavIntent::Next);
-        nav.dispatch(NavIntent::Next);
+        nav.dispatch(NavIntent::Down);
+        nav.dispatch(NavIntent::Down);
         assert_eq!(nav.current().focused_index(), Some(0));
         // The selection lives inside the widget, not exposed on Screen
         // directly; render + pixel-sample in the PNG-dump test is the
@@ -228,7 +245,7 @@ mod tests {
     #[test]
     fn activate_on_a_list_with_no_callback_does_not_change_the_stack() {
         let mut nav = Navigator::new(list_screen("root", 3));
-        nav.dispatch(NavIntent::Activate);
+        nav.dispatch(NavIntent::Select);
         assert_eq!(nav.depth(), 1);
     }
 
@@ -243,7 +260,7 @@ mod tests {
         let root = Screen::new("root", vec![Box::new(list)]);
         let mut nav = Navigator::new(root);
 
-        nav.dispatch(NavIntent::Activate);
+        nav.dispatch(NavIntent::Select);
         assert_eq!(nav.depth(), 2);
         assert_eq!(nav.current().title, "detail");
     }
@@ -251,7 +268,7 @@ mod tests {
     #[test]
     fn per_screen_focus_memory_is_preserved_across_push_and_pop() {
         let mut nav = Navigator::new(list_screen("root", 5));
-        nav.dispatch(NavIntent::Next); // move selection within the list
+        nav.dispatch(NavIntent::Down); // move selection within the list
 
         nav.push(list_screen("detail", 2));
         assert_eq!(nav.current().focused_index(), Some(0));
@@ -283,7 +300,7 @@ mod tests {
         let row0_highlighted = fb.pixel(Point::new(20, 18));
         assert_eq!(row0_highlighted, palette::SURFACE_ELEVATED, "row 0 starts selected");
 
-        nav.dispatch(NavIntent::Next);
+        nav.dispatch(NavIntent::Down);
         nav.render(&mut fb).unwrap();
         let row0_after_move = fb.pixel(Point::new(20, 18));
         assert_ne!(

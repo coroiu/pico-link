@@ -360,10 +360,10 @@ impl Widget for MenuList {
 
     fn on_intent(&mut self, intent: NavIntent) -> Action {
         match intent {
-            NavIntent::Next => self.move_selection(1),
-            NavIntent::Prev => self.move_selection(-1),
-            NavIntent::NextN(n) => self.move_selection(i32::from(n)),
-            NavIntent::Activate | NavIntent::Back => {}
+            NavIntent::Down => self.move_selection(1),
+            NavIntent::Up => self.move_selection(-1),
+            NavIntent::JumpBy(n) => self.move_selection(i32::from(n)),
+            NavIntent::Select | NavIntent::Back | NavIntent::Left | NavIntent::Right | NavIntent::ShortcutX | NavIntent::ShortcutY => {}
         }
         Action::None
     }
@@ -410,11 +410,11 @@ mod tests {
     fn next_and_prev_move_selection_and_clamp_at_the_ends() {
         let mut menu = MenuList::new(items(2));
         assert_eq!(menu.selected_index(), 0);
-        menu.on_intent(NavIntent::Prev);
+        menu.on_intent(NavIntent::Up);
         assert_eq!(menu.selected_index(), 0);
-        menu.on_intent(NavIntent::Next);
+        menu.on_intent(NavIntent::Down);
         assert_eq!(menu.selected_index(), 1);
-        menu.on_intent(NavIntent::Next);
+        menu.on_intent(NavIntent::Down);
         assert_eq!(menu.selected_index(), 1);
     }
 
@@ -431,7 +431,7 @@ mod tests {
             assert_eq!(index, 1);
             Action::PopView
         });
-        menu.on_intent(NavIntent::Next);
+        menu.on_intent(NavIntent::Down);
         let action = menu.on_focus(FocusEvent::Activated);
         assert!(matches!(action, Action::PopView));
     }
