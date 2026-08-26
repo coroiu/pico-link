@@ -1,10 +1,14 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use cortex_m_rt::entry;
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::spi::{Config as SpiConfig, Spi};
 use embassy_time::Delay;
+use embedded_hal::delay::DelayNs;
 use panic_halt as _;
 
 // Link-seam probe for pico-link-8v3.1 gate 3/4: force the linker to pull in
@@ -158,15 +162,66 @@ mod st7789 {
     }
 }
 
-#[entry]
-fn main() -> ! {
-    let p = embassy_rp::init(Default::default());
+// --- Core1 stack + dual-core auto-BOOTSEL escape hatch (pico-link-8v3.2.6) ---
+//
+// The board has no USB reset interface yet (that lands with pico-link-
+// 8v3.2.2's picotool reboot support), so every flash normally needs a
+// manual BOOTSEL hold. For unattended overnight iteration that is fatal:
+// the first hypothesis that hangs or crashes ends the whole run. The fix,
+// per Andreas's explicit approval of the dual-core design over a simpler
+// single-core timer: core0 does nothing risky at all. It spawns core1 to
+// run the still-unverified display bring-up, waits a fixed window, and
+// unconditionally calls the RP2350 bootrom's reset_to_usb_boot - a watchdog
+// scratch-register reboot (see embassy-rp 0.10.0's
+// src/rom_data/rp235x.rs:770, ported from pico-sdk's bootrom.c) that does
+// not require core1, or anything else, to cooperate or even still be
+// running.
+//
+// Independence claim, stated plainly rather than assumed: the RP2350's two
+// Cortex-M33 cores have separate NVICs and separate fault handling: a
+// HardFault or an infinite loop on core1 halts (or loops on) core1 only: it
+// does not touch core0's instruction stream, and core0's poll loop below
+// touches no core1-owned peripheral and no shared mutex/spinlock, only a
+// plain atomic flag and the hardware timer. I have NOT verified this on
+// real silicon by deliberately hard-faulting core1 - that is a fair
+// residual gap, and I'm flagging it rather than quietly asserting more
+// confidence than I have. The one theoretical shared-resource risk I can
+// think of: both cores fetch code over the same XIP flash interface, so if
+// core1's fault happened to wedge that shared controller mid-transaction
+// (not just loop in already-fetched code), it could in principle stall
+// core0's fetches too. I have no evidence this occurs for the SPI/GPIO code
+// running on core1 here, and it is not something core0 can insure itself
+// against without moving code into RAM, which I did not do tonight.
+static mut CORE1_STACK: Stack<16384> = Stack::new();
+
+/// Set by core1 once the ST7789 bring-up call has RETURNED (not merely
+/// started) - i.e. it ran to completion without hanging or hard-faulting
+/// before reaching this point. This is deliberately the ONLY thing core0
+/// waits on, and only up to a bounded deadline: if core1 never sets it,
+/// core0's poll loop below still terminates on its own timer and reboots
+/// anyway. The flag is a best-effort "did the risky code get through init"
+/// signal, not a display-correctness signal - it says nothing about
+/// red-vs-white, only about whether init_and_fill returned.
+static CORE1_DISPLAY_INIT_DONE: AtomicU32 = AtomicU32::new(0);
+
+/// Runs on core1: the ST7789 bring-up plus the pre-existing BTstack/TinyUSB
+/// link-seam probes. Everything here is allowed to hang or fault - that is
+/// the entire point of running it off core0.
+fn run_core1(
+    spi1: embassy_rp::Peri<'static, embassy_rp::peripherals::SPI1>,
+    sck: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_10>,
+    mosi: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_11>,
+    dc: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_8>,
+    cs: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_9>,
+    rst: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_12>,
+    bl: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_13>,
+) -> ! {
     let mut delay = Delay;
 
-    let dc = Output::new(p.PIN_8, Level::Low);
-    let cs = Output::new(p.PIN_9, Level::High);
-    let rst = Output::new(p.PIN_12, Level::Low);
-    let bl = Output::new(p.PIN_13, Level::Low);
+    let dc = Output::new(dc, Level::Low);
+    let cs = Output::new(cs, Level::High);
+    let rst = Output::new(rst, Level::Low);
+    let bl = Output::new(bl, Level::Low);
 
     let mut spi_config = SpiConfig::default();
     // 20MHz on the first attempt produced a solid white screen (backlight
@@ -175,12 +230,16 @@ fn main() -> ! {
     // a variable while that fix is being verified; 1MHz is nowhere near
     // ST7789's ~62.5MHz ceiling. Bump back up once the fill is confirmed.
     spi_config.frequency = 1_000_000;
-    let spi = Spi::new_blocking_txonly(p.SPI1, p.PIN_10, p.PIN_11, spi_config);
+    let spi = Spi::new_blocking_txonly(spi1, sck, mosi, spi_config);
 
     let mut display = st7789::St7789::new(spi, dc, cs, rst, bl);
     // Solid red fill, RGB565 0xF800 - the sign of life Andreas is asked to
     // look for.
     display.init_and_fill(&mut delay, 0xF800);
+
+    // Signal core0: init_and_fill returned. See CORE1_DISPLAY_INIT_DONE's
+    // doc comment for exactly what this does and does not claim.
+    CORE1_DISPLAY_INIT_DONE.store(1, Ordering::SeqCst);
 
     unsafe {
         btstack_ffi::btstack_memory_init();
@@ -191,10 +250,84 @@ fn main() -> ! {
         // Never actually reached with a dummy transport (hci_power_control
         // is not wired up yet - gate 5/6), but proves gap_inquiry_start
         // resolves at link time against the cross-compiled BTstack archive.
+        // Deliberately AFTER the done-flag store above: this probe is not
+        // known to return, and must not be able to block the hatch signal.
         let _ = btstack_ffi::gap_inquiry_start(5);
         let _ = tinyusb_ffi::tusb_inited();
     }
 
+    loop {
+        cortex_m::asm::wfe();
+    }
+}
+
+#[entry]
+fn main() -> ! {
+    let p = embassy_rp::init(Default::default());
+
+    let core1_stack = unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) };
+    let spi1 = p.SPI1;
+    let sck = p.PIN_10;
+    let mosi = p.PIN_11;
+    let dc = p.PIN_8;
+    let cs = p.PIN_9;
+    let rst = p.PIN_12;
+    let bl = p.PIN_13;
+
+    spawn_core1(p.CORE1, core1_stack, move || {
+        run_core1(spi1, sck, mosi, dc, cs, rst, bl)
+    });
+
+    // --- Core0: nothing but the auto-BOOTSEL escape hatch below ---
+    //
+    // Timing: a ~10s / ~25s split, chosen so the two outcomes are trivially
+    // distinguishable from the host by timing when the RP2350 volume
+    // reappears under /Volumes (per the coordinator's overnight telemetry
+    // request), while both numbers stay in the "a human can read the
+    // screen, an unattended loop isn't painfully slow" 15-30s ballpark this
+    // was scoped to land in:
+    //   - up to SUCCESS_DEADLINE_MS (10s): poll CORE1_DISPLAY_INIT_DONE
+    //     every 100ms. Display init in this spike is a few hundred
+    //     RAMWR-loop milliseconds at 1MHz, so 10s is generous slack for a
+    //     genuine success signal to arrive.
+    //   - if not signalled by then: keep waiting, WITHOUT continuing to
+    //     depend on the flag, up to HARD_DEADLINE_MS (25s), then reboot
+    //     unconditionally regardless of core1's state. This is the
+    //     independence guarantee: a hung or hard-faulted core1 still cannot
+    //     prevent core0 from reaching reset_to_usb_boot, it only pushes the
+    //     timing from the ~10s success bucket to the ~25s fallback bucket.
+    const POLL_INTERVAL_MS: u32 = 100;
+    const SUCCESS_DEADLINE_MS: u32 = 10_000;
+    const HARD_DEADLINE_MS: u32 = 25_000;
+
+    let mut delay = Delay;
+    let mut elapsed_ms: u32 = 0;
+    let mut signalled = false;
+    while elapsed_ms < SUCCESS_DEADLINE_MS {
+        if CORE1_DISPLAY_INIT_DONE.load(Ordering::SeqCst) != 0 {
+            signalled = true;
+            break;
+        }
+        delay.delay_ms(POLL_INTERVAL_MS);
+        elapsed_ms += POLL_INTERVAL_MS;
+    }
+    let deadline_ms = if signalled { SUCCESS_DEADLINE_MS } else { HARD_DEADLINE_MS };
+    while elapsed_ms < deadline_ms {
+        delay.delay_ms(POLL_INTERVAL_MS);
+        elapsed_ms += POLL_INTERVAL_MS;
+    }
+
+    // Drops the chip into BOOTSEL; re-enumerates as the RP2350 mass-storage
+    // drive with no human involvement. Signature verified against embassy-rp
+    // 0.10.0's vendored source (src/rom_data/rp235x.rs:770): both arguments
+    // are bitmasks - 0 for usb_activity_gpio_pin_mask means no activity-LED
+    // pin, 0 for disable_interface_mask means both the mass-storage and
+    // PICOBOOT USB interfaces stay enabled, matching a cold boot into
+    // BOOTSEL.
+    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+
+    // reset_to_usb_boot does not return on success (REBOOT2_FLAG_NO_RETURN_ON_SUCCESS).
+    // This only executes if the reboot call itself failed.
     loop {
         cortex_m::asm::nop();
     }
