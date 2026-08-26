@@ -8,8 +8,11 @@
 //! whatever data a call site's list actually represents. A domain-specific
 //! view maps its own model into `ListItem`s before handing them here.
 
-use std::cell::Cell;
-use std::convert::Infallible;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::cell::Cell;
+use core::convert::Infallible;
 
 use embedded_graphics::{
     draw_target::{DrawTarget, DrawTargetExt},

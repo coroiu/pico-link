@@ -20,7 +20,9 @@
 //! `target.clipped(&some_sub_area)` *inside* its own `render`, using the
 //! `area` it was handed, per `DrawTargetExt::clipped()`.
 
-use std::convert::Infallible;
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::convert::Infallible;
 
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;

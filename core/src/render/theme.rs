@@ -19,7 +19,7 @@
 //! that spike and was derived + probed fresh separately (see
 //! `icon::CARET_RIGHT`'s doc comment).
 
-use std::convert::Infallible;
+use core::convert::Infallible;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::pixelcolor::Rgb565;

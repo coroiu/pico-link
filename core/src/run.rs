@@ -90,15 +90,30 @@
 //! predicate and lets each binary decide what "keep going" means for it.
 //! A real-target binary just passes `|| true`.
 //!
-//! # Why sleeping is `std::thread::sleep`, not a `Clock` method
+//! # Why sleeping is a `Clock` method
 //!
-//! `Clock` only exposes `now()`, not a sleep primitive — deliberately: the
-//! trait models *reading* wall-clock time, not scheduling.
-//! `std::thread::sleep` is available on every target this project builds
-//! for, so there is no portability reason to route it through an injected
-//! trait.
+//! This used to read the other way: `Clock` exposed only `now()`, and the
+//! loop called `std::thread::sleep` directly, on the reasoning that sleeping
+//! is scheduling, not clock-reading, and `std::thread::sleep` was available
+//! on every target this project built for -- so there was no portability
+//! reason to route it through an injected trait.
+//!
+//! That premise held only while every run mode had `std`. This crate is now
+//! `no_std` + `alloc` (see `lib.rs`), and the RP2350 firmware target this
+//! is heading for has no `std::thread` to sleep on -- "blocking" there means
+//! something target-specific (a busy-wait against a hardware timer, a WFI/
+//! low-power instruction, an RTOS-less delay loop), which is exactly the
+//! kind of platform-specific detail this crate's trait seams exist to keep
+//! out of `run`. So the loop no longer calls a sleep primitive directly at
+//! all: it asks the injected [`crate::platform::Clock`] to sleep, and each
+//! concrete `Clock` impl (the emulator's, backed by `std::thread::sleep`
+//! today; a future RP2350 impl backed by whatever the hardware needs)
+//! decides what "block for this long" actually means on its target. The
+//! trait's *shape* argument from before still holds -- this doesn't turn
+//! `Clock` into a general scheduler, it just adds the one sleep primitive
+//! `run`'s frame-budget wait actually needs.
 
-use std::time::Duration;
+use core::time::Duration;
 
 use crate::app::App;
 use crate::platform::{Clock, DisplayPower, DisplaySurface, InputSource, Platform, PowerControl};
@@ -354,7 +369,7 @@ pub fn run<P: Platform>(
 
         let elapsed = platform.clock().now().saturating_duration_since(frame_start);
         if let Some(remaining) = frame_budget.checked_sub(elapsed) {
-            std::thread::sleep(remaining);
+            platform.clock().sleep(remaining);
         }
     }
 }
@@ -365,9 +380,9 @@ mod tests {
     use crate::input::NavIntent;
     use crate::platform::FrameBuffer565;
     use std::cell::{Cell, RefCell};
-    use std::convert::Infallible;
+    use core::convert::Infallible;
     use std::rc::Rc;
-    use std::time::Instant;
+    use crate::platform::Instant;
 
     /// A `PowerControl` stub whose `on_external_power` is settable and
     /// whose `enter_deep_sleep` calls are counted, via shared `Rc` handles.
@@ -407,10 +422,15 @@ mod tests {
         }
     }
 
-    /// Error type for [`FailingStubDisplay`]. `Debug`-only (no
-    /// `Display`/`std::error::Error` impl) -- deliberately the bare
-    /// minimum `run`'s new trait bound requires, so this test doesn't
-    /// accidentally prove more than the bound actually demands.
+    /// Error type for [`FailingStubDisplay`]. `Debug`-only (no `Display` or
+    /// error-trait impl) -- deliberately the bare minimum `run`'s trait
+    /// bound (`<P::Display as DisplaySurface>::Error: core::fmt::Debug`)
+    /// requires, so this test doesn't accidentally prove more than the
+    /// bound actually demands. No error-trait impl exists to name here
+    /// regardless: this crate is `no_std` (see `lib.rs`), and `core` has no
+    /// `Error` trait of its own to implement -- there was never real code
+    /// behind the old `std::error::Error` wording in this comment, only
+    /// the description of what `StubFlushError` deliberately omits.
     #[derive(Debug)]
     struct StubFlushError;
 
@@ -456,7 +476,18 @@ mod tests {
     struct StubClock;
     impl Clock for StubClock {
         fn now(&self) -> Instant {
-            Instant::now()
+            // A fixed reading is sufficient: none of the tests using
+            // `StubClock` exercise idle/deep-sleep timing (that's what
+            // `ControllableClock` below is for), so only monotonicity
+            // (trivially true for a constant) matters here.
+            Instant::from_micros(0)
+        }
+        fn sleep(&self, _duration: Duration) {
+            // No-op: unit tests must not actually block real wall-clock
+            // time. Every test here passes `frame_budget:
+            // Duration::from_millis(0)`, so a real sleep would never be
+            // more than a few microseconds anyway, but a no-op keeps the
+            // test suite's runtime independent of that even so.
         }
     }
 
@@ -605,7 +636,7 @@ mod tests {
 
     // --- Idle/wake ---
     //
-    // `StubClock` above returns real `Instant::now()`, which is useless for
+    // `StubClock` above returns a fixed reading, which is useless for
     // deterministically crossing an idle timeout in a fast unit test --
     // hence `ControllableClock`, whose `now()` is scriptable from the test
     // body (typically from inside the `should_continue` closure, so the
@@ -623,7 +654,12 @@ mod tests {
 
     impl ControllableClock {
         fn new() -> Self {
-            Self(Rc::new(RefCell::new(Instant::now())))
+            // The reference point is arbitrary (see `Instant`'s doc
+            // comment) -- these tests only ever read relative elapsed time
+            // via `saturating_duration_since`, never the raw value, so
+            // starting at zero is exactly as valid as starting from a real
+            // clock reading.
+            Self(Rc::new(RefCell::new(Instant::from_micros(0))))
         }
 
         fn advance(&self, duration: Duration) {
@@ -635,6 +671,11 @@ mod tests {
     impl Clock for ControllableClock {
         fn now(&self) -> Instant {
             *self.0.borrow()
+        }
+        fn sleep(&self, _duration: Duration) {
+            // No-op, same rationale as `StubClock::sleep` -- these tests
+            // advance time explicitly via `advance`, never by actually
+            // blocking.
         }
     }
 

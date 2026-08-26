@@ -4,7 +4,10 @@
 //! `simple_gui::document::Document`'s `ViewStackEntry` (title + components
 //! + `focused_index`), reimplemented on `embedded-graphics`.
 
-use std::convert::Infallible;
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::convert::Infallible;
 
 use embedded_graphics::{
     draw_target::DrawTargetExt,
@@ -456,7 +459,7 @@ mod tests {
     /// glyph rendering could plausibly have painted (no status dot, no
     /// readout, a one-character title to keep the shield/title text away
     /// from the right edge this glyph draws into).
-    struct BleOnlyWidget(std::cell::Cell<Option<HidLinkState>>);
+    struct BleOnlyWidget(core::cell::Cell<Option<HidLinkState>>);
 
     impl Widget for BleOnlyWidget {
         fn measure(&self, _constraints: Size) -> Size {
@@ -474,7 +477,7 @@ mod tests {
     }
 
     fn ble_screen(state: Option<HidLinkState>) -> Screen {
-        let mut screen = Screen::new("T", vec![Box::new(BleOnlyWidget(std::cell::Cell::new(state)))]);
+        let mut screen = Screen::new("T", vec![Box::new(BleOnlyWidget(core::cell::Cell::new(state)))]);
         screen.initialize_focus();
         screen
     }

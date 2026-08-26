@@ -31,7 +31,8 @@
     clippy::cast_sign_loss
 )]
 
-use std::convert::Infallible;
+use alloc::string::String;
+use core::convert::Infallible;
 
 use embedded_graphics::{
     draw_target::DrawTargetExt,

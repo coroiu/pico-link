@@ -10,7 +10,9 @@
 //! and later popping back restores exactly the focus state that was there
 //! before the push — no explicit save/restore step needed.
 
-use std::convert::Infallible;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::convert::Infallible;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::OriginDimensions;
@@ -103,7 +105,7 @@ impl Navigator {
     /// (from `App::handle_input`, right after dispatching each batch of
     /// intents).
     pub fn take_output(&mut self) -> Vec<OutputRequest> {
-        std::mem::take(&mut self.pending_output)
+        core::mem::take(&mut self.pending_output)
     }
 
     /// Dispatches a semantic navigation intent to the current screen.
