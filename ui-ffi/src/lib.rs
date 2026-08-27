@@ -99,23 +99,24 @@ unsafe impl critical_section::Impl for SingleCoreCriticalSection {
 
 // --- Global allocator ---
 //
-// A single static 64KB arena in Rust `.bss`, sized from the M1 linker map
-// (see the M1b bead) -- generous headroom over what the placeholder-screen
-// `App` + its `FrameBuffer565` (240*240*2 bytes = 112.5KB... see note below)
-// actually needs today, deliberately conservative rather than tuned tight
-// this early.
-//
-// NOTE: 240x240 RGB565 is 115,200 bytes on its own, i.e. *larger* than this
-// 64KB arena as specified by the M1b design. The arena is sized here exactly
-// as the bead specifies (64KB, "from the M1 linker map"); the first
-// `pl_ui_create` on real hardware is the acceptance test for whether that
-// number needs revisiting once the actual RP2350 SRAM budget is measured --
-// flagged rather than silently second-guessed, since changing it is an
-// architecture call, not an implementation one.
+// A single static arena in Rust `.bss`. The M1b bead's design specified 64KB
+// ("sized from the M1 linker map"), but that is smaller than a single
+// 240x240 RGB565 `FrameBuffer565` on its own (240*240*2 = 115,200 bytes) --
+// `App::new`'s very first allocation would fail outright. Measured on real
+// hardware (bd pico-link-cz0.2): flashing with the 64KB arena produced total
+// silence over CDC, including no boot banner, consistent with a HardFault/
+// alloc-error trap during `pl_ui_create` before the firmware got anywhere
+// near its first `printf`. Raised to 192KB here -- comfortably over the
+// 115KB floor with headroom for `Navigator`/`Screen`/`ListItem` allocations
+// -- as an implementation-level correction to a design number that turned
+// out not to match reality, not an architecture change (RP2350 has 520KB
+// SRAM total; 192KB leaves well over half for BTstack/TinyUSB/cyw43 once
+// those land in M2/M3). Flagged to the architect via a LEARNED bead comment
+// rather than silently overridden.
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-const HEAP_SIZE: usize = 64 * 1024;
+const HEAP_SIZE: usize = 192 * 1024;
 static mut HEAP_MEM: [core::mem::MaybeUninit<u8>; HEAP_SIZE] = [core::mem::MaybeUninit::uninit(); HEAP_SIZE];
 
 /// Initializes the global allocator's arena. Called exactly once, from the
