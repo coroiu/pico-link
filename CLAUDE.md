@@ -292,6 +292,25 @@ These were expensively earned on the predecessor project. The hardware-specific
 ones were dropped in the pivot; what remains is platform-independent and still
 applies.
 
+- **CDC over the macOS tty path can KERNEL PANIC this Mac.** Reported by Andreas
+  2026-08-27, with tinygo-org/tinygo#5531 as the pointer; the linked issue
+  documents the panics on Apple Silicon but NOT the mechanism, so treat the
+  cause as unknown and the risk as real. The related #3106 mentions a powered
+  USB hub as a mitigation, disputed by the reporter. Suspicion, not established
+  fact: the laptop crash that ended the 2026-08-26 night session may have been
+  this, and that session had been opening /dev/cu.usbmodem* repeatedly.
+  **RULES, follow them even though the tty path usually works:**
+  - Prefer talking to the device DIRECTLY over USB — picotool, or libusb/pyusb —
+    over opening `/dev/cu.usbmodem*`. Direct USB access bypasses the AppleUSBCDC
+    kext, which is the component implicated in the panics.
+  - When the tty genuinely is the only channel, open it ONCE for a long capture.
+    Do NOT loop open/close/reopen — repeated enumeration and driver attach is the
+    pattern most associated with the crashes.
+  - NEVER have two readers on the same tty. Besides the panic risk it silently
+    corrupts data: two readers steal bytes from each other, which produces
+    fragmented lines AND counter jumps indistinguishable from a real firmware
+    bug. This cost real debugging time on 2026-08-27.
+  - A crashed laptop loses the beads board — it has no remote backup.
 - **Reading the board's CDC console needs DTR asserted explicitly.** embassy-usb's
   `wait_connection()` blocks until DTR, and on macOS a plain `cat /dev/cu.usbmodem*`
   does not reliably assert it - you get an open port and zero bytes, which looks
