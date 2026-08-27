@@ -132,13 +132,6 @@ mod btstack_ffi {
         // comment for why it stays in C.
         pub fn timer_probe_start();
         pub fn timer_probe_fired_count_get() -> u32;
-
-        // Code-review follow-up (pico-link-8v3.2.3): a live capture showed
-        // btstack_timer_fired jump by 138 in one second. This reads back
-        // timer_probe.c's ring buffer of the exact hal_time_ms() reading
-        // used for each fire, so a burst like that can be inspected
-        // instead of theorised about - see timer_probe.c's header comment.
-        pub fn timer_probe_fire_log_get(seq: u32) -> u32;
     }
 }
 
@@ -267,36 +260,6 @@ mod btstack_hal {
         // hal_time_ms-based BTstack port lives with; BTstack's timer
         // comparisons are wraparound-safe by design.
         embassy_time::Instant::now().as_millis() as u32
-    }
-
-    /// Code-review follow-up (pico-link-8v3.2.3): mitigation for a live
-    /// burst where `btstack_timer_fired` jumped by 138 in one second. Root
-    /// cause not confirmed (a 165s single-reader capture spanning a fresh
-    /// boot did not reproduce it - see the bead), but the MECHANISM is
-    /// confirmed by static analysis regardless of trigger:
-    /// `btstack_run_loop_base_process_timers(now)` (vendored, unpatched)
-    /// snapshots `now` ONCE per `btstack_run_loop_embedded_execute_once()`
-    /// call, then loops re-firing any timer whose freshly re-armed timeout
-    /// is still <= that frozen snapshot - uncapped. One bad/stale
-    /// `hal_time_ms()` reading feeding that snapshot is enough to melt down
-    /// into however many re-fires it takes real time to close the gap.
-    ///
-    /// `EXECUTE_ONCE_EPOCH` is bumped by `run_core1` immediately before each
-    /// `execute_once()` call, and read back by `timer_probe.c` via
-    /// `pico_link_execute_once_epoch_get()` so it can tell "this fire is
-    /// happening in the SAME `execute_once()` call as my last fire" (same
-    /// epoch) from "this is a normal ~1000ms-later fire" (different
-    /// epoch) - see `timer_probe.c`'s exponential-backoff use of it.
-    static EXECUTE_ONCE_EPOCH: AtomicU32 = AtomicU32::new(0);
-
-    /// Called once by `run_core1` immediately before each `execute_once()` call.
-    pub fn bump_execute_once_epoch() {
-        EXECUTE_ONCE_EPOCH.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[unsafe(no_mangle)]
-    pub extern "C" fn pico_link_execute_once_epoch_get() -> u32 {
-        EXECUTE_ONCE_EPOCH.load(Ordering::Relaxed)
     }
 }
 
@@ -719,10 +682,6 @@ mod usb_console {
     #[embassy_executor::task]
     async fn console_task(mut class: Cdc) -> ! {
         let mut n: u32 = 0;
-        // Code-review follow-up (pico-link-8v3.2.3): last ANOMALY_SEQ value
-        // this task has already reported, so a burst on core1 gets printed
-        // exactly once, whenever this task next notices it changed.
-        let mut last_reported_anomaly: u32 = 0;
         loop {
             class.wait_connection().await;
             let _ = class
@@ -739,30 +698,6 @@ mod usb_console {
                     // Host closed the port - go back to waiting for a fresh
                     // connection rather than erroring out.
                     break;
-                }
-
-                let anomaly_seq = ANOMALY_SEQ.load(Ordering::SeqCst);
-                if anomaly_seq != last_reported_anomaly {
-                    last_reported_anomaly = anomaly_seq;
-                    let iter = ANOMALY_ITER.load(Ordering::SeqCst);
-                    let fires = ANOMALY_FIRES.load(Ordering::SeqCst);
-                    let now_before = ANOMALY_NOW_BEFORE.load(Ordering::SeqCst);
-                    let prev = ANOMALY_PREV_READING.load(Ordering::SeqCst);
-                    let first = ANOMALY_FIRST_READING.load(Ordering::SeqCst);
-                    let second = ANOMALY_SECOND_READING.load(Ordering::SeqCst);
-                    let last = ANOMALY_LAST_READING.load(Ordering::SeqCst);
-
-                    let mut a1: FixedBuf<48> = FixedBuf::new();
-                    let _ = write!(a1, "ANOMALY#{anomaly_seq} iter={iter} fires={fires}\r\n");
-                    let _ = class.write_packet(a1.as_bytes()).await;
-
-                    let mut a2: FixedBuf<48> = FixedBuf::new();
-                    let _ = write!(a2, "  now_before={now_before} prev={prev}\r\n");
-                    let _ = class.write_packet(a2.as_bytes()).await;
-
-                    let mut a3: FixedBuf<48> = FixedBuf::new();
-                    let _ = write!(a3, "  first={first} second={second} last={last}\r\n");
-                    let _ = class.write_packet(a3.as_bytes()).await;
                 }
             }
         }
@@ -849,47 +784,6 @@ static USB_STAGE: AtomicU32 = AtomicU32::new(stage::BOOT);
 /// does NOT happen any more.
 static TIMER_PROBE_FIRED: AtomicU32 = AtomicU32::new(0);
 
-/// Code-review follow-up (pico-link-8v3.2.3): live evidence of a burst
-/// where `TIMER_PROBE_FIRED` jumped by 138 in one second surfaced after
-/// the first VERIFIED ON HARDWARE claim - undisclosed because the original
-/// 14s capture window was too short to catch it and too shallow to have
-/// prompted a search for it. These fields exist so a burst like that gets
-/// reported with hard numbers instead of theorised about.
-///
-/// `ANOMALY_SEQ` is bumped by core1 each time `run_core1`'s loop notices
-/// `TIMER_PROBE_FIRED` advanced by more than 1 in a single
-/// `btstack_run_loop_embedded_execute_once()` call - i.e. more than one
-/// fire happened inside a single, single-snapshot
-/// `btstack_run_loop_base_process_timers(now)` pass. `console_task` on
-/// core0 polls this once a second and prints a full report whenever it
-/// changes. All fields are written by core1 before `ANOMALY_SEQ` is
-/// bumped, and core0 only trusts them after observing a NEW `ANOMALY_SEQ`
-/// value, so there is no torn-read risk in the report itself even though
-/// nothing here is a single atomic transaction across cores.
-static ANOMALY_SEQ: AtomicU32 = AtomicU32::new(0);
-/// `run_core1`'s own loop iteration counter at the time of the burst.
-static ANOMALY_ITER: AtomicU32 = AtomicU32::new(0);
-/// How many fires happened inside the one flagged `execute_once()` call.
-static ANOMALY_FIRES: AtomicU32 = AtomicU32::new(0);
-/// hal_time_ms(), read directly by `run_core1` (Rust side) immediately
-/// BEFORE calling into `execute_once()` - this is what
-/// `btstack_run_loop_embedded_execute_once`'s own internal `now` snapshot
-/// should read microseconds later, from the SAME underlying clock.
-static ANOMALY_NOW_BEFORE: AtomicU32 = AtomicU32::new(0);
-/// The last hal_time_ms() reading logged BEFORE the burst started (the
-/// most recent normal fire, or 0 if the burst was the very first fire) -
-/// the baseline the burst's first reading should be compared against.
-static ANOMALY_PREV_READING: AtomicU32 = AtomicU32::new(0);
-/// The FIRST hal_time_ms() reading inside the burst.
-static ANOMALY_FIRST_READING: AtomicU32 = AtomicU32::new(0);
-/// The SECOND hal_time_ms() reading inside the burst (shows the early
-/// rate of change, if any).
-static ANOMALY_SECOND_READING: AtomicU32 = AtomicU32::new(0);
-/// The LAST hal_time_ms() reading inside the burst - expected to have
-/// finally caught up to (be within ~1ms of) `ANOMALY_NOW_BEFORE`, since
-/// that is the condition that ends the burst.
-static ANOMALY_LAST_READING: AtomicU32 = AtomicU32::new(0);
-
 /// Runs on core1: the ST7789 bring-up plus the pre-existing BTstack/TinyUSB
 /// link-seam probes. Everything here is allowed to hang or fault - that is
 /// the entire point of running it off core0.
@@ -965,51 +859,11 @@ fn run_core1(
     // second, so polling faster than the stage can change would just smear
     // the screen.
     let mut painted = stage::BOOT;
-    let mut iter: u32 = 0;
     loop {
-        // Code-review follow-up (pico-link-8v3.2.3): bracket every
-        // execute_once() call with a direct hal_time_ms() read and a
-        // before/after fire count, so a multi-fire burst inside a single
-        // call can be caught and reported with the exact readings that
-        // produced it - see the ANOMALY_* statics' doc comments.
-        let now_before = btstack_hal::hal_time_ms();
-        let fired_before = unsafe { btstack_ffi::timer_probe_fired_count_get() };
-        // Mitigation (see btstack_hal::EXECUTE_ONCE_EPOCH's doc comment):
-        // bump the epoch BEFORE calling in, so timer_probe.c can tell a
-        // same-pass re-fire from a normal ~1000ms-later one no matter how
-        // many times it gets re-invoked inside this one call.
-        btstack_hal::bump_execute_once_epoch();
         unsafe {
             btstack_ffi::btstack_run_loop_embedded_execute_once();
+            TIMER_PROBE_FIRED.store(btstack_ffi::timer_probe_fired_count_get(), Ordering::SeqCst);
         }
-        let fired_after = unsafe { btstack_ffi::timer_probe_fired_count_get() };
-        TIMER_PROBE_FIRED.store(fired_after, Ordering::SeqCst);
-
-        let fires_this_call = fired_after.wrapping_sub(fired_before);
-        if fires_this_call > 1 {
-            let prev_reading = if fired_before > 0 {
-                unsafe { btstack_ffi::timer_probe_fire_log_get(fired_before - 1) }
-            } else {
-                0
-            };
-            let first_reading = unsafe { btstack_ffi::timer_probe_fire_log_get(fired_before) };
-            let second_reading = unsafe { btstack_ffi::timer_probe_fire_log_get(fired_before + 1) };
-            let last_reading = unsafe { btstack_ffi::timer_probe_fire_log_get(fired_after - 1) };
-
-            ANOMALY_ITER.store(iter, Ordering::SeqCst);
-            ANOMALY_FIRES.store(fires_this_call, Ordering::SeqCst);
-            ANOMALY_NOW_BEFORE.store(now_before, Ordering::SeqCst);
-            ANOMALY_PREV_READING.store(prev_reading, Ordering::SeqCst);
-            ANOMALY_FIRST_READING.store(first_reading, Ordering::SeqCst);
-            ANOMALY_SECOND_READING.store(second_reading, Ordering::SeqCst);
-            ANOMALY_LAST_READING.store(last_reading, Ordering::SeqCst);
-            // Bumped LAST, after every other field is written - console_task
-            // on core0 only trusts the fields above once it observes this
-            // change, so there is no torn-report risk despite these being
-            // separate atomics rather than one cross-core transaction.
-            ANOMALY_SEQ.fetch_add(1, Ordering::SeqCst);
-        }
-        iter = iter.wrapping_add(1);
 
         let now = USB_STAGE.load(Ordering::SeqCst).min(stage::CONFIGURED);
         if now != painted {
