@@ -230,6 +230,184 @@ impl FrameTiming {
     }
 }
 
+/// What one [`Runner::step`] call actually did, for a caller that wants to
+/// know without re-deriving it from `App`/`DisplaySurface` state. Currently
+/// informational only (no caller in this crate branches on it -- `run`'s
+/// `while` loop below ignores the return value entirely), but a future
+/// caller with no frame-budget sleep of its own to drive off (e.g. the M1b
+/// `ui-ffi` staticlib's `pl_ui_tick`, called from C on C's own clock) can use
+/// it to decide whether a render actually happened this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// No input arrived and nothing was rendered this step (may still have
+    /// changed `PowerState`, e.g. crossing the idle timeout).
+    Idle,
+    /// Input was polled and forwarded to `App`, but nothing was dirty (or
+    /// the display was asleep), so no render/flush happened.
+    InputHandled,
+    /// `App` was dirty and `DisplaySurface::flush` was called (regardless
+    /// of whether it succeeded -- see [`FlushErrorTracker`] for how a
+    /// failure is surfaced instead of propagated).
+    Rendered,
+}
+
+/// One iteration's worth of the state the module doc's pseudocode
+/// describes: input poll, idle/deep-sleep bookkeeping, and a dirty-gated
+/// render+flush. Holds everything that must persist *between* iterations
+/// (`PowerState`, `last_input`, the deep-sleep latch, the error-rate
+/// limiters, and -- behind the `frame-timing` feature -- the rolling
+/// accumulator) so a caller can drive it one step at a time instead of only
+/// via the all-in-one [`run`] loop below.
+///
+/// This split exists so the *loop shape* (poll → dirty-gated render/flush →
+/// sleep) is reusable by something other than [`run`]'s own
+/// `while should_continue()` -- e.g. a future caller whose own clock/timing
+/// isn't `crate::platform::Clock::sleep`-shaped -- without duplicating any
+/// of the idle/deep-sleep/error-tracking logic above. `run` itself is now a
+/// thin driver: read `now`, call [`Runner::step`], repeat.
+pub struct Runner {
+    #[cfg(feature = "frame-timing")]
+    frame_timing: FrameTiming,
+    flush_errors: FlushErrorTracker,
+    power_errors: FlushErrorTracker,
+    power_state: PowerState,
+    last_input: crate::platform::Instant,
+    /// Set once `PowerControl::enter_deep_sleep` has fired, so a host
+    /// test's no-op recording stub (which, unlike real hardware, actually
+    /// returns) doesn't re-fire it every subsequent iteration once
+    /// eligible -- see the module doc's "Deep sleep" section.
+    deep_sleep_triggered: bool,
+    idle_timeout: Option<Duration>,
+    deep_sleep_timeout: Option<Duration>,
+}
+
+impl Runner {
+    /// Builds a fresh `Runner`, starting `Active` with `last_input` set to
+    /// `now` (i.e. the idle clock starts counting from construction, not
+    /// from some earlier unknown point) -- mirroring what the pre-refactor
+    /// `run` did inline at the top of its own function body.
+    #[must_use]
+    pub fn new(now: crate::platform::Instant, idle_timeout: Option<Duration>, deep_sleep_timeout: Option<Duration>) -> Self {
+        Self {
+            #[cfg(feature = "frame-timing")]
+            frame_timing: FrameTiming::new(),
+            flush_errors: FlushErrorTracker::new("DisplaySurface::flush"),
+            power_errors: FlushErrorTracker::new("DisplaySurface::set_power"),
+            power_state: PowerState::Active,
+            last_input: now,
+            deep_sleep_triggered: false,
+            idle_timeout,
+            deep_sleep_timeout,
+        }
+    }
+
+    /// Runs exactly one iteration of the module doc's loop body against
+    /// `platform`/`app`, treating `now` as this step's `frame_start` (the
+    /// caller reads the clock, not `step` itself, so a caller with its own
+    /// timing source -- e.g. C owning the clock over FFI -- doesn't need a
+    /// `crate::platform::Clock` at all). Does **not** sleep for the
+    /// remainder of any frame budget -- that stays [`run`]'s concern, since
+    /// a step-at-a-time caller may have a completely different idea of
+    /// pacing (or none at all).
+    pub fn step<P: Platform>(&mut self, platform: &mut P, app: &mut App, now: crate::platform::Instant) -> StepOutcome
+    where
+        <P::Display as DisplaySurface>::Error: core::fmt::Debug,
+    {
+        let frame_start = now;
+        let intents = platform.input().poll();
+        let mut outcome = StepOutcome::Idle;
+
+        if intents.is_empty() {
+            if let Some(idle_timeout) = self.idle_timeout {
+                if self.power_state == PowerState::Active && frame_start.saturating_duration_since(self.last_input) >= idle_timeout {
+                    match platform.display().set_power(DisplayPower::Off) {
+                        Ok(()) => self.power_errors.on_ok(),
+                        Err(error) => self.power_errors.on_err(&error),
+                    }
+                    self.power_state = PowerState::Asleep;
+                }
+            }
+
+            // Deep sleep (see the module doc's "Deep sleep" section):
+            // independent of `power_state` above (not gated on already
+            // being `Asleep`) -- in practice `Tb` is well past `Ta` so the
+            // screen is already blanked by the time this can fire, but
+            // the check itself only cares about elapsed idle time and
+            // external power.
+            if let Some(deep_sleep_timeout) = self.deep_sleep_timeout {
+                let idle_elapsed = frame_start.saturating_duration_since(self.last_input);
+                if !self.deep_sleep_triggered && idle_elapsed >= deep_sleep_timeout && !platform.power().on_external_power() {
+                    platform.power().enter_deep_sleep();
+                    self.deep_sleep_triggered = true;
+                }
+            }
+        } else {
+            self.last_input = frame_start;
+            match self.power_state {
+                PowerState::Asleep => {
+                    // The wake-triggering input only wakes the display —
+                    // it is deliberately never forwarded to
+                    // `app.handle_input` (see the module doc). `App`
+                    // never learns it was asleep; `mark_dirty` forces the
+                    // fresh flush the just-woken display needs even
+                    // though nothing on screen actually changed.
+                    match platform.display().set_power(DisplayPower::On) {
+                        Ok(()) => self.power_errors.on_ok(),
+                        Err(error) => self.power_errors.on_err(&error),
+                    }
+                    self.power_state = PowerState::Active;
+                    app.mark_dirty();
+                }
+                PowerState::Active => {
+                    app.handle_input(intents);
+                    outcome = StepOutcome::InputHandled;
+                }
+            }
+        }
+
+        // Blanked while `Asleep`: skip render+flush entirely rather than
+        // rendering into a framebuffer nothing will show. `app.dirty()`
+        // deliberately stays untouched by this gate (not cleared, not
+        // read via `render()`) — a dirty flag survives blanked frames so
+        // the next real wake renders it immediately.
+        if app.dirty() && self.power_state == PowerState::Active {
+            #[cfg(feature = "frame-timing")]
+            let render_start = platform.clock().now();
+
+            let framebuffer = app.render();
+
+            #[cfg(feature = "frame-timing")]
+            let render_end = platform.clock().now();
+
+            // A flush failure (e.g. a real SPI write error on hardware) is
+            // not something this loop can meaningfully recover from frame
+            // to frame; device-specific errors are absorbed at the
+            // surface adapter, not propagated into the platform-free
+            // core. Still not panicking here (the loop stays infallible)
+            // -- but no longer silently discarded either:
+            // `FlushErrorTracker` makes a persistent failure visible over
+            // serial (rate-limited) instead of looking like an
+            // inexplicable frozen screen.
+            match platform.display().flush(framebuffer) {
+                Ok(()) => self.flush_errors.on_ok(),
+                Err(error) => self.flush_errors.on_err(&error),
+            }
+            outcome = StepOutcome::Rendered;
+
+            #[cfg(feature = "frame-timing")]
+            {
+                let flush_end = platform.clock().now();
+                self.frame_timing.record(
+                    render_end.saturating_duration_since(render_start),
+                    flush_end.saturating_duration_since(render_end),
+                );
+            }
+        }
+
+        outcome
+    }
+}
+
 /// Runs the app loop against `platform` until `should_continue` returns
 /// `false`. `frame_budget` is the target time per iteration (input poll +
 /// app step + render + flush); if an iteration finishes early, the
@@ -254,6 +432,10 @@ impl FrameTiming {
 /// `idle_timeout`'s own contract; `Some` calls
 /// `PowerControl::enter_deep_sleep` after that much idle time, provided
 /// the platform isn't on external power.
+///
+/// This is now a thin loop around [`Runner::step`] -- see that type's doc
+/// comment for why the state it used to hold inline was pulled out into a
+/// reusable struct.
 pub fn run<P: Platform>(
     platform: &mut P,
     app: &mut App,
@@ -264,108 +446,12 @@ pub fn run<P: Platform>(
 ) where
     <P::Display as DisplaySurface>::Error: core::fmt::Debug,
 {
-    #[cfg(feature = "frame-timing")]
-    let mut frame_timing = FrameTiming::new();
-    let mut flush_errors = FlushErrorTracker::new("DisplaySurface::flush");
-    let mut power_errors = FlushErrorTracker::new("DisplaySurface::set_power");
-
-    let mut power_state = PowerState::Active;
-    let mut last_input = platform.clock().now();
-    // Set once `PowerControl::enter_deep_sleep` has fired, so a host test's
-    // no-op recording stub (which, unlike real hardware, actually returns)
-    // doesn't re-fire it every subsequent iteration once eligible -- see
-    // the module doc's "Deep sleep" section.
-    let mut deep_sleep_triggered = false;
+    let mut runner = Runner::new(platform.clock().now(), idle_timeout, deep_sleep_timeout);
 
     while should_continue() {
         let frame_start = platform.clock().now();
 
-        let intents = platform.input().poll();
-
-        if intents.is_empty() {
-            if let Some(idle_timeout) = idle_timeout {
-                if power_state == PowerState::Active && frame_start.saturating_duration_since(last_input) >= idle_timeout {
-                    match platform.display().set_power(DisplayPower::Off) {
-                        Ok(()) => power_errors.on_ok(),
-                        Err(error) => power_errors.on_err(&error),
-                    }
-                    power_state = PowerState::Asleep;
-                }
-            }
-
-            // Deep sleep (see the module doc's "Deep sleep" section):
-            // independent of `power_state` above (not gated on already
-            // being `Asleep`) -- in practice `Tb` is well past `Ta` so the
-            // screen is already blanked by the time this can fire, but
-            // the check itself only cares about elapsed idle time and
-            // external power.
-            if let Some(deep_sleep_timeout) = deep_sleep_timeout {
-                let idle_elapsed = frame_start.saturating_duration_since(last_input);
-                if !deep_sleep_triggered && idle_elapsed >= deep_sleep_timeout && !platform.power().on_external_power() {
-                    platform.power().enter_deep_sleep();
-                    deep_sleep_triggered = true;
-                }
-            }
-        } else {
-            last_input = frame_start;
-            match power_state {
-                PowerState::Asleep => {
-                    // The wake-triggering input only wakes the display —
-                    // it is deliberately never forwarded to
-                    // `app.handle_input` (see the module doc). `App`
-                    // never learns it was asleep; `mark_dirty` forces the
-                    // fresh flush the just-woken display needs even
-                    // though nothing on screen actually changed.
-                    match platform.display().set_power(DisplayPower::On) {
-                        Ok(()) => power_errors.on_ok(),
-                        Err(error) => power_errors.on_err(&error),
-                    }
-                    power_state = PowerState::Active;
-                    app.mark_dirty();
-                }
-                PowerState::Active => {
-                    app.handle_input(intents);
-                }
-            }
-        }
-
-        // Blanked while `Asleep`: skip render+flush entirely rather than
-        // rendering into a framebuffer nothing will show. `app.dirty()`
-        // deliberately stays untouched by this gate (not cleared, not
-        // read via `render()`) — a dirty flag survives blanked frames so
-        // the next real wake renders it immediately.
-        if app.dirty() && power_state == PowerState::Active {
-            #[cfg(feature = "frame-timing")]
-            let render_start = platform.clock().now();
-
-            let framebuffer = app.render();
-
-            #[cfg(feature = "frame-timing")]
-            let render_end = platform.clock().now();
-
-            // A flush failure (e.g. a real SPI write error on hardware) is
-            // not something this loop can meaningfully recover from frame
-            // to frame; device-specific errors are absorbed at the
-            // surface adapter, not propagated into the platform-free
-            // core. Still not panicking here (the loop stays infallible)
-            // -- but no longer silently discarded either:
-            // `FlushErrorTracker` makes a persistent failure visible over
-            // serial (rate-limited) instead of looking like an
-            // inexplicable frozen screen.
-            match platform.display().flush(framebuffer) {
-                Ok(()) => flush_errors.on_ok(),
-                Err(error) => flush_errors.on_err(&error),
-            }
-
-            #[cfg(feature = "frame-timing")]
-            {
-                let flush_end = platform.clock().now();
-                frame_timing.record(
-                    render_end.saturating_duration_since(render_start),
-                    flush_end.saturating_duration_since(render_end),
-                );
-            }
-        }
+        runner.step(platform, app, frame_start);
 
         let elapsed = platform.clock().now().saturating_duration_since(frame_start);
         if let Some(remaining) = frame_budget.checked_sub(elapsed) {
