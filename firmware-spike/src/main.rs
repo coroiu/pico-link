@@ -115,6 +115,151 @@ mod btstack_ffi {
         pub fn hci_init(transport: *const hci_transport_t, config: *const core::ffi::c_void);
         pub fn hci_transport_dummy_instance() -> *const hci_transport_t;
         pub fn gap_inquiry_start(duration: u8) -> u8;
+
+        // pico-link-8v3.2.3: btstack_run_loop_embedded's own "process one
+        // iteration" entry point (poll data sources, execute callbacks,
+        // process timers against hal_time_ms, then hal_cpu_disable_irqs /
+        // hal_cpu_enable_irqs[_and_sleep]). Calling this repeatedly from
+        // run_core1's existing paint loop, rather than handing control to
+        // the blocking `btstack_run_loop_embedded_execute()` forever, is
+        // the "timer-driven, no tick handler needed" design this bead
+        // calls for - see run_core1 for where it's driven from.
+        pub fn btstack_run_loop_embedded_execute_once();
+
+        // timer_probe.c: registers one recurring 1000ms BTstack timer and
+        // exposes how many times it has fired. This is the acceptance-
+        // criterion proof for pico-link-8v3.2.3 - see that file's header
+        // comment for why it stays in C.
+        pub fn timer_probe_start();
+        pub fn timer_probe_fired_count_get() -> u32;
+    }
+}
+
+/// hal_cpu_*/hal_time_ms for BTstack's embedded port (pico-link-8v3.2.3).
+///
+/// Both hal_shim.c stub functions this replaces are gone; these are real
+/// implementations, in Rust rather than duplicated C register access, per
+/// the epic's "C owns nothing above itself" rule - BTstack's C code calls
+/// straight into Rust for both the clock and the critical-section
+/// primitive, same seam shape as everything else in this crate.
+///
+/// SCOPE: BTstack (and therefore all of this) runs exclusively on core1 in
+/// this spike - core0 owns USB/CDC and never calls any of these functions.
+/// Both the IRQ_DISABLE_DEPTH counter and the raw PRIMASK bit these
+/// functions manipulate are core-local (Cortex-M33 gives each core its own
+/// NVIC/PRIMASK), so there is no cross-core race to reason about here.
+mod btstack_hal {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Nesting depth for hal_cpu_disable_irqs/hal_cpu_enable_irqs.
+    ///
+    /// WHY THIS EXISTS: BTstack calls these two functions in matched pairs,
+    /// but those pairs NEST - btstack_run_loop_embedded_execute_once's own
+    /// disable/enable wraps the trigger-event check, and code called from
+    /// within that window (timer callbacks, data source processing) is free
+    /// to open its own disable/enable pair to protect a shorter critical
+    /// section. A naive implementation ("disable = cpsid i, enable = cpsie
+    /// i", no bookkeeping) breaks the instant it nests: the INNER
+    /// hal_cpu_enable_irqs call would unconditionally re-enable interrupts
+    /// while the OUTER critical section is still logically in force,
+    /// exposing exactly the state the outer section existed to protect.
+    ///
+    /// FIX: track nesting depth. Only the disable call that takes depth
+    /// 0 -> 1 actually clears PRIMASK; only the enable call that takes
+    /// depth 1 -> 0 restores it. Every call in between just adjusts the
+    /// counter and leaves PRIMASK alone, so an inner enable can never
+    /// unmask interrupts out from under an outer disable.
+    static IRQ_DISABLE_DEPTH: AtomicU32 = AtomicU32::new(0);
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn hal_cpu_disable_irqs() {
+        // Safe to call unconditionally even if IRQs are already masked
+        // (nested case) - cpsid i is idempotent.
+        cortex_m::interrupt::disable();
+        IRQ_DISABLE_DEPTH.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn hal_cpu_enable_irqs() {
+        // fetch_update's Ok(_) payload is the value BEFORE the swap, so
+        // Ok(1) means depth just went 1 -> 0: this was the outermost
+        // enable call, the one actually allowed to touch PRIMASK.
+        //
+        // Ordering::Relaxed is correct, not merely convenient: every access
+        // to this counter happens with this core's own IRQs already masked
+        // (we are always inside a still-active disable/enable pair when we
+        // touch it), so there is no concurrent access to order against -
+        // the pairing itself is what provides the exclusion, same as the
+        // depth counter needing no lock in the first place.
+        let prev = IRQ_DISABLE_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            if d == 0 {
+                None
+            } else {
+                Some(d - 1)
+            }
+        });
+        match prev {
+            Ok(1) => {
+                // SAFETY: this is the outermost enable, matched 1:1 with
+                // the outermost disable via the depth counter above - by
+                // construction no caller further up the stack still
+                // believes it holds a critical section.
+                unsafe { cortex_m::interrupt::enable() };
+            }
+            Ok(_) => {
+                // Still nested (depth > 0 after the decrement) - leave
+                // PRIMASK alone, an outer critical section is still live.
+            }
+            Err(_) => {
+                // Called with depth already 0: an enable with no matching
+                // disable. Every call site we've read (btstack_run_loop_
+                // embedded.c's execute_once, plus BTstack's own hci.c/
+                // l2cap.c critical sections) pairs these 1:1, so this
+                // should not happen in practice. Deliberately do nothing
+                // rather than force-enable: leaving IRQs masked is a loud,
+                // safe failure (hang) rather than a silent one (an outer
+                // critical section elsewhere loses protection early).
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn hal_cpu_enable_irqs_and_sleep() {
+        // NOT a real WFI-based sleep. btstack_run_loop_embedded_execute_once
+        // calls this exactly when there is nothing to do until the next
+        // timer or data-source event, and on real embedded ports that is
+        // normally where a periodic tick/alarm IRQ wakes the core back up.
+        // Core1 in this spike has ZERO unmasked NVIC interrupt sources of
+        // its own (no periodic alarm IRQ is configured for it - see
+        // run_core1's doc comment on why core0/core1 are otherwise kept
+        // independent), so a real `wfi` here would block forever: nothing
+        // would ever wake it. That would silently turn "the run loop went
+        // idle for one iteration" into "the run loop is dead," which would
+        // break the exact 1000ms-timer proof this bead exists to produce.
+        //
+        // Trade made instead: busy-poll. Re-enable IRQs (reusing the same
+        // nesting-safe path as hal_cpu_enable_irqs) and return immediately;
+        // run_core1's own delay_ms(50) between execute_once() calls is what
+        // bounds the polling rate. Real low-power sleep needs a periodic
+        // wake source wired to core1's NVIC (e.g. a TIMER ALARM IRQ) -
+        // tracked as follow-up, not implemented here.
+        hal_cpu_enable_irqs();
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn hal_time_ms() -> u32 {
+        // embassy_time's global time driver reads the RP2350's TIMER
+        // peripheral directly (not core-affine - it's a plain MMIO
+        // register, not a per-core resource), and was already brought up
+        // by `embassy_rp::init()` on core0 before core1 was ever spawned
+        // (see `fn main`), so this is safe to call from core1 with no
+        // additional synchronization. Truncated to u32 (BTstack's own
+        // hal_time_ms contract, and btstack_time_t is uint32_t here since
+        // ENABLE_TESTING_SUPPORT is not defined in btstack_config.h) -
+        // wraps after ~49.7 days, which is the same wraparound every other
+        // hal_time_ms-based BTstack port lives with; BTstack's timer
+        // comparisons are wraparound-safe by design.
+        embassy_time::Instant::now().as_millis() as u32
     }
 }
 
@@ -521,10 +666,19 @@ mod usb_console {
 
     /// Prints a boot line the instant the host opens the port (DTR), then a
     /// heartbeat once a second for as long as the port stays open. The
-    /// heartbeat is driven by `embassy_time` (embassy-rp's own hardware
-    /// timer, already live via the `time-driver` feature) - it is NOT proof
-    /// that BTstack's `hal_time_ms` works, that is pico-link-8v3.2.3's gate,
-    /// still open.
+    /// heartbeat's own 1000ms cadence is driven by `embassy_time` (embassy-
+    /// rp's own hardware timer, already live via the `time-driver`
+    /// feature) - that alone is NOT proof that BTstack's `hal_time_ms`
+    /// works.
+    ///
+    /// What IS that proof: each line also carries `btstack_timer_fired`,
+    /// read from `TIMER_PROBE_FIRED` - a count core1 maintains from
+    /// timer_probe.c's own independent 1000ms BTstack run-loop timer (see
+    /// run_core1). Two independently-clocked 1000ms sources landing on the
+    /// same host-visible line, both incrementing by 1 roughly once a
+    /// second, is the pico-link-8v3.2.3 acceptance criterion: hal_time_ms
+    /// returning 0 (its old stub value) is exactly what would have pinned
+    /// btstack_timer_fired at 0 forever while heartbeat kept climbing.
     #[embassy_executor::task]
     async fn console_task(mut class: Cdc) -> ! {
         let mut n: u32 = 0;
@@ -535,9 +689,10 @@ mod usb_console {
                 .await;
             loop {
                 Timer::after(Duration::from_millis(1000)).await;
-                let mut buf: FixedBuf<32> = FixedBuf::new();
+                let fired = TIMER_PROBE_FIRED.load(Ordering::SeqCst);
+                let mut buf: FixedBuf<48> = FixedBuf::new();
                 buf.clear();
-                let _ = write!(buf, "heartbeat {n}\r\n");
+                let _ = write!(buf, "heartbeat {n} btstack_timer_fired={fired}\r\n");
                 n = n.wrapping_add(1);
                 if class.write_packet(buf.as_bytes()).await.is_err() {
                     // Host closed the port - go back to waiting for a fresh
@@ -618,6 +773,17 @@ mod stage {
 
 static USB_STAGE: AtomicU32 = AtomicU32::new(stage::BOOT);
 
+/// pico-link-8v3.2.3 acceptance-criterion evidence: the fire count of
+/// `timer_probe.c`'s recurring 1000ms `BTstack` timer, republished by core1
+/// (which owns the `BTstack` run loop) into this atomic once per its own
+/// poll-loop iteration, and printed by core0's `console_task` once a second.
+/// If `hal_time_ms` still returned 0 (its old stub value), `BTstack`'s timer
+/// deadline check (`now >= ts->timeout`, using values computed from
+/// `hal_time_ms`) would never advance past the first comparison and this
+/// would stay 0 forever - that is exactly the failure mode this proves
+/// does NOT happen any more.
+static TIMER_PROBE_FIRED: AtomicU32 = AtomicU32::new(0);
+
 /// Runs on core1: the ST7789 bring-up plus the pre-existing BTstack/TinyUSB
 /// link-seam probes. Everything here is allowed to hang or fault - that is
 /// the entire point of running it off core0.
@@ -668,15 +834,57 @@ fn run_core1(
         // known to return, and must not be able to block the hatch signal.
         let _ = btstack_ffi::gap_inquiry_start(5);
         let _ = tinyusb_ffi::tusb_inited();
+
+        // pico-link-8v3.2.3: arm the recurring 1000ms BTstack timer that
+        // proves hal_time_ms + the embedded run loop's timer path actually
+        // work end to end. Must come after btstack_run_loop_init above -
+        // btstack_run_loop_set_timer/add_timer dispatch through whichever
+        // run loop instance was registered there.
+        btstack_ffi::timer_probe_start();
     }
 
-    // Core1's remaining job: paint whatever enumeration stage core0's USB
-    // handler has reached. This is the debug channel for a broken debug
-    // channel - see USB_STAGE. Repaints only on change; a full 240x240 fill
-    // at 1MHz SPI is roughly a second, so polling faster than the stage can
-    // change would just smear the screen.
+    // Core1's remaining job: drive the BTstack embedded run loop one
+    // iteration at a time (poll data sources, execute callbacks, process
+    // timers against hal_time_ms, then the hal_cpu_* critical section around
+    // the idle check - see btstack_hal in this file) and paint whatever USB
+    // enumeration stage core0's USB handler has reached. Driving the run
+    // loop by repeated execute_once() calls from this existing poll loop,
+    // rather than handing control to the blocking execute() forever, is the
+    // "timer-driven, no tick-handler ISR needed" shape decided for this
+    // bead - see btstack_hal::hal_cpu_enable_irqs_and_sleep for why a real
+    // WFI-based sleep inside execute_once would have made this loop (and
+    // the display repaint below) stop dead instead.
+    //
+    // Repaints only on change; a full 240x240 fill at 1MHz SPI is roughly a
+    // second, so polling faster than the stage can change would just smear
+    // the screen.
+    //
+    // pico-link-8v3.2.3 code-review follow-up, EXPECTED SAMPLING BEHAVIOUR
+    // (not a defect - do not "fix" this): this loop only calls
+    // execute_once() once per 50ms delay_ms below, so timer_probe.c's
+    // 1000ms re-arm (btstack_run_loop_set_timer, which computes
+    // hal_time_ms() + 1000 at fire time) lands, on average, ~25ms and up to
+    // ~50ms after its nominal due time - an effective period of roughly
+    // 1026-1051ms against the CDC console's exact 1000ms heartbeat cadence
+    // (embassy_time::Timer, a completely independent clock source). That
+    // drift accumulates until it crosses a full heartbeat tick, which then
+    // reads as one btstack_timer_fired delta of 0 in the printed log,
+    // roughly once every 20-38 heartbeats depending on phase - confirmed
+    // empirically on hardware as regular ~22-heartbeat intervals between
+    // zero-deltas across several 100-200s single-reader captures, with zero
+    // burst-shaped (delta > 1) anomalies once connect-adjacent lines are
+    // excluded (see timer_probe.c's header comment for why the FIRST few
+    // lines after any (re)connect are not representative - they can carry
+    // a backlog queued behind a blocked CDC write). If a future change
+    // lowers this loop's poll granularity, this drift pattern's period will
+    // change accordingly; it disappearing entirely is the actual anomaly.
     let mut painted = stage::BOOT;
     loop {
+        unsafe {
+            btstack_ffi::btstack_run_loop_embedded_execute_once();
+            TIMER_PROBE_FIRED.store(btstack_ffi::timer_probe_fired_count_get(), Ordering::SeqCst);
+        }
+
         let now = USB_STAGE.load(Ordering::SeqCst).min(stage::CONFIGURED);
         if now != painted {
             display.fill(stage::COLORS[now as usize]);
