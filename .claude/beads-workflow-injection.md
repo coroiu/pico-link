@@ -63,7 +63,7 @@ If the orchestrator's approach would break something, explain what you found and
 <during-implementation>
 1. Work ONLY in your worktree: `.worktrees/bd-{BEAD_ID}/`
 2. Commit frequently with descriptive messages
-3. Log progress: `bd comment {BEAD_ID} "Completed X, working on Y"`
+3. Log progress: `bd comments add {BEAD_ID} "Completed X, working on Y"`
 </during-implementation>
 
 <on-completion>
@@ -81,13 +81,13 @@ WARNING: You will be BLOCKED if you skip any step. Execute ALL in order:
 
 3. **Optionally log learnings:**
    ```bash
-   bd comment {BEAD_ID} "LEARNED: [key technical insight]"
+   bd comments add {BEAD_ID} "LEARNED: [key technical insight]"
    ```
    If you discovered a gotcha or pattern worth remembering, log it. Not required.
 
 4. **Leave completion comment:**
    ```bash
-   bd comment {BEAD_ID} "Completed: [summary]"
+   bd comments add {BEAD_ID} "Completed: [summary]"
    ```
 
 5. **Mark status:**
