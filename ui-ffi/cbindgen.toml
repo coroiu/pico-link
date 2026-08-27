@@ -1,0 +1,39 @@
+# cbindgen config for the ui-ffi -> firmware/include/pico_link_ui.h header.
+# Invoked as a CMake build step (see firmware/CMakeLists.txt) so the header
+# can never drift from the actual Rust FFI surface -- a hand-written header
+# is the most common source of silent FFI ABI bugs (see the M1b bead).
+
+language = "C"
+header = """
+/* GENERATED FILE -- DO NOT EDIT.
+ *
+ * Produced by cbindgen from ui-ffi/src/lib.rs as a CMake build step (see
+ * firmware/CMakeLists.txt). Edit the Rust FFI surface in ui-ffi/src/lib.rs
+ * instead and rebuild; hand-editing this file will be silently overwritten
+ * and will drift from the real ABI in the meantime. */
+"""
+include_guard = "PICO_LINK_UI_H"
+braces = "SameLine"
+line_length = 100
+tab_width = 4
+documentation = true
+documentation_style = "doxy"
+
+[export]
+prefix = ""
+include = ["PlUi", "PlIntent", "PlIntentTag"]
+
+[fn]
+prefix = ""
+args = "auto"
+
+[enum]
+# Prefixed with the enum name (-> PL_INTENT_TAG_UP, not bare UP) so these
+# common short names (Up/Down/Left/Right/Select/Back) can never collide
+# with a macro from pico-sdk or any other header this file gets included
+# alongside.
+prefix_with_name = true
+rename_variants = "ScreamingSnakeCase"
+
+[parse]
+parse_deps = false
