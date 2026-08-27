@@ -29,8 +29,14 @@ git branch --list "bd-*"
   during cleanup.
 - **Check every `bd-*` branch has an upstream**:
   `git rev-parse --abbrev-ref @{u}`. A supervisor reporting "pushed" is not
-  evidence it pushed. Unpushed branches exist on one laptop only, and so does
-  the beads board — say so plainly rather than assuming it is fine.
+  evidence it pushed. Unpushed branches exist on one laptop only — say so
+  plainly rather than assuming it is fine.
+- **Back up the beads board with `bd dolt push`.** The board lives only in the
+  gitignored `.beads/embeddeddolt/`, so nothing else in the session's commits
+  preserves it. Verify it landed with `git ls-remote origin | grep dolt`
+  (`refs/dolt/data` present) — a clean exit code is not proof on its own. If it
+  fails, check `bd dolt remote list` first: bd keeps its own remote, separate
+  from git's, and a stale entry there is the likeliest cause.
 - Delete scratch files the session created. Do **not** `pkill -f "desktop"` —
   see CLAUDE.md.
 

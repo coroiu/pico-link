@@ -212,7 +212,11 @@ real time.
   10/10). Push with
   `git push ssh://git@ssh.github.com:443/coroiu/pico-link.git main`. Andreas
   declined a `~/.ssh/config` change and handles it himself.
-- **The beads board has no remote backup.** It lives only in
-  `.beads/embeddeddolt/`, which is gitignored. JSONL auto-export is OFF by
-  default in beads 1.2.2, so `.beads/issues.jsonl` is never generated. `bd dolt
-  push` fails for the same port-22 reason.
+- **The beads board has a remote backup as of 2026-08-27.** It lives in
+  `.beads/embeddeddolt/`, which is gitignored, and JSONL auto-export is OFF by
+  default in beads 1.2.2 so `.beads/issues.jsonl` is never generated — but
+  `bd dolt push` now replicates it to `refs/dolt/data` on `coroiu/pico-link`.
+  The earlier "push fails" note blamed the port-22 block; the real cause was
+  bd's own remote list (separate from git's) still pointing at the pre-pivot
+  `bitwarden-hw-key` repo on port 22. Repointed with `bd dolt remote add origin
+  git+ssh://git@ssh.github.com:443/coroiu/pico-link.git`.

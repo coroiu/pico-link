@@ -320,7 +320,8 @@ applies.
     corrupts data: two readers steal bytes from each other, which produces
     fragmented lines AND counter jumps indistinguishable from a real firmware
     bug. This cost real debugging time on 2026-08-27.
-  - A crashed laptop loses the beads board — it has no remote backup.
+  - A crashed laptop loses any beads-board state since the last `bd dolt push`
+    (the board now has a remote — see the backup note below).
 - **Reading the board's CDC console needs DTR asserted explicitly.** embassy-usb's
   `wait_connection()` blocks until DTR, and on macOS a plain `cat /dev/cu.usbmodem*`
   does not reliably assert it - you get an open port and zero bytes, which looks
@@ -342,7 +343,9 @@ applies.
 - **Beads/worktree hygiene.** The board lives in the embedded Dolt DB at
   `.beads/embeddeddolt/`, which is gitignored — there is nothing to commit before
   a merge, and nothing in git to recover the board from. Back it up with
-  `bd dolt push` (needs `ssh-add` first; Dolt cannot prompt for a passphrase).
+  `bd dolt push` — this WORKS as of 2026-08-27, pushing `refs/dolt/data` to
+  `coroiu/pico-link`; run it at session close. If it ever fails on a passphrase,
+  `ssh-add` first: Dolt cannot prompt.
   `git branch -d` may balk because beads auto-syncs to branch tips — verify
   `git log main..<branch>` is empty, then `git branch -D`. When dispatching a
   supervisor, tell it to create its worktree from local `main` and verify the base
@@ -504,9 +507,16 @@ ADRs — trust the ADRs, not older prose in this file, if they conflict.
   `git push ssh://git@ssh.github.com:443/coroiu/pico-link.git main`. Bare
   `ssh -T git@github.com` can succeed a few times while `git fetch` fails
   seconds later — measure with a loop, don't conclude from one probe.
-- **The beads board has NO remote backup.** It lives only in
-  `.beads/embeddeddolt/` (gitignored). `bd dolt push` fails for the same port-22
-  reason.
+- **The beads board DOES have a remote backup** (fixed 2026-08-27; supersedes
+  the earlier "no remote backup" note). It lives in `.beads/embeddeddolt/`
+  (gitignored), and `bd dolt push` replicates it to `refs/dolt/data` on
+  `coroiu/pico-link`. The earlier failure was NOT the port-22 block: bd keeps
+  its **own** remote list, separate from git's, and it still pointed at the
+  pre-pivot `git+ssh://git@github.com/coroiu/bitwarden-hw-key.git`. Inspect with
+  `bd dolt remote list`; it is now
+  `git+ssh://git@ssh.github.com:443/coroiu/pico-link.git`. Changing `git remote`
+  does not change bd's — verify a push landed with
+  `git ls-remote origin | grep dolt`.
 - **The auto-mode classifier did NOT block `.claude/hooks/` or
   `.claude/agents/` edits** this session, contrary to the note above — it
   appears to gate files that actually grant permissions. Attempt the edit rather

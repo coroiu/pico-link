@@ -31,3 +31,6 @@ headless_scene.png
 .beads-credential-key
 .beads/proxieddb/
 .DS_Store
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.json
