@@ -30,3 +30,4 @@ headless_scene.png
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.DS_Store
