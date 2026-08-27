@@ -331,9 +331,15 @@ applies.
 - **Reading the board's CDC console needs DTR asserted explicitly.** embassy-usb's
   `wait_connection()` blocks until DTR, and on macOS a plain `cat /dev/cu.usbmodem*`
   does not reliably assert it - you get an open port and zero bytes, which looks
-  exactly like dead firmware. `tools/usb-console/cdc_reader.py --assert-dtr` sends
-  the CDC `SET_CONTROL_LINE_STATE` control transfer directly; `tty_fallback.py`
-  does the tty-side `ioctl(TIOCMBIS, TIOCM_DTR)` equivalent for the fallback path.
+  exactly like dead firmware. `tools/usb-console/cdc_reader.py --assert-dtr`
+  attempts the CDC `SET_CONTROL_LINE_STATE` control transfer, but **it does not
+  work on macOS**: claiming the CDC-Communication interface fails with `EACCES`
+  even though claiming the CDC-Data interface for reads succeeds (measured
+  2026-08-27, bead pico-link-4mc; a prior `detach_kernel_driver` does not help).
+  So DTR is currently only assertable via `tty_fallback.py`'s
+  `ioctl(TIOCMBIS, TIOCM_DTR)` — the risky path. This only bites on firmware
+  that GATES its console on DTR, which embassy-usb did; pico-sdk's `stdio_usb`
+  does not block on it, so C-first firmware is expected to print regardless.
   This is why the boot line was missed while the heartbeats were fine.
 - **`timeout` does not exist on this Mac** (no coreutils). Use a background PID
   plus `sleep` and `kill`, or Python, when a read needs a deadline.
