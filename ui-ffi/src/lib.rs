@@ -350,9 +350,16 @@ pub unsafe extern "C" fn pl_ui_tick(ui: *mut PlUi, now_us: u64) {
     let _ = now_us;
 }
 
-/// Renders the current screen (only if dirty -- mirrors
-/// `pico_link_core::run::Runner::step`'s own dirty gate) and hands back a
-/// borrowed pointer to the raw RGB565 pixel data plus its length in pixels
+/// Renders the current screen -- unconditionally, every call, regardless of
+/// `App::dirty()` (unlike `pico_link_core::run::Runner::step`'s dirty gate,
+/// which this FFI surface does NOT mirror: `App::render` itself has no
+/// dirty check, only `Runner`/`run` do, and neither is in the M1 FFI
+/// surface). Idempotent -- calling it twice with no intervening
+/// `pl_ui_input`/`pl_ui_tick` produces the identical frame both times -- but
+/// C should not assume a cheap early-out here; skipping a redundant blit
+/// when nothing changed is C's own call to make, not something this
+/// function does for it. Hands back a borrowed pointer to the raw RGB565
+/// pixel data plus its length in pixels
 /// (not bytes). Native CPU (little-endian) `u16` values, one per pixel, row
 /// major -- **not** the panel's big-endian wire format; C's DMA blit is
 /// expected to byte-swap in hardware on the way out (see

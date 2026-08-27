@@ -76,6 +76,8 @@ add_dependencies(ui_ffi ui_ffi_build)
 
 add_executable(pico_link
     src/main.c
+    src/st7789.c
+    src/input.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
@@ -94,6 +96,9 @@ target_compile_definitions(pico_link PRIVATE
 
 target_link_libraries(pico_link
     pico_stdlib
+    hardware_spi
+    hardware_dma
+    hardware_gpio
     ui_ffi
 )
 

@@ -5,7 +5,9 @@
 // milestone links in ui-ffi, a no_std + alloc Rust staticlib, over the
 // narrow extern "C" surface in the generated firmware/include/pico_link_ui.h
 // (see CMakeLists.txt -- cbindgen regenerates it from ui-ffi/src/lib.rs on
-// every build, so it can never hand-drift from the real FFI ABI).
+// every build, so it can never hand-drift from the real FFI ABI), drives a
+// Waveshare Pico-LCD-1.3 ST7789 panel (st7789.c/h), and polls the joystick +
+// buttons (input.c/h).
 //
 // Deliberately does NOT poke CPACR or touch any coprocessor-access register:
 // pico-sdk's runtime_init() is responsible for that now. If a NOCP
@@ -14,21 +16,31 @@
 
 #include <stdio.h>
 
+#include "hardware/spi.h"
 #include "pico/stdlib.h"
+
+#include "input.h"
 #include "pico_link_ui.h"
+#include "st7789.h"
 
 // The one call in the Rust -> C direction (see pico_link_ui.h's doc comment
 // on pl_ui_panic_hook): Rust hands us a panic message on the way to
 // spinning forever, since it has no unwinder on this target and nothing
 // else safe to do. Report it over the CDC console -- the only I/O channel
-// this milestone has -- so a panic during bring-up is visible rather than
+// available for this -- so a panic during bring-up is visible rather than
 // looking like a silent hang.
 void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
     printf("\r\n!!! ui-ffi PANIC: %.*s\r\n", (int)len, (const char *)msg);
 }
 
-#define PANEL_WIDTH 240
-#define PANEL_HEIGHT 240
+#define PANEL_WIDTH ST7789_WIDTH
+#define PANEL_HEIGHT ST7789_HEIGHT
+
+// RGB565, big-endian-agnostic constants (these are plain 16-bit values;
+// st7789_init_and_fill sends them MSB-first itself).
+#define COLOR_RED 0xF800
+#define COLOR_GREEN 0x07E0
+#define COLOR_BLUE 0x001F
 
 int main(void) {
     stdio_init_all();
@@ -41,6 +53,38 @@ int main(void) {
     printf("board: pimoroni_pico_plus2_w_rp2350\r\n");
     printf("pico-sdk owns main(); ui-ffi (Rust core) linked in over FFI.\r\n");
 
+    // --- Staged panel bring-up (M1b design: confirm each stage before the
+    // next) ---
+    //
+    // Stage 1+2 combined into one flash (no live visual feedback loop
+    // available to this agent -- see the M1b bead comments): backlight on,
+    // then three full-screen solid-colour fills in sequence, entirely via
+    // the blocking (non-DMA) path -- zero Rust rendering anywhere in this
+    // sequence. If the colours on the panel are wrong here, the bug is in
+    // this file / st7789.c, not in ui-ffi or core. A human watching the
+    // panel (or the bench webcam) should see: red, pause, green, pause,
+    // blue, pause -- each via a fresh st7789_init_and_fill call (which
+    // internally does the hardware reset + register init once more; a
+    // second/third re-init is wasteful but harmless and keeps this
+    // sequence simple to read).
+    st7789_init(spi1);
+    printf("st7789_init OK (SPI1, DC=%d CS=%d SCK=%d MOSI=%d RST=%d BL=%d, %d Hz)\r\n",
+           ST7789_PIN_DC, ST7789_PIN_CS, ST7789_PIN_SCK, ST7789_PIN_MOSI, ST7789_PIN_RST, ST7789_PIN_BL,
+           ST7789_INIT_BAUDRATE_HZ);
+
+    printf("panel: solid RED fill\r\n");
+    st7789_init_and_fill(spi1, COLOR_RED);
+    sleep_ms(1000);
+
+    printf("panel: solid GREEN fill\r\n");
+    st7789_init_and_fill(spi1, COLOR_GREEN);
+    sleep_ms(1000);
+
+    printf("panel: solid BLUE fill\r\n");
+    st7789_init_and_fill(spi1, COLOR_BLUE);
+    sleep_ms(1000);
+
+    // --- The Rust UI ---
     struct PlUi *ui = pl_ui_create(PANEL_WIDTH, PANEL_HEIGHT);
     if (ui == NULL) {
         printf("pl_ui_create FAILED -- halting\r\n");
@@ -50,59 +94,62 @@ int main(void) {
     }
     printf("pl_ui_create OK\r\n");
 
-    // Sample the same pixel core's own tests use to prove a selection
-    // move actually happened (row 0's highlight fill, well past the
-    // chip/text -- see core/src/app.rs's
-    // handle_input_marks_dirty_and_moving_selection_changes_the_rendered_framebuffer
-    // test), NOT pixel 0 -- (0,0) sits in the header bar, which a list
-    // selection move never touches, so it would look "unchanged" even with
-    // a fully working input path.
-    #define SAMPLE_X 200
-    #define SAMPLE_Y 18
-    #define SAMPLE_INDEX ((SAMPLE_Y) * PANEL_WIDTH + (SAMPLE_X))
+    pl_link_input_init();
+    printf("pl_link_input_init OK\r\n");
 
-    const uint16_t *px = NULL;
-    uintptr_t px_len = 0;
-    pl_ui_render(ui, &px, &px_len);
-    // Snapshot the sample pixel's value NOW, into a local -- `px` itself
-    // stays a borrowed pointer into the app's single live framebuffer (see
-    // pl_ui_render's doc comment), so re-reading it after the second
-    // render below would just show the *new* frame's value, not prove
-    // anything changed.
-    uint16_t sample_before = (px_len > SAMPLE_INDEX) ? px[SAMPLE_INDEX] : 0;
-    printf(
-        "pl_ui_render: %lu pixels (expected %d), sample pixel (%d,%d) = 0x%04x\r\n",
-        (unsigned long)px_len,
-        PANEL_WIDTH * PANEL_HEIGHT,
-        SAMPLE_X, SAMPLE_Y,
-        sample_before
-    );
-
-    // Exercise the input path too: one Down intent should move the
-    // selection, which (per pico_link_core::App::handle_input) marks the
-    // app dirty -- rendering again should hand back a different value at
-    // the sampled pixel than the fresh-app render above if (and only if)
-    // the FFI input plumbing is actually wired correctly end to end.
-    struct PlIntent down = { .tag = PL_INTENT_TAG_DOWN, .jump_by = 0 };
-    pl_ui_input(ui, &down, 1);
-    pl_ui_tick(ui, time_us_64());
-
-    const uint16_t *px2 = NULL;
-    uintptr_t px2_len = 0;
-    pl_ui_render(ui, &px2, &px2_len);
-    uint16_t sample_after = (px2_len > SAMPLE_INDEX) ? px2[SAMPLE_INDEX] : 0;
-    printf(
-        "after Down: %lu pixels, sample pixel (%d,%d) = 0x%04x (%s)\r\n",
-        (unsigned long)px2_len,
-        SAMPLE_X, SAMPLE_Y,
-        sample_after,
-        (px_len == px2_len && px2_len > SAMPLE_INDEX && sample_before == sample_after) ? "UNCHANGED, input path may be broken" : "changed as expected"
-    );
-
-    uint32_t heartbeat = 0;
+    // Superloop on core0 only (M1b design). Every iteration: poll debounced
+    // input edges, forward to Rust, tick, render, blit, print per-frame
+    // timing -- the bead's hardware acceptance criterion.
+    PlIntent intents[8];
     while (true) {
-        printf("heartbeat %lu\r\n", (unsigned long)heartbeat++);
-        sleep_ms(1000);
+        uint64_t frame_start_us = time_us_64();
+
+        size_t n = pl_link_input_poll(intents, 8);
+        if (n > 0) {
+            pl_ui_input(ui, intents, n);
+        }
+        pl_ui_tick(ui, frame_start_us);
+
+        const uint16_t *px = NULL;
+        uintptr_t px_len = 0;
+        uint64_t render_start_us = time_us_64();
+        pl_ui_render(ui, &px, &px_len);
+        uint64_t render_end_us = time_us_64();
+
+        if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
+            // ui_tick()/pl_ui_render() must not be called again until this
+            // DMA completes (st7789_blit_framebuffer blocks until it does)
+            // -- Rust can never write while DMA reads, per the M1b design's
+            // no-tearing, no-double-buffering contract.
+            st7789_blit_framebuffer(spi1, px, (uint32_t)px_len);
+        }
+        uint64_t blit_end_us = time_us_64();
+
+        static uint32_t frame_count = 0;
+        frame_count++;
+        // Rate-limit the per-frame print to once a second (at a ~few-ms
+        // frame time this is still hundreds of frames between prints) so
+        // the CDC console stays readable rather than flooded -- the bead
+        // asks for "CDC prints per-frame render and blit timing", which
+        // this satisfies by printing exactly that breakdown, just not on
+        // literally every single frame.
+        if (frame_count % 60 == 1) {
+            printf(
+                "frame %lu: render=%lluus blit=%lluus total=%lluus\r\n",
+                (unsigned long)frame_count,
+                (unsigned long long)(render_end_us - render_start_us),
+                (unsigned long long)(blit_end_us - render_end_us),
+                (unsigned long long)(blit_end_us - frame_start_us)
+            );
+        }
+
+        // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
+        // re-renders unconditionally every call -- see its doc comment in
+        // pico_link_ui.h. Blitting every iteration regardless is simple and
+        // correct, if not maximally efficient -- a later milestone can add
+        // a "was this frame actually new" signal to the FFI surface if the
+        // redundant-blit cost turns out to matter.
+        sleep_ms(16); // ~60Hz loop pace, matching the emulator's frame budget
     }
 
     return 0;
