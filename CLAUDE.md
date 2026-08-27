@@ -310,9 +310,15 @@ applies.
   fact: the laptop crash that ended the 2026-08-26 night session may have been
   this, and that session had been opening /dev/cu.usbmodem* repeatedly.
   **RULES, follow them even though the tty path usually works:**
-  - Prefer talking to the device DIRECTLY over USB — picotool, or libusb/pyusb —
-    over opening `/dev/cu.usbmodem*`. Direct USB access bypasses the AppleUSBCDC
-    kext, which is the component implicated in the panics.
+  - **Use `tools/usb-console/cdc_reader.py` as the standard capture path.**
+    (bead pico-link-4mc, 2026-08-27) It reads the CDC-Data bulk endpoint
+    directly over libusb/pyusb and never opens a `/dev/cu.usbmodem*` node at
+    all, bypassing the AppleUSBCDC kext entirely — not just "preferring"
+    direct USB, but structurally avoiding the tty layer. Verified against the
+    live spike firmware: claimed the interface and read real heartbeat text
+    with zero tty nodes opened (see `tools/usb-console/README.md` for what was
+    measured). `tools/usb-console/tty_fallback.py` is the tty path, kept only
+    as a clearly-marked fallback for when the direct path doesn't work.
   - When the tty genuinely is the only channel, open it ONCE for a long capture.
     Do NOT loop open/close/reopen — repeated enumeration and driver attach is the
     pattern most associated with the crashes.
@@ -325,9 +331,10 @@ applies.
 - **Reading the board's CDC console needs DTR asserted explicitly.** embassy-usb's
   `wait_connection()` blocks until DTR, and on macOS a plain `cat /dev/cu.usbmodem*`
   does not reliably assert it - you get an open port and zero bytes, which looks
-  exactly like dead firmware. Open the fd and `ioctl(TIOCMBIS, TIOCM_DTR)` (a few
-  lines of Python) before reading. This is why the boot line was missed while the
-  heartbeats were fine.
+  exactly like dead firmware. `tools/usb-console/cdc_reader.py --assert-dtr` sends
+  the CDC `SET_CONTROL_LINE_STATE` control transfer directly; `tty_fallback.py`
+  does the tty-side `ioctl(TIOCMBIS, TIOCM_DTR)` equivalent for the fallback path.
+  This is why the boot line was missed while the heartbeats were fine.
 - **`timeout` does not exist on this Mac** (no coreutils). Use a background PID
   plus `sleep` and `kill`, or Python, when a read needs a deadline.
 - **Rendering-change verification discipline.** "Tests pass + a 1x PNG + the
