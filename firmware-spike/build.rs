@@ -85,8 +85,14 @@ fn main() {
     for src in core_sources {
         build.file(btstack.join(src));
     }
-    build.file(probe_dir.join("hal_shim.c"));
+    // hal_shim.c is gone (pico-link-8v3.2.3): hal_time_ms and the IRQ-mask
+    // hal_cpu_* functions now live in Rust (see main.rs's `btstack_hal`
+    // module) so C owns nothing above itself, and hal_tick_* was dead code
+    // - btstack_config.h sets HAVE_EMBEDDED_TIME_MS (not HAVE_EMBEDDED_TICK),
+    // so btstack_run_loop_embedded.c never called the tick-handler path in
+    // the first place.
     build.file(probe_dir.join("hci_transport_dummy.c"));
+    build.file(probe_dir.join("timer_probe.c"));
 
     build.compile("btstack_probe");
 
