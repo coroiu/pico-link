@@ -11,7 +11,6 @@ embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thr
 embassy-time = "0.5"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
-panic-halt = "1.0"
 cyw43 = { version = "0.7.0", features = ["bluetooth"] }
 cyw43-pio = "0.10.0"
 cyw43-firmware = { version = "0.1.0", features = ["bluetooth"] }

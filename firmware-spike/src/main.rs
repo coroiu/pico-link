@@ -17,7 +17,6 @@ use embassy_time::{Delay, Duration, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embedded_hal::delay::DelayNs;
 use embassy_usb::{Builder as UsbBuilder, Config as UsbConfig};
-use panic_halt as _;
 use static_cell::StaticCell;
 
 // pico-link-8v3.2.7: embassy-usb owns the USB peripheral tonight (THROWAWAY -
@@ -26,6 +25,45 @@ use static_cell::StaticCell;
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
+
+/// Custom panic handler, replacing `panic-halt`'s bare `loop {}`.
+///
+/// WHY: that silent halt is what masked pico-link-8v3.2.7's real bug (a
+/// too-small CONTROL_BUF, see its comment above) for an entire session. The
+/// panic fired inside usb_task's poll - i.e. inside a normal async task on
+/// core0's cooperative executor, not inside the USBCTRL_IRQ ISR - and
+/// `loop {}` never unwound back to `Executor::run()`, so it never got the
+/// chance to poll ANY other task again either. That froze
+/// `watchdog_feed_task` and (in the since-removed async-Timer design) the
+/// old safety_net_task right along with USB, which read on the bench as a
+/// total, USB-independent hang rather than what it actually was: a panic in
+/// one task with everything else collaterally starved.
+///
+/// CHOICE: jump straight to `reset_to_usb_boot()` rather than looping and
+/// waiting on the hardware watchdog armed in `fn main`. Two reasons. First,
+/// there is no RTT/probe attached on this bench, so `PanicInfo` has nowhere
+/// to go - printing it and then halting buys nothing a plain halt doesn't
+/// already give (once again: nothing distinguishable). Second, the thing we
+/// actually need for the unattended dev loop is recovery, and this gets it
+/// ~8s faster than letting the watchdog time out. Cost: a panic is no
+/// longer distinguishable on-screen from a clean reboot - the USB_STAGE
+/// colour mechanism already answers "how far did enumeration get" for
+/// panics on that specific path, which was this session's actual open
+/// question; a panic anywhere else now just self-recovers rather than
+/// wedging, which is the trade this project needs more than a diagnosis
+/// display can't show anyway.
+///
+/// Calling a synchronous ROM function from panic context is safe here: it
+/// only pokes WATCHDOG scratch/control registers and does not touch
+/// whatever state was live when the panic fired, so it doesn't matter that
+/// that state may be inconsistent.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+    loop {
+        cortex_m::asm::nop();
+    }
+}
 
 /// Small `core::fmt::Write` sink over a fixed buffer - avoids pulling in
 /// `heapless` as a direct dependency (it's already a transitive dep of
@@ -317,7 +355,20 @@ mod usb_console {
 
     static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
-    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    // 256, matching CONFIG_DESC/BOS_DESC below - NOT 64 (pico-link-8v3.2.7
+    // root cause, found by a parallel investigation and confirmed by
+    // arithmetic against the vendored source: embassy-usb 0.6.0 writes each
+    // string descriptor into this same buffer as it answers
+    // GET_DESCRIPTOR(STRING) requests, and asserts `pos + 2 < buf.len()`
+    // (embassy-usb-0.6.0 src/lib.rs:753). config.product below is 38 chars -
+    // UTF-16LE plus the 2-byte header needs 78 bytes, which blew a 64-byte
+    // buffer. manufacturer (17 chars) and serial_number (7 chars) both fit
+    // under 64 and would not have triggered this, which is why enumeration
+    // got as far as it did before dying on the product string specifically.
+    // The panic happened inside usb_task's poll (device.run().await), not
+    // inside the USBCTRL_IRQ ISR - see the panic handler below for why that
+    // made it look like a total hang rather than a panic.
+    static CONTROL_BUF: StaticCell<[u8; 256]> = StaticCell::new();
     static CDC_STATE: StaticCell<CdcState<'static>> = StaticCell::new();
     static RESET_HANDLER: StaticCell<reset_iface::ResetHandler> = StaticCell::new();
     static STAGE_HANDLER: StaticCell<StageHandler> = StaticCell::new();
@@ -358,7 +409,7 @@ mod usb_console {
             CONFIG_DESC.init([0; 256]),
             BOS_DESC.init([0; 256]),
             &mut [][..],
-            CONTROL_BUF.init([0; 64]),
+            CONTROL_BUF.init([0; 256]),
         );
 
         let class = CdcAcmClass::new(&mut builder, CDC_STATE.init(CdcState::new()), 64);

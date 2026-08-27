@@ -670,7 +670,6 @@ dependencies = [
  "embassy-time",
  "embassy-usb",
  "embedded-hal 1.0.0",
- "panic-halt",
  "static_cell",
 ]
 
@@ -975,12 +974,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "panic-halt"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a513e167849a384b7f9b746e517604398518590a9142f4846a32e3c2a4de7b11"
 
 [[package]]
 name = "parking_lot"
