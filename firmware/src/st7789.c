@@ -148,12 +148,31 @@ void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel
     spi_write_blocking(s_spi, &ramwr, 1);
     dc_high();
 
-    // Switch to 16-bit SPI frames for the pixel burst: each 32-bit write to
-    // spi_get_hw(spi)->dr below pushes one 16-bit RGB565 pixel into the
-    // PL022 TX FIFO in a single frame, which is what lets the DMA engine's
-    // own byte-swap (channel_config_set_bswap) do the little-endian ->
-    // big-endian conversion in hardware instead of a 115KB staging buffer
-    // (see FrameBuffer565::as_raw_u16's doc comment).
+    // Switch to 16-bit SPI frames for the pixel burst: each 16-bit-wide
+    // DMA write to spi_get_hw(spi)->dr below pushes one RGB565 pixel VALUE
+    // into the PL022 TX FIFO in a single frame; the PL022 then shifts that
+    // 16-bit value out MSB-first per its DSS=16 configuration, which is
+    // exactly the same byte order st7789_init_and_fill's manual two-byte
+    // write above (color >> 8, then color & 0xff) already sends.
+    //
+    // NO byte-swap here -- deliberately corrected from the original M1b
+    // design, which called for channel_config_set_bswap(true). A same-width
+    // (16-bit-to-16-bit) DMA transfer on this bus is endianness-transparent:
+    // it copies the bit pattern of the source halfword into the destination
+    // halfword without reinterpreting it as a byte stream, so it already
+    // reconstructs the correct native RGB565 VALUE with no swap needed --
+    // identical in effect to the blocking path above. Evidence (bd
+    // pico-link-cz0.2, coordinator's webcam review): a solid RED/GREEN/BLUE
+    // fill via the blocking path (this function's sibling, no DMA, no
+    // bswap) photographed correctly on the real panel, proving INVON/MADCTL/
+    // CS-framing are all fine; the REAL UI content, rendered via THIS DMA
+    // path with bswap enabled, photographed as almost exactly the bitwise
+    // inversion (~value) of the emulator's reference colours -- not the
+    // scrambled-but-not-inverted result plain byte-reordering of a 16-bit
+    // value would produce (checked numerically against the actual
+    // background/header RGB565 constants in core/src/render/theme.rs).
+    // Removing the unneeded swap converges this path back to the
+    // already-proven-correct blocking-path behaviour.
     spi_set_format(s_spi, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
     dma_channel_config c = dma_channel_get_default_config(s_dma_chan);
@@ -161,7 +180,7 @@ void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel
     channel_config_set_dreq(&c, spi_get_dreq(s_spi, true));
     channel_config_set_read_increment(&c, true);
     channel_config_set_write_increment(&c, false);
-    channel_config_set_bswap(&c, true);
+    channel_config_set_bswap(&c, false);
 
     dma_channel_configure(s_dma_chan, &c, &spi_get_hw(s_spi)->dr, px, pixel_count, true);
     dma_channel_wait_for_finish_blocking(s_dma_chan);

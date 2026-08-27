@@ -72,17 +72,29 @@ int main(void) {
            ST7789_PIN_DC, ST7789_PIN_CS, ST7789_PIN_SCK, ST7789_PIN_MOSI, ST7789_PIN_RST, ST7789_PIN_BL,
            ST7789_INIT_BAUDRATE_HZ);
 
-    printf("panel: solid RED fill\r\n");
+    // Extended to a photographable ~3s hold per colour, with an explicit
+    // marker printed BOTH before the fill call starts and again once the
+    // hold begins, each carrying a monotonic timestamp -- this is the
+    // decisive colour-mapping diagnostic (coordinator-directed follow-up to
+    // the first M1b pass, which got layout/geometry right per a webcam
+    // comparison against the emulator's reference PNG, but photographed
+    // solid-background near-black core content as the BRIGHTEST thing in
+    // frame, i.e. inverted). Zero Rust involved in this sequence, so
+    // whatever the camera sees here isolates the bug to this file.
+    printf("FILL_START:RED@%lluus\r\n", (unsigned long long)time_us_64());
     st7789_init_and_fill(spi1, COLOR_RED);
-    sleep_ms(1000);
+    printf("FILL_HOLD:RED@%lluus\r\n", (unsigned long long)time_us_64());
+    sleep_ms(5000);
 
-    printf("panel: solid GREEN fill\r\n");
+    printf("FILL_START:GREEN@%lluus\r\n", (unsigned long long)time_us_64());
     st7789_init_and_fill(spi1, COLOR_GREEN);
-    sleep_ms(1000);
+    printf("FILL_HOLD:GREEN@%lluus\r\n", (unsigned long long)time_us_64());
+    sleep_ms(5000);
 
-    printf("panel: solid BLUE fill\r\n");
+    printf("FILL_START:BLUE@%lluus\r\n", (unsigned long long)time_us_64());
     st7789_init_and_fill(spi1, COLOR_BLUE);
-    sleep_ms(1000);
+    printf("FILL_HOLD:BLUE@%lluus\r\n", (unsigned long long)time_us_64());
+    sleep_ms(5000);
 
     // --- The Rust UI ---
     struct PlUi *ui = pl_ui_create(PANEL_WIDTH, PANEL_HEIGHT);
