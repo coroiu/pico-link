@@ -1,0 +1,24 @@
+[package]
+name = "ui-ffi"
+version = "0.1.0"
+authors = ["Andreas Coroiu <andreas.coroiu@gmail.com>"]
+edition = "2021"
+rust-version = "1.77"
+
+# The FFI seam for the C-first pivot (ADR 2026-08-27): a `no_std` + `alloc`
+# staticlib that pico-sdk's C `main()` links in and calls over a narrow
+# `extern "C"` surface (see `src/lib.rs`) for rendering only. C calls Rust;
+# Rust calls nothing back except `pl_ui_panic_hook`. No `cortex-m-rt`, no
+# embassy, no `rp-pac` -- pico-sdk owns `main()`, boot, and scheduling.
+#
+# Deliberately depends on nothing platform-specific beyond `critical-section`
+# (a trait-only crate for embedded-alloc's internal locking, not a runtime)
+# and `embedded-alloc` (the allocator itself).
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+pico-link-core = { path = "../core" }
+embedded-alloc = { version = "0.6", default-features = false, features = ["llff"] }
+critical-section = { version = "1.2", features = ["restore-state-u32"] }

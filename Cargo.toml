@@ -1,11 +1,23 @@
 [workspace]
 resolver = "2"
-members = ["core", "emulator"]
+members = ["core", "emulator", "ui-ffi"]
+# Plain `cargo build`/`cargo test` at the repo root stays scoped to the
+# host-native crates -- `ui-ffi` is `no_std` + `alloc`, cross-compiled only
+# via `cargo build -p ui-ffi --target thumbv8m.main-none-eabihf` (driven by
+# firmware/CMakeLists.txt), never as part of the default host build/test.
+default-members = ["core", "emulator"]
 
 # Profiles are workspace-level-only in Cargo; defined here so both the
 # firmware and emulator crates share them without duplication.
 [profile.release]
 opt-level = "s"
+# `ui-ffi` is a `no_std` `extern "C"` staticlib with no unwinder on its
+# target (thumbv8m.main-none-eabihf) -- unwinding across an `extern "C"`
+# boundary is UB regardless. Scoped to the release profile only so `cargo
+# test`'s dev-profile build (host, `std`, `#[should_panic]` tests that rely
+# on unwinding) is unaffected -- see core/src's own `#[cfg(test)]` `std`
+# escape hatch.
+panic = "abort"
 
 [profile.dev]
 debug = true    # Symbols are nice and they don't increase the size on Flash
