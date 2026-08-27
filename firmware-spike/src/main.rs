@@ -858,6 +858,26 @@ fn run_core1(
     // Repaints only on change; a full 240x240 fill at 1MHz SPI is roughly a
     // second, so polling faster than the stage can change would just smear
     // the screen.
+    //
+    // pico-link-8v3.2.3 code-review follow-up, EXPECTED SAMPLING BEHAVIOUR
+    // (not a defect - do not "fix" this): this loop only calls
+    // execute_once() once per 50ms delay_ms below, so timer_probe.c's
+    // 1000ms re-arm (btstack_run_loop_set_timer, which computes
+    // hal_time_ms() + 1000 at fire time) lands, on average, ~25ms and up to
+    // ~50ms after its nominal due time - an effective period of roughly
+    // 1026-1051ms against the CDC console's exact 1000ms heartbeat cadence
+    // (embassy_time::Timer, a completely independent clock source). That
+    // drift accumulates until it crosses a full heartbeat tick, which then
+    // reads as one btstack_timer_fired delta of 0 in the printed log,
+    // roughly once every 20-38 heartbeats depending on phase - confirmed
+    // empirically on hardware as regular ~22-heartbeat intervals between
+    // zero-deltas across several 100-200s single-reader captures, with zero
+    // burst-shaped (delta > 1) anomalies once connect-adjacent lines are
+    // excluded (see timer_probe.c's header comment for why the FIRST few
+    // lines after any (re)connect are not representative - they can carry
+    // a backlog queued behind a blocked CDC write). If a future change
+    // lowers this loop's poll granularity, this drift pattern's period will
+    // change accordingly; it disappearing entirely is the actual anomaly.
     let mut painted = stage::BOOT;
     loop {
         unsafe {
