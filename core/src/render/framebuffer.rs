@@ -23,27 +23,43 @@ use core::convert::Infallible;
 use embedded_graphics::{
     draw_target::DrawTarget,
     geometry::OriginDimensions,
-    pixelcolor::{IntoStorage, Rgb565},
+    pixelcolor::{raw::RawU16, IntoStorage, Rgb565},
     prelude::{Point, Size},
     Pixel,
 };
 use embedded_graphics_framebuf::{backends::FrameBufferBackend, FrameBuf};
 
-/// Heap-backed storage for [`FrameBuf`]. Local newtype required by Rust's
-/// orphan rules: neither `FrameBufferBackend` (foreign trait, from
-/// `embedded-graphics-framebuf`) nor `Vec<Rgb565>` (foreign type, from
-/// `std`) is defined in this crate, so a direct `impl` is not allowed.
-struct HeapBuffer(Vec<Rgb565>);
+/// Heap-backed storage for [`FrameBuf`], backed by raw `u16` storage rather
+/// than `Rgb565` values directly.
+///
+/// This is a **correctness** fix, not a style preference: `Rgb565` is a
+/// nested `repr(Rust)` newtype (`Rgb565(RawU16(u16))`), and Rust's `repr(Rust)`
+/// makes no layout guarantee that such a type is bit-identical to a bare
+/// `u16` -- there is no `repr(transparent)` anywhere in that chain. Storing
+/// `Vec<Rgb565>` and then having C DMA that memory directly (as
+/// [`FrameBuffer565::as_raw_u16`] exists to support -- see M1b) would
+/// reinterpret memory the compiler never promised has that shape. Storing
+/// `Vec<u16>` instead and converting at the `FrameBufferBackend` boundary
+/// (`RawU16::new` / `Rgb565::from`, both cheap newtype wraps of a value
+/// already in a register) sidesteps the question entirely: the backing
+/// storage this type hands out a `&[u16]` view of really is `u16`s, by
+/// construction, not by assumption.
+///
+/// Local newtype required by Rust's orphan rules: neither
+/// `FrameBufferBackend` (foreign trait, from `embedded-graphics-framebuf`)
+/// nor `Vec<u16>` (foreign type, from `alloc`) is defined in this crate, so
+/// a direct `impl` is not allowed.
+struct HeapBuffer(Vec<u16>);
 
 impl FrameBufferBackend for HeapBuffer {
     type Color = Rgb565;
 
     fn set(&mut self, index: usize, color: Self::Color) {
-        self.0[index] = color;
+        self.0[index] = color.into_storage();
     }
 
     fn get(&self, index: usize) -> Self::Color {
-        self.0[index]
+        Rgb565::from(RawU16::new(self.0[index]))
     }
 
     fn nr_elements(&self) -> usize {
@@ -69,7 +85,7 @@ impl FrameBuffer565 {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
         let pixel_count = width as usize * height as usize;
-        let data = vec![Rgb565::default(); pixel_count];
+        let data = vec![Rgb565::default().into_storage(); pixel_count];
         Self {
             inner: FrameBuf::new(HeapBuffer(data), width as usize, height as usize),
         }
@@ -128,12 +144,27 @@ impl FrameBuffer565 {
     ///
     /// Panics if `out.len() != width() * height() * 2`.
     pub fn write_be_bytes(&self, out: &mut [u8]) {
-        let colors: &[Rgb565] = &self.inner.data.0;
-        assert_eq!(out.len(), colors.len() * 2, "write_be_bytes: `out` must be exactly width*height*2 bytes");
+        let raw: &[u16] = &self.inner.data.0;
+        assert_eq!(out.len(), raw.len() * 2, "write_be_bytes: `out` must be exactly width*height*2 bytes");
 
-        for (chunk, color) in out.chunks_exact_mut(2).zip(colors) {
-            chunk.copy_from_slice(&color.into_storage().to_be_bytes());
+        for (chunk, &value) in out.chunks_exact_mut(2).zip(raw) {
+            chunk.copy_from_slice(&value.to_be_bytes());
         }
+    }
+
+    /// Borrows the backing storage as raw little-endian `u16` RGB565 values,
+    /// one per pixel in row-major order -- the CPU-native form a `no_std`
+    /// `DisplaySurface` (the RP2350 firmware's ST7789 driver, M1b) DMAs
+    /// straight out of Rust memory. Deliberately the CPU's native `u16`
+    /// endianness (little-endian on this project's Cortex-M33 target), NOT
+    /// the panel's big-endian wire format -- unlike [`Self::write_be_bytes`],
+    /// which exists specifically to produce that wire format. The DMA
+    /// consumer is expected to byte-swap in hardware (e.g. the RP2350 DMA
+    /// engine's `bswap` option) on the way out, which is exactly why this
+    /// method hands back native values rather than pre-swapping them here.
+    #[must_use]
+    pub fn as_raw_u16(&self) -> &[u16] {
+        &self.inner.data.0
     }
 }
 
