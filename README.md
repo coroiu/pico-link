@@ -46,11 +46,12 @@ so the interface can be developed and tested with no hardware attached.
 
 ## Credits and licence
 
-The audio and radio half is built on
-**[USBPods](https://github.com/wasdwasd0105/USBPods-Pico2W)** by wasdwasd0105 —
-UAC1/UAC2 in, SBC/AAC/AAC-ELD/LDAC/LHDC out on a Pico 2 W. Pico Link forks it and
-adds the screen.
+The audio and radio half draws on **[USBPods](https://github.com/wasdwasd0105/USBPods-Pico2W)**
+by wasdwasd0105 — UAC1/UAC2 in, SBC/AAC/AAC-ELD/LDAC/LHDC out on a Pico 2 W — as
+a reference for how pico-sdk, BTstack, TinyUSB and libldac fit together on this
+hardware. Pico Link's own firmware links the same C libraries directly; the
+display and UI are Rust called into from C over a narrow FFI. See
+`.planning/decisions/` for the architecture ADRs.
 
-Licensed **GPL-3.0**, inherited from USBPods. LDAC encoding uses Sony's
-Apache-2.0 `libldac`; Bluetooth is BlueKitchen's BTstack as distributed with the
-Pico SDK.
+LDAC encoding uses Sony's Apache-2.0 `libldac`; Bluetooth is BlueKitchen's
+BTstack as distributed with the Pico SDK.

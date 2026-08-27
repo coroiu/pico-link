@@ -1,6 +1,8 @@
 # Pico Link — Roadmap
 
-**Last updated:** 2026-08-26 (project founded; pivoted from a Bitwarden hardware-key prototype)
+**Last updated:** 2026-08-27 (firmware architecture flipped C-first — see
+`decisions/2026-08-27-c-first-pico-sdk-owns-main.md`; project founded
+2026-08-26, pivoted from a Bitwarden hardware-key prototype)
 
 ## Vision
 
@@ -51,11 +53,19 @@ TinyUSB + Sony's Apache-2.0 libldac + FDK-AAC. It already does UAC1/UAC2 in and
 SBC/AAC/AAC-ELD/LDAC/LHDC out on a Pico 2 W. It has no display; its UI is a
 serial console.
 
-**We do not fork it.** Pico Link is its own Rust firmware that links the same
-underlying C libraries — BTstack, libldac, TinyUSB — directly. USBPods is a
-reference to read for how they fit together; reading it is not copying it, so
-its GPL-3 is not inherited. See
-[ADR 2026-08-26](decisions/2026-08-26-rust-owns-the-binary-no-usbpods-fork.md).
+USBPods is a reference to read for how these C libraries fit together on this
+exact hardware; reading it is not copying it, so its GPL-3 is not inherited by
+that alone. **As of [ADR 2026-08-27](decisions/2026-08-27-c-first-pico-sdk-owns-main.md),
+pico-sdk owns `main()` and `runtime_init` — the same boot path USBPods uses —
+and Rust (`core/`) is a staticlib called from C over FFI, not the owner of the
+binary.** **DECIDED (same-day update to that ADR): Route B — we write our own
+C against pico-sdk. USBPods stays a reference to read, never to vendor or
+fork.** GPL-3 is viral across the link boundary, so there is no partial fork;
+the hard parts (UAC2 + explicit-feedback clock loop, A2DP/AVDTP, LDAC) already
+have licence-clean first-party references vendored in the SDK itself. The
+earlier "no fork" position
+([ADR 2026-08-26](decisions/2026-08-26-rust-owns-the-binary-no-usbpods-fork.md),
+now superseded) is reaffirmed under the new architecture, not reopened.
 
 ## What we inherited
 
@@ -91,28 +101,34 @@ Host-side only; runs fully in parallel with C.
   Strictly richer than the encoder it replaces.
 - **B4** Keep all three run modes green throughout, at 240x240.
 
-### C — Firmware: Rust owns the binary
-Hardware-gated. **Not a fork** — see
+### C — Firmware: C-first, pico-sdk owns `main()`
+Hardware-gated. **Architecture flipped 2026-08-27** — see
+[ADR 2026-08-27](decisions/2026-08-27-c-first-pico-sdk-owns-main.md), which
+supersedes the "Rust owns the binary"
 [ADR 2026-08-26](decisions/2026-08-26-rust-owns-the-binary-no-usbpods-fork.md).
-Cargo builds the `.elf`; BTstack, libldac and TinyUSB link in as C static
-libraries. USBPods is a reference to read, not a base to patch.
+pico-sdk owns `main()` and `runtime_init`; `core/` is a `no_std` + `alloc`
+staticlib called from C over a narrow FFI for rendering only. **The
+fork/no-fork question is decided: Route B, we write our own C against
+pico-sdk, USBPods stays read-only reference** (same-day update to the ADR
+above). The detailed migration plan is pending from the architect and will
+land as beads — this milestone's sub-tasks below predate the flip and need
+re-cutting once that design lands.
 - **C1** ~~Fork USBPods~~ **DONE 2026-08-26.** Stock USBPods flashed on the
   Pimoroni Pico Plus 2 W — the real target, not the Pico 2 W reference the
   roadmap assumed — and LDAC worked. Partially discharges C2 as well.
-- **C-spike** **DONE.** Proved Cargo can own the binary with BTstack + TinyUSB
-  linked: 76 BTstack symbols, zero undefined, `cortex_m_rt` owns the vector
-  table, no pico-sdk runtime. Link-seam only — nothing ran on hardware.
-- **C2** Board config for the Pico Plus 2 W — RM2 pin setup, RP2350B, 16MB flash,
-  PSRAM init, in Rust via `embassy-rp`/`rp-hal`.
-- **C3** ~~Link Rust into their CMake build~~ — inverted. The linking question is
-  answered in the other direction and the spike settled it.
-- **C4** PSRAM framebuffer + ST7789 driver on GP8-13. **Verify PSRAM write and
-  DMA-to-SPI bandwidth sustains UI framerates** — the whole render approach rests
-  on this assumption, so prove it before building on it. Note there is no mature
-  Rust support for RP2350 QMI XIP PSRAM; expect to write the init.
-- **C5** Joystick and buttons to `NavIntent`. The vocabulary already exists
-  (Epic B3) — this is the firmware `InputSource` impl. Use pull-**ups**: RP2350
-  erratum E9 affects pull-downs.
+- **C-spike** **DONE, then superseded.** Proved Cargo *could* link BTstack +
+  TinyUSB into a Rust-owned binary: 76 BTstack symbols, zero undefined,
+  `cortex_m_rt` owns the vector table, no pico-sdk runtime present in the
+  binary. That was a real result, but it verified linking, not running — three
+  sessions of gate-2 bring-up against it found a HardFault (CPACR never
+  enabled) and a hang in `cyw43_spi_init`, both traceable to pico-sdk's
+  `runtime_init` never running. Superseded by the C-first ADR.
+- **C2–C5** (board config, PSRAM framebuffer + ST7789 driver, joystick/button
+  input) — the substance of these tasks is unchanged, but their language and
+  FFI direction invert under C-first: C owns board/peripheral bring-up
+  directly via pico-sdk, and Rust's role is the render/input logic behind the
+  FFI seam rather than owning the drivers. Re-cut as beads once the migration
+  design lands.
 
 ### D — UI integration (the MVP)
 - **D1** The `extern "C"` seam. Rust owns SPI, DMA and the framebuffer directly
@@ -155,32 +171,57 @@ C1 → C2 → C3 → C4, C5                    (hardware)
 - **PSRAM framebuffer bandwidth** (C4) — the assumption everything visual rests
   on. Prove it first.
 - **RM2 board config** (C2) — mitigated by keeping a stock Pico 2 W as reference.
-- ~~**Rust/pico-sdk linking** (C3)~~ — RETIRED. The C-spike linked BTstack and
-  TinyUSB into a Cargo-owned binary with zero undefined symbols.
+- ~~**Rust/pico-sdk linking** (C3)~~ — RETIRED as a linking question, then
+  RESURFACED as a running question. The C-spike linked BTstack and TinyUSB into
+  a Cargo-owned binary with zero undefined symbols, but three sessions of real
+  bring-up (a HardFault, a hang, inert `.preinit_array` runtime-init hooks)
+  showed the binary couldn't actually run without pico-sdk's own
+  `runtime_init`. Resolved by the C-first ADR: pico-sdk now owns `main()`.
 - ~~**`no_std` port scope** (B1)~~ — RETIRED. Done; `core` cross-compiles for
-  `thumbv8m.main-none-eabihf`.
-- ~~**Upstream drift**~~ — RETIRED by the no-fork decision. We track the C
-  libraries directly, not someone's fork of them.
+  `thumbv8m.main-none-eabihf`, and stays true regardless of who owns `main()`.
+- ~~**Upstream relationship reopened.**~~ — RETIRED. Briefly reopened by the
+  C-first pivot, now decided (same-day update to the C-first ADR): Route B,
+  we write our own C against pico-sdk; USBPods stays a read-only reference,
+  never forked or vendored.
 - **Rewriting working audio** — the real-time USB/resample/encode/A2DP path is
-  genuine engineering and we are now writing our own rather than inheriting
-  USBPods'. Mitigated by keeping TinyUSB's UAC2 in C rather than writing a Rust
-  one, so the clock-feedback loop is proven code. Do not rewrite that loop until
-  the dongle works.
-- **`hal_time_ms` and friends are stubs** — the C-spike shimmed BTstack's HAL to
-  get a link. BTstack timers cannot work until they are real (`pico-link-8v3.2`).
+  genuine engineering. Mitigated by keeping TinyUSB's UAC2 in C rather than
+  writing a Rust one, so the clock-feedback loop is proven code. Do not rewrite
+  that loop until the dongle works.
+- **Gate-2 radio bring-up not yet achieved.** Attempted three times against the
+  Rust-owns-`main()` architecture; not once against C-first. This is now the
+  primary open risk on the critical path to the MVP.
 
 ## Settled decisions
 
-- **Rust, not C, for everything above the codecs.** BTstack and libldac stay C
-  behind FFI; there is no Rust Bluetooth Classic host stack and writing one is not
-  a project.
+- **C owns `main()`, `runtime_init` and scheduling; Rust is a staticlib behind
+  a narrow FFI.** Flipped 2026-08-27 from "Rust owns the binary" after three
+  sessions established that linking BTstack into a Rust-owned binary was never
+  the risk — running it without pico-sdk's runtime was. BTstack's run loop is
+  the scheduler. See
+  [ADR 2026-08-27](decisions/2026-08-27-c-first-pico-sdk-owns-main.md).
+- **BTstack and libldac stay C behind FFI** — there is no Rust Bluetooth
+  Classic host stack and writing one is not a project. This did not change.
 - **240x240 is fixed.** The larger 2" panel was considered and dropped, so the
   resolution is a constant, not a parameter.
 - **No rotary encoder.** The joystick and four buttons are the input model.
-- **No USBPods fork.** Rust owns the binary; BTstack, libldac and TinyUSB link
-  in as C libraries. TinyUSB is provisionally C — a Rust UAC2 is a later option,
-  not a commitment. Confirmed by the C-spike, 2026-08-26.
-- **Licensing is open by choice, not obligation.** Not forking means our code is
-  not required to be GPL-3; Andreas confirmed open is fine regardless. BTstack's
-  commercial terms, the LDAC trademark and FDK-AAC patents apply the same either
-  way and only matter if this ever goes commercial.
+- **TinyUSB owns the USB device controller.** The `embassy-usb` CDC console
+  that bootstrapped observability during bring-up is retired now that it has
+  served its purpose. See
+  [ADR 2026-08-27](decisions/2026-08-27-usb-device-stack-returns-to-tinyusb.md).
+- **`cyw43-driver` licensing is fine while RP-only.** Its `LICENSE.RP` applies
+  (not the default non-commercial licence) because RP2350 is Raspberry Pi Ltd
+  silicon. Recorded on bead `pico-link-kq9`.
+- **We write our own C against pico-sdk; USBPods stays a read-only
+  reference — never forked or vendored (Route B).** Decided same-day as a
+  follow-up to the C-first ADR. GPL-3 is viral across the link boundary, so
+  there is no partial fork: vendoring even one USBPods `.c` file would make
+  the entire linked binary GPL-3. The hard parts already have licence-clean
+  first-party references vendored in the SDK itself (TinyUSB's `uac2_headset`
+  example, MIT; BTstack's `a2dp_source_demo.c`; Sony's Apache-2.0 `libldac`),
+  which is what makes Route B affordable — a few extra days on the
+  explicit-feedback clock loop, not weeks. Our own code keeps a free choice
+  of licence. Safeguards: never clone USBPods into the repo tree (read it in
+  a scratch directory outside the checkout); every non-trivial C file we
+  write carries a one-line provenance header; a provenance gate runs before
+  M4 merges. See the "Update (same day, 2026-08-27)" section of
+  [ADR 2026-08-27](decisions/2026-08-27-c-first-pico-sdk-owns-main.md).

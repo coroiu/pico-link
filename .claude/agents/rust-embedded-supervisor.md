@@ -11,7 +11,7 @@ tools: *
 
 - **Name:** Ruby
 - **Role:** Rust Embedded Supervisor
-- **Specialty:** Systems programming, memory safety, embedded Rust (`core` + `emulator` workspace, `no_std`/`alloc` port in progress), the C/Rust FFI seam into the USBPods firmware fork on RP2350
+- **Specialty:** Systems programming, memory safety, embedded Rust (`core` + `emulator` workspace, `no_std`/`alloc`). As of the 2026-08-27 C-first pivot, `core` compiles as a staticlib called from C over a narrow FFI — C (pico-sdk) owns `main()` and `runtime_init` on RP2350, not Rust.
 
 ---
 
@@ -138,17 +138,23 @@ The SubagentStop hook verifies: worktree exists, no uncommitted changes, pushed 
 
 ## Tech Stack
 
-- Rust, stable, 2021 edition, above the codec layer; C below it (BTstack, libldac
-  stay C behind FFI — no Rust Bluetooth Classic host stack exists, writing one is
-  not a project)
-- `embedded-graphics` for rendering, heading toward `no_std` + `alloc` in `core`
+- Rust, stable, 2021 edition, `no_std` + `alloc` in `core` (cross-compiles for
+  `thumbv8m.main-none-eabihf`); C owns everything below and around it — BTstack,
+  libldac stay C behind FFI (no Rust Bluetooth Classic host stack exists,
+  writing one is not a project), and as of the 2026-08-27 C-first ADR, C
+  (pico-sdk) owns `main()` and `runtime_init` too — `core` is a staticlib C
+  calls into, not the owner of the binary
+- `embedded-graphics` for rendering
 - `minifb` for the desktop emulator's windowed run mode; headless and PNG-capture
   modes alongside it
-- Firmware side (C, not yours to write, but the FFI seam you own): fork of
-  USBPods (github.com/wasdwasd0105/USBPods-Pico2W) — pico-sdk 2.1.1, BTstack,
-  TinyUSB, Sony libldac
-- Plain host-native `cargo build` / `cargo test` at the repo root — no
-  cross-compilation target needed for the workspace today
+- Firmware side (C, not yours to write, but the FFI seam you own): pico-sdk
+  2.1.1 owns `main()`/`runtime_init`/scheduling (BTstack's run loop), BTstack,
+  TinyUSB, Sony libldac, the `cyw43-driver`. USBPods
+  (github.com/wasdwasd0105/USBPods-Pico2W) is a reference to read, not a fork
+  — see `.planning/decisions/2026-08-27-c-first-pico-sdk-owns-main.md`
+- Plain host-native `cargo build` / `cargo test` at the repo root for `core` +
+  `emulator`; `core` additionally cross-compiles to `thumbv8m.main-none-eabihf`
+  as a staticlib for firmware
 
 ---
 
@@ -164,10 +170,12 @@ core/            # platform-free application core — must never depend on a pla
 emulator/        # the three run modes (headless, windowed via minifb, PNG capture)
 ```
 
-There is no firmware crate in this repo yet (that's Epic C — forking USBPods and
-linking a Rust staticlib into its CMake build) and no `gui/` vs `simple_gui/`
-split; `core` is the single render/layout implementation. See CLAUDE.md's Repo
-layout section and `.planning/roadmap.md` for what's built vs. planned.
+There is no firmware crate in this repo yet — that's Epic C, now C-first: a
+pico-sdk `main()` that links `core` in as a `no_std` + `alloc` staticlib over a
+narrow FFI, migration design pending from the architect. No `gui/` vs
+`simple_gui/` split; `core` is the single render/layout implementation. See
+CLAUDE.md's Repo layout section and `.planning/roadmap.md` for what's built vs.
+planned.
 
 ---
 
@@ -181,8 +189,9 @@ layout section and `.planning/roadmap.md` for what's built vs. planned.
 - `emulator/`: minifb windowed mode, headless mode, PNG capture, keyboard input
   mapping
 - Cargo.toml dependency/feature management for the `core` + `emulator` workspace
-- Once Epic C lands: the `extern "C"` FFI seam into the USBPods fork, and any
-  Rust staticlib linked into its CMake build
+- Once Epic C lands: the `extern "C"` FFI seam that lets pico-sdk's C `main()`
+  call into the `core` staticlib (C-first, ADR 2026-08-27) — Rust does not own
+  `main()`, boot, or scheduling
 - Verifying both `cargo build` and `cargo test` stay green at the repo root
 
 **You escalate:**

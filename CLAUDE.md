@@ -34,16 +34,24 @@ sound card. RP2350 + CYW43439 has both.
 
 ## Tech Stack
 
-- **Languages**: Rust (stable, 2021 edition) above the codec layer; C below it.
-- **Firmware**: fork of USBPods (github.com/wasdwasd0105/USBPods-Pico2W) —
-  GPL-3, pico-sdk 2.1.1, BTstack, TinyUSB, Sony libldac (Apache-2.0), FDK-AAC.
-  **BTstack and libldac stay C behind FFI** — there is no Rust Bluetooth Classic
-  host stack, and writing one is not a project.
-- **Shared core**: `embedded-graphics`, heading for `no_std` + `alloc`.
-- **Desktop emulator**: minifb (windowed), headless, PNG capture.
-- **Licence**: GPL-3, inherited by forking USBPods. Their
-  `LICENSE-EXCEPTIONS.md` grants a section-7 linking exception that already names
-  the Rust `core`/`compiler-builtins` libraries.
+- **Languages**: C owns the firmware binary — `main()`, `runtime_init`, boot,
+  and scheduling (BTstack's run loop). Rust is a `no_std` + `alloc` staticlib
+  (`core/`) called from C over a narrow FFI for rendering only.
+- **Firmware**: pico-sdk 2.1.1, BTstack, TinyUSB, Sony libldac (Apache-2.0),
+  FDK-AAC, the `cyw43-driver` (RM2 radio). USBPods
+  (github.com/wasdwasd0105/USBPods-Pico2W) is a reference to READ for how these
+  fit together on this exact hardware — copying its code inherits GPL-3,
+  reading it does not. See
+  [ADR 2026-08-27](.planning/decisions/2026-08-27-c-first-pico-sdk-owns-main.md)
+  for why C, not Rust, owns `main()`.
+- **`cyw43-driver` licensing**: its `LICENSE.RP` applies (not the default
+  non-commercial licence) because RP2350 is Raspberry Pi Ltd silicon —
+  commercially fine as long as Pico Link stays RP-only.
+- **Shared core**: `embedded-graphics`, `no_std` + `alloc`, cross-compiles for
+  `thumbv8m.main-none-eabihf`. Platform-free; must never depend on a platform
+  crate.
+- **Desktop emulator**: minifb (windowed), headless, PNG capture. Host-native,
+  entirely unaffected by the firmware architecture.
 
 ## Repo layout
 
@@ -234,9 +242,11 @@ This project keeps durable knowledge in version-controlled markdown, separate fr
 
 ### Firmware build (RP2350)
 
-- Firmware is a fork of USBPods: C, CMake, pico-sdk 2.1.1. Build produces a
-  `.uf2`; flash by holding **BOOTSEL** while plugging the board in and copying
-  the file onto the `RP2350` drive that appears.
+- Firmware is C, CMake, pico-sdk 2.1.1 — pico-sdk owns `main()` and
+  `runtime_init` (ADR 2026-08-27, C-first). `core/` is a Rust `no_std` + `alloc`
+  staticlib linked in and called over FFI for rendering; it does not own the
+  binary. Build produces a `.uf2`; flash by holding **BOOTSEL** while plugging
+  the board in and copying the file onto the `RP2350` drive that appears.
 - Target board is the **Pimoroni Pico Plus 2 W** (RP2350B + RM2 radio). USBPods
   ships board headers for `usbpods_universal` and `waveshare_rp2350b_plus_w`;
   ours is modelled on the latter. **Keep a stock Pico 2 W flashed with unmodified
@@ -454,29 +464,39 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 ## Current State
 
-**2026-08-26 — Epics A and B complete. All host-side work is done; everything
-remaining is firmware and needs hardware.** See `.planning/progress.md` for
-detail and `.planning/decisions/` for the architecture ADR.
+**2026-08-27 — Epics A and B complete. Firmware architecture pivoted C-first;
+gate-2 radio bring-up attempted three times, not yet achieved.** See
+`.planning/progress.md` for detail and `.planning/decisions/` for the current
+ADRs — trust the ADRs, not older prose in this file, if they conflict.
 
 - **Epic A done.** Repo squashed to one orphan commit, pushed to
   `github.com/coroiu/pico-link`. Old remote dropped; prehistory stays at
   `coroiu/bitwarden-hw-key`. Local tag `pre-squash-archive` pins it here.
-  **One step left:** outside a running session, `mv esp32-bluetooth-tx pico-link`
-  and restart Claude Code there — renaming the cwd mid-session breaks worktree
-  registrations, and the memory directory is keyed to the old path.
 - **Epic B done.** `core` is `no_std` + `alloc` and cross-compiles for
   `thumbv8m.main-none-eabihf`; 240x240 retarget with the row budget recomputed
   (5 rows + peek); joystick + 4-button `NavIntent` replacing the encoder
   vocabulary; all three run modes verified at 240x240. 137 tests green.
-- **THE FIRMWARE PLAN CHANGED — there is no USBPods fork.** Rust owns the
-  binary; BTstack, libldac and TinyUSB link in as C static libraries. Verified
-  in a real ELF (76 BTstack symbols, zero undefined, `cortex_m_rt` owns the
-  vector table, no pico-sdk runtime). USBPods is a reference to READ — copying
-  its code would inherit GPL-3, reading it does not. Any doc still describing a
-  fork is stale; trust the ADR.
-- **Next:** `pico-link-8v3.2` — first real execution on hardware. The spike in
-  `firmware-spike/` links but has never run: `hal_time_ms()` returns 0, the HCI
-  transport is a stub, and the RP2350 USB device controller is not linked.
+- **THE FIRMWARE PLAN CHANGED AGAIN, 2026-08-27 — C-first.** pico-sdk owns
+  `main()` and `runtime_init`; `core/` becomes a `no_std` + `alloc` staticlib
+  called from C over a narrow FFI, for rendering only. This **supersedes** the
+  2026-08-26 "Rust owns the binary" decision: that ADR's link-seam verification
+  (76 BTstack symbols, zero undefined, `cortex_m_rt` owning the vector table,
+  no pico-sdk runtime in the binary) was real, but it tested linking, not
+  running — and running is what failed, three sessions and ~1.45M tokens in,
+  with the radio never brought up (a GPIO-coprocessor HardFault from an
+  unwritten CPACR, then a hang in `cyw43_spi_init`'s PIO/DMA claim sequence;
+  pico-sdk's `runtime_init` hooks sit in the linked binary as inert
+  `.preinit_array` data — nothing calls them). See
+  [ADR 2026-08-27](.planning/decisions/2026-08-27-c-first-pico-sdk-owns-main.md).
+  USBPods remains a reference to READ, not something this repo forks; whether
+  the C-first migration ends up structurally similar to it is migration detail
+  for the architect, not decided by any ADR yet.
+- **TinyUSB decided** ([ADR 2026-08-27](.planning/decisions/2026-08-27-usb-device-stack-returns-to-tinyusb.md)):
+  TinyUSB owns the USB device controller; the `embassy-usb` CDC console that
+  gave the project its only debug channel during bring-up is retired now that
+  it has served its purpose.
+- **Next:** the C-first migration, detailed design pending from the architect,
+  landing as beads.
 
 ### Environment gotchas learned this session
 
