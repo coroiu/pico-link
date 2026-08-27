@@ -262,12 +262,44 @@ The device must be exercisable by agents in three modes — **headless** (no win
 AI drives it and inspects captured screenshots), **windowed** (minifb, for humans
 without hardware), and **real target** (the Pico). Tess owns this.
 
+### Orchestrator context discipline
+
+**The orchestrator's context never clears; a subagent's does.** Every large tool
+output the main thread reads is paid for for the rest of the session, and when
+it fills up, the session ends mid-task. So:
+
+- **Never dump a large command's output into the main thread.** Pipe through
+  `head`/`tail`/`grep`/`awk` and take only the lines that decide the next step.
+  `system_profiler`, `ioreg`, full `cargo build` logs and whole-file `cat`s are
+  the usual offenders.
+- **Read files in slices** (`sed -n 'A,Bp'`), not whole, once you know roughly
+  where the answer lives.
+- **The orchestrator does not do the work. It delegates.** Investigation,
+  build-fix-flash-verify loops, hardware bring-up debugging, code changes — all
+  of it belongs in a subagent whose context is disposable. The main thread
+  reads the agent's conclusion, decides, and dispatches again. A debug loop
+  that "needs tight iteration" is exactly the case for a subagent, not the
+  exception to it: iterate inside the agent, report once.
+- The orchestrator's own tool use should be small and decisive: reading a bead,
+  checking `git log`, a one-line status probe. If a task will take more than a
+  couple of tool calls, it is a dispatch, not a do.
+- Prefer one targeted command over exploratory sweeps; think first about what
+  the output will look like.
+
 ### Environment & workflow gotchas (learned)
 
 These were expensively earned on the predecessor project. The hardware-specific
 ones were dropped in the pivot; what remains is platform-independent and still
 applies.
 
+- **Reading the board's CDC console needs DTR asserted explicitly.** embassy-usb's
+  `wait_connection()` blocks until DTR, and on macOS a plain `cat /dev/cu.usbmodem*`
+  does not reliably assert it - you get an open port and zero bytes, which looks
+  exactly like dead firmware. Open the fd and `ioctl(TIOCMBIS, TIOCM_DTR)` (a few
+  lines of Python) before reading. This is why the boot line was missed while the
+  heartbeats were fine.
+- **`timeout` does not exist on this Mac** (no coreutils). Use a background PID
+  plus `sleep` and `kill`, or Python, when a read needs a deadline.
 - **Rendering-change verification discipline.** "Tests pass + a 1x PNG + the
   binary launches" is INSUFFICIENT evidence for a render change. Inspect
   framebuffers and PNGs at ZOOM (sub-pixel and text-overflow bugs hide at 1x)
