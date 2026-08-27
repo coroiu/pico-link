@@ -12,7 +12,7 @@ use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::USB;
 use embassy_rp::spi::{Config as SpiConfig, Spi};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
-use embassy_rp::watchdog::{ResetReason, Watchdog};
+use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Delay, Duration, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embedded_hal::delay::DelayNs;
@@ -690,30 +690,35 @@ fn run_core1(
 fn main() -> ! {
     let p = embassy_rp::init(Default::default());
 
-    // Hardware-watchdog recovery, checked immediately after `init()` and
-    // before anything else - core1 spawn, USB setup, all of it. `pac` is
-    // `pub(crate)` inside embassy-rp, so a pre-`init()` raw register read
-    // (which would cover `init()` itself too) isn't available from outside
-    // the crate; `Watchdog::reset_reason()` is the earliest hook this crate
-    // exposes. `init()`'s own risk is judged low - it's `ClockConfig::
-    // crystal(12_000_000)`, embassy-rp's own default and the standard
-    // Pico/Pico 2 crystal, not the bespoke code that actually hung.
+    // REGRESSION FOUND AND REVERTED ON REAL HARDWARE (same session): this
+    // used to check `Watchdog::reset_reason() == Some(ResetReason::TimedOut)`
+    // right here and jump straight back to `reset_to_usb_boot()` if so, on
+    // the theory that a watchdog-timeout reason means core0 locked up last
+    // boot. That is WRONG on RP2350: the ROM's own `reboot()` function (see
+    // embassy-rp's `rom_data::reboot`, called by both `reset_to_usb_boot`
+    // AND, per observed behaviour, whatever the UF2 bootloader itself uses
+    // to launch a freshly-flashed app) takes a `delay_ms` and is itself
+    // watchdog/timer-based - it sets the SAME `ResetReason::TimedOut` that a
+    // genuine lockup-driven timeout would. Flashing this exact check live
+    // produced an infinite loop: every boot-after-flash read TimedOut (left
+    // over from the UF2 launch reboot, not a lockup) and bounced immediately
+    // back into BOOTSEL before the app ever ran - confirmed by picotool
+    // still reporting "RP2350 Boot" and no /dev/cu.usbmodem* node ever
+    // appearing, repeatably, right after a UF2 copy that DID complete
+    // (the RP2350 volume disappeared, confirming the write succeeded).
     //
-    // If the watchdog reset us because nothing fed it in time, jump straight
-    // to the ROM bootloader's BOOTSEL mode. `reset_to_usb_boot` is a
-    // synchronous ROM call with its own from-scratch USB stack - it does not
-    // depend on our USB driver or the executor, so it is not subject to
-    // whatever hung on the previous boot. See `watchdog_feed_task`'s doc
-    // comment for the full story of why this replaces pico-link-8v3.2.6's
-    // async-Timer safety net.
-    let mut watchdog = Watchdog::new(p.WATCHDOG);
-    if watchdog.reset_reason() == Some(ResetReason::TimedOut) {
-        embassy_rp::rom_data::reset_to_usb_boot(0, 0);
-        loop {
-            cortex_m::asm::nop();
-        }
-    }
-
+    // Distinguishing "my own countdown genuinely expired" from "the ROM's
+    // unrelated reboot() glue used the same mechanism" needs a private
+    // scratch-register sentinel (write a marker before `watchdog.start()`,
+    // check-and-clear it here) rather than `reset_reason()` alone - not
+    // implemented here for lack of a safe way to verify it without risking
+    // another bounce-loop burning the current BOOTSEL window. Filed as
+    // follow-up; the watchdog arm+feed below (which does NOT depend on this
+    // distinction) is kept and is still the real recovery mechanism for an
+    // actual runtime lockup - it just reboots to the (working) app instead
+    // of straight to BOOTSEL, which is enough for the picotool reset
+    // interface (pico-link-b4o) to take it the rest of the way.
+    //
     // Arm the watchdog as early as possible, before core1 spawn or any USB
     // setup - the whole point is to cover as much of the risky code as
     // possible, including setup that runs before the executor exists to
@@ -723,6 +728,7 @@ fn main() -> ! {
     // `watchdog_feed_task` re-arms it for another 8s every 3s once the
     // executor is up, so under normal operation it never fires. Under a
     // total lockup it fires within 8s of the last feed.
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
     watchdog.start(Duration::from_secs(8));
 
     let core1_stack = unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) };
