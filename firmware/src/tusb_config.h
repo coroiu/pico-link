@@ -43,9 +43,25 @@ extern "C" {
 #define CFG_TUSB_OS OPT_OS_NONE
 #endif
 
+// DIAGNOSTIC ONLY -- bead pico-link-icb (macOS never enters the audio
+// streaming alt-setting; is SET_INTERFACE even arriving?). Level 2 turns
+// on usbd.c's TU_LOG_USBD() calls in process_control_request(), which log
+// every standard/class control request by name -- exactly the visibility
+// needed to see whether SET_INTERFACE (or anything else) for the audio
+// streaming interface reaches the device at all. Checked the noise budget
+// before flipping this on: audio_device.c has zero TU_LOG_DRV call sites
+// (grep-verified) so nothing logs per-ISO-packet, and dcd_rp2040.c has
+// exactly one TU_LOG call, at init only -- so this does not reintroduce
+// the >1ms-per-tick risk pico-link-tfj just fixed. Routed through
+// pl_tusb_trace_printf (usb_pump.c), NOT pl_log, because TU_LOG fires from
+// inside tud_task() while the 0xC0 worker already holds pl_usb_mutex --
+// see usb_pump.h's doc comment on pl_tusb_trace_printf for why pl_log
+// would silently drop these. STRIP before this instrumentation is
+// considered permanent; not meant to reach main as-is.
 #ifndef CFG_TUSB_DEBUG
-#define CFG_TUSB_DEBUG 0
+#define CFG_TUSB_DEBUG 2
 #endif
+#define CFG_TUSB_DEBUG_PRINTF pl_tusb_trace_printf
 
 #define CFG_TUD_ENABLED 1
 #define CFG_TUD_MAX_SPEED BOARD_TUD_MAX_SPEED

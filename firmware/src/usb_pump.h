@@ -87,4 +87,35 @@ uint32_t pl_usb_pump_read_pcm(uint8_t *out, uint32_t max);
 // Call from the superloop.
 void pl_usb_pump_report(void);
 
+//--------------------------------------------------------------------+
+// DIAGNOSTIC ONLY -- bead pico-link-icb (macOS never enters the audio
+// streaming alt-setting). NOT for merge to main as-is; strip before this
+// branch's instrumentation is considered permanent.
+//
+// Question this answers: does SET_INTERFACE (or any other control
+// transfer) for the audio streaming interface ever actually arrive at the
+// device? tusb_config.h wires CFG_TUSB_DEBUG=2 and
+// CFG_TUSB_DEBUG_PRINTF=pl_tusb_trace_printf so TinyUSB's own
+// TU_LOG_USBD() calls in usbd.c's process_control_request() (every
+// standard/class control request, logged by name) land here instead of
+// going through printf/pl_log directly.
+//
+// Why a separate mechanism instead of routing through pl_log(): TU_LOG
+// calls happen from *inside* tud_task(), which the 0xC0 worker
+// (pl_usb_pump_worker_irq) calls while already holding pl_usb_mutex.
+// pl_log() uses a NON-recursive mutex_try_enter on that same mutex, so a
+// nested pl_log() call from within tud_task() would always fail the
+// try-enter and silently drop -- exactly the messages this diagnostic
+// needs to see. So this is a second, independent SPSC byte ring: single
+// writer (the 0xC0 worker, via pl_tusb_trace_printf, called only from
+// within tud_task()), single reader (pl_usb_trace_flush(), called from
+// main.c's superloop thread context), same ownership discipline as the
+// PCM ring above -- no mutex needed, plain volatile head/tail.
+int pl_tusb_trace_printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+// Drains the trace ring and prints its contents via pl_log(), a line (or
+// partial line) at a time. Call from the superloop, same as
+// pl_usb_pump_report(). Safe to call even when the ring is empty (no-op).
+void pl_usb_trace_flush(void);
+
 #endif // PICO_LINK_USB_PUMP_H

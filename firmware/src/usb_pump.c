@@ -149,6 +149,68 @@ void pl_log(const char *fmt, ...) {
     mutex_exit(&pl_usb_mutex);
 }
 
+//--------------------------------------------------------------------+
+// DIAGNOSTIC ONLY -- bead pico-link-icb. See usb_pump.h's doc comment.
+//--------------------------------------------------------------------+
+#define PL_TUSB_TRACE_CAPACITY (4u * 1024u)
+static char s_tusb_trace_ring[PL_TUSB_TRACE_CAPACITY];
+static volatile uint32_t s_tusb_trace_head; // producer-owned (0xC0 worker, via tud_task())
+static volatile uint32_t s_tusb_trace_tail; // consumer-owned (main.c superloop)
+static volatile uint32_t s_tusb_trace_drop_count;
+
+int pl_tusb_trace_printf(const char *format, ...) {
+    char buf[160];
+    va_list args;
+    va_start(args, format);
+    int n = vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    if (n <= 0) {
+        return n;
+    }
+    uint32_t len = (uint32_t)n;
+    if (len > sizeof(buf) - 1) {
+        len = sizeof(buf) - 1; // vsnprintf truncated; only what's in buf is real
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t head = s_tusb_trace_head;
+        uint32_t next_head = (head + 1) % PL_TUSB_TRACE_CAPACITY;
+        if (next_head == s_tusb_trace_tail) {
+            s_tusb_trace_drop_count++;
+            break; // ring full -- drop the rest of this line rather than overwrite
+        }
+        s_tusb_trace_ring[head] = buf[i];
+        s_tusb_trace_head = next_head;
+    }
+    return n;
+}
+
+void pl_usb_trace_flush(void) {
+    // Drain in modest chunks through pl_log()'s own vsnprintf-free %s path
+    // so a long backlog doesn't hog pl_usb_mutex for one giant call.
+    char chunk[128];
+    for (;;) {
+        uint32_t tail = s_tusb_trace_tail;
+        if (tail == s_tusb_trace_head) {
+            break; // caught up
+        }
+        uint32_t n = 0;
+        while (n < sizeof(chunk) - 1) {
+            uint32_t t = s_tusb_trace_tail;
+            if (t == s_tusb_trace_head) {
+                break;
+            }
+            chunk[n++] = s_tusb_trace_ring[t];
+            s_tusb_trace_tail = (t + 1) % PL_TUSB_TRACE_CAPACITY;
+        }
+        chunk[n] = '\0';
+        pl_log("%s", chunk);
+    }
+    if (s_tusb_trace_drop_count) {
+        pl_log("tusb-trace: dropped %lu bytes (ring full)\r\n", (unsigned long)s_tusb_trace_drop_count);
+        s_tusb_trace_drop_count = 0;
+    }
+}
+
 void pl_usb_pump_report(void) {
     uint64_t now_us = time_us_64();
     if (s_last_report_us != 0 && now_us - s_last_report_us < 1000000) {
