@@ -25,11 +25,22 @@
 #define ST7789_PIN_RST 12
 #define ST7789_PIN_BL 13
 
-// Keep low (~1MHz) until CS framing is confirmed on THIS board -- the
-// spike's earlier white screen at 20MHz predated the CS-held-low-across-
-// parameters fix, so a fast clock is not itself proof of a working driver.
-// Bump once a solid-colour fill is confirmed correct on the panel.
-#define ST7789_INIT_BAUDRATE_HZ (1 * 1000 * 1000)
+// CS framing is confirmed on this board (pico-link-cz0.2/pico-link-14l) --
+// the earlier white screen at 20MHz predated the CS-held-low-across-
+// parameters fix and is not evidence against a fast clock. Raised from the
+// deliberately-conservative 1MHz bring-up value, verified clean on real
+// hardware (webcam) at 40MHz and 62MHz -- both landed on the SAME actual
+// 37.5MHz (spi_set_baudrate rounds down to the nearest achievable
+// clk_peri/(prescale*postdiv); with prescale's 2-254 even-only floor, 75MHz
+// (prescale=2, postdiv=1) is the next step up but exceeds a 62MHz request,
+// so it wasn't picked). Requesting 75MHz directly hits that divisor exactly
+// and is ALSO clean on hardware (blit time roughly halved, 26.9ms -> 13.5ms,
+// matching the clock ratio). With prescale's floor of 2 and a 150MHz
+// peripheral clock, clk_peri/2 = 75MHz is the SPI hardware ceiling here --
+// there is no higher clean divisor to try. st7789_init prints the
+// requested-vs-actual Hz achieved (st7789.c) -- re-check that line if this
+// peripheral clock configuration ever changes.
+#define ST7789_INIT_BAUDRATE_HZ (75 * 1000 * 1000)
 
 void st7789_init(spi_inst_t *spi);
 
