@@ -581,14 +581,39 @@ pub unsafe extern "C" fn pl_ui_render(ui: *mut PlUi, out_px: *mut *const u16, ou
 // change entirely on the C side of this seam -- this function's signature
 // doesn't need to change for that fix to land.
 
-/// Mirrors [`pico_link_core::LinkState`]'s four variants 1:1.
+/// Mirrors [`pico_link_core::LinkState`]'s four variants 1:1. Explicit
+/// discriminants (pinned, not compiler-assigned) for the same reason as
+/// [`PlIntentTag`]'s: [`PlLinkStateChangedPayload::state`] carries this
+/// value as a plain `u32`, not as a `PlLinkState`-typed field -- see that
+/// field's doc comment. `PlLinkState` itself stays a real Rust enum purely
+/// so the cbindgen header keeps emitting named `PL_LINK_STATE_*` C
+/// constants for firmware source to use.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlLinkState {
-    Idle,
-    Scanning,
-    Connecting,
-    Connected,
+    Idle = 0,
+    Scanning = 1,
+    Connecting = 2,
+    Connected = 3,
+}
+
+impl core::convert::TryFrom<u32> for PlLinkState {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- same hazard, same fix
+    /// as [`PlIntentTag`]'s `TryFrom` impl (pico-link-ptu): this payload
+    /// sits inside [`PlEventPayload`], a union C constructs and
+    /// [`pl_ui_push_event`] receives by value, one layer beneath the outer
+    /// tag this bead originally hardened.
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlLinkState::Idle),
+            1 => Ok(PlLinkState::Scanning),
+            2 => Ok(PlLinkState::Connecting),
+            3 => Ok(PlLinkState::Connected),
+            _ => Err(()),
+        }
+    }
 }
 
 impl From<PlLinkState> for LinkState {
@@ -604,15 +629,34 @@ impl From<PlLinkState> for LinkState {
 
 /// Mirrors [`pico_link_core::ConnectFailureReason`]'s five variants 1:1.
 /// See that type's doc comment for what each means and which two are
-/// structurally non-retryable.
+/// structurally non-retryable. Explicit discriminants pinned for the same
+/// reason as [`PlLinkState`]'s -- see [`PlConnectFailedPayload::reason`]'s
+/// doc comment.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlFailureReason {
-    Timeout,
-    Rejected,
-    NoA2dpSink,
-    NeedsPin,
-    RadioError,
+    Timeout = 0,
+    Rejected = 1,
+    NoA2dpSink = 2,
+    NeedsPin = 3,
+    RadioError = 4,
+}
+
+impl core::convert::TryFrom<u32> for PlFailureReason {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see [`PlLinkState`]'s
+    /// `TryFrom` impl for the full rationale (pico-link-ptu).
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlFailureReason::Timeout),
+            1 => Ok(PlFailureReason::Rejected),
+            2 => Ok(PlFailureReason::NoA2dpSink),
+            3 => Ok(PlFailureReason::NeedsPin),
+            4 => Ok(PlFailureReason::RadioError),
+            _ => Err(()),
+        }
+    }
 }
 
 impl From<PlFailureReason> for ConnectFailureReason {
@@ -628,10 +672,19 @@ impl From<PlFailureReason> for ConnectFailureReason {
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::LinkStateChanged`.
+///
+/// `state` is a plain `u32`, not [`PlLinkState`] -- deliberately, for the
+/// same reason as [`PlEvent::tag`]: this payload sits inside the
+/// [`PlEventPayload`] union, which [`pl_ui_push_event`] receives by value,
+/// so a `PlLinkState`-typed field here would already be undefined behaviour
+/// to read the moment C hands in a garbage discriminant. The numeric values
+/// match [`PlLinkState`]'s pinned discriminants exactly, so the wire layout
+/// is unchanged (see pico-link-ptu). Convert via [`PlLinkState::try_from`]
+/// rather than transmuting.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlLinkStateChangedPayload {
-    pub state: PlLinkState,
+    pub state: u32,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::DeviceDiscovered`. `name`
@@ -650,11 +703,15 @@ pub struct PlDeviceDiscoveredPayload {
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectFailed`.
+///
+/// `reason` is a plain `u32`, not [`PlFailureReason`] -- same reason and
+/// same fix as [`PlLinkStateChangedPayload::state`]; see that field's doc
+/// comment (pico-link-ptu).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectFailedPayload {
     pub addr: [u8; 6],
-    pub reason: PlFailureReason,
+    pub reason: u32,
 }
 
 /// Which variant of [`PlEventPayload`] is active in a given [`PlEvent`].
@@ -772,8 +829,18 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
     let core_event = match tag {
         PlEventTag::LinkStateChanged => {
             // SAFETY: `tag` says this union currently holds `link_state_changed`.
+            // Reading `payload` itself is sound regardless of `state`'s
+            // value because `PlLinkStateChangedPayload::state` is a plain
+            // `u32` -- see that field's doc comment.
             let payload = unsafe { event.payload.link_state_changed };
-            Event::LinkStateChanged(payload.state.into())
+            let state = match PlLinkState::try_from(payload.state) {
+                Ok(state) => state,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            Event::LinkStateChanged(state.into())
         }
         PlEventTag::DeviceDiscovered => {
             // SAFETY: `tag` says this union currently holds `device_discovered`.
@@ -792,8 +859,18 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
         PlEventTag::DevicesCleared => Event::DevicesCleared,
         PlEventTag::ConnectFailed => {
             // SAFETY: `tag` says this union currently holds `connect_failed`.
+            // Reading `payload` itself is sound regardless of `reason`'s
+            // value because `PlConnectFailedPayload::reason` is a plain
+            // `u32` -- see that field's doc comment.
             let payload = unsafe { event.payload.connect_failed };
-            Event::ConnectFailed { addr: payload.addr, reason: payload.reason.into() }
+            let reason = match PlFailureReason::try_from(payload.reason) {
+                Ok(reason) => reason,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            Event::ConnectFailed { addr: payload.addr, reason: reason.into() }
         }
     };
     ui.app.handle_event(core_event);
@@ -989,7 +1066,7 @@ mod tests {
     #[test]
     fn pl_ui_push_event_rejects_out_of_range_tag_without_panicking() {
         let ui = new_ui();
-        let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle } };
+        let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: 4, // one past ConnectFailed = 3, the highest legal PlEventTag
@@ -1009,7 +1086,7 @@ mod tests {
     #[test]
     fn pl_ui_push_event_rejects_garbage_tag_distinct_from_version_mismatch() {
         let ui = new_ui();
-        let payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected } };
+        let payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected as u32 } };
         // A wildly out-of-range tag (e.g. an uninitialized-memory pattern)
         // with an otherwise-correct version -- this must be caught by the
         // tag check, not slip through because only `version` is validated.
@@ -1029,12 +1106,12 @@ mod tests {
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::LinkStateChanged as u32,
-                payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected } },
+                payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected as u32 } },
             },
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::DevicesCleared as u32,
-                payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle } },
+                payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } },
             },
         ];
         unsafe {
@@ -1075,5 +1152,132 @@ mod tests {
         }
         assert!(PlEventTag::try_from(4u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_nested_link_state() {
+        // The outer tag (LinkStateChanged) is legal -- only the *nested*
+        // `state` field, one layer deeper in the union, is garbage. This is
+        // the exact gap the tag-only hardening left open: `PlEventTag`
+        // alone being valid says nothing about `PlLinkStateChangedPayload`.
+        let ui = new_ui();
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: 99 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range nested PlLinkState should be counted, not matched-on");
+            assert_eq!((*ui).app.model().link_state, LinkState::Idle, "rejected event must not reach App::handle_event");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_garbage_nested_link_state() {
+        let ui = new_ui();
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: 0xFFFF_FFFF } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1);
+            assert_eq!((*ui).app.model().link_state, LinkState::Idle);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_nested_failure_reason() {
+        // Same gap, other nested payload: `PlEventTag::ConnectFailed` is
+        // legal, `PlConnectFailedPayload::reason` is garbage.
+        let ui = new_ui();
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::ConnectFailed as u32,
+            payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0xAA; 6], reason: 255 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range nested PlFailureReason should be counted, not matched-on");
+            assert_eq!((*ui).app.model().last_connect_failure, None, "rejected event must not reach App::handle_event");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_garbage_nested_failure_reason() {
+        let ui = new_ui();
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::ConnectFailed as u32,
+            payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0xAA; 6], reason: 0xDEAD_BEEF } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1);
+            assert_eq!((*ui).app.model().last_connect_failure, None);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_accepts_every_legal_nested_link_state_and_failure_reason() {
+        let ui = new_ui();
+        unsafe {
+            for state in [PlLinkState::Idle, PlLinkState::Scanning, PlLinkState::Connecting, PlLinkState::Connected] {
+                let event = PlEvent {
+                    version: PL_EVENT_ABI_VERSION,
+                    tag: PlEventTag::LinkStateChanged as u32,
+                    payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: state as u32 } },
+                };
+                pl_ui_push_event(ui, event);
+            }
+            for reason in [
+                PlFailureReason::Timeout,
+                PlFailureReason::Rejected,
+                PlFailureReason::NoA2dpSink,
+                PlFailureReason::NeedsPin,
+                PlFailureReason::RadioError,
+            ] {
+                let event = PlEvent {
+                    version: PL_EVENT_ABI_VERSION,
+                    tag: PlEventTag::ConnectFailed as u32,
+                    payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0; 6], reason: reason as u32 } },
+                };
+                pl_ui_push_event(ui, event);
+            }
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "every nested state/reason above is legal -- none should be counted as malformed");
+            assert_eq!(
+                (*ui).app.model().last_connect_failure,
+                Some(([0; 6], ConnectFailureReason::RadioError)),
+                "the last legal ConnectFailed event should have taken effect"
+            );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_link_state_try_from_round_trips_every_legal_discriminant() {
+        let legal = [PlLinkState::Idle, PlLinkState::Scanning, PlLinkState::Connecting, PlLinkState::Connected];
+        for state in legal {
+            assert!(PlLinkState::try_from(state as u32).is_ok());
+        }
+        assert!(PlLinkState::try_from(4u32).is_err());
+        assert!(PlLinkState::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn pl_failure_reason_try_from_round_trips_every_legal_discriminant() {
+        let legal =
+            [PlFailureReason::Timeout, PlFailureReason::Rejected, PlFailureReason::NoA2dpSink, PlFailureReason::NeedsPin, PlFailureReason::RadioError];
+        for reason in legal {
+            assert!(PlFailureReason::try_from(reason as u32).is_ok());
+        }
+        assert!(PlFailureReason::try_from(5u32).is_err());
+        assert!(PlFailureReason::try_from(u32::MAX).is_err());
     }
 }
