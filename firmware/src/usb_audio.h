@@ -38,4 +38,37 @@ uint32_t pl_usb_audio_sample_rate(void);
 // FIFO not draining fast enough" (see pl_usb_pump_report).
 uint32_t pl_usb_audio_packet_count(void);
 
+// --- Instrumentation (bead pico-link-icb probe 2) ---
+// These answer whether SET_INTERFACE (for ANY interface) or any audio
+// control-entity request ever reaches this firmware at all, before
+// packet_count==0 / streaming==false is trusted as evidence the host
+// never selected the streaming alt-setting. All are plain integer
+// counters updated from callbacks that already run inside the 0xC0
+// worker IRQ (see usb_pump.h) -- no formatting happens in that context;
+// pl_usb_pump_report reads and prints them from outside it.
+
+// Cumulative count of tud_audio_set_itf_cb firings, for ANY interface
+// number -- not just ITF_NUM_AUDIO_STREAMING.
+uint32_t pl_usb_audio_set_itf_calls(void);
+
+// The interface number (wIndex low byte) from the most recent
+// SET_INTERFACE the class driver routed to tud_audio_set_itf_cb.
+uint8_t pl_usb_audio_last_set_itf(void);
+
+// The alternate setting (wValue low byte) from the most recent
+// SET_INTERFACE the class driver routed to tud_audio_set_itf_cb.
+uint8_t pl_usb_audio_last_set_alt(void);
+
+// Cumulative count of clock_get_request calls (UAC2_ENTITY_CLOCK GET,
+// any control selector/request).
+uint32_t pl_usb_audio_clock_get_calls(void);
+
+// Cumulative count of feature_unit_get_request calls (UAC2_ENTITY_FEATURE_UNIT
+// GET, any control selector/request).
+uint32_t pl_usb_audio_fu_get_calls(void);
+
+// Cumulative count of feature_unit_set_request calls (UAC2_ENTITY_FEATURE_UNIT
+// SET, any control selector/request).
+uint32_t pl_usb_audio_fu_set_calls(void);
+
 #endif // PICO_LINK_USB_AUDIO_H

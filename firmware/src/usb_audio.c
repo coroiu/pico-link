@@ -32,10 +32,25 @@ static volatile bool streaming = false;
 static volatile uint32_t pcm_bytes_total = 0;
 static volatile uint32_t packet_count = 0;
 
+// --- Instrumentation (bead pico-link-icb probe 2): lightweight integer
+// counters only -- no printf/vsnprintf here, this file's callbacks run
+// inside the 0xC0 worker IRQ via tud_task() (pl_usb_pump_worker_irq).
+// Answers whether SET_INTERFACE (for ANY interface, matching or not) or
+// any audio control-entity request ever arrives at all, before trusting
+// packet_count==0 as evidence the streaming alt-setting was never
+// selected. See pl_usb_pump_report for where these get surfaced.
+static volatile uint32_t s_set_itf_calls;
+static volatile uint8_t s_last_set_itf; // last wIndex low byte seen, any interface
+static volatile uint8_t s_last_set_alt; // last wValue low byte seen, any interface
+static volatile uint32_t s_clock_get_calls;
+static volatile uint32_t s_fu_get_calls;
+static volatile uint32_t s_fu_set_calls;
+
 //--------------------------------------------------------------------+
 // Clock entity (UAC2_ENTITY_CLOCK)
 //--------------------------------------------------------------------+
 static bool clock_get_request(uint8_t rhport, audio_control_request_t const *request) {
+    s_clock_get_calls++;
     if (request->bControlSelector == AUDIO_CS_CTRL_SAM_FREQ) {
         if (request->bRequest == AUDIO_CS_REQ_CUR) {
             audio_control_cur_4_t cur = {(int32_t)tu_htole32(current_sample_rate)};
@@ -76,6 +91,7 @@ static bool clock_set_request(uint8_t rhport, audio_control_request_t const *req
 // Feature unit entity (UAC2_ENTITY_FEATURE_UNIT) -- mute/volume
 //--------------------------------------------------------------------+
 static bool feature_unit_get_request(uint8_t rhport, audio_control_request_t const *request) {
+    s_fu_get_calls++;
     uint8_t ch = request->bChannelNumber;
     if (ch >= CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1) {
         return false;
@@ -102,6 +118,7 @@ static bool feature_unit_get_request(uint8_t rhport, audio_control_request_t con
 
 static bool feature_unit_set_request(uint8_t rhport, audio_control_request_t const *request, uint8_t const *buf) {
     (void)rhport;
+    s_fu_set_calls++;
     uint8_t ch = request->bChannelNumber;
     if (ch >= CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1 || request->bRequest != AUDIO_CS_REQ_CUR) {
         return false;
@@ -146,6 +163,12 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     (void)rhport;
     uint8_t itf = tu_u16_low(tu_le16toh(p_request->wIndex));
     uint8_t alt = tu_u16_low(tu_le16toh(p_request->wValue));
+    // Record regardless of match -- bead pico-link-icb probe 2 needs to
+    // know whether SET_INTERFACE arrives for ANY interface at all, not
+    // just the one we expect.
+    s_set_itf_calls++;
+    s_last_set_itf = itf;
+    s_last_set_alt = alt;
     if (itf == ITF_NUM_AUDIO_STREAMING) {
         streaming = (alt != 0);
     }
@@ -231,4 +254,28 @@ uint32_t pl_usb_audio_sample_rate(void) {
 
 uint32_t pl_usb_audio_packet_count(void) {
     return packet_count;
+}
+
+uint32_t pl_usb_audio_set_itf_calls(void) {
+    return s_set_itf_calls;
+}
+
+uint8_t pl_usb_audio_last_set_itf(void) {
+    return s_last_set_itf;
+}
+
+uint8_t pl_usb_audio_last_set_alt(void) {
+    return s_last_set_alt;
+}
+
+uint32_t pl_usb_audio_clock_get_calls(void) {
+    return s_clock_get_calls;
+}
+
+uint32_t pl_usb_audio_fu_get_calls(void) {
+    return s_fu_get_calls;
+}
+
+uint32_t pl_usb_audio_fu_set_calls(void) {
+    return s_fu_set_calls;
 }
