@@ -33,6 +33,43 @@
 static struct PlUi *g_ui;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
+// --- pico-link-a67: one PlEvent union in, replacing the old
+// pl_ui_set_link_state/pl_ui_add_device/pl_ui_clear_devices setter trio ---
+//
+// Small helpers so each call site below builds one PlEvent value and pushes
+// it, rather than repeating the version/tag/payload boilerplate. Every
+// PlEvent must carry PL_EVENT_ABI_VERSION -- pl_ui_push_event silently
+// no-ops on a mismatch (see pico_link_ui.h's doc comment on
+// pl_ui_push_event), so a helper that always sets it is cheap insurance
+// against a call site accidentally leaving it zero-initialized.
+
+static void pl_bt_push_link_state(enum PlLinkState state) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_LINK_STATE_CHANGED,
+        .payload = {.link_state_changed = {.state = state}},
+    };
+    pl_ui_push_event(g_ui, event);
+}
+
+static void pl_bt_push_devices_cleared(void) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_DEVICES_CLEARED,
+        .payload = {0},
+    };
+    pl_ui_push_event(g_ui, event);
+}
+
+static void pl_bt_push_device_discovered(const uint8_t *addr, const uint8_t *name, uint16_t name_len, int8_t rssi) {
+    struct PlEvent event = {.version = PL_EVENT_ABI_VERSION, .tag = PL_EVENT_TAG_DEVICE_DISCOVERED};
+    memcpy(event.payload.device_discovered.addr, addr, 6);
+    event.payload.device_discovered.name = name;
+    event.payload.device_discovered.name_len = name_len;
+    event.payload.device_discovered.rssi = rssi;
+    pl_ui_push_event(g_ui, event);
+}
+
 // --- HCI Read Local Version Information: the acceptance-criterion probe ---
 //
 // Fires once, the first time BTSTACK_EVENT_STATE reports HCI_STATE_WORKING
@@ -69,8 +106,8 @@ static void pl_bt_handle_read_local_version_complete(const uint8_t *params, uint
 
 static void pl_bt_start_scan(void) {
     printf("BT: starting GAP inquiry (%d.%ds)\r\n", (PL_INQUIRY_DURATION_UNITS * 128) / 100, (PL_INQUIRY_DURATION_UNITS * 128) % 100);
-    pl_ui_clear_devices(g_ui);
-    pl_ui_set_link_state(g_ui, PL_LINK_STATE_SCANNING);
+    pl_bt_push_devices_cleared();
+    pl_bt_push_link_state(PL_LINK_STATE_SCANNING);
     gap_inquiry_start(PL_INQUIRY_DURATION_UNITS);
 }
 
@@ -99,7 +136,7 @@ static void pl_bt_handle_inquiry_result(const uint8_t *packet) {
         "BT: inquiry result %02x:%02x:%02x:%02x:%02x:%02x rssi=%d name=\"%.*s\"\r\n",
         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], rssi, (int)name_len, name_buf
     );
-    pl_ui_add_device(g_ui, addr, (const uint8_t *)name_buf, name_len, rssi);
+    pl_bt_push_device_discovered(addr, (const uint8_t *)name_buf, name_len, rssi);
 }
 
 static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -140,7 +177,7 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 
         case GAP_EVENT_INQUIRY_COMPLETE:
             printf("BT: inquiry complete\r\n");
-            pl_ui_set_link_state(g_ui, PL_LINK_STATE_IDLE);
+            pl_bt_push_link_state(PL_LINK_STATE_IDLE);
             break;
 
         default:
@@ -166,21 +203,30 @@ void pl_bt_init(struct PlUi *ui) {
 
 void pl_bt_poll_commands(struct PlUi *ui) {
     PlCommand command = pl_ui_poll_command(ui);
+
+    // Defensive ABI version check (pico-link-a67) -- Rust is the sole
+    // producer of PlCommand and always sets this correctly today, but a
+    // mismatch here means the payload union must not be trusted under this
+    // build's variant shapes, so bail rather than switch on `tag` at all.
+    if (command.version != PL_COMMAND_ABI_VERSION) {
+        printf("BT: pl_ui_poll_command version mismatch (got %u, expected %u) -- ignoring\r\n", command.version, PL_COMMAND_ABI_VERSION);
+        return;
+    }
+
     switch (command.tag) {
         case PL_COMMAND_TAG_START_SCAN:
             pl_bt_start_scan();
             break;
 
-        case PL_COMMAND_TAG_CONNECT:
+        case PL_COMMAND_TAG_CONNECT: {
             // M2's acceptance criterion is that this is observable over
             // CDC, not that a connection actually opens -- see bt.h's doc
             // comment on this function.
-            printf(
-                "BT: PL_CMD_CONNECT %02x:%02x:%02x:%02x:%02x:%02x\r\n",
-                command.addr[0], command.addr[1], command.addr[2], command.addr[3], command.addr[4], command.addr[5]
-            );
-            pl_ui_set_link_state(ui, PL_LINK_STATE_CONNECTING);
+            const uint8_t *addr = command.payload.connect.addr;
+            printf("BT: PL_CMD_CONNECT %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+            pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
             break;
+        }
 
         case PL_COMMAND_TAG_NONE:
         default:

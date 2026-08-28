@@ -57,7 +57,7 @@ pub mod power;
 pub mod render;
 pub mod run;
 
-pub use app::{App, Command, DeviceEntry, LinkState};
+pub use app::{App, BtModel, Command, ConnectFailureReason, DeviceEntry, Event, LinkState};
 pub use input::NavIntent;
 pub use power::{IdlePowerSetting, DEFAULT_DEEP_SLEEP_TIMEOUT, DEFAULT_IDLE_TIMEOUT};
 pub use run::run;

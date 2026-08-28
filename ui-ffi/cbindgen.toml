@@ -21,7 +21,25 @@ documentation_style = "doxy"
 
 [export]
 prefix = ""
-include = ["PlUi", "PlIntent", "PlIntentTag", "PlLinkState", "PlCommand", "PlCommandTag"]
+include = [
+    "PlUi",
+    "PlIntent",
+    "PlIntentTag",
+    "PlLinkState",
+    "PlFailureReason",
+    "PlLinkStateChangedPayload",
+    "PlDeviceDiscoveredPayload",
+    "PlConnectFailedPayload",
+    "PlEventTag",
+    "PlEventPayload",
+    "PlEvent",
+    "PL_EVENT_ABI_VERSION",
+    "PlCommandTag",
+    "PlConnectPayload",
+    "PlCommandPayload",
+    "PlCommand",
+    "PL_COMMAND_ABI_VERSION",
+]
 
 [fn]
 prefix = ""

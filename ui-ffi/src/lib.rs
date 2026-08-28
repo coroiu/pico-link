@@ -43,7 +43,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use embedded_alloc::LlffHeap as Heap;
-use pico_link_core::{App, Command, LinkState, NavIntent};
+use pico_link_core::{App, Command, ConnectFailureReason, DeviceEntry, Event, LinkState, NavIntent};
 
 // --- critical-section implementation ---
 //
@@ -330,11 +330,11 @@ pub unsafe extern "C" fn pl_ui_input(ui: *mut PlUi, intents: *const PlIntent, co
 
 /// One tick of the app core's clock, with `now_us` C's own timestamp (C
 /// owns the clock under the FFI direction rule -- Rust never reads a
-/// hardware timer itself). Reserved for future time-driven repaint sources
-/// (e.g. a live link-status indicator); today's placeholder root screen has
-/// no such source, so this is currently a deliberate no-op beyond accepting
-/// the call. A no-op (including the "deliberate no-op" above) if `ui` is
-/// null.
+/// hardware timer itself). Previously discarded `now_us` entirely (see
+/// pico-link-a67) -- now recorded via [`App::tick`] so the core actually has
+/// a clock available, for future time-driven repaint sources (e.g. a live
+/// link-status/liveness indicator during multi-second waits, per the
+/// approved on-device UI design). A no-op if `ui` is null.
 ///
 /// # Safety
 ///
@@ -346,9 +346,8 @@ pub unsafe extern "C" fn pl_ui_tick(ui: *mut PlUi, now_us: u64) {
         return;
     }
     // SAFETY: caller contract above.
-    let _ui = &mut *ui;
-    // `now_us` is intentionally unused today -- see the doc comment above.
-    let _ = now_us;
+    let ui = &mut *ui;
+    ui.app.tick(now_us);
 }
 
 /// Renders the current screen -- unconditionally, every call, regardless of
@@ -403,13 +402,55 @@ pub unsafe extern "C" fn pl_ui_render(ui: *mut PlUi, out_px: *mut *const u16, ou
     }
 }
 
-// --- M2: the Bluetooth link surface ---
+// --- The Bluetooth link surface: one PlEvent union in, one PlCommand union out ---
 //
-// C calls these to push live BTstack state into the devices screen and to
-// poll user-initiated commands back out. `core` itself has no idea BTstack
-// exists -- it only knows `LinkState`/`DeviceEntry`/`Command` (see
-// `pico_link_core::app`'s doc comments) -- this is the seam that adapts
-// those to a C-friendly ABI, same pattern as `PlIntent`/`NavIntent` above.
+// Restructured in pico-link-a67 from three per-field setters
+// (`pl_ui_set_link_state`/`pl_ui_add_device`/`pl_ui_clear_devices`) into a
+// single tagged-union event surface, per Ada's sustainable-path design
+// (bead pico-link-aii.1's comments). `core` itself has no idea BTstack
+// exists -- it only knows `Event`/`LinkState`/`DeviceEntry`/`Command`/
+// `ConnectFailureReason` (see `pico_link_core::app`'s doc comments) -- this
+// is the seam that adapts those to a C-friendly ABI, same pattern as
+// `PlIntent`/`NavIntent` above.
+//
+// # Why a union, not more flat setters
+//
+// The old shape's failure mode was structural: every new field the
+// approved on-device UI design needs (codec, bitrate, per-device codec
+// availability + reason, volume, ...) would have been another setter, each
+// one a new call site in C *and* Rust, with no way to express "this failed,
+// here's why." A tagged union scales by adding a payload struct + a tag
+// variant -- existing tags/payloads are untouched, so old C call sites
+// don't need to change when a new event kind is added later (only new call
+// sites do).
+//
+// # ABI version guard
+//
+// [`PlEvent`]/[`PlCommand`] each carry a `version` field, checked by the
+// consumer (`pl_ui_push_event` here for events; `bt.c`'s own poll loop for
+// commands) against [`PL_EVENT_ABI_VERSION`]/[`PL_COMMAND_ABI_VERSION`]
+// before the `payload` union is read at all. In this repo the cbindgen
+// header is regenerated from this file on every firmware build (see
+// `firmware/CMakeLists.txt`), so producer and consumer can't drift within
+// one build -- but a version field costs nothing and is exactly the kind of
+// guard that turns "add a variant, forget to update every call site" from a
+// silent wrong-union-arm read into a defensive no-op/ignore instead. C
+// literals that zero-initialize `version` (e.g. `PlEvent event = {0};` with
+// the field never set) are caught by this the same way a version *mismatch*
+// would be.
+//
+// # The IRQ-context note (pico-link-6o2, NOT fixed here)
+//
+// `bt.c` currently calls what is now `pl_ui_push_event` directly from
+// BTstack's background IRQ context, which violates the "nothing calls into
+// Rust from interrupt context" rule pico-link-5am established -- tracked
+// separately as pico-link-6o2 and deliberately not fixed in this bead. This
+// one-event-at-a-time, pass-by-value `pl_ui_push_event(ui, PlEvent)` shape
+// is exactly what that fix needs, though: C growing its own ring buffer of
+// `PlEvent` values (filled from IRQ context, drained by the superloop in
+// thread context, each drained event handed to this same function) is a
+// change entirely on the C side of this seam -- this function's signature
+// doesn't need to change for that fix to land.
 
 /// Mirrors [`pico_link_core::LinkState`]'s four variants 1:1.
 #[repr(C)]
@@ -432,84 +473,163 @@ impl From<PlLinkState> for LinkState {
     }
 }
 
-/// Sets the Bluetooth link's coarse lifecycle state, refreshing the
-/// devices screen's "Scan" row sublabel to match. A no-op if `ui` is null.
-///
-/// # Safety
-///
-/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
-/// destroyed.
-#[no_mangle]
-pub unsafe extern "C" fn pl_ui_set_link_state(ui: *mut PlUi, state: PlLinkState) {
-    if ui.is_null() {
-        return;
-    }
-    // SAFETY: caller contract above.
-    let ui = &mut *ui;
-    ui.app.set_link_state(state.into());
+/// Mirrors [`pico_link_core::ConnectFailureReason`]'s five variants 1:1.
+/// See that type's doc comment for what each means and which two are
+/// structurally non-retryable.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlFailureReason {
+    Timeout,
+    Rejected,
+    NoA2dpSink,
+    NeedsPin,
+    RadioError,
 }
 
-/// Adds (or, if `addr` is already known, updates the name/rssi of) one
-/// discovered Bluetooth device. `name` points to `name_len` bytes of UTF-8
-/// text, not necessarily NUL-terminated; invalid UTF-8 is replaced lossily
-/// rather than rejected (see the module doc's memory rules). A null `name`
-/// (regardless of `name_len`) is treated as an empty device name. A no-op
-/// if `ui` or `addr` is null.
+impl From<PlFailureReason> for ConnectFailureReason {
+    fn from(reason: PlFailureReason) -> Self {
+        match reason {
+            PlFailureReason::Timeout => ConnectFailureReason::Timeout,
+            PlFailureReason::Rejected => ConnectFailureReason::Rejected,
+            PlFailureReason::NoA2dpSink => ConnectFailureReason::NoA2dpSink,
+            PlFailureReason::NeedsPin => ConnectFailureReason::NeedsPin,
+            PlFailureReason::RadioError => ConnectFailureReason::RadioError,
+        }
+    }
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::LinkStateChanged`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlLinkStateChangedPayload {
+    pub state: PlLinkState,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::DeviceDiscovered`. `name`
+/// points to `name_len` bytes of UTF-8 text, not necessarily
+/// NUL-terminated; invalid UTF-8 is replaced lossily rather than rejected
+/// (see the module doc's memory rules). A null `name` (regardless of
+/// `name_len`) is treated as an empty device name. `name`/`addr` are
+/// borrowed for the duration of the [`pl_ui_push_event`] call only.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlDeviceDiscoveredPayload {
+    pub addr: [u8; 6],
+    pub name: *const u8,
+    pub name_len: usize,
+    pub rssi: i8,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectFailed`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlConnectFailedPayload {
+    pub addr: [u8; 6],
+    pub reason: PlFailureReason,
+}
+
+/// Which variant of [`PlEventPayload`] is active in a given [`PlEvent`].
+/// `DevicesCleared` carries no data -- the payload union is simply unread
+/// for that tag (see [`PlEventPayload`]'s doc comment).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlEventTag {
+    LinkStateChanged,
+    DeviceDiscovered,
+    DevicesCleared,
+    ConnectFailed,
+}
+
+/// The union of every [`PlEvent`] payload shape. Which field is valid to
+/// read is determined entirely by the sibling `tag` field on [`PlEvent`] --
+/// reading the wrong field is a logic bug, not a memory-safety one (every
+/// member is a plain, `Copy`, no-`Drop` payload struct), but is still
+/// meaningless data. `PlEventTag::DevicesCleared` has no payload of its
+/// own; the union simply isn't read for that tag, so no placeholder member
+/// is needed for it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union PlEventPayload {
+    pub link_state_changed: PlLinkStateChangedPayload,
+    pub device_discovered: PlDeviceDiscoveredPayload,
+    pub connect_failed: PlConnectFailedPayload,
+}
+
+/// ABI version [`PlEvent`] producers (C call sites) must set on every
+/// value. Bumped whenever an existing tag's payload shape changes in a way
+/// that isn't purely additive (a new tag/payload variant does not need a
+/// bump -- old tags are unaffected); see the module section doc for the
+/// version-guard rationale.
+pub const PL_EVENT_ABI_VERSION: u32 = 1;
+
+/// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
+/// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
+/// `pl_ui_clear_devices` setter trio. See the module section doc above for
+/// the union-vs-setters rationale and the ABI version guard.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlEvent {
+    pub version: u32,
+    pub tag: PlEventTag,
+    pub payload: PlEventPayload,
+}
+
+/// Pushes one [`PlEvent`] into the app core, folding it into the live
+/// Bluetooth model and refreshing the root screen
+/// (`App::handle_event`'s FFI entry point). A no-op if `ui` is null or
+/// `event.version` doesn't match [`PL_EVENT_ABI_VERSION`] (see the module
+/// section doc's ABI version guard -- a mismatch means the `payload` union
+/// must not be read under this build's variant shapes).
 ///
 /// # Safety
 ///
 /// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
-/// destroyed. If non-null, `addr` must point to 6 valid bytes. If non-null,
-/// `name` must point to at least `name_len` valid bytes. Both `addr` and
-/// `name` are borrowed for the duration of this call only.
+/// destroyed. For `PlEventTag::DeviceDiscovered`, if `payload.device_discovered.name`
+/// is non-null it must point to at least `name_len` valid bytes, borrowed
+/// for the duration of this call only.
 #[no_mangle]
-pub unsafe extern "C" fn pl_ui_add_device(ui: *mut PlUi, addr: *const u8, name: *const u8, name_len: usize, rssi: i8) {
-    if ui.is_null() || addr.is_null() {
+pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
+    if ui.is_null() || event.version != PL_EVENT_ABI_VERSION {
         return;
     }
     // SAFETY: caller contract above.
     let ui = &mut *ui;
-    // SAFETY: caller contract above -- `addr` points to 6 valid bytes.
-    let addr_slice = core::slice::from_raw_parts(addr, 6);
-    let mut addr_bytes = [0u8; 6];
-    addr_bytes.copy_from_slice(addr_slice);
 
-    let name = if name.is_null() || name_len == 0 {
-        String::new()
-    } else {
-        // SAFETY: caller contract above -- `name` points to at least
-        // `name_len` valid bytes for the duration of this call.
-        let bytes = core::slice::from_raw_parts(name, name_len);
-        String::from_utf8_lossy(bytes).into_owned()
+    let core_event = match event.tag {
+        PlEventTag::LinkStateChanged => {
+            // SAFETY: `tag` says this union currently holds `link_state_changed`.
+            let payload = unsafe { event.payload.link_state_changed };
+            Event::LinkStateChanged(payload.state.into())
+        }
+        PlEventTag::DeviceDiscovered => {
+            // SAFETY: `tag` says this union currently holds `device_discovered`.
+            let payload = unsafe { event.payload.device_discovered };
+            let addr = payload.addr;
+            let name = if payload.name.is_null() || payload.name_len == 0 {
+                String::new()
+            } else {
+                // SAFETY: caller contract above -- `name` points to at
+                // least `name_len` valid bytes for the duration of this call.
+                let bytes = unsafe { core::slice::from_raw_parts(payload.name, payload.name_len) };
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+            Event::DeviceDiscovered(DeviceEntry { addr, name, rssi: payload.rssi })
+        }
+        PlEventTag::DevicesCleared => Event::DevicesCleared,
+        PlEventTag::ConnectFailed => {
+            // SAFETY: `tag` says this union currently holds `connect_failed`.
+            let payload = unsafe { event.payload.connect_failed };
+            Event::ConnectFailed { addr: payload.addr, reason: payload.reason.into() }
+        }
     };
-
-    ui.app.add_device(addr_bytes, name, rssi);
+    ui.app.handle_event(core_event);
 }
 
-/// Clears the discovered-device list, e.g. at the start of a fresh scan.
-/// A no-op if `ui` is null.
-///
-/// # Safety
-///
-/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
-/// destroyed.
-#[no_mangle]
-pub unsafe extern "C" fn pl_ui_clear_devices(ui: *mut PlUi) {
-    if ui.is_null() {
-        return;
-    }
-    // SAFETY: caller contract above.
-    let ui = &mut *ui;
-    ui.app.clear_devices();
-}
-
-/// Mirrors [`pico_link_core::Command`]'s two variants, flattened into a
-/// tag+payload struct the same way [`PlIntent`] flattens `NavIntent` (see
-/// its doc comment) -- `addr` is only meaningful when
-/// `tag == PlCommandTag::Connect`. `PlCommandTag::None` is not one of
-/// `Command`'s variants; it exists purely so [`pl_ui_poll_command`] has a
-/// value to return when nothing is queued (or `ui` is null), since this
-/// function returns by value rather than an `Option`-shaped pointer.
+/// Which variant of [`PlCommand`] this value is. `None` is not one of
+/// [`pico_link_core::Command`]'s variants; it exists purely so
+/// [`pl_ui_poll_command`] has a value to return when nothing is queued (or
+/// `ui` is null, or `ui`'s version check fails), since this function
+/// returns by value rather than an `Option`-shaped pointer.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlCommandTag {
@@ -518,12 +638,52 @@ pub enum PlCommandTag {
     Connect,
 }
 
-/// See [`PlCommandTag`]'s doc comment for the `addr` field's contract.
+/// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlConnectPayload {
+    pub addr: [u8; 6],
+}
+
+/// The union of every [`PlCommand`] payload shape -- mirrors
+/// [`PlEventPayload`]'s shape (one member per tag that carries data;
+/// `StartScan`/`None` carry none). Kept as a real union rather than a flat
+/// `addr` field specifically so this scales the same way `PlEvent` does:
+/// planned future commands (per-device codec set, LDAC quality set, AVRCP
+/// volume set -- see `.planning/design/2026-08-28-on-device-ui.md` section
+/// 14's "Ada" handoff) have payload shapes `addr` alone can't carry, and
+/// adding them means adding a payload struct + tag variant here, not
+/// reshaping this one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union PlCommandPayload {
+    pub connect: PlConnectPayload,
+}
+
+/// ABI version [`PlCommand`] consumers (C call sites, i.e. `bt.c`'s poll
+/// loop) must check against before reading `payload`. Rust is the sole
+/// producer of `PlCommand` values (see [`pl_ui_poll_command`]) and always
+/// sets this correctly; the check exists on the C side as the same
+/// defensive belt-and-suspenders guard [`PL_EVENT_ABI_VERSION`] is for
+/// events -- see the module section doc.
+pub const PL_COMMAND_ABI_VERSION: u32 = 1;
+
+/// One user-initiated command, Rust -> C. See [`PlCommandPayload`]'s doc
+/// comment for the extensibility rationale and [`PL_COMMAND_ABI_VERSION`]
+/// for the version-guard contract.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlCommand {
+    pub version: u32,
     pub tag: PlCommandTag,
-    pub addr: [u8; 6],
+    pub payload: PlCommandPayload,
+}
+
+/// A `PlCommand` with `tag == PlCommandTag::None`, `version` already set
+/// correctly -- the "nothing queued" value returned by [`pl_ui_poll_command`]
+/// in every case that isn't `Some(Command::{StartScan,Connect})`.
+fn pl_command_none() -> PlCommand {
+    PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::None, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
 }
 
 /// Pops the oldest user-initiated command queued by the devices screen
@@ -540,13 +700,17 @@ pub struct PlCommand {
 #[no_mangle]
 pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
     if ui.is_null() {
-        return PlCommand { tag: PlCommandTag::None, addr: [0; 6] };
+        return pl_command_none();
     }
     // SAFETY: caller contract above.
     let ui = &mut *ui;
     match ui.app.poll_command() {
-        Some(Command::StartScan) => PlCommand { tag: PlCommandTag::StartScan, addr: [0; 6] },
-        Some(Command::Connect { addr }) => PlCommand { tag: PlCommandTag::Connect, addr },
-        None => PlCommand { tag: PlCommandTag::None, addr: [0; 6] },
+        Some(Command::StartScan) => {
+            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::StartScan, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
+        }
+        Some(Command::Connect { addr }) => {
+            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::Connect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
+        }
+        None => pl_command_none(),
     }
 }
