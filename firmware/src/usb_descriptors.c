@@ -83,7 +83,13 @@ const uint8_t *tud_descriptor_device_cb(void) {
     + TUD_CDC_DESC_LEN \
     + TUD_RPI_RESET_DESC_LEN)
 
-static const uint8_t usbd_desc_cfg[USBD_DESC_LEN] = {
+// Sized by the initializer list, not by USBD_DESC_LEN directly: this way a
+// mismatch between USBD_DESC_LEN's macro arithmetic and what the
+// TUD_*_DESCRIPTOR macros actually expand to is a compile-time array-size
+// mismatch (via the _Static_assert below) instead of a silent
+// implicit-zero-fill truncation that would only surface as a host-side
+// enumeration failure.
+static const uint8_t usbd_desc_cfg[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, STRID_LANGID, USBD_DESC_LEN, 0x00, USBD_MAX_POWER_MA),
 
@@ -101,6 +107,9 @@ static const uint8_t usbd_desc_cfg[USBD_DESC_LEN] = {
     // working (see reset_interface.c, still linked via pico_enable_stdio_usb).
     TUD_RPI_RESET_DESCRIPTOR(ITF_NUM_RESET, STRID_RESET)
 };
+
+_Static_assert(sizeof(usbd_desc_cfg) == USBD_DESC_LEN,
+    "usbd_desc_cfg's actual byte count does not match USBD_DESC_LEN's macro arithmetic");
 
 const uint8_t *tud_descriptor_configuration_cb(uint8_t index) {
     (void)index;
