@@ -21,7 +21,7 @@ documentation_style = "doxy"
 
 [export]
 prefix = ""
-include = ["PlUi", "PlIntent", "PlIntentTag"]
+include = ["PlUi", "PlIntent", "PlIntentTag", "PlLinkState", "PlCommand", "PlCommandTag"]
 
 [fn]
 prefix = ""

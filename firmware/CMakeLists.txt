@@ -78,10 +78,16 @@ add_executable(pico_link
     src/main.c
     src/st7789.c
     src/input.c
+    src/bt.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
 target_include_directories(pico_link PRIVATE ${PICO_LINK_UI_HEADER_DIR})
+
+# btstack_config.h lives alongside bt.c/main.c -- BTstack's own headers
+# #include "btstack_config.h" unqualified and expect it on the include
+# path, same as any other project-supplied BTstack config.
+target_include_directories(pico_link PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 
 pico_set_program_name(pico_link "pico_link")
 pico_set_program_version(pico_link "0.1.0")
@@ -92,6 +98,16 @@ pico_enable_stdio_usb(pico_link 1)
 pico_enable_stdio_uart(pico_link 0)
 target_compile_definitions(pico_link PRIVATE
     PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=1
+    # M2 (bd pico-link-cz0.3): whichever core loads the cyw43 Bluetooth
+    # firmware needs at least 48KB of stack -- earned expensively on real
+    # hardware in an earlier session, where an 8-16KB core0 stack
+    # overflowed during PIO/SPI init with a badly misleading symptom (a
+    # diagnostic store on the FIRST line of a task appeared never to
+    # execute, depending on what code came LATER). Set well above that
+    # floor. Core1 is never launched (see main.c/bt.c's module docs --
+    # matching USBPods' own working reference, everything runs on core0),
+    # so PICO_CORE1_STACK_SIZE is left at the SDK default.
+    PICO_STACK_SIZE=0xC000
 )
 
 target_link_libraries(pico_link
@@ -100,6 +116,12 @@ target_link_libraries(pico_link
     hardware_dma
     hardware_gpio
     ui_ffi
+    # M2: the ready-made HCI transport this C-first pivot exists to use
+    # (see bt.c's module doc). pico_btstack_cyw43 pulls in
+    # pico_btstack_hci_transport_cyw43 and pico_btstack_base transitively.
+    pico_btstack_classic
+    pico_btstack_cyw43
+    pico_cyw43_arch_threadsafe_background
 )
 
 pico_add_extra_outputs(pico_link)

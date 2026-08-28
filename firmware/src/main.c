@@ -16,9 +16,12 @@
 
 #include <stdio.h>
 
+#include "btstack.h"
 #include "hardware/spi.h"
+#include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 
+#include "bt.h"
 #include "input.h"
 #include "pico_link_ui.h"
 #include "st7789.h"
@@ -53,48 +56,17 @@ int main(void) {
     printf("board: pimoroni_pico_plus2_w_rp2350\r\n");
     printf("pico-sdk owns main(); ui-ffi (Rust core) linked in over FFI.\r\n");
 
-    // --- Staged panel bring-up (M1b design: confirm each stage before the
-    // next) ---
-    //
-    // Stage 1+2 combined into one flash (no live visual feedback loop
-    // available to this agent -- see the M1b bead comments): backlight on,
-    // then three full-screen solid-colour fills in sequence, entirely via
-    // the blocking (non-DMA) path -- zero Rust rendering anywhere in this
-    // sequence. If the colours on the panel are wrong here, the bug is in
-    // this file / st7789.c, not in ui-ffi or core. A human watching the
-    // panel (or the bench webcam) should see: red, pause, green, pause,
-    // blue, pause -- each via a fresh st7789_init_and_fill call (which
-    // internally does the hardware reset + register init once more; a
-    // second/third re-init is wasteful but harmless and keeps this
-    // sequence simple to read).
+    // Panel bring-up itself is proven on real hardware as of M1b (bd
+    // pico-link-cz0.2) -- the staged red/green/blue diagnostic fills that
+    // proved it lived here only for that one bring-up flash and are gone
+    // now; keeping a 15-second colour hold in every boot would only slow
+    // down this bead's flash/verify cycles for a display path that isn't
+    // in scope here (panel colour follow-ups belong to bd pico-link-14l,
+    // per this bead's explicit "do not chase panel colour" instruction).
     st7789_init(spi1);
     printf("st7789_init OK (SPI1, DC=%d CS=%d SCK=%d MOSI=%d RST=%d BL=%d, %d Hz)\r\n",
            ST7789_PIN_DC, ST7789_PIN_CS, ST7789_PIN_SCK, ST7789_PIN_MOSI, ST7789_PIN_RST, ST7789_PIN_BL,
            ST7789_INIT_BAUDRATE_HZ);
-
-    // Extended to a photographable ~3s hold per colour, with an explicit
-    // marker printed BOTH before the fill call starts and again once the
-    // hold begins, each carrying a monotonic timestamp -- this is the
-    // decisive colour-mapping diagnostic (coordinator-directed follow-up to
-    // the first M1b pass, which got layout/geometry right per a webcam
-    // comparison against the emulator's reference PNG, but photographed
-    // solid-background near-black core content as the BRIGHTEST thing in
-    // frame, i.e. inverted). Zero Rust involved in this sequence, so
-    // whatever the camera sees here isolates the bug to this file.
-    printf("FILL_START:RED@%lluus\r\n", (unsigned long long)time_us_64());
-    st7789_init_and_fill(spi1, COLOR_RED);
-    printf("FILL_HOLD:RED@%lluus\r\n", (unsigned long long)time_us_64());
-    sleep_ms(5000);
-
-    printf("FILL_START:GREEN@%lluus\r\n", (unsigned long long)time_us_64());
-    st7789_init_and_fill(spi1, COLOR_GREEN);
-    printf("FILL_HOLD:GREEN@%lluus\r\n", (unsigned long long)time_us_64());
-    sleep_ms(5000);
-
-    printf("FILL_START:BLUE@%lluus\r\n", (unsigned long long)time_us_64());
-    st7789_init_and_fill(spi1, COLOR_BLUE);
-    printf("FILL_HOLD:BLUE@%lluus\r\n", (unsigned long long)time_us_64());
-    sleep_ms(5000);
 
     // --- The Rust UI ---
     struct PlUi *ui = pl_ui_create(PANEL_WIDTH, PANEL_HEIGHT);
@@ -109,9 +81,36 @@ int main(void) {
     pl_link_input_init();
     printf("pl_link_input_init OK\r\n");
 
-    // Superloop on core0 only (M1b design). Every iteration: poll debounced
-    // input edges, forward to Rust, tick, render, blit, print per-frame
-    // timing -- the bead's hardware acceptance criterion.
+    // --- M2: bring the radio up ---
+    //
+    // cyw43_arch_init() claims the SPI/PIO/DMA resources the bead's banked
+    // hardware evidence already proved work (read32_swapped round-trip),
+    // then pl_bt_init() registers BTstack's packet handler and asks for
+    // HCI_POWER_ON -- see bt.c's module doc for why this is expected to
+    // succeed where three earlier Rust-first sessions could not.
+    //
+    // Deliberately core0-only, matching USBPods' own working reference
+    // (read from a scratch clone outside this repo -- its core1 is
+    // launched for nothing BTstack/cyw43-related; core1 never runs there
+    // either) rather than inventing a different core split, per this
+    // bead's 15-minute precondition.
+    if (cyw43_arch_init()) {
+        printf("cyw43_arch_init FAILED -- halting\r\n");
+        while (true) {
+            tight_loop_contents();
+        }
+    }
+    printf("cyw43_arch_init OK\r\n");
+
+    pl_bt_init(ui);
+
+    // Superloop on core0 only (M1b design, unchanged by M2). Every
+    // iteration: poll debounced input edges, forward to Rust, tick,
+    // render, blit, print per-frame timing, then poll one queued
+    // Bluetooth command -- all still plain C driving the same FFI surface,
+    // no new threading model. BTstack's own work happens in the cyw43
+    // background IRQ (pico_cyw43_arch_threadsafe_background, linked in
+    // CMakeLists.txt), not in this loop.
     PlIntent intents[8];
     while (true) {
         uint64_t frame_start_us = time_us_64();
@@ -136,6 +135,8 @@ int main(void) {
             st7789_blit_framebuffer(spi1, px, (uint32_t)px_len);
         }
         uint64_t blit_end_us = time_us_64();
+
+        pl_bt_poll_commands(ui);
 
         static uint32_t frame_count = 0;
         frame_count++;
