@@ -31,6 +31,7 @@ use crate::input::NavIntent;
 use crate::platform::{HidLinkState, OutputRequest};
 
 use super::framebuffer::FrameBuffer565;
+use super::list::ListItemKey;
 use super::screen::Screen;
 
 /// High-level focus state transitions, decoupled from whatever transport
@@ -215,6 +216,24 @@ pub trait Widget {
     /// into the freshly built replacement (`VerticalList::with_selected`)
     /// instead of resetting the user's place in the list on every event.
     fn selected_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// This widget's own currently selected row's identity key, if it has
+    /// one — see [`super::list::ListItem::key`] / [`ListItemKey`].
+    /// `None` for widgets with no keyed-identity concept (the default),
+    /// or when the currently selected row was never tagged with a key.
+    ///
+    /// Exists for the same reason [`Self::selected_index`] does, one
+    /// level more robust: a caller that rebuilds a screen's widgets from
+    /// scratch on every model change can read this back before discarding
+    /// the old widget, then carry it into the freshly built replacement's
+    /// selection-resolution call (`VerticalList::with_selected_identity`)
+    /// so a rebuild that reorders, inserts, or removes *other* rows
+    /// doesn't move the selection away from the row the user was actually
+    /// looking at — the failure mode a plain index-based carry-forward
+    /// has.
+    fn selected_key(&self) -> Option<ListItemKey> {
         None
     }
 }

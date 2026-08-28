@@ -20,7 +20,14 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::input::NavIntent;
-use crate::render::{Action, FrameBuffer565, ListItem, Navigator, Screen, VerticalList};
+use crate::render::{Action, FrameBuffer565, ListItem, ListItemKey, Navigator, Screen, VerticalList};
+
+/// The devices screen's "Scan for headphones" row's identity key. Not
+/// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
+/// instead — see [`ListItemKey::from`]'s doc comment for why this can
+/// never collide with a real device's key (a device key's top two bytes
+/// are always `0`; this sentinel's are always `0xFF`).
+const SCAN_ROW_KEY: ListItemKey = ListItemKey::from_bytes([0xFF; 8]);
 
 /// The Bluetooth link's coarse lifecycle state, as reported by C over
 /// [`App::set_link_state`] (`pl_ui_set_link_state` in the FFI surface).
@@ -167,18 +174,34 @@ pub type DeviceAddr = [u8; 6];
 /// address. Rebuilt from scratch on every state change (see
 /// [`App::rebuild_root`]) rather than mutated in place -- simplest correct
 /// thing for a list this small, and it keeps the closures below trivially
-/// `'static` (each rebuild captures a fresh, owned snapshot). `selected`
-/// carries forward the outgoing screen's selection (see
-/// [`Navigator::root_selected_index`]/[`Navigator::replace_root`]) so a
-/// model change mid-browse doesn't snap the user's selection back to row 0;
-/// `None` (first build) starts at row 0 via `VerticalList`'s own default.
-fn build_devices_screen(model: &BtModel, selected: Option<usize>, commands: &Rc<RefCell<VecDeque<Command>>>) -> Screen {
-    let mut items = vec![ListItem::new("Scan for headphones").with_sublabel(model.link_state.label())];
+/// `'static` (each rebuild captures a fresh, owned snapshot).
+///
+/// Every row carries a [`ListItemKey`] -- [`SCAN_ROW_KEY`] for the fixed
+/// scan row, `device.addr` (via `From<[u8; 6]>`) for a device row -- so
+/// `prev_key`/`prev_index` (the outgoing screen's
+/// [`Navigator::root_selected_key`]/[`Navigator::root_selected_index`])
+/// can carry the user's selection forward **by identity** through
+/// [`VerticalList::with_selected_identity`]: a device arriving, being
+/// renamed in place, or a stale one dropping out of `model.devices` no
+/// longer moves the selection just because the *index* it used to occupy
+/// now means something else. `prev_key` of `None`/not-found falls back to
+/// clamping `prev_index` -- see that method's doc comment for the exact
+/// rule. `(None, 0)` (first build) starts at row 0.
+fn build_devices_screen(
+    model: &BtModel,
+    prev_key: Option<ListItemKey>,
+    prev_index: usize,
+    commands: &Rc<RefCell<VecDeque<Command>>>,
+) -> Screen {
+    let mut items =
+        vec![ListItem::new("Scan for headphones").with_sublabel(model.link_state.label()).with_key(SCAN_ROW_KEY)];
     if model.devices.is_empty() {
         // A single-row list has nowhere for Up/Down to move the selection
         // to, which also reads as a dead screen to a first-time user --
         // an explicit "nothing found yet" row keeps the list navigable
         // and communicates the empty state instead of just looking inert.
+        // No key: it's a transient placeholder, not a persistent entity
+        // worth carrying a selection onto.
         items.push(ListItem::new("No devices found").with_sublabel("Select Scan to search"));
     }
     for device in &model.devices {
@@ -187,22 +210,21 @@ fn build_devices_screen(model: &BtModel, selected: Option<usize>, commands: &Rc<
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}  RSSI {}",
             device.addr[0], device.addr[1], device.addr[2], device.addr[3], device.addr[4], device.addr[5], device.rssi
         );
-        items.push(ListItem::new(label).with_sublabel(sublabel));
+        items.push(ListItem::new(label).with_sublabel(sublabel).with_key(ListItemKey::from(device.addr)));
     }
 
     let devices_snapshot: Vec<DeviceEntry> = model.devices.clone();
     let commands_for_activate = Rc::clone(commands);
-    let mut list = VerticalList::new(items).on_activate_index(move |index| {
-        if index == 0 {
-            commands_for_activate.borrow_mut().push_back(Command::StartScan);
-        } else if let Some(device) = devices_snapshot.get(index - 1) {
-            commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
-        }
-        Action::None
-    });
-    if let Some(selected) = selected {
-        list = list.with_selected(selected);
-    }
+    let list = VerticalList::new(items)
+        .on_activate_index(move |index| {
+            if index == 0 {
+                commands_for_activate.borrow_mut().push_back(Command::StartScan);
+            } else if let Some(device) = devices_snapshot.get(index - 1) {
+                commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
+            }
+            Action::None
+        })
+        .with_selected_identity(prev_key, prev_index);
     Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back")
 }
 
@@ -246,7 +268,7 @@ impl App {
     pub fn new(width: u32, height: u32) -> Self {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let model = BtModel::default();
-        let navigator = Navigator::new(build_devices_screen(&model, None, &commands));
+        let navigator = Navigator::new(build_devices_screen(&model, None, 0, &commands));
         Self { navigator, framebuffer: FrameBuffer565::new(width, height), dirty: true, model, now_us: 0, commands }
     }
 
@@ -263,8 +285,9 @@ impl App {
     /// crate builds today, fatal for the approved multi-screen design (see
     /// pico-link-a67 / pico-link-aii.1's defect 1).
     fn rebuild_root(&mut self) {
-        let selected = self.navigator.root_selected_index();
-        self.navigator.replace_root(build_devices_screen(&self.model, selected, &self.commands));
+        let prev_key = self.navigator.root_selected_key();
+        let prev_index = self.navigator.root_selected_index().unwrap_or(0);
+        self.navigator.replace_root(build_devices_screen(&self.model, prev_key, prev_index, &self.commands));
         self.dirty = true;
     }
 
@@ -556,6 +579,87 @@ mod tests {
         // Same for a link-state change while browsing.
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
         assert_eq!(app.root_selected_index(), Some(2), "a link-state change must not reset the user's selection");
+    }
+
+    // --- pico-link-znb.4: selection carried by identity, not index ---
+    //
+    // `a_device_arriving_mid_navigation_does_not_reset_the_root_screens_
+    // selection` above already proves the *index* doesn't move when the
+    // App's own append-only device order (design section 9 rule 1: stable
+    // sort, first-seen order, append at bottom, never re-sort by RSSI)
+    // happens not to disturb it. These go one step further: they assert
+    // the selection resolves to the *same device address* (not just the
+    // same index -- proving the identity-key path, not an accident of
+    // append-only ordering), and cover the update-in-place and
+    // selection-vanishes cases the design also calls out. The "a new row
+    // gets inserted *before* the selected one" stress case -- which App's
+    // append-only ordering can never itself produce -- is exercised
+    // directly against `VerticalList::with_selected_identity` in
+    // `render::list::tests` instead, since that's the widget-level
+    // mechanism this all rests on and the ordering rule App builds atop it
+    // makes it unreachable at this level by design.
+
+    #[test]
+    fn selecting_a_device_survives_further_devices_arriving_identified_by_address_not_just_index() {
+        let mut app = App::new(240, 240);
+        let device_a = [1, 1, 1, 1, 1, 1];
+        app.add_device(device_a, String::from("Device A"), -50);
+
+        // Root rows: 0 = Scan, 1 = Device A. Select Device A.
+        app.handle_input(vec![NavIntent::Down]);
+        assert_eq!(app.root_selected_index(), Some(1));
+        assert_eq!(app.model().devices[0].addr, device_a);
+
+        app.add_device([2, 2, 2, 2, 2, 2], String::from("Device B"), -60);
+        app.add_device([3, 3, 3, 3, 3, 3], String::from("Device C"), -70);
+
+        let selected = app.root_selected_index().expect("a device must still be selected");
+        assert_eq!(
+            app.model().devices[selected - 1].addr,
+            device_a,
+            "the selected row must still resolve to Device A's address, not merely the same index"
+        );
+    }
+
+    #[test]
+    fn a_late_name_for_an_already_listed_device_replaces_its_row_in_place() {
+        let mut app = App::new(240, 240);
+        let addr = [7, 7, 7, 7, 7, 7];
+        app.add_device(addr, String::new(), -55); // nameless first report
+
+        app.handle_input(vec![NavIntent::Down]); // select the device row
+        assert_eq!(app.root_selected_index(), Some(1));
+
+        // The name resolves later, same address.
+        app.add_device(addr, String::from("Sony WH-1000XM5"), -55);
+
+        assert_eq!(app.model().devices.len(), 1, "a late name must update the existing row, not append a second one");
+        assert_eq!(app.model().devices[0].name, "Sony WH-1000XM5");
+        assert_eq!(app.root_selected_index(), Some(1), "the late name must not disturb the selection");
+    }
+
+    #[test]
+    fn the_selected_devices_disappearing_clamps_selection_instead_of_resetting_to_row_zero() {
+        let mut app = App::new(240, 240);
+        app.add_device([1, 1, 1, 1, 1, 1], String::from("Device A"), -50);
+        app.handle_input(vec![NavIntent::Down]);
+        assert_eq!(app.root_selected_index(), Some(1));
+
+        // The selected device drops out of the model entirely (e.g. a
+        // future timeout/removal path -- simulated here via the one
+        // removal primitive App has today, a full clear).
+        app.clear_devices();
+
+        // Only the Scan row and the "No devices found" placeholder remain
+        // (rows 0 and 1); the vanished key isn't found, so
+        // `with_selected_identity` falls back to clamping the previous
+        // index (1) into the new list's bounds -- landing on row 1, not
+        // snapping back past it to row 0.
+        assert_eq!(
+            app.root_selected_index(),
+            Some(1),
+            "losing the selected row must clamp to the nearest surviving row, not reset to row 0"
+        );
     }
 
     #[test]

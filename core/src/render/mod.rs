@@ -60,7 +60,7 @@ pub mod widget;
 pub use chrome::{compute_chrome, ChromeLayout};
 pub use confirm::ConfirmView;
 pub use framebuffer::FrameBuffer565;
-pub use list::{ListItem, VerticalList, ROW_HEIGHT};
+pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};
 pub use menu::{MenuItem, MenuList};
 pub use message::MessageView;
 pub use navigator::Navigator;

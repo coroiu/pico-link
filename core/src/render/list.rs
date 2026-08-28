@@ -29,8 +29,55 @@ use super::framebuffer::FrameBuffer565;
 use super::theme::{self, font, icon, palette};
 use super::widget::{Action, FocusEvent, Widget};
 
-/// A single displayable row. Display-only: no identifiers, no domain
-/// fields — just what a `VerticalList` needs to draw a row.
+/// An opaque row-identity key, supplied by the call site — e.g. a
+/// Bluetooth device's 6-byte address. `Copy`/allocation-free by design:
+/// `core` is `no_std` + `alloc`, and identity needs to be cheap to carry
+/// around and compare on every rebuild of a live-data-backed list, so this
+/// is a fixed-size byte key rather than a `String`/`Vec`-backed one.
+///
+/// This is what lets [`VerticalList::with_selected_identity`] resolve a
+/// row's *position* across a rebuild instead of trusting a caller-supplied
+/// index, which is the actual bug this type exists to close — see that
+/// method's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ListItemKey([u8; 8]);
+
+impl ListItemKey {
+    /// Builds a key from a raw 8-byte value. `const fn` so callers can
+    /// define sentinel keys (e.g. a fixed row that isn't backed by any
+    /// domain entity) as `const`s.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 8]) -> Self {
+        Self(bytes)
+    }
+
+    /// Builds a key from a `u64` id, little-endian.
+    #[must_use]
+    pub const fn from_u64(id: u64) -> Self {
+        Self(id.to_le_bytes())
+    }
+}
+
+impl From<[u8; 6]> for ListItemKey {
+    /// Widens a 6-byte Bluetooth device address into a key by
+    /// zero-padding the top two bytes. Those two bytes are never `0xFF`
+    /// for a real device address wrapped this way (a real address can be
+    /// anything in its own 6 bytes, but this conversion always leaves
+    /// bytes `[6]`/`[7]` at `0`), so a key built via
+    /// [`ListItemKey::from_bytes`] with those two bytes non-zero (e.g.
+    /// `[0xFF; 8]`, used by `pico_link_core::app` for its non-device
+    /// "Scan" row) can never collide with a real device's key.
+    fn from(addr: [u8; 6]) -> Self {
+        let mut bytes = [0_u8; 8];
+        bytes[..6].copy_from_slice(&addr);
+        Self(bytes)
+    }
+}
+
+/// A single displayable row. Display-only: no domain fields beyond an
+/// optional identity key — just what a `VerticalList` needs to draw a row
+/// and (if the caller supplies one) resolve its position by identity
+/// rather than index across a rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListItem {
     pub label: String,
@@ -41,6 +88,12 @@ pub struct ListItem {
     /// that wants "icon, no colored background" instead of "no chip at
     /// all". `None` (the default) keeps the letter chip. See [`RowChip`].
     pub icon: Option<char>,
+    /// This row's stable identity, if the caller has one (e.g. a
+    /// Bluetooth device address). `None` for rows with no natural
+    /// identity (a static menu row, a transient placeholder) — such rows
+    /// keep falling back to index-based selection carry-forward, see
+    /// [`VerticalList::with_selected_identity`].
+    pub key: Option<ListItemKey>,
 }
 
 impl ListItem {
@@ -50,6 +103,7 @@ impl ListItem {
             label: label.into(),
             sublabel: None,
             icon: None,
+            key: None,
         }
     }
 
@@ -65,6 +119,13 @@ impl ListItem {
     #[must_use]
     pub fn with_icon(mut self, icon: char) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// Tags this row with a stable identity key — see [`ListItem::key`].
+    #[must_use]
+    pub fn with_key(mut self, key: ListItemKey) -> Self {
+        self.key = Some(key);
         self
     }
 }
@@ -478,6 +539,56 @@ impl VerticalList {
         self
     }
 
+    /// Sets the initially selected row by **identity**, with an
+    /// index-based fallback — the fix for the defect `with_selected`
+    /// (index-only) has: a store-backed list rebuilt from live data on
+    /// every model change (the devices screen driven by Bluetooth
+    /// inquiry results, e.g.) can grow, shrink, or reorder between builds,
+    /// and a plain index into the *new* list no longer points at the row
+    /// the user was actually looking at.
+    ///
+    /// `prev_key` is the outgoing widget's [`Self::selected_key`] (`None`
+    /// if it had no keyed row selected, e.g. the very first build).
+    /// `prev_index` is the outgoing widget's plain [`Self::selected_index`],
+    /// used only as the fallback below.
+    ///
+    /// # The rule
+    ///
+    /// - If `prev_key` is `Some` and some row in the freshly built `items`
+    ///   carries that same key: select **that row**, wherever it now sits.
+    ///   This is the actual point of this method — inserting or removing
+    ///   *other* rows around the selected one must never move the
+    ///   selection, and a rebuild (e.g. a late name arriving for an
+    ///   existing device, replacing that row's label in place) that keeps
+    ///   the same key at the same index is naturally a no-op here too.
+    /// - Otherwise — `prev_key` is `None` (first build, or the caller has
+    ///   no identity for this list), or the key it names is no longer
+    ///   present (the previously selected row was removed / timed out) —
+    ///   fall back to **clamping `prev_index` to the new list's bounds**
+    ///   (`prev_index.min(items.len().saturating_sub(1))`). This is a
+    ///   deliberate "clamp to the nearest surviving position" rule, not a
+    ///   reset to row `0`: if the selected row was near the bottom of a
+    ///   long list and vanished, landing back at row 0 would be just as
+    ///   disorienting as an unrelated selection jump, so the fallback
+    ///   keeps the cursor at roughly the same *place* in the list instead.
+    #[must_use]
+    pub fn with_selected_identity(mut self, prev_key: Option<ListItemKey>, prev_index: usize) -> Self {
+        self.selected = prev_key
+            .and_then(|key| self.items.iter().position(|item| item.key == Some(key)))
+            .unwrap_or_else(|| prev_index.min(self.items.len().saturating_sub(1)));
+        self
+    }
+
+    /// The currently selected row's identity key, if it has one — the
+    /// `prev_key` a caller reads back before rebuilding this widget from
+    /// scratch, to pass into the replacement's
+    /// [`Self::with_selected_identity`]. `None` if the list is empty or
+    /// the selected row was never tagged with [`ListItem::with_key`].
+    #[must_use]
+    pub fn selected_key(&self) -> Option<ListItemKey> {
+        self.items.get(self.selected).and_then(|item| item.key)
+    }
+
     /// Sets the initial focus-highlight state. Same rationale as
     /// `with_selected`: a caller that rebuilds this widget fresh per render
     /// still needs to carry forward focus state it tracks itself.
@@ -521,6 +632,10 @@ impl Widget for VerticalList {
 
     fn selected_index(&self) -> Option<usize> {
         Some(self.selected)
+    }
+
+    fn selected_key(&self) -> Option<ListItemKey> {
+        VerticalList::selected_key(self)
     }
 
     fn on_focus(&mut self, event: FocusEvent) -> Action {
@@ -879,5 +994,104 @@ mod tests {
         let mut fb = FrameBuffer565::new(64, 40);
         let area = Rectangle::new(Point::new(0, 0), Size::new(64, 40));
         list.render(area, &mut fb).unwrap();
+    }
+
+    // --- pico-link-znb.4: stable identity across rebuilds ---
+    //
+    // `VerticalList` is rebuilt from scratch on every model change (see
+    // `pico_link_core::app::build_devices_screen`); these tests exercise
+    // `with_selected_identity`/`selected_key` directly against the widget,
+    // independent of the `App`-level device model, to pin down the exact
+    // resolution rule the design's phase-2 stable-ordering requirement
+    // depends on.
+
+    fn keyed_item(key: u64, label: &str) -> ListItem {
+        ListItem::new(label).with_key(ListItemKey::from_u64(key))
+    }
+
+    #[test]
+    fn selection_follows_its_keyed_row_when_other_rows_are_inserted_around_it() {
+        // First build: A, B, C -- select A (index 0).
+        let list = VerticalList::new(vec![keyed_item(1, "A"), keyed_item(2, "B"), keyed_item(3, "C")]);
+        assert_eq!(list.selected_key(), Some(ListItemKey::from_u64(1)));
+
+        // Rebuild with two more rows inserted -- one *before* A, one
+        // between A and B -- simulating discovery results arriving that
+        // sort/land around the previously selected device. A must still
+        // be the selection, now at index 1, not index 0.
+        let rebuilt = VerticalList::new(vec![
+            keyed_item(4, "D"), // inserted before A
+            keyed_item(1, "A"),
+            keyed_item(5, "E"), // inserted between A and B
+            keyed_item(2, "B"),
+            keyed_item(3, "C"),
+        ])
+        .with_selected_identity(list.selected_key(), list.selected_index());
+
+        assert_eq!(rebuilt.selected_index(), 1, "selection must follow A to its new index");
+        assert_eq!(rebuilt.selected_key(), Some(ListItemKey::from_u64(1)));
+    }
+
+    #[test]
+    fn a_relabeled_row_with_the_same_key_keeps_the_selection_and_does_not_duplicate() {
+        // A late name arriving for an already-listed row: same key, new
+        // label, same position -- selection must resolve to it unchanged,
+        // and the rebuilt list must still have exactly as many rows (no
+        // second row appended for the "same" entity under a new label).
+        let list = VerticalList::new(vec![keyed_item(1, "(unknown device)"), keyed_item(2, "B")]);
+        assert_eq!(list.selected_index(), 0);
+
+        let rebuilt = VerticalList::new(vec![keyed_item(1, "Sony WH-1000XM5"), keyed_item(2, "B")])
+            .with_selected_identity(list.selected_key(), list.selected_index());
+
+        assert_eq!(rebuilt.selected_index(), 0, "the relabeled row must keep the selection");
+        assert_eq!(rebuilt.items.len(), 2, "a relabel must update in place, not append a second row");
+        assert_eq!(rebuilt.items[0].label, "Sony WH-1000XM5");
+    }
+
+    #[test]
+    fn the_selected_rows_key_disappearing_clamps_to_the_nearest_surviving_position_not_row_zero() {
+        // Five rows, selection on the last one (index 4, key 5) -- the
+        // "removed/timed out while selected" case. The rebuilt list drops
+        // that row (down to 3 rows) and gains no replacement for it, so
+        // no row in the new list carries key 5 -- the fallback must clamp
+        // `prev_index` (4) to the new list's bounds (index 2, the new
+        // last row), NOT reset to row 0.
+        let list = VerticalList::new(vec![
+            keyed_item(1, "A"),
+            keyed_item(2, "B"),
+            keyed_item(3, "C"),
+            keyed_item(4, "D"),
+            keyed_item(5, "E"),
+        ]);
+        let mut list = list;
+        for _ in 0..4 {
+            list.on_intent(NavIntent::Down);
+        }
+        assert_eq!(list.selected_key(), Some(ListItemKey::from_u64(5)));
+
+        let rebuilt = VerticalList::new(vec![keyed_item(1, "A"), keyed_item(2, "B"), keyed_item(3, "C")])
+            .with_selected_identity(list.selected_key(), list.selected_index());
+
+        assert_eq!(
+            rebuilt.selected_index(),
+            2,
+            "a vanished selection must clamp to the nearest surviving row, not jump back to row 0"
+        );
+    }
+
+    #[test]
+    fn with_selected_identity_falls_back_to_the_index_when_no_key_is_given() {
+        // A caller with no identity concept for this list (e.g. `None`
+        // for both the first build and any rebuild) behaves exactly like
+        // the retired `with_selected`: plain index clamping.
+        let rebuilt = VerticalList::new(items(3)).with_selected_identity(None, 5);
+        assert_eq!(rebuilt.selected_index(), 2, "out-of-range prev_index must clamp to the last row");
+    }
+
+    #[test]
+    fn selected_key_is_none_for_an_empty_list_or_an_unkeyed_row() {
+        assert_eq!(VerticalList::new(vec![]).selected_key(), None);
+        assert_eq!(VerticalList::new(items(3)).selected_key(), None, "plain ListItem::new rows carry no key");
     }
 }
