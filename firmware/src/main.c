@@ -20,11 +20,13 @@
 #include "hardware/spi.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+#include "tusb.h"
 
 #include "bt.h"
 #include "input.h"
 #include "pico_link_ui.h"
 #include "st7789.h"
+#include "usb_audio.h"
 
 // The one call in the Rust -> C direction (see pico_link_ui.h's doc comment
 // on pl_ui_panic_hook): Rust hands us a panic message on the way to
@@ -46,6 +48,21 @@ void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
 #define COLOR_BLUE 0x001F
 
 int main(void) {
+    // M3: this project now owns TinyUSB's init/task loop (see
+    // CMakeLists.txt linking `tinyusb_device`, and tusb_config.h/
+    // usb_descriptors.c/.h's module docs). stdio_init_all() below still
+    // wires up the CDC console through pico_stdio_usb's stdio_usb.c, but
+    // that code now ASSERTS tud_inited() rather than calling tusb_init()
+    // itself -- so this call has to come first, and tud_task() has to be
+    // pumped by this file's superloop from here on (pico_stdio_usb's own
+    // background low-priority-IRQ tud_task() driver is compiled out once
+    // LIB_TINYUSB_DEVICE is set).
+    tusb_rhport_init_t dev_init = {
+        .role = TUSB_ROLE_DEVICE,
+        .speed = TUSB_SPEED_AUTO,
+    };
+    tusb_init(BOARD_TUD_RHPORT, &dev_init);
+
     stdio_init_all();
 
     // Give a host-side terminal a moment to attach after CDC enumerates,
@@ -156,7 +173,18 @@ int main(void) {
     // background IRQ (pico_cyw43_arch_threadsafe_background, linked in
     // CMakeLists.txt), not in this loop.
     PlIntent intents[8];
+    uint64_t audio_report_start_us = time_us_64();
+    uint32_t audio_report_start_bytes = pl_usb_audio_pcm_bytes_total();
     while (true) {
+        // M3: service TinyUSB every iteration -- this is what used to
+        // happen for free inside pico_stdio_usb's own background IRQ
+        // before this project took over tud_init()/tud_task() (see the
+        // comment on tusb_init() above). Draining the audio OUT FIFO right
+        // after is this milestone's "consumer": no I2S/LDAC yet (that is
+        // M4), just proving PCM arrives correctly and at the right rate.
+        tud_task();
+        pl_usb_audio_task();
+
         uint64_t frame_start_us = time_us_64();
 
         size_t n = pl_link_input_poll(intents, 8);
@@ -183,6 +211,31 @@ int main(void) {
 #ifndef PL_DIAG_SKIP_BT
         pl_bt_poll_commands(ui);
 #endif
+
+        // M3 acceptance evidence: a MEASURED byte rate, not just "it
+        // enumerated". Report once a second while actually streaming --
+        // sample_rate * channels * bytes/sample is the expected rate;
+        // printing the measured one alongside lets a human (or the
+        // verification loop) compare them directly.
+        uint64_t now_us = time_us_64();
+        if (now_us - audio_report_start_us >= 1000000) {
+            uint32_t bytes_now = pl_usb_audio_pcm_bytes_total();
+            uint32_t delta_bytes = bytes_now - audio_report_start_bytes;
+            uint64_t delta_us = now_us - audio_report_start_us;
+            if (pl_usb_audio_streaming()) {
+                printf(
+                    "usb-audio: streaming rate=%luHz ch=2 bits=16 measured=%lu B/s (%lu bytes / %llums)\r\n",
+                    (unsigned long)pl_usb_audio_sample_rate(),
+                    (unsigned long)((uint64_t)delta_bytes * 1000000ULL / delta_us),
+                    (unsigned long)delta_bytes,
+                    (unsigned long long)(delta_us / 1000)
+                );
+            } else {
+                printf("usb-audio: idle (alt 0 / not streaming), total=%lu bytes\r\n", (unsigned long)bytes_now);
+            }
+            audio_report_start_us = now_us;
+            audio_report_start_bytes = bytes_now;
+        }
 
         static uint32_t frame_count = 0;
         frame_count++;

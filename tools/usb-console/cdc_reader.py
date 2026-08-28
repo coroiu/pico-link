@@ -54,11 +54,18 @@ except ImportError:
     )
     sys.exit(2)
 
-# pico-sdk's default TinyUSB stdio-over-CDC VID:PID, also used by the
-# embassy-usb spike firmware this was first verified against. Override with
-# --vid/--pid if a future firmware revision changes its descriptors.
+# M3 (bd pico-link-cz0.4): the firmware's USB device topology changed from
+# CDC-only to a TinyUSB composite (UAC2 speaker + CDC console + reset vendor
+# interface) -- interface INDEXES moved as a result (CDC is no longer
+# interface 0/1), which is exactly why find_cdc_data_interface() below
+# selects by CLASS CODE rather than a hardcoded interface number. The PID
+# also changed, from the CDC-only firmware's 0x000A to 0x000C, to mark the
+# new composite descriptor; VID is unchanged (still pico-sdk's own
+# "Raspberry Pi" allocation, since RP2350 is Raspberry Pi silicon). Override
+# with --vid/--pid (or use --list) if a future firmware revision changes
+# its descriptors again.
 DEFAULT_VID = 0x2E8A
-DEFAULT_PID = 0x000A
+DEFAULT_PID = 0x000C
 
 CDC_DATA_CLASS = 0x0A
 CDC_COMM_CLASS = 0x02

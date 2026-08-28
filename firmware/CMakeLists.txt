@@ -79,6 +79,8 @@ add_executable(pico_link
     src/st7789.c
     src/input.c
     src/bt.c
+    src/usb_descriptors.c
+    src/usb_audio.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
@@ -140,6 +142,16 @@ target_link_libraries(pico_link
     pico_btstack_classic
     pico_btstack_cyw43
     pico_cyw43_arch_threadsafe_background
+    # M3: link the MARKED tinyusb_device target (not just the
+    # tinyusb_device_unmarked that pico_enable_stdio_usb pulls in on its
+    # own) -- this is what sets the LIB_TINYUSB_DEVICE=1 compile definition
+    # that tells pico_stdio_usb "the app owns tud_init()/descriptors now",
+    # compiling OUT its own default tusb_config.h and descriptor callbacks
+    # (see firmware/src/tusb_config.h's module doc) while KEEPING its
+    # stdio_usb.c I/O glue and reset_interface.c vendor-reset driver linked
+    # in. This is pico-sdk's own documented pattern for a custom composite
+    # device that still wants the CDC console + BOOTSEL-reset behavior.
+    tinyusb_device
 )
 
 pico_add_extra_outputs(pico_link)
