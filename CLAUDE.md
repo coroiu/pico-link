@@ -123,6 +123,45 @@ For trivial changes (<10 lines) on a **feature branch**, you can bypass the full
 
 **Always commit immediately after quick-fix** to avoid orphaned uncommitted changes.
 
+## Orchestrator Autonomy
+
+**Default to acting.** Andreas has said explicitly: be more independent, trust
+yourself more. The failure mode on this project has never been an orchestrator
+that moved too fast — it has been one that stopped to ask about things it could
+have checked, or worse, believed an agent's report instead of checking.
+
+**Decide without asking** when: a bead's approach is already designed; an
+agent's claim can be verified with a command; the choice has a conventional
+right answer; the work is reversible (a branch, a worktree, a bead, a doc); or
+the question is "which of these should I do first" and one clearly unblocks
+more than the others. Say what you decided and why — do not present a menu.
+
+**Ask** only when: the decision is a product-priority call that changes what
+gets built; it is irreversible or outward-facing (a push, a force, a history
+rewrite); it needs a physical action only Andreas can take; or two readings of
+the request lead to materially different work. Bundle questions rather than
+trickling them, and always attach a recommendation.
+
+**Never ask** for permission to verify something. Run the command.
+
+**Verify before you believe.** Agents report optimistically and are sometimes
+wrong in ways that look like success:
+- "Tests pass" — run them, and read the counts. A crate with 0 tests passing
+  is not evidence.
+- "Pushed" — `git rev-parse --abbrev-ref <branch>@{u}`. A supervisor claimed a
+  push on 2026-08-28 for a branch with no upstream at all.
+- "Builds" — if C changed or a generated header moved, cross-compile the
+  firmware yourself. A green `cargo test` says nothing about the C side.
+- A counter reading zero is not a pass. On 2026-08-28 an audio test reported
+  0 packets / 0 high-water and the correct reading was "the test never ran",
+  not "no overflow occurred".
+- Read the actual test body before trusting a test name.
+
+**When an agent retracts or corrects itself, that is the system working.** Two
+agents self-corrected on 2026-08-28 (a misattributed design idea, a feature
+specced against an RTC this board does not have) and both corrections were
+right. Relay them plainly; do not re-litigate.
+
 ## Investigation Before Delegation
 
 **Lead with evidence, not assumptions.** Before delegating any work:
@@ -152,7 +191,9 @@ Every task goes through beads. No exceptions (unless user approves a quick fix).
 
 1. **Investigate deeply** — Read the relevant files (not just grep). Identify the specific line/function.
 2. **Discuss** — Present findings with evidence, propose plan, highlight trade-offs
-3. **User confirms** approach
+3. **Decide.** For routine calls, decide yourself and say what you decided and
+   why. Ask only when the readings genuinely diverge (see *Orchestrator
+   autonomy* below).
 4. **Create bead** — `bd create "Task" -d "Details"`
 5. **Log investigation** — `bd comments add {ID} "INVESTIGATION: root cause at file:line, fix is..."`
 6. **Dispatch** — `Task(subagent_type="{tech}-supervisor", prompt="BEAD_ID: {id}\n\n{brief summary}")`
@@ -443,6 +484,12 @@ applies.
   firmware.** The working toolchain is
   `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin` — point the
   firmware build at it explicitly.
+- **A fresh firmware build dir needs `PICO_SDK_PATH` exported**, or `cmake -B
+  build` dies with "SDK location was not specified" followed by the misleading
+  "could not find CMAKE_PROJECT_NAME in Cache". It is
+  `/Users/andreas/.pico-sdk/sdk/2.1.1`. The main checkout's existing `build/`
+  has it cached, so this only bites in a new worktree — which is exactly where
+  you verify a supervisor's work.
 
 
 
@@ -503,92 +550,52 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 ## Current State
 
-**2026-08-28 — the radio is up and the panel is fast: Bluetooth Classic GAP
-inquiry runs on real hardware, a full frame blits in 38.6ms (was 1.03s), and
-input is interrupt-driven off the render loop.** The display-rotation fix
-merged in the same run is **known broken** (mirrored, not rotated — see
-`pico-link-zzq` below) and still needs a real fix. This is well past the
-milestone three earlier Rust-first sessions never reached. See
-`.planning/progress.md` for detail and `.planning/decisions/` for the current
-ADRs — trust the ADRs, not older prose in this file, if they conflict.
+**2026-08-28 (afternoon) — the whole on-device UI is designed and committed, and
+the FFI it will be built on has been rebuilt to carry it.** The audio hang is
+diagnosed to two upstream TinyUSB lines but still unproven on hardware, and the
+display is un-mirrored but not yet rotated. `main` is at `6088202`.
 
-- **Epics A and B done** (unchanged from prior state — repo squash, `no_std`
-  + `alloc` core retarget to 240x240, all three run modes green).
-- **C-first ADR executed, not just decided.** In one overnight run, all merged
-  to `main`:
-  - **M1a** (`pico-link-cz0.1`, `8295a97`) — new `firmware/` CMake project on
-    pico-sdk 2.1.1, board `pimoroni_pico_plus2_w_rp2350`, CDC console,
-    unattended `picotool reboot -f -u` reflashing. No Rust yet.
-  - `pico-link-4mc` (`88661d7`) — `tools/usb-console/cdc_reader.py`, a
-    direct-USB CDC reader that never opens a `/dev/cu.*` node, is now the
-    standard capture path; `tty_fallback.py` remains a clearly-marked risky
-    fallback.
-  - `pico-link-iyf` (`915e980`) — the memory-capture hook now requires a
-    successful call, a real command position, and a bead ID that resolves.
-  - **M1b** (`pico-link-cz0.2`, `0a8c1e3`) — **the architecture proof.** Rust
-    `core` renders, C blits, on real hardware: no NOCP UsageFault, no crashes.
-    `ui-ffi` staticlib, cbindgen header, CMake-driven cargo cross-build, ST7789
-    driver, debounced input. Building it found two spec errors: the heap arena
-    was sized for 64KB but one 240x240 framebuffer alone is 115KB (raised to
-    192KB), and the target triple must be `eabi`, not `eabihf` (pico-sdk's ABI
-    is softfp).
-  - `pico-link-poi` (`ea02758`) — dead frontend boilerplate removed from
-    `.claude/`; a sweep for old-product/old-architecture terms
-    (`bitwarden`, `bhk-core`, `embassy`, `cortex_m_rt`, `owns main`, ...)
-    returned zero hits across `.claude/`.
-  - **M2** (`pico-link-cz0.3`, `4b14cc9`) — **Bluetooth radio up.** pico-sdk's
-    ready-made HCI transport over cyw43, BTstack Classic with GAP inquiry,
-    discovered devices rendered on the panel with address and RSSI,
-    webcam-verified.
-- **Follow-on hardening, merged after M2, `main` now at `52c6c53`:**
-  - `pico-link-lfm` (`9d90dd9`) — the memory-capture hook now captures EVERY
-    `LEARNED:` in a Bash call, not just the last, and fixed a pre-existing
-    watchdog defect: the bead-validation lookup ran inside a command
-    substitution, so `kill -9` left a grandchild holding the pipe (measured
-    60.09s hung -> 7.16s, inside the 10s hook timeout).
-  - `pico-link-5am` (`0c310a4`) — input debounce moved off the render loop
-    onto a 1ms pico-sdk repeating timer feeding a lock-free SPSC ring buffer
-    (cap 32, drops newest on overflow) drained by the superloop; nothing calls
-    into Rust from interrupt context. Root cause fixed: at the old ~1.03s
-    frame time an 8-sample debounce needed ~8.3s of held button, so the d-pad
-    looked dead.
-  - `pico-link-14l` (`8381c2b`) — **SPI clock 1MHz -> 75MHz** (the
-    `clk_peri`/2 hardware ceiling), full-frame blit 1.03s -> 38.6ms. Panel
-    colour also settled: an exposure-immune single-frame test (half theme
-    BACKGROUND, half pure white, compared within one photograph) shows
-    BACKGROUND as saturated blue, not washed toward white — the earlier
-    alarming absolute readings were camera exposure on an emissive panel.
-  - `pico-link-g7o` (`52c6c53`) — attempted to rotate the display via
-    `MADCTL = 0xA0`, with the input pin-to-intent table rotated 180 degrees to
-    match. **THIS IS WRONG AND IS ON `main`.** Andreas inspected the physical
-    board: the content is MIRRORED, not rotated. The orchestrator accepted it
-    from a low-resolution webcam frame, where mirrored text and 180-rotated
-    text look alike. Tracked in `pico-link-zzq`. Known good: `MADCTL = 0x60`
-    gives a correct upright image with the cable exiting LEFT. **Judge screen
-    orientation with an asymmetric CORNER TEST PATTERN** (distinct colours in
-    three corners), never by reading small text in a photo — a single frame
-    then separates rotation from mirroring unambiguously.
-- **In flight, not done:** `pico-link-cz0.4` (M3, TinyUSB composite sound
-  card, branch `bd-pico-link-cz0.4`, unmerged). macOS enumerates it
-  driverlessly as a sound card and its 227-byte config descriptor was
-  verified byte-by-byte off the live device, but the firmware hangs when
-  audio streams. The leading hypothesis was `tud_task()` starved by the
-  then-1-second blit; the superloop is now 38.6ms, so the next action is to
-  rebase onto `main` and retry streaming before any new diagnosis.
-- **Still open:** `pico-link-zzq` (**P1** — the merged rotation fix is wrong:
-  `MADCTL = 0xA0` mirrors the image instead of rotating it; known good is
-  `MADCTL = 0x60`, upright with the cable exiting LEFT, rotated 180 from
-  there; judge with an asymmetric corner test pattern, never a photo of
-  small text), `pico-link-d7k` (d-pad-select -> `PL_CMD_CONNECT` and the
-  180-degree input remap both need one human press to verify — no automated
-  input path on the real target, a standing gap in the three-run-modes
-  story), `pico-link-gap` (panic recorder), `pico-link-hfc` (P4, remaining
-  `.claude` boilerplate).
-- **Two environment facts, still current:** build with
-  `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` (pico-sdk's `stdio_usb` gates
-  console output on DTR, which the direct-USB reader can't assert on macOS);
-  the Homebrew `arm-none-eabi-gcc` lacks newlib specs, use
-  `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin`.
-- **Next:** fix `pico-link-zzq` (P1, display mirrored on `main`), and rebase
-  M3 (`pico-link-cz0.4`) onto `main` to retry audio streaming now that the
-  superloop is 38.6ms instead of ~1s.
+Read `.planning/design/2026-08-28-on-device-ui.md` before touching UI work — it
+is the design of record and supersedes the bead comments it was assembled from.
+Its section 21 is a three-tier enabling work list whose **Tier 1 (E1-E13) is
+exactly the MVP**.
+
+- **Design settled.** Ada produced a capability inventory (`pico-link-aii.1`),
+  Uma the design (`pico-link-aii.2`), reconciled against Andreas's one-page
+  sketch. His four rulings: hero codec word (not a label-value list); X rather
+  than B for manage-connected-device (B stays universally Back, because
+  press-edge-only input means no long-press, so `B, B` is the only escape);
+  the stereo level meter commissioned; the button rail built.
+- **Button geometry answered:** buttons are a **column on the right, A/B/X/Y top
+  to bottom, d-pad on the left**. Still parameterised, because fixing the
+  rotation flips both edges.
+- **`pico-link-a67` DONE, unmerged, unreviewed** (branch `bd-pico-link-a67`,
+  `1c612b6`). One `PlEvent` union in, one `PlCommand` out, versioned; `App`
+  holds a `BtModel`; `Navigator::replace_root` fixes the stack-reset bug;
+  `ConnectFailureReason` is representable with the two structurally-impossible
+  causes marked non-retryable; the clock is wired through `pl_ui_tick`.
+  Verified independently by the orchestrator: **142 tests green, firmware
+  cross-compiles to an 828KB .uf2, no new screens.**
+- **Audio: diagnosed, not fixed.** Ada traced the M3 hang to two upstream lines
+  — `audio_device.c:759-762` returns before the ISO-OUT re-arm on a full FIFO,
+  so **one overflow kills the endpoint permanently**; and `usbd.c:356-360`
+  silently drops queued events under `CFG_TUSB_DEBUG 0`, so a dropped SETUP
+  leaves EP0 half-open and the board goes deaf at raw USB level. That is the
+  wedge that has needed physical unplugs all session. `pico-link-tfj`
+  (branch `bd-pico-link-tfj`, `ec9a4a8`) implements the fix — 1ms timer to a
+  0xC0 user IRQ, `pl_log` serialising every console write, instrumentation —
+  and **its timing claim is verified on hardware (worst worker interval ~1.03ms,
+  well under the 2ms bar), but the fix itself is UNPROVEN** because macOS never
+  entered the streaming alt-setting. See `pico-link-icb`.
+- **Display: half-fixed.** `bd-pico-link-zzq` at `8dea0f5` reverts MADCTL to
+  `0x60`, which un-mirrors the panel. It is upright with the cable exiting
+  **left**; the requirement is cable exiting **right**. Not merged.
+- **Open beads that matter:** `pico-link-icb` (P1, macOS never starts streaming
+  — blocks proving the audio fix), `pico-link-a67` (done, needs review+merge),
+  `pico-link-zzq` (P1, rotation half-done), `pico-link-6o2` (P1, `bt.c:102`
+  calls Rust from IRQ context — a latent memory-safety bug found incidentally),
+  `pico-link-gap` (P1, panic recorder — promoted from speculative after a bare
+  `*** PANIC ***` cost a physical power-cycle and yielded one word),
+  `pico-link-e7n`, `pico-link-yz6`, `pico-link-d7k`, `pico-link-hfc`.
+- **Next:** dispatch a **code-reviewer on `pico-link-a67`** (it is the FFI
+  surface every future screen sits on), then **`pico-link-icb`** on hardware.
