@@ -33,37 +33,54 @@ static const pl_input_pin_t PINS[PL_INPUT_PIN_COUNT] = {
 // (rock solid pressed) -- which at the ~1ms sample rate means the input
 // must have been stable for ~8ms before it's trusted, filtering out
 // mechanical switch bounce without a hand-tuned single threshold.
+//
+// Touched ONLY from sample_and_debounce_callback, which pico-sdk's default
+// alarm pool runs in hardware IRQ context on core 0 -- never read or
+// written from the superloop, so it needs no locking of its own.
 static uint8_t s_history[PL_INPUT_PIN_COUNT];
 // Whether each pin's last *debounced* (not raw) state was "pressed" --
 // this is what edge detection compares against, so a press event fires
-// exactly once per press, not once per still-bouncing sample.
+// exactly once per press, not once per still-bouncing sample. Same
+// IRQ-only ownership as s_history above.
 static bool s_debounced_pressed[PL_INPUT_PIN_COUNT];
 
-static absolute_time_t s_next_sample_time;
+static struct repeating_timer s_sample_timer;
 
-void pl_link_input_init(void) {
-    for (size_t i = 0; i < PL_INPUT_PIN_COUNT; i++) {
-        uint8_t pin = PINS[i].gpio;
-        gpio_init(pin);
-        gpio_set_dir(pin, GPIO_IN);
-        // Pull-UP, not pull-down: RP2350 erratum E9 (see CLAUDE.md).
-        gpio_pull_up(pin);
-        s_history[i] = 0xFF; // start "confidently released"
-        s_debounced_pressed[i] = false;
-    }
-    s_next_sample_time = get_absolute_time();
-}
+// Single-producer/single-consumer ring buffer decoupling the IRQ-context
+// sampler (producer, writes s_ring_head) from the superloop drain (consumer,
+// writes s_ring_tail) -- see pl_link_input_poll below. Each side owns
+// exactly one index, so plain volatile uint8_t reads/writes are sufficient:
+// there is no read-modify-write race, and RP2350 loads/stores of a single
+// byte are inherently atomic. No mutex, no IRQ masking, no calls into Rust
+// from IRQ context -- the FFI direction rule (C calls Rust, never the
+// reverse) stays intact because pl_ui_input is only ever called from
+// main.c's superloop, which drains this buffer via pl_link_input_poll.
+//
+// Capacity: 32 is generous headroom over anything a human can produce --
+// even mashing every one of the 9 pins simultaneously only yields at most 9
+// press-edge events per debounce-settled transition, and a full second of
+// superloop stall (today's ~1.03s worst case at 1MHz SPI, pico-link-14l)
+// would need over three such simultaneous all-button mashes to overflow it.
+#define PL_INPUT_RING_CAPACITY 32
 
-size_t pl_link_input_poll(PlIntent *out, size_t max) {
-    absolute_time_t now = get_absolute_time();
-    if (absolute_time_diff_us(now, s_next_sample_time) > 0) {
-        // Not time to sample yet -- self-paced, see the header's doc
-        // comment.
-        return 0;
-    }
-    s_next_sample_time = delayed_by_us(now, PL_INPUT_SAMPLE_INTERVAL_US);
+static PlIntent s_ring[PL_INPUT_RING_CAPACITY];
+static volatile uint8_t s_ring_head; // producer-owned (IRQ)
+static volatile uint8_t s_ring_tail; // consumer-owned (superloop)
+// Diagnostics only: counts intents dropped because the ring was full when
+// the sampler tried to push. Never drained/reset; a real bump here across a
+// bring-up session is a bug to chase (either the superloop stopped calling
+// pl_link_input_poll, or PL_INPUT_RING_CAPACITY genuinely needs to grow),
+// not something silently swallowed.
+static volatile uint32_t s_ring_drop_count;
 
-    size_t emitted = 0;
+// Called from a hardware alarm IRQ every PL_INPUT_SAMPLE_INTERVAL_US
+// (pico-sdk's default alarm pool), decoupling debounce timing from the
+// superloop's frame rate -- see pico-link-5am. MUST NOT call into Rust:
+// pl_ui_t is not Sync and every call into it must come from the superloop
+// on core 0, so this callback only ever touches the C-side debounce state
+// and ring buffer above.
+static bool sample_and_debounce_callback(struct repeating_timer *t) {
+    (void)t;
     for (size_t i = 0; i < PL_INPUT_PIN_COUNT; i++) {
         bool raw_high = gpio_get(PINS[i].gpio) != 0;
         s_history[i] = (uint8_t)((s_history[i] << 1) | (raw_high ? 1 : 0));
@@ -79,12 +96,62 @@ size_t pl_link_input_poll(PlIntent *out, size_t max) {
             continue;
         }
 
-        if (now_pressed && !s_debounced_pressed[i] && emitted < max) {
-            out[emitted].tag = PINS[i].tag;
-            out[emitted].jump_by = 0; // unused for every tag this module emits
-            emitted++;
+        if (now_pressed && !s_debounced_pressed[i]) {
+            uint8_t head = s_ring_head;
+            uint8_t next_head = (uint8_t)((head + 1) % PL_INPUT_RING_CAPACITY);
+            if (next_head == s_ring_tail) {
+                // Ring full -- the superloop hasn't drained in a while.
+                // Drop this intent rather than overwrite an undrained one
+                // (overwriting would corrupt the consumer's view instead of
+                // just losing one event) and count it so the drop is
+                // visible instead of silent.
+                s_ring_drop_count++;
+            } else {
+                s_ring[head].tag = PINS[i].tag;
+                s_ring[head].jump_by = 0; // unused for every tag this module emits
+                s_ring_head = next_head;
+            }
         }
         s_debounced_pressed[i] = now_pressed;
+    }
+    return true; // keep repeating
+}
+
+void pl_link_input_init(void) {
+    for (size_t i = 0; i < PL_INPUT_PIN_COUNT; i++) {
+        uint8_t pin = PINS[i].gpio;
+        gpio_init(pin);
+        gpio_set_dir(pin, GPIO_IN);
+        // Pull-UP, not pull-down: RP2350 erratum E9 (see CLAUDE.md).
+        gpio_pull_up(pin);
+        s_history[i] = 0xFF; // start "confidently released"
+        s_debounced_pressed[i] = false;
+    }
+    s_ring_head = 0;
+    s_ring_tail = 0;
+    s_ring_drop_count = 0;
+
+    // Negative interval: fire every PL_INPUT_SAMPLE_INTERVAL_US measured
+    // from the previous scheduled time, not from when the callback
+    // finished -- keeps the sample rate exact regardless of how long the
+    // callback itself takes (pico-sdk's add_repeating_timer_us convention).
+    add_repeating_timer_us(-PL_INPUT_SAMPLE_INTERVAL_US, sample_and_debounce_callback, NULL, &s_sample_timer);
+}
+
+// Drains debounced press-edge events already queued by the timer IRQ --
+// does no sampling itself, so it's cheap and safe to call every superloop
+// iteration regardless of the loop's own rate. Writes at most `max` events
+// into `out` and returns how many were written.
+size_t pl_link_input_poll(PlIntent *out, size_t max) {
+    size_t emitted = 0;
+    while (emitted < max) {
+        uint8_t tail = s_ring_tail;
+        if (tail == s_ring_head) {
+            break; // caught up
+        }
+        out[emitted] = s_ring[tail];
+        s_ring_tail = (uint8_t)((tail + 1) % PL_INPUT_RING_CAPACITY);
+        emitted++;
     }
     return emitted;
 }

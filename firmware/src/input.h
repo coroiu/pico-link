@@ -28,16 +28,26 @@
 #define PL_INPUT_PIN_X 19
 #define PL_INPUT_PIN_Y 21
 
-// Configures all 9 GPIOs as inputs with internal pull-ups.
+// Configures all 9 GPIOs as inputs with internal pull-ups and starts a
+// pico-sdk repeating timer that samples and debounces them every ~1ms in
+// hardware IRQ context, independent of the caller's own loop rate (see
+// pico-link-5am -- sampling used to be driven from the superloop, which
+// meant the debounce needed ~8x the *render* frame time to register a
+// press). The IRQ callback never touches Rust; it only pushes debounced
+// press-edge events into an internal ring buffer for pl_link_input_poll to
+// drain.
 void pl_link_input_init(void);
 
-// Self-paced: internally tracks the last sample time and is a no-op unless
-// at least ~1ms has elapsed since the previous call, so it is safe (and
-// intended) to call this every superloop iteration regardless of the
-// loop's own rate. Writes at most `max` newly edge-triggered press events
-// into `out` (one entry per pin that debounced from released to pressed
-// this sample) and returns how many were written -- 0 most calls, since
-// presses are comparatively rare events.
+// Drains already-debounced press-edge events queued by the background
+// timer -- does no sampling itself, so it is cheap and safe (and intended)
+// to call every superloop iteration regardless of the loop's own rate.
+// Writes at most `max` newly edge-triggered press events into `out` (one
+// entry per pin that debounced from released to pressed) and returns how
+// many were written -- 0 most calls, since presses are comparatively rare
+// events. If the internal ring buffer overflows (the superloop hasn't
+// drained fast enough for a burst of presses), the oldest-unseen events
+// already queued are preserved and the newest overflowing ones are dropped
+// with a diagnostic counter bumped internally -- see input.c.
 size_t pl_link_input_poll(PlIntent *out, size_t max);
 
 #endif // PICO_LINK_INPUT_H
