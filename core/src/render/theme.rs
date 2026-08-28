@@ -135,6 +135,37 @@ pub mod font {
         FontRenderer::new::<fonts::u8g2_font_helvB08_tf>().with_ignore_unknown_chars(true)
     }
 
+    /// The Home status face's hero codec word (design section 6: "LDAC",
+    /// "AAC", "SBC", ...) — the design's central bet that *"is it actually
+    /// LDAC, or did it quietly fall back"* is answerable at a glance across
+    /// a desk (~30-50cm), which `helvB12` (the previous ceiling in this
+    /// module, via [`name`]) cannot do at that distance.
+    ///
+    /// Face: `u8g2_font_helvB24_tf` — bold Helvetica, 24px nominal, measured
+    /// 25px cap height for an all-caps codec word (via
+    /// `cargo run -p pico-link-core --example hero_font_probe`, checked
+    /// against `get_rendered_dimensions_aligned`'s bounding box for "LDAC",
+    /// "SBC", "AAC"), inside the ~20-26px band the design specifies.
+    /// `helvB18_tf` (the next face down) was rejected: at the same viewing
+    /// distance driving the ~20-26px requirement, 18px reads closer to
+    /// `name()`'s weight than to a hero. The `_tf` glyph set ("full") covers
+    /// ASCII digits as well as uppercase letters, so a caller pairing this
+    /// with a bitrate figure (section 6's "909 kbps" line) or any future
+    /// all-digits use is covered by this face directly, though the current
+    /// design routes the bitrate line through [`value`], not this accessor.
+    ///
+    /// Flash cost: `u8g2_font_helvB24_tf.u8g2font`'s glyph table is 6566
+    /// bytes (vs. 3275 bytes for `helvB12_tf`, already linked in via
+    /// [`name`]) — a new font entirely, so this is +6566 bytes of flash
+    /// (measured against the crate's on-disk font blob; the linked
+    /// `.rodata` cost tracks that figure closely since `u8g2-fonts` embeds
+    /// each font as one static byte table with no per-glyph code
+    /// generation).
+    #[must_use]
+    pub const fn hero() -> FontRenderer {
+        FontRenderer::new::<fonts::u8g2_font_helvB24_tf>().with_ignore_unknown_chars(true)
+    }
+
     /// The hint bar's control-legend text. One size down from
     /// `username`/the design-review mockup's `helvR10` (Andreas's
     /// feedback: the hint bar reads as decoration, not primary content,
