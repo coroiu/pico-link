@@ -6,6 +6,8 @@
 
 #include "st7789.h"
 
+#include <stdio.h>
+
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
@@ -62,7 +64,8 @@ void st7789_init(spi_inst_t *spi) {
     gpio_set_function(ST7789_PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(ST7789_PIN_MOSI, GPIO_FUNC_SPI);
 
-    spi_init(s_spi, ST7789_INIT_BAUDRATE_HZ);
+    uint actual_baud = spi_init(s_spi, ST7789_INIT_BAUDRATE_HZ);
+    printf("st7789: requested %d Hz, actual %u Hz\r\n", ST7789_INIT_BAUDRATE_HZ, actual_baud);
     spi_set_format(s_spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
     s_dma_chan = dma_claim_unused_channel(true);
