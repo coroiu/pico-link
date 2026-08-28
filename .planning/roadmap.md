@@ -1,8 +1,9 @@
 # Pico Link — Roadmap
 
-**Last updated:** 2026-08-27 (firmware architecture flipped C-first — see
-`decisions/2026-08-27-c-first-pico-sdk-owns-main.md`; project founded
-2026-08-26, pivoted from a Bitwarden hardware-key prototype)
+**Last updated:** 2026-08-28 (C-first migration executed, gate-2 radio
+bring-up achieved on real hardware — see `decisions/2026-08-27-c-first-pico-sdk-owns-main.md`
+and `.planning/progress.md`; project founded 2026-08-26, pivoted from a
+Bitwarden hardware-key prototype)
 
 ## Vision
 
@@ -110,9 +111,10 @@ pico-sdk owns `main()` and `runtime_init`; `core/` is a `no_std` + `alloc`
 staticlib called from C over a narrow FFI for rendering only. **The
 fork/no-fork question is decided: Route B, we write our own C against
 pico-sdk, USBPods stays read-only reference** (same-day update to the ADR
-above). The detailed migration plan is pending from the architect and will
-land as beads — this milestone's sub-tasks below predate the flip and need
-re-cutting once that design lands.
+above).
+
+**The C-first migration executed overnight, 2026-08-27 into 2026-08-28, all
+merged to `main`.** Detail in `.planning/progress.md`.
 - **C1** ~~Fork USBPods~~ **DONE 2026-08-26.** Stock USBPods flashed on the
   Pimoroni Pico Plus 2 W — the real target, not the Pico 2 W reference the
   roadmap assumed — and LDAC worked. Partially discharges C2 as well.
@@ -123,12 +125,19 @@ re-cutting once that design lands.
   sessions of gate-2 bring-up against it found a HardFault (CPACR never
   enabled) and a hang in `cyw43_spi_init`, both traceable to pico-sdk's
   `runtime_init` never running. Superseded by the C-first ADR.
-- **C2–C5** (board config, PSRAM framebuffer + ST7789 driver, joystick/button
-  input) — the substance of these tasks is unchanged, but their language and
-  FFI direction invert under C-first: C owns board/peripheral bring-up
-  directly via pico-sdk, and Rust's role is the render/input logic behind the
-  FFI seam rather than owning the drivers. Re-cut as beads once the migration
-  design lands.
+- **M1a DONE** (`pico-link-cz0.1`) — new `firmware/` CMake project on pico-sdk
+  2.1.1, board `pimoroni_pico_plus2_w_rp2350`, CDC console, unattended
+  `picotool reboot -f -u` reflashing.
+- **M1b DONE** (`pico-link-cz0.2`) — the architecture proof: Rust `core`
+  renders, C blits, over the FFI seam, on real hardware, no crashes.
+- **M2 DONE, gate-2 achieved** (`pico-link-cz0.3`) — Bluetooth radio up:
+  BTstack Classic GAP inquiry over pico-sdk's cyw43 HCI transport, discovered
+  devices rendered on the panel with address and RSSI, webcam-verified. This
+  is the milestone three earlier Rust-first sessions never reached.
+- **M3 IN FLIGHT** (`pico-link-cz0.4`) — TinyUSB composite sound card.
+  Remaining C2–C5-equivalent scope (PSRAM framebuffer bandwidth at full SPI
+  speed, joystick/button input exercised on real hardware) tracked as beads,
+  not restated here.
 
 ### D — UI integration (the MVP)
 - **D1** The `extern "C"` seam. Rust owns SPI, DMA and the framebuffer directly
@@ -168,8 +177,10 @@ C1 → C2 → C3 → C4, C5                    (hardware)
 
 ## Live risks
 
-- **PSRAM framebuffer bandwidth** (C4) — the assumption everything visual rests
-  on. Prove it first.
+- **PSRAM framebuffer bandwidth / panel colour accuracy** (`pico-link-14l`) —
+  the assumption everything visual rests on is still only partly proven: the
+  SPI clock is held at a deliberately conservative 1MHz, making a full 240x240
+  blit take ~1.008s, and absolute panel colour has not been verified.
 - **RM2 board config** (C2) — mitigated by keeping a stock Pico 2 W as reference.
 - ~~**Rust/pico-sdk linking** (C3)~~ — RETIRED as a linking question, then
   RESURFACED as a running question. The C-spike linked BTstack and TinyUSB into
@@ -187,9 +198,17 @@ C1 → C2 → C3 → C4, C5                    (hardware)
   genuine engineering. Mitigated by keeping TinyUSB's UAC2 in C rather than
   writing a Rust one, so the clock-feedback loop is proven code. Do not rewrite
   that loop until the dongle works.
-- **Gate-2 radio bring-up not yet achieved.** Attempted three times against the
-  Rust-owns-`main()` architecture; not once against C-first. This is now the
-  primary open risk on the critical path to the MVP.
+- ~~**Gate-2 radio bring-up not yet achieved.**~~ — RETIRED, ACHIEVED
+  2026-08-27 into 2026-08-28 (`pico-link-cz0.3`, merged `4b14cc9`). BTstack
+  Classic GAP inquiry runs on real hardware over pico-sdk's cyw43 HCI
+  transport, against the C-first architecture, webcam-verified.
+- **No automated input path on the real target** (`pico-link-d7k`) — the
+  d-pad-select -> `PL_CMD_CONNECT` path is implemented but has never been
+  exercised on real hardware, because there is no way for an agent to drive
+  buttons on the physical device. A standing gap in the three-run-modes
+  testability story.
+- **TinyUSB composite sound card** (`pico-link-cz0.4`, M3, in flight) — the
+  next milestone gating the MVP.
 
 ## Settled decisions
 

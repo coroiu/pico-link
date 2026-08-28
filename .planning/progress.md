@@ -1,18 +1,22 @@
 # Progress
 
-**Last updated:** 2026-08-27
+**Last updated:** 2026-08-28
 
 ## Where things stand
 
 Epics A and B are **complete**. All host-side work is done. Firmware
-architecture flipped C-first on 2026-08-27: pico-sdk owns `main()` and
-`runtime_init`; `core/` becomes a `no_std` + `alloc` staticlib called from C
-over a narrow FFI. See
+architecture is C-first (flipped 2026-08-27): pico-sdk owns `main()` and
+`runtime_init`; `core/` is a `no_std` + `alloc` staticlib called from C over a
+narrow FFI. See
 [ADR 2026-08-27](decisions/2026-08-27-c-first-pico-sdk-owns-main.md), which
-supersedes the 2026-08-26 "Rust owns the binary" ADR. Gate-2 radio bring-up has
-been attempted three times against the now-superseded architecture and **not
-yet achieved** — that is the next real piece of work, against the new
-architecture.
+supersedes the 2026-08-26 "Rust owns the binary" ADR.
+
+**Gate-2 radio bring-up is ACHIEVED**, against the C-first architecture, in an
+overnight run merged 2026-08-27 into 2026-08-28 (`pico-link-cz0.3`, merged
+`4b14cc9`): BTstack Classic GAP inquiry runs over pico-sdk's cyw43 HCI
+transport, discovered devices render on the panel with address and RSSI,
+webcam-verified. This is the milestone three earlier Rust-first sessions never
+reached. See "Session 2026-08-27 into 2026-08-28" below for the full run.
 
 ### Epic A — repo reset ✅
 Repo squashed to a single orphan initial commit and pushed to
@@ -43,7 +47,7 @@ must move with it.
 - **B4** All three run modes verified at 240x240 — headless, windowed (live
   `screencapture`, not just "it launched"), and `--dump-png`. 137 tests green.
 
-### Epic C — firmware, in progress; architecture flipped 2026-08-27
+### Epic C — firmware, in progress; C-first, gate-2 achieved
 **The architecture decision changed twice.** First
 [ADR 2026-08-26](decisions/2026-08-26-rust-owns-the-binary-no-usbpods-fork.md):
 Rust owns the binary, BTstack/libldac/TinyUSB link in as C static libraries.
@@ -86,15 +90,35 @@ roughly 1.45M agent tokens the radio was never brought up:
   applies (not its default non-commercial licence) because RP2350 is
   Raspberry Pi Ltd silicon — commercially fine while Pico Link stays RP-only.
 
+**M1a, M1b and M2 of the C-first migration are DONE**, all merged to `main` in
+an overnight run 2026-08-27 into 2026-08-28. See "Session 2026-08-27 into
+2026-08-28" below for the full account.
+- **M1a done** (`pico-link-cz0.1`, `8295a97`) — new `firmware/` CMake project
+  on pico-sdk 2.1.1, board `pimoroni_pico_plus2_w_rp2350`, CDC console,
+  unattended `picotool reboot -f -u` reflashing. No Rust yet.
+- **M1b done** (`pico-link-cz0.2`, `0a8c1e3`) — the architecture proof: Rust
+  `core` renders, C blits, on real hardware, no crashes. `ui-ffi` staticlib,
+  cbindgen header, CMake-driven cargo cross-build, ST7789 driver, debounced
+  input.
+- **M2 done** (`pico-link-cz0.3`, `4b14cc9`) — **gate-2 radio bring-up
+  achieved**, against the C-first architecture. BTstack Classic GAP inquiry
+  over pico-sdk's cyw43 HCI transport; discovered devices render on the panel
+  with address and RSSI; webcam-verified. This is the milestone three earlier
+  Rust-first sessions never reached.
+
 ## Next step
 
-The C-first migration. Detailed design is pending from the architect (Ada) and
-will land as beads — do not invent implementation steps ahead of that design.
-The shape is known from the ADR: pico-sdk's `main()`/`runtime_init` boots the
-device; BTstack's run loop becomes the scheduler; `core/` compiles as a
-`no_std` + `alloc` staticlib; the display seam is Rust-renders-framebuffer /
-C-blits-over-SPI. Gate-2 radio bring-up (cyw43 BR/EDR) is the acceptance bar,
-now to be attempted against this architecture instead of the superseded one.
+**M3 — TinyUSB composite sound card** (`pico-link-cz0.4`), in flight now.
+M1a/M1b/M2 of the C-first migration are done: pico-sdk boots the device,
+`core/` renders behind the FFI seam, C blits over SPI, BTstack's run loop is
+the scheduler, and BR/EDR GAP inquiry works on real silicon. M3 is the next
+milestone gating the MVP.
+
+Also open, not blocking M3: `pico-link-14l` (panel colour accuracy unproven;
+SPI held at a conservative 1MHz, ~1.008s per full 240x240 blit) and
+`pico-link-d7k` (the d-pad-select -> `PL_CMD_CONNECT` path is implemented but
+never exercised on real hardware — there is no automated input path on the
+real target, a standing gap in the three-run-modes testability story).
 
 **The upstream-relationship question (fork vs. no-fork) is decided, same day.**
 Ada analysed it, the orchestrator accepted Route B: we write our own C against
@@ -158,36 +182,103 @@ the failures observable at all) and are now retired along with the rest of
 the Rust-owns-`main()` boot path; `core/`, `emulator/`, and the hardware
 workflow gotchas below are unaffected.
 
+## Session 2026-08-27 into 2026-08-28 — C-first migration executed, gate 2 achieved
+
+An overnight run took the C-first ADR from decision to working silicon. All
+merged to `main` (now at `4b14cc9`) and pushed.
+
+**Merged, in order:**
+1. `pico-link-cz0.1` (M1a), `8295a97` — new `firmware/` CMake project on
+   pico-sdk 2.1.1, board `pimoroni_pico_plus2_w_rp2350`, CDC console,
+   unattended `picotool reboot -f -u` reflashing. No Rust.
+2. `pico-link-4mc`, `88661d7` — `tools/usb-console/cdc_reader.py`, a
+   direct-USB CDC reader that never opens a `/dev/cu.*` node, now the standard
+   capture path. `tty_fallback.py` remains a clearly-marked risky fallback.
+3. `pico-link-iyf`, `915e980` — the memory-capture hook now requires a
+   successful call, a real command position, and a bead ID that resolves.
+4. `pico-link-cz0.2` (M1b), `0a8c1e3` — **the architecture proof.** Rust
+   `core` renders, C blits, on real hardware. No NOCP UsageFault, no crashes.
+   `ui-ffi` staticlib, cbindgen header, CMake-driven cargo cross-build, ST7789
+   driver, debounced input. `FrameBuffer565` now backed by `Vec<u16>`; `run.rs`
+   refactored into `Runner`/`step()`. Two design corrections found by building
+   it: the specified 64KB heap arena is smaller than one 115KB framebuffer
+   (raised to 192KB), and the target triple is `eabi`, not `eabihf`, to match
+   pico-sdk's softfp ABI.
+5. `pico-link-poi`, `ea02758` — dead frontend boilerplate removed from
+   `.claude/`. Also verified a negative worth recording: sweeping `.claude/`
+   for `bitwarden`, `bhk-core`, `hardware key`, `rust owns`, `owns main`,
+   `embassy`, `cortex_m_rt` returns zero hits — no agent definition still
+   describes the old product or the abandoned Rust-first architecture.
+6. `pico-link-cz0.3` (M2), `4b14cc9` — **Bluetooth radio up.** pico-sdk's
+   ready-made HCI transport over cyw43, BTstack Classic with GAP inquiry,
+   discovered devices rendered on the panel with address and RSSI,
+   webcam-verified. This is the milestone three earlier Rust-first sessions
+   never reached.
+
+**Two hard-won environment facts from this run:**
+- pico-sdk's `stdio_usb` gates ALL console output on DTR
+  (`stdio_usb_connected()` returns `tud_cdc_connected()`), and the direct-USB
+  reader cannot assert DTR on macOS — a healthy board therefore reads as
+  permanently silent. Fix: build with
+  `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` (DTR, not DTE). This cost a
+  supervisor a whole hang hunt; see CLAUDE.md's "Environment & workflow
+  gotchas" for the full account.
+- The Homebrew `arm-none-eabi-gcc` lacks newlib specs. The working toolchain
+  is at `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin`.
+
+**Still open, not done:** `pico-link-cz0.4` (M3, TinyUSB composite sound card)
+is in flight now. `pico-link-14l` — absolute panel colour is not proven and
+the SPI clock is still at a deliberately conservative 1MHz, making a full
+240x240 blit take ~1.008s. `pico-link-d7k` — the d-pad-select to
+`PL_CMD_CONNECT` path is implemented but never exercised on real hardware,
+because there is no automated input path on the real target — a standing gap
+in the three-run-modes testability story. `pico-link-lfm` (memory-capture hook
+keeps only the last LEARNED per Bash call) is in flight.
+
 ## Open beads
 
-- `pico-link-8v3.2.4` — cyw43 BR/EDR bring-up; attempted against the
-  now-superseded Rust-owns-`main()` architecture, root-caused to a missing
-  `runtime_init`. Re-cut against C-first once the architect's migration design
-  lands.
-- `pico-link-4mc` — replace the CDC tty read path with direct USB (SAFETY, P1)
-- `pico-link-gap` — panic recorder: survive the reboot, report on next boot
-- `pico-link-46w` — enforce core affinity on the IRQ depth counter
-- `pico-link-1rp` — watchdog is blind to a core1 lockup; core0 keeps feeding it
-- `pico-link-8v3.2.2` — TinyUSB CDC route, DEFERRED not cancelled; the
-  embassy-usb console replaced it for now and must move to TinyUSB when UAC2
-  audio takes the USB peripheral
-- `pico-link-poi` — dead `.claude` template files missed by A7
-- `pico-link-iyf` — memory-capture hook fires on any Bash text mentioning it
+- `pico-link-cz0.4` — M3, TinyUSB composite sound card. In flight.
+- `pico-link-14l` — panel colour accuracy unproven; SPI clock conservatively
+  at 1MHz (~1.008s per full blit)
+- `pico-link-d7k` — d-pad-select -> `PL_CMD_CONNECT` never exercised on real
+  hardware; no automated input path on the real target
+- `pico-link-lfm` — memory-capture hook keeps only the last LEARNED per Bash
+  call. In flight.
+- `pico-link-gap` — panic recorder: survive the reboot, report on next boot.
+  Filed against the retired Rust-owns-`main()` `hal_shim`; applicability under
+  the C-first `firmware/` project is unverified this session, not re-checked.
+- `pico-link-46w` — enforce core affinity on the IRQ depth counter. Same
+  caveat: filed against the retired `hal_shim`, not re-checked against C-first.
+- `pico-link-1rp` — watchdog is blind to a core1 lockup; core0 keeps feeding
+  it. Same caveat: filed against the retired `hal_shim`, not re-checked
+  against C-first.
 
 ## Hardware workflow — read this before touching the board
 
-Earned expensively on 2026-08-27. All of it is non-obvious and all of it cost
-real time.
+Earned expensively on 2026-08-27, against the now-retired embassy-usb /
+Rust-owns-`main()` firmware-spike. The build/tooling facts below still apply
+to the C-first `firmware/` project; the CDC-specific one is superseded by the
+2026-08-27-into-08-28 entry right after it.
 
 - **`PICO_SDK_PATH=/Users/andreas/pico-sdk` is REQUIRED for every firmware build
   and is NOT set in the environment.** The build fails immediately without it.
+- **The Homebrew `arm-none-eabi-gcc` lacks newlib specs and cannot build the
+  firmware.** The working toolchain is
+  `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin`.
 - **`picotool uf2 convert` needs `-t elf`.** Without it picotool silently writes
   a ZERO-BYTE .uf2 and reports success. You then flash nothing and debug a
   phantom.
-- **Reading the CDC console needs DTR asserted explicitly.** embassy-usb's
-  `wait_connection()` blocks until DTR, and a plain `cat /dev/cu.usbmodem*` on
-  macOS does not reliably assert it — you get an open port and zero bytes, which
-  looks exactly like dead firmware. Open the fd and `ioctl(TIOCMBIS, TIOCM_DTR)`.
+- **(C-first `firmware/`, 2026-08-28) pico-sdk's `stdio_usb` gates ALL console
+  output on DTR**, and the direct-USB reader (`cdc_reader.py`) cannot assert
+  DTR on macOS — a healthy board reads as permanently silent, indistinguishable
+  from a hang. Build with `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` (DTR, not
+  DTE) so `stdio_usb_connected()` falls back to `tud_ready()`. Cost a
+  supervisor a whole hang hunt; keep the flag set in `firmware/CMakeLists.txt`.
+- **(Retired embassy-usb architecture) reading the CDC console needed DTR
+  asserted explicitly.** embassy-usb's `wait_connection()` blocked until DTR,
+  and a plain `cat /dev/cu.usbmodem*` on macOS did not reliably assert it. This
+  applied to the Rust-owns-`main()` firmware-spike, not the current
+  `firmware/` project.
 - **`timeout` does not exist on this Mac.** No coreutils.
 - **CDC over the macOS tty path can KERNEL PANIC this machine** (see CLAUDE.md
   for the full rule). Prefer picotool/libusb; one tty open per capture; never
@@ -201,10 +292,11 @@ real time.
 - **Nothing added to CORE0's executor may block for >8s.** A hardware watchdog is
   armed for 8s and fed every 3s from core0. Core1 may block freely — that is
   where the risky code belongs.
-- **Dev affordances currently in main that must NOT ship:** the watchdog, the
-  panic-to-BOOTSEL handler, the borrowed 0x2e8a/0x000a VID/PID (Raspberry Pi's,
-  used because picotool only scans that vendor ID), and the USB_STAGE display
-  instrumentation.
+- **Dev affordances that must NOT ship (as filed against the retired
+  `hal_shim` firmware-spike; not re-verified against the current `firmware/`
+  project):** the watchdog, the panic-to-BOOTSEL handler, the borrowed
+  0x2e8a/0x000a VID/PID (Raspberry Pi's, used because picotool only scans that
+  vendor ID), and the USB_STAGE display instrumentation.
 
 ## Environment notes
 

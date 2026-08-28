@@ -426,6 +426,23 @@ applies.
   grep is not enough: the pre-squash audit caught the crate name `bhk-core`
   ("Bitwarden Hardware Key core") and the stale `.claude/agents/*.md` definitions,
   neither of which lives under `core/src` or `emulator/src`.
+- **GitHub SSH port 22 is blocked on this machine** (measured 0/10; port 443
+  10/10). Push with `git push ssh://git@ssh.github.com:443/coroiu/pico-link.git
+  main`. Bare `ssh -T git@github.com` can succeed a few times while `git fetch`
+  fails seconds later — measure with a loop, don't conclude from one probe.
+- **The beads board has a remote backup as of 2026-08-27.** It lives in
+  `.beads/embeddeddolt/` (gitignored) and `bd dolt push` replicates it to
+  `refs/dolt/data` on `coroiu/pico-link`. `bd` keeps its **own** remote list,
+  separate from git's — inspect with `bd dolt remote list`; changing
+  `git remote` does not change it. Verify a push landed with
+  `git ls-remote origin | grep dolt`.
+- **The auto-mode classifier gates files that grant permissions, not all of
+  `.claude/`.** `.claude/hooks/` and `.claude/agents/` edits go through
+  normally; it's `settings.json` and permission-granting config it blocks.
+- **The Homebrew `arm-none-eabi-gcc` lacks newlib specs and cannot build the
+  firmware.** The working toolchain is
+  `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin` — point the
+  firmware build at it explicitly.
 
 
 
@@ -486,57 +503,46 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 ## Current State
 
-**2026-08-27 — Epics A and B complete. Firmware architecture pivoted C-first;
-gate-2 radio bring-up attempted three times, not yet achieved.** See
-`.planning/progress.md` for detail and `.planning/decisions/` for the current
-ADRs — trust the ADRs, not older prose in this file, if they conflict.
+**2026-08-28 — the radio is up: Bluetooth Classic GAP inquiry runs on real
+hardware, under the C-first architecture, with discovered devices rendered on
+the panel.** This is the milestone three earlier Rust-first sessions never
+reached. See `.planning/progress.md` for detail and `.planning/decisions/` for
+the current ADRs — trust the ADRs, not older prose in this file, if they
+conflict.
 
-- **Epic A done.** Repo squashed to one orphan commit, pushed to
-  `github.com/coroiu/pico-link`. Old remote dropped; prehistory stays at
-  `coroiu/bitwarden-hw-key`. Local tag `pre-squash-archive` pins it here.
-- **Epic B done.** `core` is `no_std` + `alloc` and cross-compiles for
-  `thumbv8m.main-none-eabihf`; 240x240 retarget with the row budget recomputed
-  (5 rows + peek); joystick + 4-button `NavIntent` replacing the encoder
-  vocabulary; all three run modes verified at 240x240. 137 tests green.
-- **THE FIRMWARE PLAN CHANGED AGAIN, 2026-08-27 — C-first.** pico-sdk owns
-  `main()` and `runtime_init`; `core/` becomes a `no_std` + `alloc` staticlib
-  called from C over a narrow FFI, for rendering only. This **supersedes** the
-  2026-08-26 "Rust owns the binary" decision: that ADR's link-seam verification
-  (76 BTstack symbols, zero undefined, `cortex_m_rt` owning the vector table,
-  no pico-sdk runtime in the binary) was real, but it tested linking, not
-  running — and running is what failed, three sessions and ~1.45M tokens in,
-  with the radio never brought up (a GPIO-coprocessor HardFault from an
-  unwritten CPACR, then a hang in `cyw43_spi_init`'s PIO/DMA claim sequence;
-  pico-sdk's `runtime_init` hooks sit in the linked binary as inert
-  `.preinit_array` data — nothing calls them). See
-  [ADR 2026-08-27](.planning/decisions/2026-08-27-c-first-pico-sdk-owns-main.md).
-  USBPods remains a reference to READ, not something this repo forks; whether
-  the C-first migration ends up structurally similar to it is migration detail
-  for the architect, not decided by any ADR yet.
-- **TinyUSB decided** ([ADR 2026-08-27](.planning/decisions/2026-08-27-usb-device-stack-returns-to-tinyusb.md)):
-  TinyUSB owns the USB device controller; the `embassy-usb` CDC console that
-  gave the project its only debug channel during bring-up is retired now that
-  it has served its purpose.
-- **Next:** the C-first migration, detailed design pending from the architect,
-  landing as beads.
-
-### Environment gotchas learned this session
-
-- **GitHub SSH port 22 is blocked here** (0/10; port 443 is 10/10). Push with
-  `git push ssh://git@ssh.github.com:443/coroiu/pico-link.git main`. Bare
-  `ssh -T git@github.com` can succeed a few times while `git fetch` fails
-  seconds later — measure with a loop, don't conclude from one probe.
-- **The beads board DOES have a remote backup** (fixed 2026-08-27; supersedes
-  the earlier "no remote backup" note). It lives in `.beads/embeddeddolt/`
-  (gitignored), and `bd dolt push` replicates it to `refs/dolt/data` on
-  `coroiu/pico-link`. The earlier failure was NOT the port-22 block: bd keeps
-  its **own** remote list, separate from git's, and it still pointed at the
-  pre-pivot `git+ssh://git@github.com/coroiu/bitwarden-hw-key.git`. Inspect with
-  `bd dolt remote list`; it is now
-  `git+ssh://git@ssh.github.com:443/coroiu/pico-link.git`. Changing `git remote`
-  does not change bd's — verify a push landed with
-  `git ls-remote origin | grep dolt`.
-- **The auto-mode classifier did NOT block `.claude/hooks/` or
-  `.claude/agents/` edits** this session, contrary to the note above — it
-  appears to gate files that actually grant permissions. Attempt the edit rather
-  than pre-emptively declaring it blocked.
+- **Epics A and B done** (unchanged from prior state — repo squash, `no_std`
+  + `alloc` core retarget to 240x240, all three run modes green).
+- **C-first ADR executed, not just decided.** In one overnight run, all merged
+  to `main`:
+  - **M1a** (`pico-link-cz0.1`, `8295a97`) — new `firmware/` CMake project on
+    pico-sdk 2.1.1, board `pimoroni_pico_plus2_w_rp2350`, CDC console,
+    unattended `picotool reboot -f -u` reflashing. No Rust yet.
+  - `pico-link-4mc` (`88661d7`) — `tools/usb-console/cdc_reader.py`, a
+    direct-USB CDC reader that never opens a `/dev/cu.*` node, is now the
+    standard capture path; `tty_fallback.py` remains a clearly-marked risky
+    fallback.
+  - `pico-link-iyf` (`915e980`) — the memory-capture hook now requires a
+    successful call, a real command position, and a bead ID that resolves.
+  - **M1b** (`pico-link-cz0.2`, `0a8c1e3`) — **the architecture proof.** Rust
+    `core` renders, C blits, on real hardware: no NOCP UsageFault, no crashes.
+    `ui-ffi` staticlib, cbindgen header, CMake-driven cargo cross-build, ST7789
+    driver, debounced input. Building it found two spec errors: the heap arena
+    was sized for 64KB but one 240x240 framebuffer alone is 115KB (raised to
+    192KB), and the target triple must be `eabi`, not `eabihf` (pico-sdk's ABI
+    is softfp).
+  - `pico-link-poi` (`ea02758`) — dead frontend boilerplate removed from
+    `.claude/`; a sweep for old-product/old-architecture terms
+    (`bitwarden`, `bhk-core`, `embassy`, `cortex_m_rt`, `owns main`, ...)
+    returned zero hits across `.claude/`.
+  - **M2** (`pico-link-cz0.3`, `4b14cc9`) — **Bluetooth radio up.** pico-sdk's
+    ready-made HCI transport over cyw43, BTstack Classic with GAP inquiry,
+    discovered devices rendered on the panel with address and RSSI,
+    webcam-verified.
+- **In flight, not done:** `pico-link-cz0.4` (M3, TinyUSB composite sound
+  card). Open: `pico-link-14l` (panel colour accuracy unproven; SPI clock
+  deliberately conservative at 1MHz, ~1.008s per full 240x240 blit),
+  `pico-link-d7k` (d-pad-select -> `PL_CMD_CONNECT` implemented but never
+  exercised on real hardware — no automated input path on the real target,
+  a standing gap in the three-run-modes story), `pico-link-lfm`
+  (memory-capture hook keeps only the last LEARNED per Bash call).
+- **Next:** M3, TinyUSB composite sound card, currently in flight.
