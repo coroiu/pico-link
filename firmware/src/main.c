@@ -57,16 +57,27 @@ int main(void) {
     printf("pico-sdk owns main(); ui-ffi (Rust core) linked in over FFI.\r\n");
 
     // Panel bring-up itself is proven on real hardware as of M1b (bd
-    // pico-link-cz0.2) -- the staged red/green/blue diagnostic fills that
-    // proved it lived here only for that one bring-up flash and are gone
-    // now; keeping a 15-second colour hold in every boot would only slow
-    // down this bead's flash/verify cycles for a display path that isn't
-    // in scope here (panel colour follow-ups belong to bd pico-link-14l,
-    // per this bead's explicit "do not chase panel colour" instruction).
+    // pico-link-cz0.2). An earlier version of this M2 session's main.c
+    // dropped the RGB staging fills entirely, on the mistaken assumption
+    // they were purely a bring-up diagnostic -- they are NOT. st7789_init()
+    // only brings up the GPIO/SPI peripheral; the actual panel bring-up
+    // (hardware reset, SLPOUT, COLMOD, MADCTL, INVON, the one-time CASET/
+    // RASET address window st7789_blit_framebuffer's own doc comment
+    // depends on, DISPON, and turning the backlight on) all lives inside
+    // st7789_init_and_fill -- see st7789.c. Dropping that call left the
+    // panel held in reset with the backlight off: st7789_blit_framebuffer
+    // was still dutifully DMA'ing pixels, just into a panel that was never
+    // taken out of reset. This cost a real debugging detour during M2's
+    // Bluetooth bring-up (bd pico-link-cz0.3) before the camera+CDC
+    // evidence pointed back here, not at BT at all. One fill call, no hold
+    // sleep -- the multi-second colour-hold loop is still gone (a real
+    // simplification, not the bug), just not the fill itself.
     st7789_init(spi1);
     printf("st7789_init OK (SPI1, DC=%d CS=%d SCK=%d MOSI=%d RST=%d BL=%d, %d Hz)\r\n",
            ST7789_PIN_DC, ST7789_PIN_CS, ST7789_PIN_SCK, ST7789_PIN_MOSI, ST7789_PIN_RST, ST7789_PIN_BL,
            ST7789_INIT_BAUDRATE_HZ);
+    st7789_init_and_fill(spi1, 0x0000); // black -- the Rust UI's first render replaces this immediately
+    printf("st7789_init_and_fill OK -- panel out of reset, backlight on\r\n");
 
     // --- The Rust UI ---
     struct PlUi *ui = pl_ui_create(PANEL_WIDTH, PANEL_HEIGHT);
