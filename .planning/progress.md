@@ -18,6 +18,16 @@ transport, discovered devices render on the panel with address and RSSI,
 webcam-verified. This is the milestone three earlier Rust-first sessions never
 reached. See "Session 2026-08-27 into 2026-08-28" below for the full run.
 
+**The same overnight run continued past M2** and, still on `main`
+(now at `52c6c53`), fixed the three biggest usability blockers left standing:
+input was unusable (8.3s hold needed to register a press), the panel took
+over a second per frame, and the UI rendered upside-down relative to how the
+board sits with its cable out. The first two are fixed; the rotation attempt
+landed MIRRORED instead and is tracked in `pico-link-zzq` — see "Session
+2026-08-27 into 2026-08-28" below for the full account, including the
+still-open M3 (TinyUSB audio) and why photographs cannot settle screen
+orientation.
+
 ### Epic A — repo reset ✅
 Repo squashed to a single orphan initial commit and pushed to
 `github.com/coroiu/pico-link` (private). The 403-commit prehistory stays at
@@ -108,17 +118,25 @@ an overnight run 2026-08-27 into 2026-08-28. See "Session 2026-08-27 into
 
 ## Next step
 
-**M3 — TinyUSB composite sound card** (`pico-link-cz0.4`), in flight now.
-M1a/M1b/M2 of the C-first migration are done: pico-sdk boots the device,
-`core/` renders behind the FFI seam, C blits over SPI, BTstack's run loop is
-the scheduler, and BR/EDR GAP inquiry works on real silicon. M3 is the next
-milestone gating the MVP.
+**M3 — TinyUSB composite sound card** (`pico-link-cz0.4`), branch
+`bd-pico-link-cz0.4`, still unmerged and still the next milestone gating the
+MVP. macOS enumerates the device driverlessly as a sound card and its 227-byte
+config descriptor was verified byte-by-byte off the live device, but the
+firmware hangs when audio actually streams. The leading hypothesis was
+`tud_task()` starved by the then-1-second blit; that superloop is now 38.6ms
+(`pico-link-14l`, below), so the first action on resuming this branch is to
+**rebase onto `main` and simply retry streaming before any new diagnosis.**
 
-Also open, not blocking M3: `pico-link-14l` (panel colour accuracy unproven;
-SPI held at a conservative 1MHz, ~1.008s per full 240x240 blit) and
-`pico-link-d7k` (the d-pad-select -> `PL_CMD_CONNECT` path is implemented but
-never exercised on real hardware — there is no automated input path on the
-real target, a standing gap in the three-run-modes testability story).
+Also open, not blocking M3: `pico-link-d7k` (the d-pad-select ->
+`PL_CMD_CONNECT` path, and the new 180-degree input remap from the rotation
+fix, both still need one human press on real hardware to verify — there is no
+automated input path on the real target, a standing gap in the three-run-modes
+testability story), `pico-link-gap` (panic recorder, applicability under the
+C-first `firmware/` project unverified), `pico-link-hfc` (P4, remaining
+`.claude` boilerplate).
+
+`pico-link-14l` (panel colour + SPI clock) is now **done**, not open — see the
+session write-up below.
 
 **The upstream-relationship question (fork vs. no-fork) is decided, same day.**
 Ada analysed it, the orchestrator accepted Route B: we write our own C against
@@ -214,6 +232,42 @@ merged to `main` (now at `4b14cc9`) and pushed.
    discovered devices rendered on the panel with address and RSSI,
    webcam-verified. This is the milestone three earlier Rust-first sessions
    never reached.
+7. `pico-link-lfm`, `9d90dd9` — the memory-capture hook now captures EVERY
+   `LEARNED:` in a Bash call, not just the last. Also fixed a pre-existing
+   defect worth recording: the hook's bead-validation watchdog never worked,
+   because the lookup ran inside a command substitution, so `kill -9` left a
+   grandchild holding the pipe. Measured 60.09s against a hung `bd` on the old
+   hook; now 7.16s, bounded inside the 10s hook timeout.
+8. `pico-link-5am`, `0c310a4` — input debounce moved OFF the render loop onto
+   a 1ms pico-sdk repeating timer feeding a lock-free SPSC ring buffer (cap
+   32, drops newest on overflow) that the superloop drains. Nothing calls
+   into Rust from interrupt context. Root cause it fixed: input was sampled
+   once per ~1.03s frame, and the 8-sample debounce needed ~8.3 seconds of
+   held button, so the d-pad appeared dead.
+9. `pico-link-14l`, `8381c2b` — **SPI clock 1MHz -> 75MHz** (the `clk_peri`/2
+   hardware ceiling), frame time 1.03s -> 38.6ms. Panel colour also settled:
+   an exposure-immune single-frame test (half theme BACKGROUND, half pure
+   white, compared within one photograph) shows BACKGROUND reading as
+   saturated blue, not washed toward white. The earlier alarming absolute
+   readings were camera exposure on an emissive panel, as suspected but not
+   proven until this test.
+10. `pico-link-g7o`, `52c6c53` — attempted display rotation via `MADCTL = 0xA0`
+    with the input pin-to-intent table rotated 180 degrees to match.
+    **THIS IS WRONG AND IT IS ON `main`.** Andreas inspected the physical
+    board: the content is MIRRORED, not rotated. Tracked in `pico-link-zzq`
+    (P1). Known good: `MADCTL = 0x60` gives a correct, unshifted, upright
+    image with the USB cable exiting LEFT; the requirement is that image
+    rotated 180 degrees.
+
+**The verification lesson, and it cost this run twice.** Screen orientation was
+judged from webcam photographs, and photographs cannot separate a mirror from a
+180-degree rotation when all you can read is small blurry text — both come out
+reversed. The first attempt rotated the PHOTO until text read upright and
+produced geometrically impossible results; the second accepted a mirrored build
+as correct. **Judge orientation with an asymmetric CORNER TEST PATTERN** —
+distinct colours in three of the four corners — so one frame decides it by
+which corner holds which colour, with no dependence on legibility. Andreas
+turning the board in his hand is the other reliable oracle and takes seconds.
 
 **Two hard-won environment facts from this run:**
 - pico-sdk's `stdio_usb` gates ALL console output on DTR
@@ -226,27 +280,33 @@ merged to `main` (now at `4b14cc9`) and pushed.
 - The Homebrew `arm-none-eabi-gcc` lacks newlib specs. The working toolchain
   is at `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin`.
 
-**Still open, not done:** `pico-link-cz0.4` (M3, TinyUSB composite sound card)
-is in flight now. `pico-link-14l` — absolute panel colour is not proven and
-the SPI clock is still at a deliberately conservative 1MHz, making a full
-240x240 blit take ~1.008s. `pico-link-d7k` — the d-pad-select to
-`PL_CMD_CONNECT` path is implemented but never exercised on real hardware,
-because there is no automated input path on the real target — a standing gap
-in the three-run-modes testability story. `pico-link-lfm` (memory-capture hook
-keeps only the last LEARNED per Bash call) is in flight.
+**Done as of this run:** `pico-link-lfm` (memory-capture hook, every LEARNED
+captured, watchdog fixed) and `pico-link-14l` (SPI clock, panel colour) —
+both merged, see the numbered list above.
+
+**Still open, not done:** `pico-link-cz0.4` (M3, TinyUSB composite sound
+card) — branch `bd-pico-link-cz0.4`, unmerged, hangs when audio streams; the
+leading hypothesis (`tud_task()` starved by the then-1-second blit) is now
+moot since the blit is 38.6ms, so the next step is a rebase-and-retry before
+any new diagnosis. `pico-link-d7k` — the d-pad-select to `PL_CMD_CONNECT`
+path, and the new 180-degree input remap from the rotation fix, both need one
+human press to exercise on real hardware, because there is no automated input
+path on the real target — a standing gap in the three-run-modes testability
+story.
 
 ## Open beads
 
-- `pico-link-cz0.4` — M3, TinyUSB composite sound card. In flight.
-- `pico-link-14l` — panel colour accuracy unproven; SPI clock conservatively
-  at 1MHz (~1.008s per full blit)
-- `pico-link-d7k` — d-pad-select -> `PL_CMD_CONNECT` never exercised on real
-  hardware; no automated input path on the real target
-- `pico-link-lfm` — memory-capture hook keeps only the last LEARNED per Bash
-  call. In flight.
+- `pico-link-cz0.4` — M3, TinyUSB composite sound card. Branch
+  `bd-pico-link-cz0.4`, unmerged; hangs when audio streams. Next step:
+  rebase onto `main` (now 38.6ms/frame, not ~1s) and retry before new
+  diagnosis.
+- `pico-link-d7k` — d-pad-select -> `PL_CMD_CONNECT`, and the new
+  180-degree input remap, never exercised on real hardware; no automated
+  input path on the real target
 - `pico-link-gap` — panic recorder: survive the reboot, report on next boot.
   Filed against the retired Rust-owns-`main()` `hal_shim`; applicability under
   the C-first `firmware/` project is unverified this session, not re-checked.
+- `pico-link-hfc` — P4, remaining `.claude` boilerplate.
 - `pico-link-46w` (core affinity on the IRQ depth counter) and `pico-link-1rp`
   (watchdog blind to a core1 lockup while core0 keeps feeding it) are **NOT ON
   THE BOARD** — verified 2026-08-28: `bd show` resolves neither, and the board

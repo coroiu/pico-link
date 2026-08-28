@@ -503,9 +503,10 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 ## Current State
 
-**2026-08-28 — the radio is up: Bluetooth Classic GAP inquiry runs on real
-hardware, under the C-first architecture, with discovered devices rendered on
-the panel.** This is the milestone three earlier Rust-first sessions never
+**2026-08-28 — the radio is up and the panel is fast: Bluetooth Classic GAP
+inquiry runs on real hardware, the display is upright and blits a full frame
+in 38.6ms (was 1.03s), and input is interrupt-driven off the render loop.**
+This is well past the milestone three earlier Rust-first sessions never
 reached. See `.planning/progress.md` for detail and `.planning/decisions/` for
 the current ADRs — trust the ADRs, not older prose in this file, if they
 conflict.
@@ -538,11 +539,50 @@ conflict.
     ready-made HCI transport over cyw43, BTstack Classic with GAP inquiry,
     discovered devices rendered on the panel with address and RSSI,
     webcam-verified.
+- **Follow-on hardening, merged after M2, `main` now at `52c6c53`:**
+  - `pico-link-lfm` (`9d90dd9`) — the memory-capture hook now captures EVERY
+    `LEARNED:` in a Bash call, not just the last, and fixed a pre-existing
+    watchdog defect: the bead-validation lookup ran inside a command
+    substitution, so `kill -9` left a grandchild holding the pipe (measured
+    60.09s hung -> 7.16s, inside the 10s hook timeout).
+  - `pico-link-5am` (`0c310a4`) — input debounce moved off the render loop
+    onto a 1ms pico-sdk repeating timer feeding a lock-free SPSC ring buffer
+    (cap 32, drops newest on overflow) drained by the superloop; nothing calls
+    into Rust from interrupt context. Root cause fixed: at the old ~1.03s
+    frame time an 8-sample debounce needed ~8.3s of held button, so the d-pad
+    looked dead.
+  - `pico-link-14l` (`8381c2b`) — **SPI clock 1MHz -> 75MHz** (the
+    `clk_peri`/2 hardware ceiling), full-frame blit 1.03s -> 38.6ms. Panel
+    colour also settled: an exposure-immune single-frame test (half theme
+    BACKGROUND, half pure white, compared within one photograph) shows
+    BACKGROUND as saturated blue, not washed toward white — the earlier
+    alarming absolute readings were camera exposure on an emissive panel.
+  - `pico-link-g7o` (`52c6c53`) — attempted to rotate the display via
+    `MADCTL = 0xA0`, with the input pin-to-intent table rotated 180 degrees to
+    match. **THIS IS WRONG AND IS ON `main`.** Andreas inspected the physical
+    board: the content is MIRRORED, not rotated. The orchestrator accepted it
+    from a low-resolution webcam frame, where mirrored text and 180-rotated
+    text look alike. Tracked in `pico-link-zzq`. Known good: `MADCTL = 0x60`
+    gives a correct upright image with the cable exiting LEFT. **Judge screen
+    orientation with an asymmetric CORNER TEST PATTERN** (distinct colours in
+    three corners), never by reading small text in a photo — a single frame
+    then separates rotation from mirroring unambiguously.
 - **In flight, not done:** `pico-link-cz0.4` (M3, TinyUSB composite sound
-  card). Open: `pico-link-14l` (panel colour accuracy unproven; SPI clock
-  deliberately conservative at 1MHz, ~1.008s per full 240x240 blit),
-  `pico-link-d7k` (d-pad-select -> `PL_CMD_CONNECT` implemented but never
-  exercised on real hardware — no automated input path on the real target,
-  a standing gap in the three-run-modes story), `pico-link-lfm`
-  (memory-capture hook keeps only the last LEARNED per Bash call).
-- **Next:** M3, TinyUSB composite sound card, currently in flight.
+  card, branch `bd-pico-link-cz0.4`, unmerged). macOS enumerates it
+  driverlessly as a sound card and its 227-byte config descriptor was
+  verified byte-by-byte off the live device, but the firmware hangs when
+  audio streams. The leading hypothesis was `tud_task()` starved by the
+  then-1-second blit; the superloop is now 38.6ms, so the next action is to
+  rebase onto `main` and retry streaming before any new diagnosis.
+- **Still open:** `pico-link-d7k` (d-pad-select -> `PL_CMD_CONNECT` and the
+  new 180-degree input remap both need one human press to verify — no
+  automated input path on the real target, a standing gap in the
+  three-run-modes story), `pico-link-gap` (panic recorder), `pico-link-hfc`
+  (P4, remaining `.claude` boilerplate).
+- **Two environment facts, still current:** build with
+  `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` (pico-sdk's `stdio_usb` gates
+  console output on DTR, which the direct-USB reader can't assert on macOS);
+  the Homebrew `arm-none-eabi-gcc` lacks newlib specs, use
+  `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin`.
+- **Next:** rebase M3 (`pico-link-cz0.4`) onto `main` and retry audio
+  streaming now that the superloop is 38.6ms instead of ~1s.
