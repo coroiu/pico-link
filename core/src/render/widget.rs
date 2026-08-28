@@ -203,4 +203,18 @@ pub trait Widget {
     fn chrome_contribution(&self) -> Option<ChromeContribution> {
         None
     }
+
+    /// This widget's own internal selection/cursor index, if it has one
+    /// (e.g. `VerticalList`'s selected row). `None` for widgets with no
+    /// such concept (static labels, dividers).
+    ///
+    /// Exists so a caller that rebuilds a screen's widgets from scratch on
+    /// every model change (e.g. `App::rebuild_root` over live device/link
+    /// data — see `pico_link_core::app`'s doc comments) can read back the
+    /// *old* widget's selection before discarding it, and carry it forward
+    /// into the freshly built replacement (`VerticalList::with_selected`)
+    /// instead of resetting the user's place in the list on every event.
+    fn selected_index(&self) -> Option<usize> {
+        None
+    }
 }

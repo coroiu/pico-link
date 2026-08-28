@@ -175,6 +175,15 @@ impl Screen {
         &self.widgets
     }
 
+    /// The focused widget's own internal selection index, if any — see
+    /// `Widget::selected_index`'s doc comment for why this exists (letting
+    /// a rebuilt-from-model screen carry the user's selection forward
+    /// instead of resetting it).
+    #[must_use]
+    pub fn selected_index(&self) -> Option<usize> {
+        self.focused_index.and_then(|index| self.widgets[index].selected_index())
+    }
+
     /// The currently focused widget's [`ChromeContribution`], if any.
     /// Consulting *only* the focused widget (not e.g. merging every
     /// widget's contribution) is deliberate: on every screen this bead

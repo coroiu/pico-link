@@ -519,6 +519,10 @@ impl Widget for VerticalList {
         !self.items.is_empty()
     }
 
+    fn selected_index(&self) -> Option<usize> {
+        Some(self.selected)
+    }
+
     fn on_focus(&mut self, event: FocusEvent) -> Action {
         match event {
             FocusEvent::Gained => {
