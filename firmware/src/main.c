@@ -94,6 +94,7 @@ int main(void) {
     // launched for nothing BTstack/cyw43-related; core1 never runs there
     // either) rather than inventing a different core split, per this
     // bead's 15-minute precondition.
+#ifndef PL_DIAG_SKIP_BT
     if (cyw43_arch_init()) {
         printf("cyw43_arch_init FAILED -- halting\r\n");
         while (true) {
@@ -103,6 +104,9 @@ int main(void) {
     printf("cyw43_arch_init OK\r\n");
 
     pl_bt_init(ui);
+#else
+    printf("PL_DIAG_SKIP_BT set -- skipping cyw43_arch_init/pl_bt_init\r\n");
+#endif
 
     // Superloop on core0 only (M1b design, unchanged by M2). Every
     // iteration: poll debounced input edges, forward to Rust, tick,
@@ -136,7 +140,9 @@ int main(void) {
         }
         uint64_t blit_end_us = time_us_64();
 
+#ifndef PL_DIAG_SKIP_BT
         pl_bt_poll_commands(ui);
+#endif
 
         static uint32_t frame_count = 0;
         frame_count++;
