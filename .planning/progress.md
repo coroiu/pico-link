@@ -118,7 +118,15 @@ an overnight run 2026-08-27 into 2026-08-28. See "Session 2026-08-27 into
 
 ## Next step
 
-**M3 — TinyUSB composite sound card** (`pico-link-cz0.4`), branch
+**`pico-link-zzq` (P1) first: the display-rotation fix merged this run is
+wrong** — `MADCTL = 0xA0` mirrors the panel instead of rotating it, discovered
+by Andreas inspecting the physical board after the earlier webcam-based
+verification accepted it. Known good is `MADCTL = 0x60` (upright, cable
+exiting LEFT); the actual requirement is that image rotated 180 degrees.
+Verify with an asymmetric corner test pattern, not a photo of small text — see
+the session write-up below for the full account.
+
+**Then M3 — TinyUSB composite sound card** (`pico-link-cz0.4`), branch
 `bd-pico-link-cz0.4`, still unmerged and still the next milestone gating the
 MVP. macOS enumerates the device driverlessly as a sound card and its 227-byte
 config descriptor was verified byte-by-byte off the live device, but the
@@ -127,7 +135,7 @@ firmware hangs when audio actually streams. The leading hypothesis was
 (`pico-link-14l`, below), so the first action on resuming this branch is to
 **rebase onto `main` and simply retry streaming before any new diagnosis.**
 
-Also open, not blocking M3: `pico-link-d7k` (the d-pad-select ->
+Also open, not blocking either: `pico-link-d7k` (the d-pad-select ->
 `PL_CMD_CONNECT` path, and the new 180-degree input remap from the rotation
 fix, both still need one human press on real hardware to verify — there is no
 automated input path on the real target, a standing gap in the three-run-modes
@@ -284,18 +292,28 @@ turning the board in his hand is the other reliable oracle and takes seconds.
 captured, watchdog fixed) and `pico-link-14l` (SPI clock, panel colour) —
 both merged, see the numbered list above.
 
-**Still open, not done:** `pico-link-cz0.4` (M3, TinyUSB composite sound
-card) — branch `bd-pico-link-cz0.4`, unmerged, hangs when audio streams; the
-leading hypothesis (`tud_task()` starved by the then-1-second blit) is now
-moot since the blit is 38.6ms, so the next step is a rebase-and-retry before
-any new diagnosis. `pico-link-d7k` — the d-pad-select to `PL_CMD_CONNECT`
-path, and the new 180-degree input remap from the rotation fix, both need one
-human press to exercise on real hardware, because there is no automated input
-path on the real target — a standing gap in the three-run-modes testability
-story.
+**Still open, not done:** `pico-link-zzq` (**P1** — the merged rotation fix
+is wrong: `MADCTL = 0xA0` mirrors the image rather than rotating it; known
+good is `MADCTL = 0x60`, upright with the cable exiting LEFT, and the actual
+requirement is that image rotated 180 degrees; judge with an asymmetric
+corner test pattern, not by reading text in a photo). `pico-link-cz0.4` (M3,
+TinyUSB composite sound card) — branch `bd-pico-link-cz0.4`, unmerged, hangs
+when audio streams; the leading hypothesis (`tud_task()` starved by the
+then-1-second blit) is now moot since the blit is 38.6ms, so the next step is
+a rebase-and-retry before any new diagnosis. `pico-link-d7k` — the
+d-pad-select to `PL_CMD_CONNECT` path, and the new 180-degree input remap
+from the rotation fix, both need one human press to exercise on real
+hardware, because there is no automated input path on the real target — a
+standing gap in the three-run-modes testability story.
 
 ## Open beads
 
+- `pico-link-zzq` — **P1.** The merged display-rotation fix (`pico-link-g7o`,
+  on `main` as of `52c6c53`) is wrong: `MADCTL = 0xA0` mirrors the image
+  instead of rotating it. Known good: `MADCTL = 0x60` gives an upright image
+  with the cable exiting LEFT; the actual requirement is that image rotated
+  180 degrees. Judge with an asymmetric corner test pattern (distinct colours
+  in three of four corners), never by reading small text in a photo.
 - `pico-link-cz0.4` — M3, TinyUSB composite sound card. Branch
   `bd-pico-link-cz0.4`, unmerged; hangs when audio streams. Next step:
   rebase onto `main` (now 38.6ms/frame, not ~1s) and retry before new
