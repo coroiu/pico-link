@@ -337,9 +337,15 @@ applies.
   even though claiming the CDC-Data interface for reads succeeds (measured
   2026-08-27, bead pico-link-4mc; a prior `detach_kernel_driver` does not help).
   So DTR is currently only assertable via `tty_fallback.py`'s
-  `ioctl(TIOCMBIS, TIOCM_DTR)` — the risky path. This only bites on firmware
-  that GATES its console on DTR, which embassy-usb did; pico-sdk's `stdio_usb`
-  does not block on it, so C-first firmware is expected to print regardless.
+  `ioctl(TIOCMBIS, TIOCM_DTR)` — the risky path. **pico-sdk's `stdio_usb` DOES
+  gate on DTR** (verified in `stdio_usb.c`: `stdio_usb_connected()` returns
+  `tud_cdc_connected()`, commented "this actually checks DTR", and
+  `stdio_usb_out_chars` drops everything when it is false). A healthy board is
+  therefore INDISTINGUISHABLE from a hung one over the direct-USB reader — this
+  cost a supervisor a whole hang hunt on 2026-08-28. The fix is to build the
+  firmware with `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` (note DTR, not DTE),
+  which makes `stdio_usb_connected()` return `tud_ready()` instead. Keep that
+  flag set in `firmware/CMakeLists.txt`; without it the console is a trap.
   This is why the boot line was missed while the heartbeats were fine.
 - **`timeout` does not exist on this Mac** (no coreutils). Use a background PID
   plus `sleep` and `kill`, or Python, when a read needs a deadline.
