@@ -647,7 +647,7 @@ quality-of-feel item **after** the MVP ships (E22).
 
 | | Item | Unlocks |
 |---|---|---|
-| E14 | **`NVM_NUM_LINK_KEYS` 1 -> 8** + paired store with MRU order and a default flag | The entire multi-device story. Highest-value Tier 2 item. |
+| E14 | **`NVM_NUM_LINK_KEYS` 1 -> 8** + the persisted bond store specced in S22 | The entire multi-device story. **Highest-value Tier 2 item** - until it lands, pairing a second set of headphones forgets the first, which makes the whole Devices screen a fiction. |
 | E15 | **Settings persistence (M5)** | S19. Without it Settings is a demo. |
 | E16 | **AVRCP absolute volume + capability flag** | VOL gauge, d-pad Up/Down, MUTED banner, volume limit, per-device volume. |
 | E17 | **Per-channel peak/RMS at ~4Hz**, off the real-time path | The OUT meter and its peak cap. Ship absent, never frozen. |
@@ -661,7 +661,56 @@ quality-of-feel item **after** the MVP ships (E22).
 | | Item | Value |
 |---|---|---|
 | E22 | **Dirty-rect / partial update** (ST7789 address windows) | Meter at 10-15Hz, much lower idle cost, less contention with audio. Biggest feel improvement after MVP. |
-| E23 | **Warm second ACL link** (`MAX_NR_HCI_CONNECTIONS` > 1, one streaming, one idle) | Sub-second switching instead of 2-8s. **The genuinely achievable half of multipoint: dual STREAMING stays impossible, dual CONNECTION does not.** |
+| ~~E23~~ | ~~Warm second ACL link~~ | **WITHDRAWN.** Andreas set "exactly one active connection at a time, always", and a warm idle ACL link is a second connection - keeping it under the justification that it is not *streaming* would smuggle back the thing he declined, under a different name. It optimised a problem nobody has complained about (2-8s switching) at the cost of a constraint he explicitly set. Switching stays 2-8s, presented honestly through the wizard phases. |
 | E24 | **Auto-repeat on the d-pad** | Comfort on the 11-row Settings list. |
 | E25 | **Device tag picker** - 8 icons x 8 colours | Solves permanently-nameless devices without text entry. |
-| E26 | **"Last connected N days ago"** | Needs E8 + E14. Honest presence, unlike an availability dot. |
+| E26 | ~~"Last connected N days ago"~~ -> **monotonic MRU sequence number** | **AMENDED - the original was factually wrong. There is no RTC on this board**, so wall-clock age is not derivable across reboots; a clock gives time since boot, not calendar time. The `N days ago` sublabel is **cut on merit**, not deferred, because we cannot produce the number honestly. Replaced by a 2-byte monotonic use-sequence number, which is what MRU ordering actually needs and is cheaper. Folded into E14's record format. If an RTC ever arrives - host time over USB is a plausible source - the sublabel becomes possible again. |
+
+
+## 22. The paired-device store
+
+**Capacity 8, justified from the UI outward rather than from the flash inward.**
+Eight covers every plausible user with margin, so "forget one to make room" fires
+rarely enough to be a non-event; 8 + "Pair new" = 9 rows, inside the 12-item
+rule, so Devices never needs the scrolling behaviour the design removed. Sixteen
+would fit the flash but breaks the rule and nobody owns sixteen pairs of
+headphones. The record is fixed-size, so raising the cap later is a constant
+change, not a migration.
+
+**Bond record, 64 bytes:** BD_ADDR 6, link key 16, key type 1, device name 32,
+per-device codec 1, LDAC quality 1, per-device volume 1, flags 1 (is-default,
+tag-assigned), tag 1 (reserved for E25), MRU sequence 2, CRC 2.
+
+**On the name field:** the spec allows remote names up to 248 bytes, and storing
+that for 8 devices would burn ~2KB - half the budget on strings. **32 bytes,
+truncated on a UTF-8 CHARACTER boundary**, is driven by the display: at
+`helvB12` on 240px we truncate around 20 characters anyway and the detail page
+wraps at roughly 40. `Sony WH-1000XM5` is 15 bytes; `Bose QuietComfort 45
+Headphones` is 30. The cap is invisible in practice. It must truncate on a
+character boundary, not a byte boundary, or a multi-byte name renders as a
+broken glyph.
+
+**Budget:** bonds 8 x 64 + 8-byte header = 520 B; settings ~128 B; total ~648 B,
+about 16% of the ~4KB TLV space. Room to double the cap if the UI rule ever
+changes.
+
+**One blob for bonds, a separate blob for settings.** Recommended, with the
+trade stated so Ada can overrule on facts the design does not own. For one blob:
+wear is sector-granular anyway (the QSPI flash erases in 4KB sectors and
+pico-sdk's TLV appends and compacts within one, so writing 64 bytes and writing
+512 costs the same erase - which is the argument that usually decides this);
+MRU reordering and forget-one-to-make-room are list operations, naturally atomic
+against a blob and racy across N independent entries; and one version byte, one
+migration path, instead of N. The one real argument for N entries is failure
+isolation, and **the per-record CRC restores it** - the blob can drop a single
+bad record and keep the rest. Settings stay separate deliberately: different
+change frequency (settings churn while you fiddle, bonds rarely change), and a
+settings-format migration must never be able to take your bonds with it.
+
+**What Ada owns:** BTstack's `btstack_link_key_db` interface is what actually has
+to be satisfied, and pico-sdk ships a TLV-backed implementation. A blob means
+*replacing* that implementation rather than configuring it - read the blob into
+a RAM mirror at boot and serve BTstack's per-device get/put/delete callbacks from
+the mirror, writing back on change. That is a real integration cost and it is
+Ada's call. **The UI is indifferent** to blob-versus-TLV as long as the store
+holds 8 bonds, survives reboot, and preserves MRU order.
