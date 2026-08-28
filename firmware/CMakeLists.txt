@@ -78,10 +78,16 @@ add_executable(pico_link
     src/main.c
     src/st7789.c
     src/input.c
+    src/bt.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
 target_include_directories(pico_link PRIVATE ${PICO_LINK_UI_HEADER_DIR})
+
+# btstack_config.h lives alongside bt.c/main.c -- BTstack's own headers
+# #include "btstack_config.h" unqualified and expect it on the include
+# path, same as any other project-supplied BTstack config.
+target_include_directories(pico_link PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
 
 pico_set_program_name(pico_link "pico_link")
 pico_set_program_version(pico_link "0.1.0")
@@ -92,6 +98,34 @@ pico_enable_stdio_usb(pico_link 1)
 pico_enable_stdio_uart(pico_link 0)
 target_compile_definitions(pico_link PRIVATE
     PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=1
+    # pico-sdk's stdio_usb gates ALL console output on DTR by default
+    # (stdio_usb_connected() checks tud_cdc_connected(), which tracks DTR) --
+    # stdio_usb_out_chars() silently drops everything while that's false.
+    # tools/usb-console/cdc_reader.py, this project's standard capture path,
+    # cannot assert DTR on macOS (claiming the CDC-Communication interface
+    # fails with EACCES -- see bead pico-link-4mc), so without this flag a
+    # perfectly healthy board is indistinguishable from a hung one: the
+    # console just never speaks. This makes stdio_usb_connected() return
+    # tud_ready() instead (device configured, no DTR needed) -- see
+    # pico_stdio_usb/stdio_usb.c. Root-caused 2026-08-28 after a control-test
+    # flash of the M1b baseline reproduced the exact same "zero CDC bytes"
+    # symptom as M2 despite the panel visibly rendering, which is what
+    # exposed this as a tooling gap rather than a firmware hang.
+    PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
+    # M2: Bluetooth only, no Wi-Fi -- without this, cyw43.h unconditionally
+    # pulls in lwip/netif.h (a build dependency we have no use for and
+    # haven't wired up). Matches USBPods' own working reference.
+    CYW43_LWIP=0
+    # M2 (bd pico-link-cz0.3): whichever core loads the cyw43 Bluetooth
+    # firmware needs at least 48KB of stack -- earned expensively on real
+    # hardware in an earlier session, where an 8-16KB core0 stack
+    # overflowed during PIO/SPI init with a badly misleading symptom (a
+    # diagnostic store on the FIRST line of a task appeared never to
+    # execute, depending on what code came LATER). Set well above that
+    # floor. Core1 is never launched (see main.c/bt.c's module docs --
+    # matching USBPods' own working reference, everything runs on core0),
+    # so PICO_CORE1_STACK_SIZE is left at the SDK default.
+    PICO_STACK_SIZE=0xC000
 )
 
 target_link_libraries(pico_link
@@ -100,6 +134,12 @@ target_link_libraries(pico_link
     hardware_dma
     hardware_gpio
     ui_ffi
+    # M2: the ready-made HCI transport this C-first pivot exists to use
+    # (see bt.c's module doc). pico_btstack_cyw43 pulls in
+    # pico_btstack_hci_transport_cyw43 and pico_btstack_base transitively.
+    pico_btstack_classic
+    pico_btstack_cyw43
+    pico_cyw43_arch_threadsafe_background
 )
 
 pico_add_extra_outputs(pico_link)
