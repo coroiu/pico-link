@@ -25,11 +25,14 @@
 #define ST7789_PIN_RST 12
 #define ST7789_PIN_BL 13
 
-// Keep low (~1MHz) until CS framing is confirmed on THIS board -- the
-// spike's earlier white screen at 20MHz predated the CS-held-low-across-
-// parameters fix, so a fast clock is not itself proof of a working driver.
-// Bump once a solid-colour fill is confirmed correct on the panel.
-#define ST7789_INIT_BAUDRATE_HZ (1 * 1000 * 1000)
+// CS framing is confirmed on this board (pico-link-cz0.2/pico-link-14l) --
+// the earlier white screen at 20MHz predated the CS-held-low-across-
+// parameters fix and is not evidence against a fast clock. Raised from the
+// deliberately-conservative 1MHz bring-up value one step at a time,
+// verifying a clean panel + CDC frame-timing line at each rate
+// (pico-link-14l); step back down and note the highest clean rate if a
+// given value misbehaves.
+#define ST7789_INIT_BAUDRATE_HZ (40 * 1000 * 1000)
 
 void st7789_init(spi_inst_t *spi);
 
