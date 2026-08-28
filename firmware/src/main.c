@@ -108,6 +108,85 @@ int main(void) {
     }
 #endif
 
+#ifdef PL_DIAG_MADCTL_TEST
+    // Diagnostic for pico-link-zzq: the merged 0xA0 "rotation" fix (bd
+    // pico-link-g7o) actually MIRRORS the panel, and both the earlier 0x60
+    // and 0xA0 attempts were judged by rotating a blurry photo until text
+    // read upright -- a broken measurement, since mirrored and 180-rotated
+    // text look identical in a low-res frame. This cycles all four pure-
+    // rotation MADCTL candidates and renders an ASYMMETRIC CORNER PATTERN
+    // for each, so a single photo per candidate settles rotation vs.
+    // mirroring unambiguously by which corner holds which colour -- no
+    // text, no photo-rotating, no correlating against a timestamp.
+    //
+    // Software framebuffer layout (fixed, independent of MADCTL -- MADCTL
+    // only changes how the panel maps this raster onto physical pixels):
+    //   top-left    (x<120,y<120): RED,   with N small black dots encoding
+    //                              the candidate index (N = 1..4) so the
+    //                              candidate is readable from the RED
+    //                              corner alone, wherever that corner ends
+    //                              up physically.
+    //   top-right   (x>=120,y<120): GREEN
+    //   bottom-left (x<120,y>=120): BLUE
+    //   bottom-right(x>=120,y>=120): WHITE
+    // A true rotation permutes the four corners cyclically (or by 180) and
+    // preserves each corner's own content orientation-invariant identity
+    // (still a solid colour block, dots still legible in the RED one). A
+    // mirror instead swaps two ADJACENT corners while leaving the other
+    // pair fixed on one axis -- e.g. RED and GREEN trade places but BLUE
+    // and WHITE do not (or vice versa) -- which is the tell.
+    static const uint8_t s_madctl_candidates[4] = {0x00, 0x60, 0xA0, 0xC0};
+    static uint16_t s_madctl_test_buf[PANEL_WIDTH * PANEL_HEIGHT];
+    printf("PL_DIAG_MADCTL_TEST: cycling MADCTL 0x00/0x60/0xA0/0xC0, ~5s each, corner pattern\r\n");
+    while (true) {
+        for (int idx = 0; idx < 4; idx++) {
+            uint8_t madctl = s_madctl_candidates[idx];
+            st7789_set_madctl(madctl);
+            // Reissue CASET/RASET after every MADCTL change -- see
+            // st7789_reset_window's doc comment. Testing the hypothesis that
+            // the sliver artifact seen on the MY-set candidates (0xA0, 0xC0)
+            // is a stale address-counter state from changing scan direction
+            // without reissuing the window, not a GRAM offset that needs
+            // compensating (an x-offset sweep at 0/20/40/60/80 did not clean
+            // it up -- see bead comments).
+            st7789_reset_window();
+
+            for (int y = 0; y < PANEL_HEIGHT; y++) {
+                for (int x = 0; x < PANEL_WIDTH; x++) {
+                    uint16_t color;
+                    if (x < PANEL_WIDTH / 2 && y < PANEL_HEIGHT / 2) {
+                        color = COLOR_RED;
+                    } else if (x >= PANEL_WIDTH / 2 && y < PANEL_HEIGHT / 2) {
+                        color = COLOR_GREEN;
+                    } else if (x < PANEL_WIDTH / 2 && y >= PANEL_HEIGHT / 2) {
+                        color = COLOR_BLUE;
+                    } else {
+                        color = 0xFFFF; // white
+                    }
+                    s_madctl_test_buf[y * PANEL_WIDTH + x] = color;
+                }
+            }
+            // Stamp (idx+1) black dots inside the RED quadrant, well clear
+            // of its edges, 12px squares on a 20px pitch starting at (20,20).
+            for (int dot = 0; dot <= idx; dot++) {
+                int ox = 20 + dot * 20;
+                int oy = 20;
+                for (int dy = 0; dy < 12; dy++) {
+                    for (int dx = 0; dx < 12; dx++) {
+                        s_madctl_test_buf[(oy + dy) * PANEL_WIDTH + (ox + dx)] = 0x0000;
+                    }
+                }
+            }
+
+            st7789_blit_framebuffer(spi1, s_madctl_test_buf, PANEL_WIDTH * PANEL_HEIGHT);
+            printf("PL_DIAG_MADCTL_TEST: candidate %d/4 -- MADCTL=0x%02X, %d dot(s) in RED corner\r\n",
+                   idx + 1, madctl, idx + 1);
+
+            sleep_ms(5000);
+        }
+    }
+#endif
+
     // --- The Rust UI ---
     struct PlUi *ui = pl_ui_create(PANEL_WIDTH, PANEL_HEIGHT);
     if (ui == NULL) {
