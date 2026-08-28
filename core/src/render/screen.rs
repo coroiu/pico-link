@@ -184,6 +184,16 @@ impl Screen {
         self.focused_index.and_then(|index| self.widgets[index].selected_index())
     }
 
+    /// The focused widget's own currently selected row's identity key, if
+    /// any — see `Widget::selected_key`'s doc comment. The key-based
+    /// counterpart to [`Screen::selected_index`], for the same
+    /// carry-forward purpose but robust to the underlying list reordering,
+    /// growing, or shrinking between rebuilds.
+    #[must_use]
+    pub fn selected_key(&self) -> Option<super::list::ListItemKey> {
+        self.focused_index.and_then(|index| self.widgets[index].selected_key())
+    }
+
     /// The currently focused widget's [`ChromeContribution`], if any.
     /// Consulting *only* the focused widget (not e.g. merging every
     /// widget's contribution) is deliberate: on every screen this bead
