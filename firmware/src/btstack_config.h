@@ -19,6 +19,9 @@
 #define ENABLE_CLASSIC
 #define ENABLE_LOG_ERROR
 #define ENABLE_LOG_INFO
+// hci_dump_embedded_stdout.c (linked unconditionally by pico_btstack_base)
+// hard-errors at compile time without this.
+#define ENABLE_PRINTF_HEXDUMP
 
 // pico-sdk's cyw43 HCI transport + async_context run loop combination
 // needs these two -- millisecond timers (no embedded tick source here) and
@@ -28,6 +31,8 @@
 
 #define HCI_ACL_PAYLOAD_SIZE (1691 + 4)
 #define HCI_OUTGOING_PRE_BUFFER_SIZE 4
+// Required by pico_btstack_hci_transport_cyw43 (btstack_hci_transport_cyw43.c).
+#define HCI_ACL_CHUNK_SIZE_ALIGNMENT 4
 
 // One inquiry scan, at most one outgoing connection attempt at a time --
 // this milestone never opens an L2CAP channel or SDP query, so those stay
@@ -39,6 +44,12 @@
 #define MAX_NR_BTSTACK_LINK_KEY_DB_MEMORY_ENTRIES 1
 #define MAX_NR_WHITELIST_ENTRIES 1
 #define MAX_NR_SM_LOOKUP_ENTRIES 1
+
+// pico_btstack_classic links btstack_link_key_db_tlv.c unconditionally
+// (flash-backed link key storage), which hard-errors at compile time
+// without this -- one link key is all M2 needs (no pairing/bonding flow
+// yet, just inquiry + a logged connect intent).
+#define NVM_NUM_LINK_KEYS 1
 
 // Flow control + buffer limits to avoid overrunning the cyw43 shared SPI
 // bus -- the bead's banked hardware evidence proved the bus itself works

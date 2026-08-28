@@ -98,6 +98,10 @@ pico_enable_stdio_usb(pico_link 1)
 pico_enable_stdio_uart(pico_link 0)
 target_compile_definitions(pico_link PRIVATE
     PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=1
+    # M2: Bluetooth only, no Wi-Fi -- without this, cyw43.h unconditionally
+    # pulls in lwip/netif.h (a build dependency we have no use for and
+    # haven't wired up). Matches USBPods' own working reference.
+    CYW43_LWIP=0
     # M2 (bd pico-link-cz0.3): whichever core loads the cyw43 Bluetooth
     # firmware needs at least 48KB of stack -- earned expensively on real
     # hardware in an earlier session, where an 8-16KB core0 stack
