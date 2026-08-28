@@ -92,7 +92,35 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color) {
 
     uint8_t colmod_param = 0x55; // 16 bits/pixel, RGB565
     st7789_command(ST7789_CMD_COLMOD, &colmod_param, 1);
-    uint8_t madctl_param = 0x00;
+    // MADCTL = 0xA0 (MY | MV, no MX) -- rotates the panel's addressing so
+    // the UI reads upright with the USB cable exiting to the right, per
+    // Andreas's hardware confirmation (pico-link-g7o).
+    //
+    // History, corrected 2026-08-28: the two earlier attempts (0xA0, then
+    // 0x60) were both judged by ROTATING THE CAPTURED PHOTO until the text
+    // read upright and noting where the cable pointed in that rotated
+    // view -- a broken measurement method, not a broken panel. It produced
+    // an internally impossible result (0xA0 recorded as "cable at top",
+    // 0x60 as "cable at left" -- two MADCTL values that are 180 degrees
+    // apart, since both set MV and differ only in MX vs MY, cannot
+    // legitimately give perpendicular cable positions). A RAW, unrotated
+    // capture of the then-flashed 0x60 build settled it directly: the UI
+    // was already upright with no rotation needed to read it, and the
+    // cable exits LEFT. 0xA0 is 0x60's 180-degree partner (both are pure
+    // MV-transpose rotations; MX vs MY selects which of the two 180-degree-
+    // apart results you get), so it is the clean 90-degree-equivalent swap
+    // that puts the cable on the RIGHT instead -- verified the same way,
+    // raw frame, no rotation, see bead comments. MX/MY here are pure
+    // orientation bits and don't touch the RGB/BGR bit (bit 3), which
+    // INVON below and the existing colour work are independent of.
+    //
+    // This panel is square (240x240), so the CASET/RASET window below is
+    // unaffected by MV's row/column exchange -- no per-rotation offset is
+    // needed to keep the fill full-frame and unshifted at 0xA0 (re-verified
+    // via raw, unrotated webcam capture, see bead comments). If a future
+    // panel swap needs one, that offset is added to caset_params/raset_params
+    // below, NOT here.
+    uint8_t madctl_param = 0xA0;
     st7789_command(ST7789_CMD_MADCTL, &madctl_param, 1);
     // The Waveshare Pico-LCD-1.3 panel needs display inversion on, or
     // colours render photo-negative. Wrong colour alone wouldn't explain an
