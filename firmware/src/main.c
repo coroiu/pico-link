@@ -79,6 +79,35 @@ int main(void) {
     st7789_init_and_fill(spi1, 0x0000); // black -- the Rust UI's first render replaces this immediately
     printf("st7789_init_and_fill OK -- panel out of reset, backlight on\r\n");
 
+#ifdef PL_DIAG_COLOR_TEST
+    // Reusable diagnostic (undefined by default -- pass -DPL_DIAG_COLOR_TEST
+    // to CMAKE_C_FLAGS/CMAKE_CXX_FLAGS to enable): an exposure-immune
+    // relative colour test, first run for pico-link-14l. Top half of the
+    // panel in the theme BACKGROUND constant (core/src/render/theme.rs:47,
+    // Rgb565::new(1,4,4) -> raw 0x0884), bottom half in pure white 0xFFFF,
+    // one photograph, compare the two halves to each other WITHIN that
+    // frame -- absolute webcam RGB swings with auto white balance between
+    // captures, but two patches in one frame are directly comparable. Halts
+    // here (never reaches BT/the Rust UI) so the pattern stays on screen for
+    // the camera. Result banked on pico-link-14l: BACKGROUND photographed as
+    // a clearly saturated blue (sampled ~RGB(128,183,243), channel spread
+    // ~115) against the white half's near-neutral ~RGB(207,214,221),
+    // channel spread ~14 -- BACKGROUND is nowhere near white, so colour is
+    // not washed out/inverted to white on this panel.
+    static uint16_t s_color_test_buf[PANEL_WIDTH * PANEL_HEIGHT];
+    for (int y = 0; y < PANEL_HEIGHT; y++) {
+        uint16_t color = (y < PANEL_HEIGHT / 2) ? 0x0884 : 0xFFFF;
+        for (int x = 0; x < PANEL_WIDTH; x++) {
+            s_color_test_buf[y * PANEL_WIDTH + x] = color;
+        }
+    }
+    st7789_blit_framebuffer(spi1, s_color_test_buf, PANEL_WIDTH * PANEL_HEIGHT);
+    printf("PL_DIAG_COLOR_TEST: blitted half-BACKGROUND(0x0884)/half-WHITE(0xFFFF) -- halting\r\n");
+    while (true) {
+        tight_loop_contents();
+    }
+#endif
+
     // --- The Rust UI ---
     struct PlUi *ui = pl_ui_create(PANEL_WIDTH, PANEL_HEIGHT);
     if (ui == NULL) {
