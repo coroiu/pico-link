@@ -276,13 +276,6 @@ int main(void) {
         // comment on pl_usb_pump_report for what the three counters mean.
         pl_usb_pump_report();
 
-        // DIAGNOSTIC ONLY -- bead pico-link-icb. Drains the TU_LOG_USBD
-        // control-transfer trace (see tusb_config.h and usb_pump.h). Call
-        // every iteration, not rate-limited, so a SET_INTERFACE seen
-        // between two 1s report ticks isn't held back and doesn't risk
-        // filling the 4KB trace ring.
-        pl_usb_trace_flush();
-
         // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
         // re-renders unconditionally every call -- see its doc comment in
         // pico_link_ui.h. Blitting every iteration regardless is simple and
