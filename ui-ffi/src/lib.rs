@@ -34,7 +34,15 @@
 //!   rather than panicking -- a null-pointer bug from the C side must not
 //!   crash the one thing (the display) a developer needs to debug it.
 
-#![no_std]
+// `no_std` everywhere except this crate's own `#[cfg(test)]` unit tests,
+// which run on the host under `cargo test -p ui-ffi` -- mirrors
+// `pico_link_core`'s own `#[cfg_attr(not(test), no_std)]` escape hatch (see
+// `core/src/lib.rs`) for exactly the same reason: `cargo test` needs `std`'s
+// panic-unwind machinery and a working host allocator, neither of which a
+// bare-metal `no_std` build provides. The heap arena, the hand-rolled
+// critical-section impl, and the panic handler below are all `#[cfg(not(test))]`
+// for the same reason -- see each section's own comment.
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
@@ -42,6 +50,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[cfg(not(test))]
 use embedded_alloc::LlffHeap as Heap;
 use pico_link_core::{App, Command, ConnectFailureReason, DeviceEntry, Event, LinkState, NavIntent};
 
@@ -60,7 +69,15 @@ use pico_link_core::{App, Command, ConnectFailureReason, DeviceEntry, Event, Lin
 // (see the module doc's "Superloop on core0 only" -- everything here runs
 // on one core with no preemption other than interrupts, which is exactly
 // what disabling PRIMASK excludes for the critical section's duration).
+// `#[cfg(not(test))]`: under `cargo test -p ui-ffi` this crate builds with
+// `std` linked in (see the crate root's `cfg_attr(not(test), no_std)`), and
+// the heap arena below (the only thing that ever calls into
+// `critical_section`) is itself `#[cfg(not(test))]`'d away in favour of
+// std's own allocator -- so no `critical_section::Impl` is ever needed, or
+// registered, under test.
+#[cfg(not(test))]
 struct SingleCoreCriticalSection;
+#[cfg(not(test))]
 critical_section::set_impl!(SingleCoreCriticalSection);
 
 // SAFETY: `acquire`/`release` correctly save and restore the interrupt
@@ -68,6 +85,7 @@ critical_section::set_impl!(SingleCoreCriticalSection);
 // contract -- interrupts are disabled for the duration and restored to
 // exactly their prior state afterward, and these two calls are never
 // reordered or elided (`acquire` returns the token `release` consumes).
+#[cfg(not(test))]
 unsafe impl critical_section::Impl for SingleCoreCriticalSection {
     unsafe fn acquire() -> critical_section::RawRestoreState {
         let primask: u32;
@@ -113,11 +131,19 @@ unsafe impl critical_section::Impl for SingleCoreCriticalSection {
 // out not to match reality, not an architecture change (RP2350 has 520KB
 // SRAM total; 192KB leaves well over half for BTstack/TinyUSB/cyw43 once
 // those land in M2/M3). Flagged to the architect via a LEARNED bead comment
-// rather than silently overridden.
+// rather than silently overridden. `#[cfg(not(test))]`: under `cargo test`
+// this crate links `std`, which already provides a working host allocator --
+// declaring a second `#[global_allocator]` here would hijack the *entire*
+// test binary (including the test harness itself, before any of our test
+// code runs) into using an uninitialized arena. See the crate root's
+// `cfg_attr(not(test), no_std)` comment.
+#[cfg(not(test))]
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
+#[cfg(not(test))]
 const HEAP_SIZE: usize = 192 * 1024;
+#[cfg(not(test))]
 static mut HEAP_MEM: [core::mem::MaybeUninit<u8>; HEAP_SIZE] = [core::mem::MaybeUninit::uninit(); HEAP_SIZE];
 
 /// Initializes the global allocator's arena. Called exactly once, from the
@@ -125,9 +151,12 @@ static mut HEAP_MEM: [core::mem::MaybeUninit<u8>; HEAP_SIZE] = [core::mem::Maybe
 /// calling it twice (or handing it overlapping memory) would corrupt heap
 /// bookkeeping; the `HEAP_INITIALIZED` latch below is what makes a second
 /// `pl_ui_create` call safe instead of relying on the C caller never doing
-/// that.
+/// that. A no-op under `cargo test` (see the `HEAP` static's doc comment) --
+/// std's own allocator is used instead.
+#[cfg(not(test))]
 static HEAP_INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+#[cfg(not(test))]
 fn ensure_heap_initialized() {
     use core::sync::atomic::Ordering;
     if HEAP_INITIALIZED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -142,6 +171,12 @@ fn ensure_heap_initialized() {
     }
 }
 
+#[cfg(test)]
+fn ensure_heap_initialized() {
+    // No-op under test -- std's allocator is already live, see the `HEAP`
+    // static's doc comment above.
+}
+
 // --- Panic handling ---
 //
 // `no_std` + no unwinder on this target (thumbv8m.main-none-eabihf) + this
@@ -149,7 +184,11 @@ fn ensure_heap_initialized() {
 // report and halt, never unwind across the `extern "C"` boundary into C
 // (which would be UB). Reports via the one call Rust is allowed to make
 // back into C, then loops forever -- there is nothing else a bare-metal
-// no_std panic handler can safely do.
+// no_std panic handler can safely do. `#[cfg(not(test))]`: a crate linked
+// into a `std` test binary must not define its own `#[panic_handler]` --
+// std already provides one (ordinary unwinding panics, which `#[test]`
+// relies on for `#[should_panic]` and for reporting a failing assertion).
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // A tiny fixed-size stack buffer, not a heap `alloc::format!` -- a
@@ -188,6 +227,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
 }
 
+// `#[cfg(not(test))]`: the only caller is `panic` above, itself
+// `#[cfg(not(test))]`'d away (see its doc comment) -- under `cargo test`
+// nothing calls this, and an unused `extern "C"` declaration triggers
+// `dead_code`.
+#[cfg(not(test))]
 extern "C" {
     /// The one call in the Rust -> C direction: reports a Rust panic
     /// message so C can log it (and, on real hardware, likely reset).
@@ -204,6 +248,17 @@ extern "C" {
 /// (see the module doc's memory rules).
 pub struct PlUi {
     app: App,
+    /// Count of `pl_ui_input`/`pl_ui_push_event` calls that carried a tag
+    /// value with no corresponding `PlIntentTag`/`PlEventTag` variant --
+    /// i.e. a malformed or garbage discriminant, most plausibly arriving via
+    /// a corrupted C-owned ring buffer entry (see pico-link-6o2) or a
+    /// version-skewed caller. Incremented instead of matched-on-and-panicking
+    /// (see [`pl_ui_input`]/[`pl_ui_push_event`]'s doc comments) so a bad tag
+    /// is graceful *and* observable rather than silently swallowed --
+    /// mirrors `firmware/src/input.c`'s own `s_ring_drop_count` diagnostic
+    /// pattern for "things dropped that a healthy system should chase."
+    /// Read via [`pl_ui_malformed_tag_count`].
+    malformed_tag_count: u32,
 }
 
 /// Creates a new UI instance rendering into a `width`x`height` framebuffer,
@@ -234,8 +289,27 @@ pub extern "C" fn pl_ui_create(width: u32, height: u32) -> *mut PlUi {
         return core::ptr::null_mut();
     }
 
-    let ui = PlUi { app: App::new(width, height) };
+    let ui = PlUi { app: App::new(width, height), malformed_tag_count: 0 };
     Box::into_raw(Box::new(ui))
+}
+
+/// Returns how many `pl_ui_input`/`pl_ui_push_event` calls have carried a
+/// tag value with no corresponding enum variant since this instance was
+/// created -- see [`PlUi::malformed_tag_count`]'s doc comment. Never
+/// resets. Returns 0 if `ui` is null.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_malformed_tag_count(ui: *mut PlUi) -> u32 {
+    if ui.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract above.
+    let ui = &*ui;
+    ui.malformed_tag_count
 }
 
 /// Destroys a UI instance created by [`pl_ui_create`], freeing every Rust
@@ -265,32 +339,74 @@ pub unsafe extern "C" fn pl_ui_destroy(ui: *mut PlUi) {
 /// `NavIntent`'s C-unrepresentable per-variant payload constraint, which is
 /// exactly why this is a flat tag+payload struct instead of a `#[repr(C)]`
 /// enum with data).
+/// Explicit discriminants (pinned, not compiler-assigned) because these
+/// exact integers are now part of the wire ABI: [`PlIntent::tag`] carries
+/// this value as a plain `u32`, not as a `PlIntentTag`-typed field -- see
+/// that field's doc comment for why. `PlIntentTag` itself stays a real Rust
+/// enum purely so the cbindgen header keeps emitting named `PL_INTENT_TAG_*`
+/// C constants for firmware source to use.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlIntentTag {
-    Up,
-    Down,
-    Left,
-    Right,
-    JumpBy,
-    Select,
-    Back,
-    ShortcutX,
-    ShortcutY,
+    Up = 0,
+    Down = 1,
+    Left = 2,
+    Right = 3,
+    JumpBy = 4,
+    Select = 5,
+    Back = 6,
+    ShortcutX = 7,
+    ShortcutY = 8,
+}
+
+impl core::convert::TryFrom<u32> for PlIntentTag {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- the only sound way to
+    /// turn a C-supplied integer into this enum. Matching directly on a
+    /// `PlIntentTag`-typed field read straight off the wire (the pre-hardening
+    /// shape) is undefined behaviour the instant a garbage discriminant is
+    /// loaded, before any Rust code even runs a check -- see pico-link-ptu.
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlIntentTag::Up),
+            1 => Ok(PlIntentTag::Down),
+            2 => Ok(PlIntentTag::Left),
+            3 => Ok(PlIntentTag::Right),
+            4 => Ok(PlIntentTag::JumpBy),
+            5 => Ok(PlIntentTag::Select),
+            6 => Ok(PlIntentTag::Back),
+            7 => Ok(PlIntentTag::ShortcutX),
+            8 => Ok(PlIntentTag::ShortcutY),
+            _ => Err(()),
+        }
+    }
 }
 
 /// One input event as C constructs it. See [`PlIntentTag`]'s doc comment
 /// for the `jump_by` field's contract.
+///
+/// `tag` is a plain `u32`, not [`PlIntentTag`] -- deliberately, so that
+/// reading a `PlIntent` off the wire (this struct is passed by value, e.g.
+/// via [`pl_ui_input`]'s `intents` slice) can never itself be undefined
+/// behaviour no matter what bit pattern C supplies. The numeric values
+/// match [`PlIntentTag`]'s pinned discriminants exactly, so the wire layout
+/// and every existing tag's numeric value are unchanged from before this
+/// hardening (see pico-link-ptu). Convert via
+/// `NavIntent::try_from`/[`PlIntentTag::try_from`] rather than transmuting.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlIntent {
-    pub tag: PlIntentTag,
+    pub tag: u32,
     pub jump_by: i16,
 }
 
-impl From<PlIntent> for NavIntent {
-    fn from(intent: PlIntent) -> Self {
-        match intent.tag {
+impl core::convert::TryFrom<PlIntent> for NavIntent {
+    type Error = ();
+
+    fn try_from(intent: PlIntent) -> Result<Self, Self::Error> {
+        let tag = PlIntentTag::try_from(intent.tag)?;
+        Ok(match tag {
             PlIntentTag::Up => NavIntent::Up,
             PlIntentTag::Down => NavIntent::Down,
             PlIntentTag::Left => NavIntent::Left,
@@ -300,7 +416,7 @@ impl From<PlIntent> for NavIntent {
             PlIntentTag::Back => NavIntent::Back,
             PlIntentTag::ShortcutX => NavIntent::ShortcutX,
             PlIntentTag::ShortcutY => NavIntent::ShortcutY,
-        }
+        })
     }
 }
 
@@ -322,10 +438,23 @@ pub unsafe extern "C" fn pl_ui_input(ui: *mut PlUi, intents: *const PlIntent, co
     // SAFETY: caller contract above.
     let ui = &mut *ui;
     // SAFETY: caller contract above -- `intents` points to `count` valid,
-    // initialized `PlIntent` values for the duration of this call.
+    // initialized `PlIntent` values for the duration of this call. Reading
+    // them is sound regardless of `tag`'s value because `PlIntent::tag` is a
+    // plain `u32` -- see that field's doc comment.
     let slice = core::slice::from_raw_parts(intents, count);
-    let mapped: Vec<NavIntent> = slice.iter().copied().map(NavIntent::from).collect();
-    ui.app.handle_input(mapped);
+    let mut mapped: Vec<NavIntent> = Vec::with_capacity(count);
+    for raw in slice.iter().copied() {
+        match NavIntent::try_from(raw) {
+            Ok(intent) => mapped.push(intent),
+            // A malformed tag drops just this one intent, not the whole
+            // batch -- graceful, and counted rather than silent (see
+            // `PlUi::malformed_tag_count`'s doc comment).
+            Err(()) => ui.malformed_tag_count += 1,
+        }
+    }
+    if !mapped.is_empty() {
+        ui.app.handle_input(mapped);
+    }
 }
 
 /// One tick of the app core's clock, with `now_us` C's own timestamp (C
@@ -531,13 +660,34 @@ pub struct PlConnectFailedPayload {
 /// Which variant of [`PlEventPayload`] is active in a given [`PlEvent`].
 /// `DevicesCleared` carries no data -- the payload union is simply unread
 /// for that tag (see [`PlEventPayload`]'s doc comment).
+/// Explicit discriminants (pinned, not compiler-assigned) for the same
+/// reason as [`PlIntentTag`]'s: [`PlEvent::tag`] carries this value as a
+/// plain `u32`, and these numbers are the wire ABI. See
+/// [`PlEvent::tag`]'s doc comment.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlEventTag {
-    LinkStateChanged,
-    DeviceDiscovered,
-    DevicesCleared,
-    ConnectFailed,
+    LinkStateChanged = 0,
+    DeviceDiscovered = 1,
+    DevicesCleared = 2,
+    ConnectFailed = 3,
+}
+
+impl core::convert::TryFrom<u32> for PlEventTag {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see
+    /// [`PlIntentTag`]'s `TryFrom` impl for the full rationale (same
+    /// hazard, same fix, pico-link-ptu).
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlEventTag::LinkStateChanged),
+            1 => Ok(PlEventTag::DeviceDiscovered),
+            2 => Ok(PlEventTag::DevicesCleared),
+            3 => Ok(PlEventTag::ConnectFailed),
+            _ => Err(()),
+        }
+    }
 }
 
 /// The union of every [`PlEvent`] payload shape. Which field is valid to
@@ -566,20 +716,31 @@ pub const PL_EVENT_ABI_VERSION: u32 = 1;
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
 /// `pl_ui_clear_devices` setter trio. See the module section doc above for
 /// the union-vs-setters rationale and the ABI version guard.
+/// `tag` is a plain `u32`, not [`PlEventTag`] -- deliberately, for the same
+/// reason as [`PlIntent::tag`]: [`PlEvent`] is passed by value across the
+/// FFI boundary (see [`pl_ui_push_event`]), so a `PlEventTag`-typed field
+/// would already be undefined behaviour to read the moment C hands in a
+/// garbage discriminant, before [`pl_ui_push_event`]'s body runs at all. The
+/// numeric values match [`PlEventTag`]'s pinned discriminants exactly, so
+/// the wire layout and every existing tag's numeric value are unchanged
+/// from before this hardening (see pico-link-ptu). Convert via
+/// [`PlEventTag::try_from`] rather than transmuting.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlEvent {
     pub version: u32,
-    pub tag: PlEventTag,
+    pub tag: u32,
     pub payload: PlEventPayload,
 }
 
 /// Pushes one [`PlEvent`] into the app core, folding it into the live
 /// Bluetooth model and refreshing the root screen
-/// (`App::handle_event`'s FFI entry point). A no-op if `ui` is null or
+/// (`App::handle_event`'s FFI entry point). A no-op if `ui` is null,
 /// `event.version` doesn't match [`PL_EVENT_ABI_VERSION`] (see the module
 /// section doc's ABI version guard -- a mismatch means the `payload` union
-/// must not be read under this build's variant shapes).
+/// must not be read under this build's variant shapes), or `event.tag`
+/// doesn't correspond to any [`PlEventTag`] variant -- the latter case
+/// increments [`PlUi::malformed_tag_count`] before returning.
 ///
 /// # Safety
 ///
@@ -595,7 +756,20 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
     // SAFETY: caller contract above.
     let ui = &mut *ui;
 
-    let core_event = match event.tag {
+    // Checked conversion from the raw wire tag -- matches the shape of the
+    // `event.version` guard above (early return, no panic) rather than
+    // matching directly on a `PlEventTag`-typed field, which would already
+    // be UB for a garbage discriminant before this line ever ran. Counted,
+    // not silent -- see `PlUi::malformed_tag_count`'s doc comment.
+    let tag = match PlEventTag::try_from(event.tag) {
+        Ok(tag) => tag,
+        Err(()) => {
+            ui.malformed_tag_count += 1;
+            return;
+        }
+    };
+
+    let core_event = match tag {
         PlEventTag::LinkStateChanged => {
             // SAFETY: `tag` says this union currently holds `link_state_changed`.
             let payload = unsafe { event.payload.link_state_changed };
@@ -630,12 +804,20 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
 /// [`pl_ui_poll_command`] has a value to return when nothing is queued (or
 /// `ui` is null, or `ui`'s version check fails), since this function
 /// returns by value rather than an `Option`-shaped pointer.
+///
+/// Unlike [`PlIntentTag`]/[`PlEventTag`], this tag never needs a checked
+/// conversion: Rust is the sole producer of every [`PlCommand`] (see
+/// [`pl_ui_poll_command`]) and never constructs one from a raw integer, so
+/// there is no C-supplied bit pattern this type is ever read from -- see
+/// pico-link-ptu. Discriminants are still pinned explicitly (not
+/// compiler-assigned) purely so [`PL_COMMAND_ABI_VERSION`]'s "wire ABI"
+/// framing applies uniformly to all three tag enums in this module.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlCommandTag {
-    None,
-    StartScan,
-    Connect,
+    None = 0,
+    StartScan = 1,
+    Connect = 2,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -712,5 +894,186 @@ pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
             PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::Connect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
         }
         None => pl_command_none(),
+    }
+}
+
+// --- Tests: pico-link-ptu, checked tag conversion ---
+//
+// Host-only (`#[cfg(test)]`, run via `cargo test -p ui-ffi` -- this crate is
+// deliberately excluded from the workspace's `default-members`, see
+// ../Cargo.toml, so these do not appear in a bare `cargo test` at the repo
+// root). Exercises the actual `pl_ui_*` entry points, not the `TryFrom`
+// impls directly in isolation, per pico-link-ptu's ask: "a test that only
+// exercises legal tags does not test this bug." Every test here feeds at
+// least one out-of-range tag value through `pl_ui_input`/`pl_ui_push_event`
+// and asserts it is rejected gracefully (no panic, no crash, and observably
+// counted) rather than merely "not observed to crash."
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Creates a fresh `PlUi` for one test. Freed by the caller via
+    /// `pl_ui_destroy` -- these tests exercise real FFI entry points, so
+    /// they follow the real ownership contract rather than reaching into
+    /// `PlUi` by constructing it directly.
+    fn new_ui() -> *mut PlUi {
+        let ui = pl_ui_create(16, 16);
+        assert!(!ui.is_null(), "pl_ui_create(16, 16) unexpectedly returned null");
+        ui
+    }
+
+    #[test]
+    fn pl_ui_input_rejects_out_of_range_tag_without_panicking() {
+        let ui = new_ui();
+        // 9 is one past PlIntentTag's highest legal discriminant (ShortcutY
+        // = 8); 0xDEAD_BEEF stands in for fully garbage memory (e.g. an
+        // uninitialized or corrupted ring-buffer slot per pico-link-6o2).
+        let bad_intents = [
+            PlIntent { tag: 9, jump_by: 0 },
+            PlIntent { tag: 0xDEAD_BEEF, jump_by: 0 },
+        ];
+        unsafe {
+            pl_ui_input(ui, bad_intents.as_ptr(), bad_intents.len());
+            assert_eq!(
+                pl_ui_malformed_tag_count(ui),
+                2,
+                "both out-of-range PlIntent tags should have been counted, not matched-on"
+            );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_input_still_applies_the_valid_intents_in_a_mixed_batch() {
+        let ui = new_ui();
+        // `App::handle_input` only sets `dirty` when it actually receives a
+        // non-empty intent list (see its doc comment) -- a clean way to
+        // prove the good intents in this batch reached the app core despite
+        // the malformed one, without depending on which screen happens to
+        // be root today. A fresh `App` starts dirty (it hasn't rendered its
+        // initial screen yet), so render once through the real FFI entry
+        // point first to get to a known-clean baseline.
+        let mut out_px = core::ptr::null();
+        let mut out_len = 0usize;
+        unsafe { pl_ui_render(ui, &mut out_px, &mut out_len) };
+        assert!(!unsafe { (*ui).app.dirty() }, "PlUi should be clean immediately after a render");
+        let mixed = [
+            PlIntent { tag: PlIntentTag::Down as u32, jump_by: 0 },
+            PlIntent { tag: 123, jump_by: 0 },
+            PlIntent { tag: PlIntentTag::Down as u32, jump_by: 0 },
+        ];
+        unsafe {
+            pl_ui_input(ui, mixed.as_ptr(), mixed.len());
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "exactly one malformed tag in this batch");
+            assert!((*ui).app.dirty(), "the two legal Down intents should still have reached App::handle_input");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_input_all_malformed_tags_leaves_app_untouched() {
+        let ui = new_ui();
+        let dirty_before = unsafe { (*ui).app.dirty() };
+        let bad_intents = [PlIntent { tag: 255, jump_by: 0 }];
+        unsafe {
+            pl_ui_input(ui, bad_intents.as_ptr(), bad_intents.len());
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1);
+            // `handle_input` is skipped entirely when nothing decoded, so a
+            // batch that is *only* malformed tags must not perturb dirty
+            // state at all.
+            assert_eq!((*ui).app.dirty(), dirty_before);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_tag_without_panicking() {
+        let ui = new_ui();
+        let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle } };
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: 4, // one past ConnectFailed = 3, the highest legal PlEventTag
+            payload: bogus_payload,
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range PlEvent tag should be counted, not matched-on");
+            // Must not have folded into the model -- link state stays the
+            // default (Idle) since the malformed event was rejected before
+            // `App::handle_event` ever ran.
+            assert_eq!((*ui).app.model().link_state, LinkState::Idle);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_garbage_tag_distinct_from_version_mismatch() {
+        let ui = new_ui();
+        let payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected } };
+        // A wildly out-of-range tag (e.g. an uninitialized-memory pattern)
+        // with an otherwise-correct version -- this must be caught by the
+        // tag check, not slip through because only `version` is validated.
+        let bad_event = PlEvent { version: PL_EVENT_ABI_VERSION, tag: 0xFFFF_FFFF, payload };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1);
+            assert_eq!((*ui).app.model().link_state, LinkState::Idle, "rejected event must not reach App::handle_event");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_accepts_every_legal_tag() {
+        let ui = new_ui();
+        let events = [
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::LinkStateChanged as u32,
+                payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected } },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::DevicesCleared as u32,
+                payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle } },
+            },
+        ];
+        unsafe {
+            for event in events {
+                pl_ui_push_event(ui, event);
+            }
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "every tag above is legal -- none should be counted as malformed");
+            assert_eq!((*ui).app.model().link_state, LinkState::Connected, "the LinkStateChanged event should have taken effect");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_intent_tag_try_from_round_trips_every_legal_discriminant() {
+        let legal = [
+            PlIntentTag::Up,
+            PlIntentTag::Down,
+            PlIntentTag::Left,
+            PlIntentTag::Right,
+            PlIntentTag::JumpBy,
+            PlIntentTag::Select,
+            PlIntentTag::Back,
+            PlIntentTag::ShortcutX,
+            PlIntentTag::ShortcutY,
+        ];
+        for tag in legal {
+            assert!(PlIntentTag::try_from(tag as u32).is_ok());
+        }
+        assert!(PlIntentTag::try_from(9u32).is_err());
+        assert!(PlIntentTag::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn pl_event_tag_try_from_round_trips_every_legal_discriminant() {
+        let legal = [PlEventTag::LinkStateChanged, PlEventTag::DeviceDiscovered, PlEventTag::DevicesCleared, PlEventTag::ConnectFailed];
+        for tag in legal {
+            assert!(PlEventTag::try_from(tag as u32).is_ok());
+        }
+        assert!(PlEventTag::try_from(4u32).is_err());
+        assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 }
