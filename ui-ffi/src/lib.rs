@@ -39,10 +39,11 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use embedded_alloc::LlffHeap as Heap;
-use pico_link_core::{App, NavIntent};
+use pico_link_core::{App, Command, LinkState, NavIntent};
 
 // --- critical-section implementation ---
 //
@@ -399,5 +400,153 @@ pub unsafe extern "C" fn pl_ui_render(ui: *mut PlUi, out_px: *mut *const u16, ou
     unsafe {
         *out_px = raw.as_ptr();
         *out_len = raw.len();
+    }
+}
+
+// --- M2: the Bluetooth link surface ---
+//
+// C calls these to push live BTstack state into the devices screen and to
+// poll user-initiated commands back out. `core` itself has no idea BTstack
+// exists -- it only knows `LinkState`/`DeviceEntry`/`Command` (see
+// `pico_link_core::app`'s doc comments) -- this is the seam that adapts
+// those to a C-friendly ABI, same pattern as `PlIntent`/`NavIntent` above.
+
+/// Mirrors [`pico_link_core::LinkState`]'s four variants 1:1.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlLinkState {
+    Idle,
+    Scanning,
+    Connecting,
+    Connected,
+}
+
+impl From<PlLinkState> for LinkState {
+    fn from(state: PlLinkState) -> Self {
+        match state {
+            PlLinkState::Idle => LinkState::Idle,
+            PlLinkState::Scanning => LinkState::Scanning,
+            PlLinkState::Connecting => LinkState::Connecting,
+            PlLinkState::Connected => LinkState::Connected,
+        }
+    }
+}
+
+/// Sets the Bluetooth link's coarse lifecycle state, refreshing the
+/// devices screen's "Scan" row sublabel to match. A no-op if `ui` is null.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_set_link_state(ui: *mut PlUi, state: PlLinkState) {
+    if ui.is_null() {
+        return;
+    }
+    // SAFETY: caller contract above.
+    let ui = &mut *ui;
+    ui.app.set_link_state(state.into());
+}
+
+/// Adds (or, if `addr` is already known, updates the name/rssi of) one
+/// discovered Bluetooth device. `name` points to `name_len` bytes of UTF-8
+/// text, not necessarily NUL-terminated; invalid UTF-8 is replaced lossily
+/// rather than rejected (see the module doc's memory rules). A null `name`
+/// (regardless of `name_len`) is treated as an empty device name. A no-op
+/// if `ui` or `addr` is null.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. If non-null, `addr` must point to 6 valid bytes. If non-null,
+/// `name` must point to at least `name_len` valid bytes. Both `addr` and
+/// `name` are borrowed for the duration of this call only.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_add_device(ui: *mut PlUi, addr: *const u8, name: *const u8, name_len: usize, rssi: i8) {
+    if ui.is_null() || addr.is_null() {
+        return;
+    }
+    // SAFETY: caller contract above.
+    let ui = &mut *ui;
+    // SAFETY: caller contract above -- `addr` points to 6 valid bytes.
+    let addr_slice = core::slice::from_raw_parts(addr, 6);
+    let mut addr_bytes = [0u8; 6];
+    addr_bytes.copy_from_slice(addr_slice);
+
+    let name = if name.is_null() || name_len == 0 {
+        String::new()
+    } else {
+        // SAFETY: caller contract above -- `name` points to at least
+        // `name_len` valid bytes for the duration of this call.
+        let bytes = core::slice::from_raw_parts(name, name_len);
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+
+    ui.app.add_device(addr_bytes, name, rssi);
+}
+
+/// Clears the discovered-device list, e.g. at the start of a fresh scan.
+/// A no-op if `ui` is null.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_clear_devices(ui: *mut PlUi) {
+    if ui.is_null() {
+        return;
+    }
+    // SAFETY: caller contract above.
+    let ui = &mut *ui;
+    ui.app.clear_devices();
+}
+
+/// Mirrors [`pico_link_core::Command`]'s two variants, flattened into a
+/// tag+payload struct the same way [`PlIntent`] flattens `NavIntent` (see
+/// its doc comment) -- `addr` is only meaningful when
+/// `tag == PlCommandTag::Connect`. `PlCommandTag::None` is not one of
+/// `Command`'s variants; it exists purely so [`pl_ui_poll_command`] has a
+/// value to return when nothing is queued (or `ui` is null), since this
+/// function returns by value rather than an `Option`-shaped pointer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlCommandTag {
+    None,
+    StartScan,
+    Connect,
+}
+
+/// See [`PlCommandTag`]'s doc comment for the `addr` field's contract.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlCommand {
+    pub tag: PlCommandTag,
+    pub addr: [u8; 6],
+}
+
+/// Pops the oldest user-initiated command queued by the devices screen
+/// (selecting "Scan" or a discovered device row), or a
+/// `PlCommandTag::None` command if none is pending -- callers should poll
+/// this once per main-loop iteration and drain it in a loop if more than
+/// one command might be queued between polls. Also returns
+/// `PlCommandTag::None` if `ui` is null.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
+    if ui.is_null() {
+        return PlCommand { tag: PlCommandTag::None, addr: [0; 6] };
+    }
+    // SAFETY: caller contract above.
+    let ui = &mut *ui;
+    match ui.app.poll_command() {
+        Some(Command::StartScan) => PlCommand { tag: PlCommandTag::StartScan, addr: [0; 6] },
+        Some(Command::Connect { addr }) => PlCommand { tag: PlCommandTag::Connect, addr },
+        None => PlCommand { tag: PlCommandTag::None, addr: [0; 6] },
     }
 }
