@@ -15,6 +15,7 @@
 
 #include "usb_audio.h"
 #include "usb_descriptors.h"
+#include "usb_pump.h"
 
 //--------------------------------------------------------------------+
 // State
@@ -29,6 +30,7 @@ static int16_t fu_volume[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];
 
 static volatile bool streaming = false;
 static volatile uint32_t pcm_bytes_total = 0;
+static volatile uint32_t packet_count = 0;
 
 //--------------------------------------------------------------------+
 // Clock entity (UAC2_ENTITY_CLOCK)
@@ -172,9 +174,28 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedba
     feedback_param->sample_freq = current_sample_rate;
 }
 
+// Fires once per received isochronous OUT packet, before this file's own
+// drain loop below reads the bytes out -- see usb_audio.h's doc comment
+// on pl_usb_audio_packet_count. Called by TinyUSB's audio class driver
+// from inside tud_task(), i.e. from within the bd pico-link-tfj 0xC0
+// worker IRQ.
+bool tud_audio_rx_done_pre_read_cb(uint8_t rhport, uint16_t n_bytes_received, uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting) {
+    (void)rhport;
+    (void)n_bytes_received;
+    (void)func_id;
+    (void)ep_out;
+    (void)cur_alt_setting;
+    packet_count++;
+    return true;
+}
+
 //--------------------------------------------------------------------+
 // Application-facing API
 //--------------------------------------------------------------------+
+// Bead pico-link-tfj: called from the 0xC0 worker IRQ
+// (pl_usb_pump_worker_irq), right after tud_task(), instead of once per
+// superloop iteration -- the drain has to keep pace with the ~1ms re-arm
+// deadline, not the render loop's frame time. See usb_pump.h's module doc.
 void pl_usb_audio_task(void) {
     uint16_t avail = tud_audio_available();
     if (avail == 0) {
@@ -185,6 +206,10 @@ void pl_usb_audio_task(void) {
         uint16_t chunk = avail > sizeof(scratch) ? (uint16_t)sizeof(scratch) : avail;
         uint16_t n = tud_audio_read(scratch, chunk);
         pcm_bytes_total += n;
+        // Feed the pump's SRAM ring so a future consumer (M4's LDAC/I2S
+        // path) can drain it -- nothing drains it yet in M3, see
+        // pl_usb_pump_push_pcm's doc comment on drop-when-full.
+        pl_usb_pump_push_pcm(scratch, n);
         if (n < chunk) {
             break;
         }
@@ -202,4 +227,8 @@ uint32_t pl_usb_audio_pcm_bytes_total(void) {
 
 uint32_t pl_usb_audio_sample_rate(void) {
     return current_sample_rate;
+}
+
+uint32_t pl_usb_audio_packet_count(void) {
+    return packet_count;
 }

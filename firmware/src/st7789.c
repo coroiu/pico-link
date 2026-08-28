@@ -12,6 +12,8 @@
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
 
+#include "usb_pump.h"
+
 #define ST7789_CMD_CASET 0x2A
 #define ST7789_CMD_RASET 0x2B
 #define ST7789_CMD_RAMWR 0x2C
@@ -65,7 +67,7 @@ void st7789_init(spi_inst_t *spi) {
     gpio_set_function(ST7789_PIN_MOSI, GPIO_FUNC_SPI);
 
     uint actual_baud = spi_init(s_spi, ST7789_INIT_BAUDRATE_HZ);
-    printf("st7789: requested %d Hz, actual %u Hz\r\n", ST7789_INIT_BAUDRATE_HZ, actual_baud);
+    pl_log("st7789: requested %d Hz, actual %u Hz\r\n", ST7789_INIT_BAUDRATE_HZ, actual_baud);
     spi_set_format(s_spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
     s_dma_chan = dma_claim_unused_channel(true);

@@ -81,6 +81,7 @@ add_executable(pico_link
     src/bt.c
     src/usb_descriptors.c
     src/usb_audio.c
+    src/usb_pump.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
@@ -114,6 +115,17 @@ target_compile_definitions(pico_link PRIVATE
     # symptom as M2 despite the panel visibly rendering, which is what
     # exposed this as a tooling gap rather than a firmware hang.
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
+    # Bead pico-link-tfj: pico_stdio_usb's own stdio_usb_out_chars() spins
+    # for up to PICO_STDIO_USB_STDOUT_TIMEOUT_US (default 500000, i.e.
+    # 500ms) waiting for tud_cdc_write_available() before giving up on one
+    # printf/pl_log call. Combined with PICO_STDIO_USB_CONNECTION_WITHOUT_DTR
+    # above (which makes stdio_usb_connected() true even with no reader
+    # attached), a listening test with no capture running could otherwise
+    # block the pl_usb_mutex -- and therefore the 0xC0 worker's
+    # mutex_try_enter -- for half a second on every single log line. 2ms is
+    # enough slack for a real reader without holding the mutex anywhere
+    # near the worker's 1ms re-arm deadline.
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000
     # M2: Bluetooth only, no Wi-Fi -- without this, cyw43.h unconditionally
     # pulls in lwip/netif.h (a build dependency we have no use for and
     # haven't wired up). Matches USBPods' own working reference.

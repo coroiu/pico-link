@@ -27,15 +27,17 @@
 #include "pico_link_ui.h"
 #include "st7789.h"
 #include "usb_audio.h"
+#include "usb_pump.h"
 
 // The one call in the Rust -> C direction (see pico_link_ui.h's doc comment
 // on pl_ui_panic_hook): Rust hands us a panic message on the way to
 // spinning forever, since it has no unwinder on this target and nothing
 // else safe to do. Report it over the CDC console -- the only I/O channel
 // available for this -- so a panic during bring-up is visible rather than
-// looking like a silent hang.
+// looking like a silent hang. Goes through pl_log(), not a bare printf --
+// see usb_pump.h's module doc (bead pico-link-tfj).
 void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
-    printf("\r\n!!! ui-ffi PANIC: %.*s\r\n", (int)len, (const char *)msg);
+    pl_log("\r\n!!! ui-ffi PANIC: %.*s\r\n", (int)len, (const char *)msg);
 }
 
 #define PANEL_WIDTH ST7789_WIDTH
@@ -63,15 +65,22 @@ int main(void) {
     };
     tusb_init(BOARD_TUD_RHPORT, &dev_init);
 
+    // Bead pico-link-tfj: brings up pl_usb_mutex and the 1ms-timer/0xC0-IRQ
+    // worker that services tud_task() from here on. Must run before
+    // stdio_init_all()/any pl_log() call -- pl_log()'s mutex has to exist
+    // first, and this firmware no longer calls tud_task() from the
+    // superloop at all (see below).
+    pl_usb_pump_init();
+
     stdio_init_all();
 
     // Give a host-side terminal a moment to attach after CDC enumerates,
     // so the boot banner below isn't lost before anyone is listening.
     sleep_ms(1500);
 
-    printf("\r\n=== pico_link firmware boot ===\r\n");
-    printf("board: pimoroni_pico_plus2_w_rp2350\r\n");
-    printf("pico-sdk owns main(); ui-ffi (Rust core) linked in over FFI.\r\n");
+    pl_log("\r\n=== pico_link firmware boot ===\r\n");
+    pl_log("board: pimoroni_pico_plus2_w_rp2350\r\n");
+    pl_log("pico-sdk owns main(); ui-ffi (Rust core) linked in over FFI.\r\n");
 
     // Panel bring-up itself is proven on real hardware as of M1b (bd
     // pico-link-cz0.2). An earlier version of this M2 session's main.c
@@ -90,11 +99,11 @@ int main(void) {
     // sleep -- the multi-second colour-hold loop is still gone (a real
     // simplification, not the bug), just not the fill itself.
     st7789_init(spi1);
-    printf("st7789_init OK (SPI1, DC=%d CS=%d SCK=%d MOSI=%d RST=%d BL=%d, %d Hz)\r\n",
+    pl_log("st7789_init OK (SPI1, DC=%d CS=%d SCK=%d MOSI=%d RST=%d BL=%d, %d Hz)\r\n",
            ST7789_PIN_DC, ST7789_PIN_CS, ST7789_PIN_SCK, ST7789_PIN_MOSI, ST7789_PIN_RST, ST7789_PIN_BL,
            ST7789_INIT_BAUDRATE_HZ);
     st7789_init_and_fill(spi1, 0x0000); // black -- the Rust UI's first render replaces this immediately
-    printf("st7789_init_and_fill OK -- panel out of reset, backlight on\r\n");
+    pl_log("st7789_init_and_fill OK -- panel out of reset, backlight on\r\n");
 
 #ifdef PL_DIAG_COLOR_TEST
     // Reusable diagnostic (undefined by default -- pass -DPL_DIAG_COLOR_TEST
@@ -119,7 +128,7 @@ int main(void) {
         }
     }
     st7789_blit_framebuffer(spi1, s_color_test_buf, PANEL_WIDTH * PANEL_HEIGHT);
-    printf("PL_DIAG_COLOR_TEST: blitted half-BACKGROUND(0x0884)/half-WHITE(0xFFFF) -- halting\r\n");
+    pl_log("PL_DIAG_COLOR_TEST: blitted half-BACKGROUND(0x0884)/half-WHITE(0xFFFF) -- halting\r\n");
     while (true) {
         tight_loop_contents();
     }
@@ -128,15 +137,15 @@ int main(void) {
     // --- The Rust UI ---
     struct PlUi *ui = pl_ui_create(PANEL_WIDTH, PANEL_HEIGHT);
     if (ui == NULL) {
-        printf("pl_ui_create FAILED -- halting\r\n");
+        pl_log("pl_ui_create FAILED -- halting\r\n");
         while (true) {
             tight_loop_contents();
         }
     }
-    printf("pl_ui_create OK\r\n");
+    pl_log("pl_ui_create OK\r\n");
 
     pl_link_input_init();
-    printf("pl_link_input_init OK\r\n");
+    pl_log("pl_link_input_init OK\r\n");
 
     // --- M2: bring the radio up ---
     //
@@ -153,16 +162,16 @@ int main(void) {
     // bead's 15-minute precondition.
 #ifndef PL_DIAG_SKIP_BT
     if (cyw43_arch_init()) {
-        printf("cyw43_arch_init FAILED -- halting\r\n");
+        pl_log("cyw43_arch_init FAILED -- halting\r\n");
         while (true) {
             tight_loop_contents();
         }
     }
-    printf("cyw43_arch_init OK\r\n");
+    pl_log("cyw43_arch_init OK\r\n");
 
     pl_bt_init(ui);
 #else
-    printf("PL_DIAG_SKIP_BT set -- skipping cyw43_arch_init/pl_bt_init\r\n");
+    pl_log("PL_DIAG_SKIP_BT set -- skipping cyw43_arch_init/pl_bt_init\r\n");
 #endif
 
     // Superloop on core0 only (M1b design, unchanged by M2). Every
@@ -172,19 +181,27 @@ int main(void) {
     // no new threading model. BTstack's own work happens in the cyw43
     // background IRQ (pico_cyw43_arch_threadsafe_background, linked in
     // CMakeLists.txt), not in this loop.
+    //
+    // Bead pico-link-tfj: tud_task()/pl_usb_audio_task() are NO LONGER
+    // called here. The isochronous OUT endpoint is only re-armed from
+    // inside tud_task() (audio_device.c's audiod_xfer_cb), on a ~1ms
+    // deadline the render+blit+BT-poll loop below cannot meet (it was
+    // ~55ms at the time this was diagnosed) -- see usb_pump.h's module
+    // doc. pl_usb_pump_init() (called above, before stdio_init_all())
+    // already installed a 1ms-timer-driven, 0xC0-priority IRQ worker that
+    // services both.
     PlIntent intents[8];
     uint64_t audio_report_start_us = time_us_64();
     uint32_t audio_report_start_bytes = pl_usb_audio_pcm_bytes_total();
+    // ~60Hz budget, matching the emulator's frame budget and the loop's
+    // former sleep_ms(16) pace -- but now a DEADLINE measured from
+    // frame_start_us rather than an unconditional sleep, since the loop
+    // body itself (blit alone: 38.6ms as of pico-link-14l) can already
+    // exceed it. Bead pico-link-tfj: the old unconditional sleep_ms(16)
+    // added a flat 16ms on top of a body that was already the dominant
+    // cost, for no reason -- it never actually paced anything to 60Hz.
+    const uint64_t frame_budget_us = 16000;
     while (true) {
-        // M3: service TinyUSB every iteration -- this is what used to
-        // happen for free inside pico_stdio_usb's own background IRQ
-        // before this project took over tud_init()/tud_task() (see the
-        // comment on tusb_init() above). Draining the audio OUT FIFO right
-        // after is this milestone's "consumer": no I2S/LDAC yet (that is
-        // M4), just proving PCM arrives correctly and at the right rate.
-        tud_task();
-        pl_usb_audio_task();
-
         uint64_t frame_start_us = time_us_64();
 
         size_t n = pl_link_input_poll(intents, 8);
@@ -223,7 +240,7 @@ int main(void) {
             uint32_t delta_bytes = bytes_now - audio_report_start_bytes;
             uint64_t delta_us = now_us - audio_report_start_us;
             if (pl_usb_audio_streaming()) {
-                printf(
+                pl_log(
                     "usb-audio: streaming rate=%luHz ch=2 bits=16 measured=%lu B/s (%lu bytes / %llums)\r\n",
                     (unsigned long)pl_usb_audio_sample_rate(),
                     (unsigned long)((uint64_t)delta_bytes * 1000000ULL / delta_us),
@@ -231,7 +248,7 @@ int main(void) {
                     (unsigned long long)(delta_us / 1000)
                 );
             } else {
-                printf("usb-audio: idle (alt 0 / not streaming), total=%lu bytes\r\n", (unsigned long)bytes_now);
+                pl_log("usb-audio: idle (alt 0 / not streaming), total=%lu bytes\r\n", (unsigned long)bytes_now);
             }
             audio_report_start_us = now_us;
             audio_report_start_bytes = bytes_now;
@@ -246,7 +263,7 @@ int main(void) {
         // this satisfies by printing exactly that breakdown, just not on
         // literally every single frame.
         if (frame_count % 60 == 1) {
-            printf(
+            pl_log(
                 "frame %lu: render=%lluus blit=%lluus total=%lluus\r\n",
                 (unsigned long)frame_count,
                 (unsigned long long)(render_end_us - render_start_us),
@@ -255,13 +272,26 @@ int main(void) {
             );
         }
 
+        // Bead pico-link-tfj instrumentation -- see usb_pump.h's doc
+        // comment on pl_usb_pump_report for what the three counters mean.
+        pl_usb_pump_report();
+
         // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
         // re-renders unconditionally every call -- see its doc comment in
         // pico_link_ui.h. Blitting every iteration regardless is simple and
         // correct, if not maximally efficient -- a later milestone can add
         // a "was this frame actually new" signal to the FFI surface if the
         // redundant-blit cost turns out to matter.
-        sleep_ms(16); // ~60Hz loop pace, matching the emulator's frame budget
+        //
+        // Bead pico-link-tfj: replaced the old unconditional sleep_ms(16)
+        // with a deadline measured from frame_start_us -- the body above
+        // (blit alone: 38.6ms as of pico-link-14l) already exceeds the
+        // budget most of the time, so this sleeps only the remainder (zero,
+        // in practice) rather than always adding a further flat 16ms.
+        uint64_t frame_elapsed_us = time_us_64() - frame_start_us;
+        if (frame_elapsed_us < frame_budget_us) {
+            sleep_us((uint32_t)(frame_budget_us - frame_elapsed_us));
+        }
     }
 
     return 0;

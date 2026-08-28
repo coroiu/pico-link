@@ -31,4 +31,11 @@ uint32_t pl_usb_audio_pcm_bytes_total(void);
 // which is the honest thing to report rather than the compile-time constant.
 uint32_t pl_usb_audio_sample_rate(void);
 
+// Cumulative count of tud_audio_rx_done_pre_read_cb firings -- one per
+// received isochronous OUT packet, BEFORE pl_usb_audio_task's drain loop
+// reads the bytes out. Bead pico-link-tfj instrumentation: distinguishes
+// "packets never arriving at all" from "packets arriving but the software
+// FIFO not draining fast enough" (see pl_usb_pump_report).
+uint32_t pl_usb_audio_packet_count(void);
+
 #endif // PICO_LINK_USB_AUDIO_H
