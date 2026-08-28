@@ -504,12 +504,13 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 ## Current State
 
 **2026-08-28 — the radio is up and the panel is fast: Bluetooth Classic GAP
-inquiry runs on real hardware, the display is upright and blits a full frame
-in 38.6ms (was 1.03s), and input is interrupt-driven off the render loop.**
-This is well past the milestone three earlier Rust-first sessions never
-reached. See `.planning/progress.md` for detail and `.planning/decisions/` for
-the current ADRs — trust the ADRs, not older prose in this file, if they
-conflict.
+inquiry runs on real hardware, a full frame blits in 38.6ms (was 1.03s), and
+input is interrupt-driven off the render loop.** The display-rotation fix
+merged in the same run is **known broken** (mirrored, not rotated — see
+`pico-link-zzq` below) and still needs a real fix. This is well past the
+milestone three earlier Rust-first sessions never reached. See
+`.planning/progress.md` for detail and `.planning/decisions/` for the current
+ADRs — trust the ADRs, not older prose in this file, if they conflict.
 
 - **Epics A and B done** (unchanged from prior state — repo squash, `no_std`
   + `alloc` core retarget to 240x240, all three run modes green).
@@ -574,15 +575,20 @@ conflict.
   audio streams. The leading hypothesis was `tud_task()` starved by the
   then-1-second blit; the superloop is now 38.6ms, so the next action is to
   rebase onto `main` and retry streaming before any new diagnosis.
-- **Still open:** `pico-link-d7k` (d-pad-select -> `PL_CMD_CONNECT` and the
-  new 180-degree input remap both need one human press to verify — no
-  automated input path on the real target, a standing gap in the
-  three-run-modes story), `pico-link-gap` (panic recorder), `pico-link-hfc`
-  (P4, remaining `.claude` boilerplate).
+- **Still open:** `pico-link-zzq` (**P1** — the merged rotation fix is wrong:
+  `MADCTL = 0xA0` mirrors the image instead of rotating it; known good is
+  `MADCTL = 0x60`, upright with the cable exiting LEFT, rotated 180 from
+  there; judge with an asymmetric corner test pattern, never a photo of
+  small text), `pico-link-d7k` (d-pad-select -> `PL_CMD_CONNECT` and the
+  180-degree input remap both need one human press to verify — no automated
+  input path on the real target, a standing gap in the three-run-modes
+  story), `pico-link-gap` (panic recorder), `pico-link-hfc` (P4, remaining
+  `.claude` boilerplate).
 - **Two environment facts, still current:** build with
   `PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1` (pico-sdk's `stdio_usb` gates
   console output on DTR, which the direct-USB reader can't assert on macOS);
   the Homebrew `arm-none-eabi-gcc` lacks newlib specs, use
   `/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin`.
-- **Next:** rebase M3 (`pico-link-cz0.4`) onto `main` and retry audio
-  streaming now that the superloop is 38.6ms instead of ~1s.
+- **Next:** fix `pico-link-zzq` (P1, display mirrored on `main`), and rebase
+  M3 (`pico-link-cz0.4`) onto `main` to retry audio streaming now that the
+  superloop is 38.6ms instead of ~1s.
