@@ -12,11 +12,30 @@ typedef struct {
     PlIntentTag tag;
 } pl_input_pin_t;
 
+// Rotated 90 degrees CCW to match the st7789.c MADCTL change (bead
+// pico-link-g7o): the joystick is physically fixed to the PCB, but the
+// panel's displayed image now rotates 90 degrees CCW relative to it, so the
+// physical direction the user perceives as "up" on the corrected screen is
+// no longer the pin the PL_INPUT_PIN_UP/DOWN/LEFT/RIGHT names describe.
+//
+// Derivation: rotating the displayed image 90 degrees CCW while the board
+// (and its joystick) stays fixed is equivalent, from the joystick's point
+// of view, to the joystick rotating 90 degrees CW relative to the screen.
+// Each pin's physical push direction, rotated 90 degrees CW, lands on the
+// intent that used to belong to the NEXT pin clockwise in the
+// up->right->down->left cycle:
+//   PIN_UP    (physical "up"    push) now points toward screen-right
+//   PIN_RIGHT (physical "right" push) now points toward screen-down
+//   PIN_DOWN  (physical "down"  push) now points toward screen-left
+//   PIN_LEFT  (physical "left"  push) now points toward screen-up
+// i.e. each entry below maps a PIN_* to the NavIntent one step clockwise
+// from its name. UNVERIFIED ON HARDWARE -- this needs a physical press to
+// confirm; see bead pico-link-g7o's completion comment and pico-link-d7k.
 static const pl_input_pin_t PINS[PL_INPUT_PIN_COUNT] = {
-    {PL_INPUT_PIN_UP, PL_INTENT_TAG_UP},
-    {PL_INPUT_PIN_DOWN, PL_INTENT_TAG_DOWN},
-    {PL_INPUT_PIN_LEFT, PL_INTENT_TAG_LEFT},
-    {PL_INPUT_PIN_RIGHT, PL_INTENT_TAG_RIGHT},
+    {PL_INPUT_PIN_UP, PL_INTENT_TAG_RIGHT},
+    {PL_INPUT_PIN_DOWN, PL_INTENT_TAG_LEFT},
+    {PL_INPUT_PIN_LEFT, PL_INTENT_TAG_UP},
+    {PL_INPUT_PIN_RIGHT, PL_INTENT_TAG_DOWN},
     // Center joystick press and button A both mean Select -- see
     // pico_link_core::NavIntent::Select's doc comment.
     {PL_INPUT_PIN_PRESS, PL_INTENT_TAG_SELECT},

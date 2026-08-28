@@ -92,7 +92,25 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color) {
 
     uint8_t colmod_param = 0x55; // 16 bits/pixel, RGB565
     st7789_command(ST7789_CMD_COLMOD, &colmod_param, 1);
-    uint8_t madctl_param = 0x00;
+    // MADCTL = 0xA0 (MY | MV, no MX) -- rotates the panel's addressing 90
+    // degrees COUNTER-CLOCKWISE relative to the previous 0x00 (identity)
+    // orientation, per Andreas's hardware confirmation (pico-link-g7o): the
+    // UI must read upright with the USB cable exiting to the right, which
+    // is a 90-degree CCW rotation of the image this board previously
+    // showed at 0x00. MV (row/column exchange, bit 5) is what makes this a
+    // 90-degree step instead of a mirror/180; MY (row address order, bit 7)
+    // rather than MX picks the CCW direction over CW (the other 90-degree
+    // option is 0x60 = MX | MV, which would be CW instead -- see st7789.c's
+    // header comment / bead pico-link-g7o for the derivation). MX/MY here
+    // are pure orientation bits and don't touch the RGB/BGR bit (bit 3),
+    // which INVON below and the existing colour work are independent of.
+    //
+    // This panel is square (240x240), so the CASET/RASET window below is
+    // unaffected by MV's row/column exchange -- no per-rotation offset was
+    // needed to keep the fill full-frame and unshifted (verified via
+    // webcam, see bead comments). If a future panel swap needs one, that
+    // offset is added to caset_params/raset_params below, NOT here.
+    uint8_t madctl_param = 0xA0;
     st7789_command(ST7789_CMD_MADCTL, &madctl_param, 1);
     // The Waveshare Pico-LCD-1.3 panel needs display inversion on, or
     // colours render photo-negative. Wrong colour alone wouldn't explain an
