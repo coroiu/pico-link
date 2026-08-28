@@ -32,7 +32,7 @@
 // verifying a clean panel + CDC frame-timing line at each rate
 // (pico-link-14l); step back down and note the highest clean rate if a
 // given value misbehaves.
-#define ST7789_INIT_BAUDRATE_HZ (40 * 1000 * 1000)
+#define ST7789_INIT_BAUDRATE_HZ (62 * 1000 * 1000)
 
 void st7789_init(spi_inst_t *spi);
 
