@@ -69,11 +69,25 @@ unlabelled buttons on a device you touch once a month are four buttons you
 never press. The **gauge column** sits on the edge *opposite* the rail - the
 d-pad edge - so the volume control and its display are under the same thumb.
 
-> **BLOCKING, PARAMETERISED:** the physical A/B/X/Y arrangement is unknown and
-> the panel rotation (`pico-link-zzq`) is unresolved. The rail's edge and slot
-> order must derive from the same constant that maps GPIO to `NavIntent`, so a
-> rotation flips labels *with* the buttons instead of silently lying. The gauge
-> binds to the opposite edge off that same constant, so they can never collide.
+**Physical arrangement (confirmed by Andreas, 2026-08-28):** the four buttons
+are a **column on the right**, ordered **A, B, X, Y top to bottom**, with the
+**d-pad on the left**. So the rail sits on the right edge with slot order A/B/X/Y
+downward, and the gauge column sits on the left, on the d-pad edge. That is the
+layout drawn above.
+
+> **STILL PARAMETERISE IT.** The panel rotation (`pico-link-zzq`) is unresolved,
+> and a 180-degree flip puts the d-pad on the right and the buttons on the left.
+> The rail's edge and slot order must derive from the same constant that maps
+> GPIO to `NavIntent`, so a rotation flips the labels *with* the buttons instead
+> of silently lying, and the gauge binds to the opposite edge off that same
+> constant. Hard-coding "right" would make the rotation fix a UI bug.
+
+**Note the interaction:** `pico-link-zzq` wants the UI upright with the *cable*
+exiting right, and the panel is currently upright with the cable exiting left.
+Resolving that rotates the board 180 degrees, which moves the d-pad to the right
+and the buttons to the left. The design is unaffected because both edges are
+parameterised - but whoever fixes the rotation must re-derive the button-to-
+intent table and the rail edge together, never separately.
 
 ## 4. Global input contract
 
@@ -373,6 +387,13 @@ any of these would be lying about what we control.
 
 ## 13. Data dependencies - degraded or cut
 
+> **SUPERSEDED IN PART BY S17.** This table was written under a brief that said
+> to cut anything lacking data in today's firmware. That brief was wrong: it
+> turns schedule facts into product decisions. S17 re-classifies every entry as
+> IMPOSSIBLE (stays cut) or NOT BUILT YET (designed properly, with enabling
+> work in S19). Read S17 first; the rulings below hold only for the IMPOSSIBLE
+> rows and for build ORDER - ship a field absent, never frozen or faked.
+
 | Field | Status | Ruling if unavailable |
 |---|---|---|
 | **Paired list / link keys** | **LOAD-BEARING** | Devices *and* the zero-press goal both collapse. Not degradable. |
@@ -439,8 +460,208 @@ every dashed field and every **cut** field in its cut form; Devices with a
 nameless row and MRU ordering. The degraded chain and the cut fields are the ones
 that will otherwise never be looked at until a user hits them.
 
-## 15. Still blocking
+## 15. Build-order rule (survives from S13)
 
-The physical A/B/X/Y arrangement on the Waveshare Pico-LCD-1.3. Rail edge, rail
-slot order and gauge edge all remain parameterised off one constant until it
-lands.
+Where a field is designed but its data is not built yet, **ship it ABSENT, never
+frozen and never faked.** A still VU meter reads as silence when it means no
+data; a permanently-dashed signal meter is a recurring admission of ignorance on
+the screen the product's credibility depends on; a volume bar that does not move
+on press is a bug report. Absent is honest; frozen is a lie.
+
+## 16. Still blocking
+
+Nothing blocks the design. The button arrangement is answered (S3). Rail edge,
+rail slot order and gauge edge stay parameterised off one constant so the
+unresolved panel rotation cannot turn into a UI bug.
+
+
+---
+
+# v6 — designed for the product we intend
+
+The design above was written under a brief to cut anything without data in
+today's firmware. Andreas corrected it: *"you are allowed to think ahead. Just
+because there is only one device and everything is lost on reboot doesn't mean
+we won't fix that. UX first! figure out what we want, and then plan for building
+it."* Sections 17-19 apply that.
+
+## 17. Impossible vs not built yet
+
+**IMPOSSIBLE — stays cut.** *Now-playing metadata* (we are the A2DP source; the
+host sends raw PCM and there is no metadata in our data path, so nothing
+downstream can invent it). *Simultaneous streaming to two sinks* (bandwidth plus
+two LDAC encodes on a 150MHz M33) - but see E23, because the useful half of
+multipoint is not impossible. *Headphone battery* - with one counter-datum
+logged rather than sat on: AVRCP 1.3+ defines `EVENT_BATT_STATUS_CHANGED` (0x06)
+on the target, and we are the controller. Support is patchy and values are
+coarse (Normal/Warning/Critical/External/FullCharge, not a percentage), so even
+at best this is a **three-state icon, never a gauge**. Not designed. Ada to close
+the question properly; "vendor-proprietary" may be slightly too strong.
+
+**NOT BUILT YET — back on the table, designed properly.** `SIGNAL` row and Home
+LINK bar (E18). `OUT` level meter and its peak cap (E17). `VOL` gauge and the
+d-pad binding (E16). `USB IN` rate (E19). Live/adaptive bitrate (E20).
+Class-of-Device scan filter (E9). The multi-device paired list (S18). The core
+clock, **upgraded from not-MVP-blocking to high priority** (S20). And the scan
+elapsed timer, **reinstated as a determinate bar** - the scan is exactly 10.24s,
+so with a clock this is measured progress, not an estimate, which is better than
+the streaming-rows-only design v5 settled for.
+
+**RETIRED AS A DESIGN RULE:** *"a setting with no persistence behind it does not
+appear."* Correct under the old brief, wrong under this one. See S19.
+
+**DECLINED ON MERIT — unchanged, and on the record as merit, not scarcity:**
+on-screen text entry for renaming, long-press gestures, B navigating forward,
+verb-first device menus, marquee names, toasts for the fallback, RSSI-sorted
+scan lists, and a volume control that pretends the host slider will follow.
+
+## 18. The multi-device story
+
+**Multiple means REMEMBERED, never simultaneously connected.** Exactly one active
+connection, always. What scales is the paired-device store.
+
+**Capacity: 8 paired devices.** Covers every plausible user with margin (desk
+over-ears, portable earbuds, a speaker, a spare) and keeps the list at 8 + "Pair
+new" = 9 rows, inside the 12-item rule. Eight link keys is a trivial flash cost.
+`NVM_NUM_LINK_KEYS` goes 1 -> 8.
+
+**Ordering: the connected device is PINNED to row 1; everything else is
+most-recently-used below it.** Pinning matters - under pure MRU the connected
+device drifts down as you use others, and "where did my headphones go" is
+disorienting on a screen you glance at. Pinned-then-MRU always puts the two most
+likely targets, what you are on and what you were on last, in rows 1 and 2.
+
+**Presence: never claim availability we have not verified.** We cannot know
+whether a paired device is in range without paging it at up to 5.12s each;
+probing all eight would cost 40 seconds of radio time and thrash the link. So a
+paired row shows `Connected` or `Paired` **and nothing else** - no availability
+dots, no "in range" claim. When you pick one and it is not there, the wizard's
+6-second "Not responding" screen handles it, which is why that screen exists and
+now earns its keep twice over. The one honest enrichment, once we have a clock
+and persistence: **"Last connected 2 days ago"** for devices not used recently -
+a fact we own, not a guess about the radio.
+
+**Switching.** `A` on a paired row switches; no confirm, it is reversible and it
+is the recurring 2-press job. Today 2-8s through the wizard phases; with a warm
+second link (E23) it becomes sub-second. Handle both: **suppress the transition
+UI entirely if the operation completes in under ~500ms** - a progress screen that
+flashes for 200ms is worse than none. Needs the clock.
+
+**Pairing when full. Never silently evict the least-recently-used.** Silent
+forgetting is the fastest way to make someone distrust a device: they blame the
+pairing, not the capacity. Instead: "Paired device list is full. You can pair 8
+devices. Choose one to forget and make room." -> Devices in a pick-one-to-forget
+mode -> Confirm -> **pairing resumes automatically from where it left off.** More
+presses, never a surprise.
+
+**Forgetting.** X -> manage -> `Forget this device` -> Confirm focused on Cancel,
+naming the consequence: "Forget Sony WH-1000XM5? You'll need to pair it again."
+plus "This will also disconnect it." when connected. Forgetting removes the link
+key **and that device's per-device settings** (codec choice, volume); this is
+conveyed by re-pairing starting fresh, not by an extra sentence.
+
+**Default device.** New per-device action on the manage page: **`Make default`**,
+feeding Settings -> "Connect to". Some people always want the desk headphones on
+plug-in regardless of what they used last, and MRU alone cannot express that.
+
+**Nameless devices.** `(unknown device)` + address tail as designed, plus two
+additions now affordable: **retry the remote-name request on connect** (E21 -
+most nameless devices are a transient GAP failure during inquiry, not a permanent
+absence, so this fixes the majority for free), and **a tag picker** for the
+genuinely nameless (E25 - 8 icons x 8 colours, four presses, a distinguishable
+tag without d-pad text entry). The tag picker keeps the merit-based decline of
+text entry intact while actually solving the underlying problem, which the
+decline alone did not.
+
+## 19. Settings, with persistence
+
+**Flat, single list, no nesting** - nesting would make
+`Home(0) -> Settings(1) -> Audio(2) -> picker(3)` and break the depth-2 rule that
+`B, B` depends on. Eleven rows: Default codec, Volume limit, Startup volume,
+Per-device volume, Auto-connect, Connect to, Brightness, Dim after, Blank after,
+About, Reset all.
+
+- **Default codec** - reinstated but **scoped to devices we have not met yet.**
+  The global preference was killed on merit because the available set is a
+  per-device intersection, and that still holds for connected devices; but "which
+  codec do I try first on something new" is a real unconstrained preference.
+  Labelled so it never competes with the per-device picker.
+- **Volume limit** - hearing safety; stops a device that can blast you.
+- **Startup volume** - `Last used` or a fixed safe level. A fixed safe default is
+  genuinely right for a device whose volume the host cannot see.
+- **Per-device volume** - earbuds and over-ears need different volumes.
+- **Connect to** - `Most recent` or a pinned default device.
+- **About** - firmware, BT address, uptime, and an `Advanced` sub-view for
+  last-error and link stats. Depth 2, terminal.
+
+**Declined: screen orientation as a user setting.** Rotation should be *correct*
+in firmware; exposing it would be shipping a bug as a preference.
+
+## 20. The clock, and two re-decisions
+
+**The clock is one FFI parameter discarded at `ui-ffi/src/lib.rs:351` and it
+unlocks eight things:** liveness during multi-second waits (a 5.12s page timeout
+with zero moving pixels is indistinguishable from a hang, which this project has
+already paid for once); a determinate 10.24s scan bar; wizard auto-dismiss
+without a C-side timer; "Last connected N days ago"; suppressing sub-500ms
+transition UI; dim/blank timing owned by core; the bitrate smoothing window; and
+peak-hold decay. Near-zero cost, eight payoffs - land it early.
+
+**Key repeat: the 12-item rule STAYS, and it was merit.** Re-checked
+independently of cost: a product where no list exceeds one screen-and-a-bit means
+the information architecture is right, and at 18fps a held-scroll you cannot
+visually track is how people overshoot. Longest list is Settings at 11.
+Auto-repeat is accepted as a **low-priority comfort item** (E24); it changes no
+screen. **Long-press stays declined** even though a clock plus release edges would
+enable it - undiscoverable on a device with a labelled button rail, and `B, B` at
+depth 2 already solves the problem it would solve.
+
+**Dirty-rect / partial update: the design wants it, and it is not MVP.** On
+merit: the level meter at 4Hz repaints all 57,600 pixels to move a few bars, and
+ST7789 supports column/row address windows natively. It buys a smoother meter
+(10-15Hz instead of 4Hz), much lower idle cost, and less SPI/CPU contention with
+audio. The design works without it at 4Hz with peak-hold, so it is the biggest
+quality-of-feel item **after** the MVP ships (E22).
+
+## 21. Enabling work list
+
+**Tier 1 - MVP REQUIRED. The MVP is fully realised at E13.**
+
+| | Item | Owner | Why MVP |
+|---|---|---|---|
+| E1 | **Cancel-scan command** | Ada | Without it scan phase 2 is a 10.24s dead end where B does nothing. Permanent trust cost. |
+| E2 | **Button rail** - `ChromeContribution` gains a/b/x/y; rail on a parameterised edge with parameterised slot order | Fern | Four unlabelled buttons are four buttons nobody presses. |
+| E3 | **`font::hero()`** ~20-26px | Fern | The reassurance goal is a glance at 30-50cm; `helvB12` cannot do it. |
+| E4 | **Hero widget + persistent banner slot** | Fern | Fallback chain links 1-2. |
+| E5 | **Phase/wizard screen**, content replaced by events, no stack push | Fern | The whole pairing flow; keeps depth at 2. |
+| E6 | **Per-device codec availability + reason**, and **disabled-but-focusable `MenuItem`** | Ada + Fern | Fallback chain link 5. The reason text is the payload. |
+| E7 | **Home two-face toggle** (status <-> menu, no push) | Fern | Discoverability without the rail; keeps depth at 2. |
+| E8 | **Core clock** - plumb the discarded `now_us` | Ada | Eight payoffs for one parameter. |
+| E9 | **Class-of-Device on inquiry results** | Ada | Keeps the scan list inside the 12-item rule in a crowded room. |
+| E10 | **Icon probes**: headphones, USB, warning triangle, check, plus | Ruby | Nothing renders without them. |
+| E11 | **Key/value field list** (check `MenuList` + `Trailing` first) | Fern | Device detail. Reuse over new. |
+| E12 | **Live list with stable identity** - append/update in place without resetting selection by position | Fern | The stable-scan-ordering rule is unimplementable otherwise. |
+| E13 | **Rename `HidLinkState` -> `LinkState`** (`widget.rs:141`) | Fern | The chrome currently lies about what the glyph means. |
+
+**Tier 2 - post-MVP, the design already assumes it.**
+
+| | Item | Unlocks |
+|---|---|---|
+| E14 | **`NVM_NUM_LINK_KEYS` 1 -> 8** + paired store with MRU order and a default flag | The entire multi-device story. Highest-value Tier 2 item. |
+| E15 | **Settings persistence (M5)** | S19. Without it Settings is a demo. |
+| E16 | **AVRCP absolute volume + capability flag** | VOL gauge, d-pad Up/Down, MUTED banner, volume limit, per-device volume. |
+| E17 | **Per-channel peak/RMS at ~4Hz**, off the real-time path | The OUT meter and its peak cap. Ship absent, never frozen. |
+| E18 | **Connected-link HCI RSSI** | SIGNAL row and the Home LINK bar. |
+| E19 | **USB IN rate (M3)** | USB IN field; also gates the meter, since without USB audio there is no PCM. |
+| E20 | **Live/adaptive bitrate readout** | The "(adaptive)" qualifier. Nominal-only until then. |
+| E21 | **Remote-name retry on connect** | Fixes most `(unknown device)` rows for near-zero work. |
+
+**Tier 3 - later, improves the product, changes no screen.**
+
+| | Item | Value |
+|---|---|---|
+| E22 | **Dirty-rect / partial update** (ST7789 address windows) | Meter at 10-15Hz, much lower idle cost, less contention with audio. Biggest feel improvement after MVP. |
+| E23 | **Warm second ACL link** (`MAX_NR_HCI_CONNECTIONS` > 1, one streaming, one idle) | Sub-second switching instead of 2-8s. **The genuinely achievable half of multipoint: dual STREAMING stays impossible, dual CONNECTION does not.** |
+| E24 | **Auto-repeat on the d-pad** | Comfort on the 11-row Settings list. |
+| E25 | **Device tag picker** - 8 icons x 8 colours | Solves permanently-nameless devices without text entry. |
+| E26 | **"Last connected N days ago"** | Needs E8 + E14. Honest presence, unlike an availability dot. |
