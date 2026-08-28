@@ -247,11 +247,14 @@ keeps only the last LEARNED per Bash call) is in flight.
 - `pico-link-gap` — panic recorder: survive the reboot, report on next boot.
   Filed against the retired Rust-owns-`main()` `hal_shim`; applicability under
   the C-first `firmware/` project is unverified this session, not re-checked.
-- `pico-link-46w` — enforce core affinity on the IRQ depth counter. Same
-  caveat: filed against the retired `hal_shim`, not re-checked against C-first.
-- `pico-link-1rp` — watchdog is blind to a core1 lockup; core0 keeps feeding
-  it. Same caveat: filed against the retired `hal_shim`, not re-checked
-  against C-first.
+- `pico-link-46w` (core affinity on the IRQ depth counter) and `pico-link-1rp`
+  (watchdog blind to a core1 lockup while core0 keeps feeding it) are **NOT ON
+  THE BOARD** — verified 2026-08-28: `bd show` resolves neither, and the board
+  holds 10 beads total. They were presumably lost in the beads 1.2.2 recovery.
+  Both described the retired Rust-owns-`main()` `hal_shim` and neither has been
+  re-examined against the C-first `firmware/` project, so re-file them only if
+  the concern turns out to apply to the current code — do not restore them
+  blindly.
 
 ## Hardware workflow — read this before touching the board
 
