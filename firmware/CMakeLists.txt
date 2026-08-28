@@ -98,6 +98,20 @@ pico_enable_stdio_usb(pico_link 1)
 pico_enable_stdio_uart(pico_link 0)
 target_compile_definitions(pico_link PRIVATE
     PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=1
+    # pico-sdk's stdio_usb gates ALL console output on DTR by default
+    # (stdio_usb_connected() checks tud_cdc_connected(), which tracks DTR) --
+    # stdio_usb_out_chars() silently drops everything while that's false.
+    # tools/usb-console/cdc_reader.py, this project's standard capture path,
+    # cannot assert DTR on macOS (claiming the CDC-Communication interface
+    # fails with EACCES -- see bead pico-link-4mc), so without this flag a
+    # perfectly healthy board is indistinguishable from a hung one: the
+    # console just never speaks. This makes stdio_usb_connected() return
+    # tud_ready() instead (device configured, no DTR needed) -- see
+    # pico_stdio_usb/stdio_usb.c. Root-caused 2026-08-28 after a control-test
+    # flash of the M1b baseline reproduced the exact same "zero CDC bytes"
+    # symptom as M2 despite the panel visibly rendering, which is what
+    # exposed this as a tooling gap rather than a firmware hang.
+    PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
     # M2: Bluetooth only, no Wi-Fi -- without this, cyw43.h unconditionally
     # pulls in lwip/netif.h (a build dependency we have no use for and
     # haven't wired up). Matches USBPods' own working reference.
