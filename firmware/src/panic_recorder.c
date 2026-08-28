@@ -176,6 +176,15 @@ void pl_panic_record_rust(const uint8_t *msg, uintptr_t len) {
 // with zero further context on 2026-08-28 (pico_platform_panic/panic.c:65).
 // Fixing that exact failure mode is this function's whole job. ---
 void __attribute__((noreturn)) __printflike(1, 0) pl_panic_c_hook(const char *fmt, ...) {
+    // Step 1 -- FIRST statement, before fmt/args are touched at all: arm
+    // the watchdog. `fmt` and any %s arguments are exactly what a
+    // memory-corruption panic can hand us as bad pointers, and vsnprintf
+    // below walks them -- code review finding (2026-08-28): this must not
+    // run before the watchdog is armed, or a bad pointer here hangs with no
+    // recovery guarantee at all. The second watchdog_enable() inside
+    // pl_panic_arm_record_and_reboot() is idempotent and harmless.
+    watchdog_enable(PL_PANIC_WATCHDOG_TIMEOUT_MS, /*pause_on_debug=*/false);
+
     // A fixed stack buffer, not anything allocator-backed -- a panic is
     // exactly the moment the allocator (if this build even has a C one;
     // ui-ffi's is Rust-side and unrelated) might be the thing that's
@@ -236,6 +245,15 @@ void __attribute__((naked)) isr_hardfault(void) {
 // writes only, per the bead's "dumbest possible" requirement for code that
 // runs this close to a real fault.
 void __attribute__((noreturn)) pl_hardfault_record(uint32_t *frame) {
+    // Step 1 -- FIRST statement, before frame is dereferenced: arm the
+    // watchdog. Code review finding (2026-08-28): a HardFault caused by
+    // stack corruption is exactly the case where `frame` itself may be
+    // invalid, and a second fault at HardFault priority is a Cortex-M
+    // lockup -- with no watchdog armed yet, silicon does not guarantee
+    // recovery from that. This call itself only touches fixed MMIO/scratch
+    // registers, never `frame`, so it is safe to run before frame[6] below.
+    watchdog_enable(PL_PANIC_WATCHDOG_TIMEOUT_MS, /*pause_on_debug=*/false);
+
     uint32_t faulting_pc = frame[6];
     uint32_t cfsr = PL_SCB_CFSR;
     pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_HARDFAULT, faulting_pc, cfsr, NULL, 0);
@@ -244,15 +262,21 @@ void __attribute__((noreturn)) pl_hardfault_record(uint32_t *frame) {
 // --- Reporting, next boot (main() calls this early) ---
 
 void pl_panic_report_and_clear(void) {
-    // Double-gated: the hardware reason register (a real watchdog-caused
-    // reset happened) AND our own magic (it was watchdog_enable(), not
-    // watchdog_reboot(), i.e. this specific recorder, that caused it).
-    // watchdog_caused_reboot() itself already excludes power-on reset
-    // (watchdog_hw->reason reads 0 there), so a fresh flash+power-cycle
-    // never misreads leftover always-on-domain bits as a panic report.
-    if (!watchdog_caused_reboot()) {
-        return;
-    }
+    // Gated on our own magic alone, NOT watchdog_caused_reboot() -- code
+    // review finding (2026-08-28): on RP2350 that also requires
+    // rom_get_last_boot_type() == BOOT_TYPE_NORMAL (hardware_watchdog/
+    // watchdog.c), which is false on the very first boot of freshly
+    // reflashed firmware (that boot's type is BOOT_TYPE_FLASH_UPDATE) --
+    // exactly the boot that follows this file's own reset_usb_boot()
+    // recovery path. Gating on it meant returning early without clearing
+    // scratch[3], leaving the retry flag set to 1 so the *next* genuine,
+    // unrelated panic was misdiagnosed as recursive and skipped recording
+    // entirely -- the very failure mode this bead exists to fix. Magic
+    // alone is still safe: the watchdog scratch registers live in the
+    // always-on domain and are NOT retained across an actual power-on
+    // reset (only across warm/watchdog/software resets and a BOOTSEL
+    // reflash cycle, none of which are power cycles), so a genuine cold
+    // boot reads scratch[0] as 0, which matches none of our magics.
     uint32_t magic = watchdog_hw->scratch[0];
     if (magic != PL_PANIC_MAGIC_RUST && magic != PL_PANIC_MAGIC_C && magic != PL_PANIC_MAGIC_HARDFAULT) {
         return;

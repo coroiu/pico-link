@@ -4,9 +4,10 @@
 // reboot the board (warm on the first one, into the USB bootloader on an
 // unresolved second one) so the failure is diagnosable without a physical
 // power-cycle. A shipped audio dongle that reboots into BOOTSEL on a field
-// fault looks completely bricked to the user -- gate this out (see
-// PL_DIAG_DISABLE_PANIC_RECORDER in CMakeLists.txt/main.c) before anything
-// ships, same as the watchdog and VID/PID dev affordances it sits next to.
+// fault looks completely bricked to the user. No compile-time gate exists
+// yet (there is no PL_DIAG_DISABLE_PANIC_RECORDER or similar today) --
+// this needs one built before anything ships, same as the watchdog and
+// VID/PID dev affordances it sits next to.
 //
 // See the bead for the full design and its ordering (arm the watchdog
 // first, then a panic-in-progress flag, then record, then reboot) and
