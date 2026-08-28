@@ -12,30 +12,32 @@ typedef struct {
     PlIntentTag tag;
 } pl_input_pin_t;
 
-// Rotated 90 degrees CCW to match the st7789.c MADCTL change (bead
-// pico-link-g7o): the joystick is physically fixed to the PCB, but the
-// panel's displayed image now rotates 90 degrees CCW relative to it, so the
-// physical direction the user perceives as "up" on the corrected screen is
-// no longer the pin the PL_INPUT_PIN_UP/DOWN/LEFT/RIGHT names describe.
+// Remapped for the corrected st7789.c MADCTL=0xA0 orientation (bead
+// pico-link-g7o, 2026-08-28 correction): the joystick is physically fixed
+// to the PCB, so the pin that ends up meaning NavIntent up/down/left/right
+// depends entirely on how the panel's MADCTL rotates the displayed image
+// relative to that fixed hardware.
 //
-// Derivation: rotating the displayed image 90 degrees CCW while the board
-// (and its joystick) stays fixed is equivalent, from the joystick's point
-// of view, to the joystick rotating 90 degrees CW relative to the screen.
-// Each pin's physical push direction, rotated 90 degrees CW, lands on the
-// intent that used to belong to the NEXT pin clockwise in the
-// up->right->down->left cycle:
-//   PIN_UP    (physical "up"    push) now points toward screen-right
-//   PIN_RIGHT (physical "right" push) now points toward screen-down
-//   PIN_DOWN  (physical "down"  push) now points toward screen-left
-//   PIN_LEFT  (physical "left"  push) now points toward screen-up
-// i.e. each entry below maps a PIN_* to the NavIntent one step clockwise
-// from its name. UNVERIFIED ON HARDWARE -- this needs a physical press to
-// confirm; see bead pico-link-g7o's completion comment and pico-link-d7k.
+// The prior mapping below (still visible in git history) was derived for
+// MADCTL=0x60. The st7789.c change from 0x60 to 0xA0 is its 180-degree
+// partner -- see the MADCTL comment there for why -- so this table is that
+// same prior mapping with a 180-degree flip applied: whatever a pin used to
+// mean now means its opposite (up<->down, left<->right). Left/right and
+// up/down are each other's antonyms under a 180-degree image rotation, so
+// this is the correct transform, not a guess -- but it was checked against
+// the actual PL_INPUT_PIN_* assignments in input.h (GP2/18/16/20 = up/down/
+// left/right) rather than trusted as arithmetic alone:
+//   PIN_UP    (GP2)  now means LEFT   (was RIGHT before the 180 flip)
+//   PIN_DOWN  (GP18) now means RIGHT  (was LEFT)
+//   PIN_LEFT  (GP16) now means DOWN   (was UP)
+//   PIN_RIGHT (GP20) now means UP     (was DOWN)
+// UNVERIFIED ON HARDWARE -- this needs a physical press to confirm; see
+// bead pico-link-g7o's completion comment and pico-link-d7k.
 static const pl_input_pin_t PINS[PL_INPUT_PIN_COUNT] = {
-    {PL_INPUT_PIN_UP, PL_INTENT_TAG_RIGHT},
-    {PL_INPUT_PIN_DOWN, PL_INTENT_TAG_LEFT},
-    {PL_INPUT_PIN_LEFT, PL_INTENT_TAG_UP},
-    {PL_INPUT_PIN_RIGHT, PL_INTENT_TAG_DOWN},
+    {PL_INPUT_PIN_UP, PL_INTENT_TAG_LEFT},
+    {PL_INPUT_PIN_DOWN, PL_INTENT_TAG_RIGHT},
+    {PL_INPUT_PIN_LEFT, PL_INTENT_TAG_DOWN},
+    {PL_INPUT_PIN_RIGHT, PL_INTENT_TAG_UP},
     // Center joystick press and button A both mean Select -- see
     // pico_link_core::NavIntent::Select's doc comment.
     {PL_INPUT_PIN_PRESS, PL_INTENT_TAG_SELECT},
