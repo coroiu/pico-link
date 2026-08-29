@@ -27,8 +27,9 @@ use core::convert::Infallible;
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
+use crate::app::LinkState;
 use crate::input::NavIntent;
-use crate::platform::{HidLinkState, OutputRequest};
+use crate::platform::OutputRequest;
 
 use super::framebuffer::FrameBuffer565;
 use super::list::ListItemKey;
@@ -130,16 +131,19 @@ pub struct ChromeContribution {
     /// A status-dot color to paint in the title bar, if this widget has an
     /// app-wide status worth surfacing there.
     pub status: Option<ChromeStatus>,
-    /// The keyboard-output link's connection state, if this widget has one
+    /// The A2DP/Bluetooth link's connection state, if this widget has one
     /// worth surfacing — rendered as a Bluetooth glyph immediately left
     /// of the `status` dot (see `super::screen::Screen::render`). A
     /// separate field rather than folding into `status`, per design
     /// review: link connectivity and general app status are independent
     /// axes of "state" that must be able to read differently on screen at
     /// the same time (e.g. synced *and* disconnected). `None` omits the
-    /// glyph, same as
-    /// `Some(HidLinkState::Unavailable)` — see `Screen::render`'s handling.
-    pub ble: Option<HidLinkState>,
+    /// glyph entirely — see `Screen::render`'s handling. Reuses
+    /// [`crate::app::LinkState`] (the same coarse Bluetooth lifecycle C
+    /// reports over `pl_ui_set_link_state`) rather than inventing a
+    /// separate chrome-only enum: the chrome doesn't need a fifth concept
+    /// of link state.
+    pub link: Option<LinkState>,
     /// Whether the focused widget's codec link is currently in the
     /// design's fallback state (`.planning/design/2026-08-28-on-device-ui.md`
     /// section 6.2, link 3 of the five-link fallback chain: the X-rail
