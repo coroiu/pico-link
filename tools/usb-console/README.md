@@ -134,6 +134,42 @@ tty:
 If both genuinely fail, use `tty_fallback.py` and follow CLAUDE.md's CDC
 rules (open once, DTR asserted, never two readers) without exception.
 
+## Sending commands: `cdc_sender.py`
+
+Writes command lines to the same CDC-Data interface `cdc_reader.py` reads
+from — direct-USB bulk OUT, no tty. This is the host side of
+`firmware/src/debug_remote.c` (bead pico-link-cd3), a debug-only module
+compiled in only when the firmware is built with `-DPL_DEBUG_REMOTE=ON`
+(off by default; never in a release build).
+
+```bash
+# Drive the on-device UI without touching the d-pad
+python3 tools/usb-console/cdc_sender.py UP DOWN SELECT
+
+# Connect straight to a known headset address, skipping GAP inquiry (pico-link-g48)
+python3 tools/usb-console/cdc_sender.py --connect AABBCCDDEEFF
+
+# Reboot the board into the USB bootloader over CDC (pico-link-vu4)
+python3 tools/usb-console/cdc_sender.py --bootsel
+```
+
+**`--bootsel`: unattended flashing, with a real limit.** It sends the
+`BOOTSEL` protocol line, which the firmware logs and then answers with
+`reset_usb_boot(0, 0)` — the board drops into the `RP2350` mass-storage
+bootloader without anyone touching it. This exists because the vendor
+CONTROL-transfer route (`picotool reboot`/`picotool load`, bead
+pico-link-d74) STALLs on a healthy board and forces a physical unplug;
+`BOOTSEL` over CDC rides the bulk data path instead, a different endpoint
+entirely, so it isn't subject to that stall.
+
+**It is not a substitute for physical BOOTSEL.** `debug_remote.c` is only
+ever reached from the running main loop — a board that's wedged, panicking,
+or hasn't gotten far enough into `main()` to poll the debug channel will
+never see this command at all. If `--bootsel` doesn't work, treat that as
+confirmation the board is stuck, not as a new mystery to chase; go press
+the physical button. Only expect this to work against a board you already
+know is alive (e.g. it's been logging heartbeats).
+
 ## Coordinating with a flashing agent
 
 Never run either script while another agent is actively flashing the board

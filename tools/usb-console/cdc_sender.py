@@ -20,6 +20,14 @@ Wire protocol (one command per line, LF-terminated):
   NAV JUMP <signed-int>
   CONNECT <addr>   -- bead pico-link-g48: bypasses GAP inquiry and connects
                        straight to a known BD_ADDR. See --connect below.
+  BOOTSEL          -- bead pico-link-vu4: reboots the board straight into
+                       the USB mass-storage bootloader (reset_usb_boot),
+                       so a flash-verify loop no longer needs a human
+                       holding the physical BOOTSEL button. See --bootsel
+                       below. Requires a PL_DEBUG_REMOTE build AND a board
+                       whose main loop is actually running -- it is NOT a
+                       substitute for physical BOOTSEL on a wedged/panicking
+                       board, only on a healthy one you want to reflash.
 
 Usage:
   python3 cdc_sender.py UP DOWN SELECT          # send three commands, exit
@@ -28,6 +36,7 @@ Usage:
   python3 cdc_sender.py --raw "NAV JUMP -3"      # send a raw protocol line verbatim
   python3 cdc_sender.py --vid 0x2e8a --pid 0xc  # override device match
   python3 cdc_sender.py --connect AABBCCDDEEFF  # connect directly to a known device address
+  python3 cdc_sender.py --bootsel               # reboot the board into the USB bootloader
 
 Command shorthand accepted (case-insensitive): UP, DOWN, LEFT, RIGHT,
 SELECT, BACK, X, Y, JUMP:<n> (e.g. JUMP:-3). Each is turned into the matching
@@ -189,6 +198,17 @@ def main():
             "stored anywhere by this tool."
         ),
     )
+    ap.add_argument(
+        "--bootsel",
+        action="store_true",
+        help=(
+            "bead pico-link-vu4: reboot the board into the USB mass-storage bootloader "
+            "(reset_usb_boot over the CDC bulk path, not the STALLing vendor control "
+            "transfer -- see pico-link-d74). Sent last, after any other commands. Needs "
+            "a PL_DEBUG_REMOTE build and a board whose main loop is actually running -- "
+            "NOT a substitute for physical BOOTSEL on a wedged or panicking board."
+        ),
+    )
     ap.add_argument("--vid", type=lambda s: int(s, 0), default=None, help=f"USB vendor ID (default: try {DEFAULT_VID:#06x}, then any)")
     ap.add_argument("--pid", type=lambda s: int(s, 0), default=None, help=f"USB product ID (default: try {DEFAULT_PID:#06x}, then any)")
     ap.add_argument("--list", action="store_true", help="enumerate candidate devices and exit")
@@ -231,6 +251,11 @@ def main():
             lines.append(raw.strip())
         if args.connect is not None:
             lines.append(to_connect_line(args.connect))
+        if args.bootsel:
+            # Sent last and unconditionally last of all -- reset_usb_boot()
+            # on the firmware side is noreturn, so anything queued after it
+            # would never be seen anyway.
+            lines.append("BOOTSEL")
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
@@ -238,7 +263,7 @@ def main():
     if not lines:
         print(
             "No commands given -- nothing to send. Pass e.g. UP DOWN SELECT, --raw 'NAV JUMP -3', "
-            "or --connect AABBCCDDEEFF.",
+            "--connect AABBCCDDEEFF, or --bootsel.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -274,11 +299,17 @@ def main():
             if i < len(lines) - 1 and args.delay > 0:
                 time.sleep(args.delay)
     finally:
+        # After --bootsel the board drops off the bus almost immediately
+        # (reset_usb_boot() is noreturn) -- release/dispose below can throw
+        # once the device is already gone, which is expected, not an error.
         try:
             usb.util.release_interface(dev, iface_num)
         except Exception:
             pass
-        usb.util.dispose_resources(dev)
+        try:
+            usb.util.dispose_resources(dev)
+        except Exception:
+            pass
         if not args.quiet:
             print("# released interface, no tty was ever opened", file=sys.stderr)
 
