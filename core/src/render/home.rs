@@ -38,24 +38,21 @@
 //! together, not inert" rule: no gauge is drawn, so no binding exists
 //! either, rather than a binding that visibly does nothing.
 //!
-//! # A and centre are the same signal -- not this bead's gap
+//! # A and centre are the same signal -- this is spec-compliant, not a gap
 //!
-//! The global input contract (design section 4) lists "A: devs" as a
-//! distinct status-face rail affordance from "centre: toggle". But
-//! `firmware/src/input.c`'s `PINS` table maps *both* the joystick's centre
-//! press and the physical A button to `PL_INTENT_TAG_SELECT` --
-//! deliberately, per that table's own comment ("Center joystick press and
-//! button A both mean Select"). `core` has no way to tell them apart: both
-//! arrive as the same [`crate::input::NavIntent::Select`]. So on Home's
-//! status face, pressing physical A does exactly what centre does --
-//! opens the menu face, landing on its pre-selected "Bluetooth" row (which
-//! is where "devs" ultimately leads, one more `Select` away) -- rather
-//! than jumping to Devices directly. [`HomeView::chrome_contribution`]
-//! still labels the A slot "devs" (the design's literal text, and the
-//! menu face's Bluetooth row is exactly what that label promises), but the
-//! immediate action is the toggle. Flagged here rather than silently
-//! reconciled, since it's a real design/firmware mismatch, not a choice
-//! this bead is free to make differently.
+//! Design section 4's global input contract states "Centre: identical to
+//! A" as an unconditional rule, and `firmware/src/input.c`'s `PINS` table
+//! maps both the joystick's centre press and the physical A button to the
+//! same `PL_INTENT_TAG_SELECT` accordingly ("Center joystick press and
+//! button A both mean Select"). So on Home's status face, pressing
+//! physical A does exactly what centre does -- opens the menu face,
+//! landing on its pre-selected "Bluetooth" row (which is where "devs"
+//! ultimately leads, one more `Select` away) -- rather than jumping to
+//! Devices directly. [`HomeView::chrome_contribution`] still labels the A
+//! slot "devs" (the design's literal text), which now overpromises by one
+//! hop; that label mismatch is real but is a separate, low-priority,
+//! already-filed follow-up, not this bead's to fix -- the toggle-first
+//! behavior itself is exactly what the design's own global rule requires.
 //!
 //! # X is left inert on both faces
 //!
@@ -289,7 +286,22 @@ impl Widget for HomeView {
                 contribution.link = Some(self.link_state);
                 Some(contribution)
             }
-            HomeFace::Menu => None,
+            HomeFace::Menu => {
+                // A must not render dim here: unlike X/Y (design section
+                // 4 rule 2's "unlabelled means inert" exemption is
+                // granted only to X and Y), A's global meaning --
+                // "activate the focused thing" -- is unconditional, and
+                // the menu face plainly has a focused thing
+                // (`HomeView::on_focus`'s `Activated` arm delegates
+                // straight to `self.menu`, which pushes Devices/Settings
+                // on the selected row). Leaving this `None` would fall
+                // back to `ButtonLabels::default()` (all four slots
+                // `Inert`), rendering A dim while it still silently
+                // navigates on press -- exactly the "mispress on a dim
+                // button is not free" violation `rail.rs`'s own
+                // `ButtonLabel::Inert` doc comment promises can't happen.
+                Some(ChromeContribution { a: Some(ButtonLabel::Live(String::from("select"))), ..Default::default() })
+            }
         }
     }
 
@@ -298,5 +310,51 @@ impl Widget for HomeView {
             HomeFace::Status => self.hero.render(area, target),
             HomeFace::Menu => self.menu.render(area, target),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::BtModel;
+
+    fn fresh_home_view() -> HomeView {
+        let model = BtModel::default();
+        let home_face = Rc::new(RefCell::new(HomeFace::default()));
+        let commands = Rc::new(RefCell::new(VecDeque::new()));
+        let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
+        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
+    }
+
+    /// Regression test for the review finding on this bead: `chrome_
+    /// contribution` returning `None` for `HomeFace::Menu` fell back to
+    /// `ButtonLabels::default()` (all four slots `Inert`), rendering A dim
+    /// while `HomeView::on_focus`'s `Activated` arm still delegates
+    /// straight to the wrapped `MenuList` -- so A silently navigated on
+    /// press despite looking inert. `rail.rs`'s own `ButtonLabel::Inert`
+    /// doc comment promises "a mispress on a dim button is always free";
+    /// a labelled-but-dim A on the menu face broke that promise on the
+    /// product's own root screen.
+    #[test]
+    fn a_is_live_on_the_menu_face_since_it_actually_activates_the_selected_row() {
+        let mut view = fresh_home_view();
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.face(), HomeFace::Menu);
+
+        let contribution = view.chrome_contribution().expect("the menu face must have a chrome opinion");
+        assert!(
+            matches!(contribution.a, Some(ButtonLabel::Live(_))),
+            "A must render live on the menu face -- it activates the selected row, not a no-op"
+        );
+    }
+
+    #[test]
+    fn a_is_live_on_the_status_face_too_labelled_devs() {
+        let view = fresh_home_view();
+        assert_eq!(view.face(), HomeFace::Status);
+
+        let contribution = view.chrome_contribution().expect("the status face must have a chrome opinion");
+        assert!(matches!(contribution.a, Some(ButtonLabel::Live(_))), "A must render live on the status face too (it toggles the face)");
     }
 }
