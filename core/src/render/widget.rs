@@ -140,6 +140,15 @@ pub struct ChromeContribution {
     /// glyph, same as
     /// `Some(HidLinkState::Unavailable)` — see `Screen::render`'s handling.
     pub ble: Option<HidLinkState>,
+    /// Whether the focused widget's codec link is currently in the
+    /// design's fallback state (`.planning/design/2026-08-28-on-device-ui.md`
+    /// section 6.2, link 3 of the five-link fallback chain: the X-rail
+    /// label switches from "link" to "why?" under fallback). This widget
+    /// carries no button-label text itself — the rail
+    /// (`pico-link-znb.5`/E2, which gives `ChromeContribution` its own
+    /// a/b/x/y label fields) reads this bit to decide which label to
+    /// show. Defaults to `false`.
+    pub fallback: bool,
 }
 
 /// A retained-mode UI element. Implementors own their own state (selection

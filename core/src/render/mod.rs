@@ -49,6 +49,7 @@
 pub mod chrome;
 pub mod confirm;
 pub mod framebuffer;
+pub mod hero;
 pub mod list;
 pub mod menu;
 pub mod message;
@@ -60,6 +61,7 @@ pub mod widget;
 pub use chrome::{compute_chrome, ChromeLayout};
 pub use confirm::ConfirmView;
 pub use framebuffer::FrameBuffer565;
+pub use hero::{BitrateStatus, CodecStatus, HeroStatusView};
 pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};
 pub use menu::{MenuItem, MenuList};
 pub use message::MessageView;
