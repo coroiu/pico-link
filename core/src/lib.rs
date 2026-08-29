@@ -61,7 +61,10 @@ pub mod power;
 pub mod render;
 pub mod run;
 
-pub use app::{App, BtModel, Command, ConnectFailureReason, ConnectStep, DeviceEntry, Event, LinkState, WizardPhase};
+pub use app::{
+    App, BtModel, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState,
+    WizardPhase,
+};
 pub use input::NavIntent;
 pub use panel::{Button, Edge, PanelOrientation, PANEL};
 pub use power::{IdlePowerSetting, DEFAULT_DEEP_SLEEP_TIMEOUT, DEFAULT_IDLE_TIMEOUT};

@@ -283,6 +283,26 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason) {
     pl_bt_ring_push(event, NULL, 0);
 }
 
+// Bead pico-link-1v5: pushes Event::CodecChanged. `name`'s bytes are
+// copied by value into the PlEvent's own fixed-size buffer right here
+// (never stored as a pointer), so -- unlike
+// pl_bt_push_device_discovered -- pl_bt_ring_push's separate deferred
+// name-buffer path is not needed; NULL/0 is passed for that parameter.
+void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t name_len, uint32_t nominal_bitrate_bps) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_CODEC_CHANGED,
+        .payload = {.codec_changed = {.name_len = name_len, .nominal_bitrate_bps = nominal_bitrate_bps}},
+    };
+    memcpy(event.payload.codec_changed.addr, addr, 6);
+    if (name_len > sizeof(event.payload.codec_changed.name)) {
+        name_len = (uint8_t)sizeof(event.payload.codec_changed.name);
+        event.payload.codec_changed.name_len = name_len;
+    }
+    memcpy(event.payload.codec_changed.name, name, name_len);
+    pl_bt_ring_push(event, NULL, 0);
+}
+
 // --- HCI Read Local Version Information: the acceptance-criterion probe ---
 //
 // Fires once, the first time BTSTACK_EVENT_STATE reports HCI_STATE_WORKING

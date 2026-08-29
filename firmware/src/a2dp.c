@@ -800,6 +800,18 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 s_ctx.frame.encoded_frame_bytes, (unsigned long)s_ctx.frame.nominal_bitrate_bps
             );
             pl_bt_push_connect_step(PL_CONNECT_STEP_NEGOTIATING_CODEC);
+
+            // Bead pico-link-1v5: tells the Home hero which codec is now
+            // live and at what nominal bitrate, so it stops reading
+            // "NO LINK" once a device is actually connected. Narrow
+            // addition at the one place codec negotiation completes --
+            // never called from the media timer path (s_ctx.frame is
+            // already fully populated by row->init above, so this reads
+            // only settled state).
+            pl_bt_push_codec_changed(
+                s_ctx.connect_addr, row->display_name, (uint8_t)strlen(row->display_name),
+                s_ctx.frame.nominal_bitrate_bps
+            );
             break;
         }
 

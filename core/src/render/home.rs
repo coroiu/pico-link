@@ -82,7 +82,7 @@ use crate::app::{build_devices_screen, build_settings_screen, BtModel, Command, 
 use crate::input::NavIntent;
 
 use super::framebuffer::FrameBuffer565;
-use super::hero::{CodecStatus, HeroStatusView};
+use super::hero::{BitrateStatus, CodecStatus, HeroStatusView};
 use super::menu::{MenuItem, MenuList};
 use super::rail::ButtonLabel;
 use super::screen::Screen;
@@ -150,16 +150,28 @@ impl HomeView {
         wizard_phase: &Rc<RefCell<WizardPhase>>,
         wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
     ) -> Self {
-        // The status face's hero widget has no live codec/bitrate data to
-        // read yet -- `BtModel` carries `link_state` and the discovered-
-        // device list, not "which device is connected, on which codec, at
-        // what bitrate" (that plumbing doesn't exist until a future FFI
-        // bead adds it; design section 13 calls codec/bitrate "Confirmed"
-        // as *eventually available*, not available today). Rendering
-        // `CodecStatus::NoLink` unconditionally is the honest choice per
-        // the design's own rule: "ship a field absent, never frozen or
-        // faked" -- this is deliberately not a `TODO`-flavored fake value.
-        let hero = HeroStatusView::new("", CodecStatus::NoLink);
+        // The status face's hero widget: `NO LINK` whenever there is no
+        // live codec (design section 15's "absent, never frozen or
+        // faked" rule -- this covers Idle/Scanning/Connecting alike, not
+        // just a bare disconnect), otherwise the connected device's name
+        // plus the codec word and nominal bitrate `BtModel::
+        // connected_codec` carries (bead pico-link-1v5). `fallback` stays
+        // `None` -- the data needed to say *why* a codec fell back to a
+        // lesser one (design section 6.2's amber banner) doesn't exist in
+        // `BtModel` yet; that's a separate, later bead, and `None` here is
+        // the honest "no reason recorded" value, not a guess.
+        let hero = match &model.connected_codec {
+            Some(codec) => {
+                let device_name =
+                    model.devices.iter().find(|d| d.addr == codec.addr).map(|d| d.name.clone()).unwrap_or_default();
+                let bitrate = BitrateStatus::Kbps(codec.nominal_bitrate_bps / 1000);
+                HeroStatusView::new(
+                    device_name,
+                    CodecStatus::Connected { word: codec.word.clone(), fallback: None, bitrate },
+                )
+            }
+            None => HeroStatusView::new("", CodecStatus::NoLink),
+        };
         let link_state = model.link_state;
 
         let model = model.clone();

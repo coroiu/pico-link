@@ -52,7 +52,9 @@ use alloc::vec::Vec;
 
 #[cfg(not(test))]
 use embedded_alloc::LlffHeap as Heap;
-use pico_link_core::{App, Command, ConnectFailureReason, ConnectStep, DeviceEntry, Event, LinkState, NavIntent};
+use pico_link_core::{
+    App, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, NavIntent,
+};
 
 // --- critical-section implementation ---
 //
@@ -799,6 +801,48 @@ pub struct PlConnectSucceededPayload {
     pub degraded: u8,
 }
 
+/// [`PlEvent`]'s payload when `tag == PlEventTag::CodecChanged`.
+///
+/// `name`/`name_len` carry the codec's display name as a bounded,
+/// fixed-size buffer copied by value -- unlike
+/// [`PlDeviceDiscoveredPayload::name`] (a borrowed pointer+len, sound
+/// because the whole event is consumed synchronously within one
+/// [`pl_ui_push_event`] call), this payload also lives inside
+/// [`PlEventPayload`], a `Copy` union with no `Drop`; a fixed buffer keeps
+/// every [`PlEventPayload`] member a plain, `Copy`, no-lifetime value with
+/// the same safety story as [`PlLinkStateChangedPayload`]'s `u32` field --
+/// `unsafe` review at the [`pl_ui_push_event`] call site only ever needs to
+/// check `name_len as usize <= name.len()`, never a pointer's validity
+/// window. Bytes past `name_len` are unspecified; `name_len` above
+/// `name.len()` is treated as an empty name (see [`pl_ui_push_event`]'s
+/// `CodecChanged` arm) rather than panicking or truncating silently.
+///
+/// `nominal_bitrate_bps` is exactly `firmware/src/codec_table.h`'s
+/// `pl_codec_frame_info_t::nominal_bitrate_bps` for whichever row just
+/// negotiated -- the codec table's own declared *nominal* figure, never a
+/// live/adaptive one (design section 13; see
+/// [`pico_link_core::app::ConnectedCodec`]'s doc comment).
+///
+/// `addr` identifies which device this codec applies to -- carried for
+/// forward compatibility though today's `core`-side handling clears codec
+/// state on any non-`Connected` `LinkStateChanged` instead of keying off
+/// it (see [`pico_link_core::app::App::set_link_state`]'s doc comment).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlCodecChangedPayload {
+    pub addr: [u8; 6],
+    /// Fixed at 16 bytes -- headroom past the longest name
+    /// `firmware/src/codec_table.h`'s table carries today ("aptX HD", 7
+    /// bytes). A literal, not a named const, matching this struct's
+    /// `addr` field (and `PlDeviceDiscoveredPayload::addr`) using a bare
+    /// `6` -- cbindgen does not inline a module-local const into an
+    /// emitted C array's size, so a named const here would fail to
+    /// compile on the C side (measured while building this payload).
+    pub name: [u8; 16],
+    pub name_len: u8,
+    pub nominal_bitrate_bps: u32,
+}
+
 /// Which variant of [`PlEventPayload`] is active in a given [`PlEvent`].
 /// `DevicesCleared`/`WizardAutoDismiss` carry no data -- the payload union
 /// is simply unread for those tags (see [`PlEventPayload`]'s doc comment).
@@ -807,10 +851,12 @@ pub struct PlConnectSucceededPayload {
 /// plain `u32`, and these numbers are the wire ABI. See
 /// [`PlEvent::tag`]'s doc comment.
 ///
-/// The last four variants were added by pico-link-znb.7 (E5, the pairing
-/// wizard) -- purely additive, so [`PL_EVENT_ABI_VERSION`] is unchanged;
-/// see [`pico_link_core::Event`]'s doc comment for the design-doc
-/// rationale each one closes.
+/// The four variants after `LinkStateChanged`..`ConnectFailed` were added
+/// by pico-link-znb.7 (E5, the pairing wizard); `CodecChanged` was added by
+/// pico-link-1v5 (the Home hero's live codec/bitrate). All purely
+/// additive, so [`PL_EVENT_ABI_VERSION`] is unchanged; see
+/// [`pico_link_core::Event`]'s doc comment for the design-doc rationale
+/// each one closes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlEventTag {
@@ -822,6 +868,7 @@ pub enum PlEventTag {
     ConnectRetrying = 5,
     ConnectSucceeded = 6,
     WizardAutoDismiss = 7,
+    CodecChanged = 8,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -840,6 +887,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             5 => Ok(PlEventTag::ConnectRetrying),
             6 => Ok(PlEventTag::ConnectSucceeded),
             7 => Ok(PlEventTag::WizardAutoDismiss),
+            8 => Ok(PlEventTag::CodecChanged),
             _ => Err(()),
         }
     }
@@ -861,6 +909,7 @@ pub union PlEventPayload {
     pub connect_step_changed: PlConnectStepChangedPayload,
     pub connect_retrying: PlConnectRetryingPayload,
     pub connect_succeeded: PlConnectSucceededPayload,
+    pub codec_changed: PlCodecChangedPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -1000,6 +1049,21 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             Event::ConnectSucceeded { degraded: payload.degraded != 0 }
         }
         PlEventTag::WizardAutoDismiss => Event::WizardAutoDismiss,
+        PlEventTag::CodecChanged => {
+            // SAFETY: `tag` says this union currently holds `codec_changed`.
+            // Reading it is sound regardless of field values -- every
+            // field is a plain integer/byte-array type with no validity
+            // invariant to violate (see `PlCodecChangedPayload`'s doc
+            // comment).
+            let payload = unsafe { event.payload.codec_changed };
+            let name_len = usize::from(payload.name_len).min(payload.name.len());
+            let word = String::from_utf8_lossy(&payload.name[..name_len]).into_owned();
+            Event::CodecChanged(ConnectedCodec {
+                addr: payload.addr,
+                word,
+                nominal_bitrate_bps: payload.nominal_bitrate_bps,
+            })
+        }
     };
     ui.app.handle_event(core_event);
 }
@@ -1234,7 +1298,7 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            tag: 8, // one past WizardAutoDismiss = 7, the highest legal PlEventTag
+            tag: 9, // one past CodecChanged = 8, the highest legal PlEventTag
             payload: bogus_payload,
         };
         unsafe {
@@ -1332,6 +1396,54 @@ mod tests {
     }
 
     #[test]
+    fn pl_ui_push_event_codec_changed_populates_connected_codec() {
+        // bead pico-link-1v5: a `CodecChanged` event's fixed-size `name`
+        // buffer round-trips into `BtModel::connected_codec` with the
+        // right name/bitrate, and a later non-`Connected`
+        // `LinkStateChanged` clears it back to `None` -- see
+        // `pico_link_core::App::set_link_state`'s doc comment for why
+        // clearing keys off the link state rather than a dedicated
+        // disconnect tag.
+        let ui = new_ui();
+        let mut name = [0u8; 16];
+        name[..4].copy_from_slice(b"LDAC");
+        let addr = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let codec_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::CodecChanged as u32,
+            payload: PlEventPayload {
+                codec_changed: PlCodecChangedPayload { addr, name, name_len: 4, nominal_bitrate_bps: 990_000 },
+            },
+        };
+        let link_connected = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected as u32 } },
+        };
+        let link_idle = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, link_connected);
+            pl_ui_push_event(ui, codec_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+            let codec = (*ui).app.model().connected_codec.clone().expect("codec should be populated");
+            assert_eq!(codec.word, "LDAC");
+            assert_eq!(codec.nominal_bitrate_bps, 990_000);
+            assert_eq!(codec.addr, addr);
+
+            pl_ui_push_event(ui, link_idle);
+            assert!(
+                (*ui).app.model().connected_codec.is_none(),
+                "disconnecting must clear the codec, never leave it stale (design section 15)"
+            );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
     fn pl_ui_push_event_rejects_out_of_range_nested_connect_step() {
         // Same gap as the nested link-state/failure-reason tests above,
         // one layer deeper for the new `ConnectStepChanged` payload: the
@@ -1390,11 +1502,12 @@ mod tests {
             PlEventTag::ConnectRetrying,
             PlEventTag::ConnectSucceeded,
             PlEventTag::WizardAutoDismiss,
+            PlEventTag::CodecChanged,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        assert!(PlEventTag::try_from(8u32).is_err());
+        assert!(PlEventTag::try_from(9u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
