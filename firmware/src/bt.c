@@ -285,6 +285,17 @@ static void pl_bt_start_scan(void) {
     gap_inquiry_start(PL_INQUIRY_DURATION_UNITS);
 }
 
+// pico-link-znb.2 (E1, MVP-blocking): stops an in-flight GAP inquiry.
+// gap_inquiry_stop() itself triggers GAP_EVENT_INQUIRY_COMPLETE (same as a
+// natural timeout), so pl_bt_packet_handler's existing
+// GAP_EVENT_INQUIRY_COMPLETE case pushes PL_LINK_STATE_IDLE -- no separate
+// push needed here. Compiled but its runtime effect is UNVERIFIED (board is
+// wedged, see pico-link-icb; this bead may not block on hardware).
+static void pl_bt_cancel_scan(void) {
+    printf("BT: cancelling GAP inquiry\r\n");
+    gap_inquiry_stop();
+}
+
 static void pl_bt_handle_inquiry_result(const uint8_t *packet) {
     bd_addr_t addr;
     gap_event_inquiry_result_get_bd_addr(packet, addr);
@@ -401,6 +412,10 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
             break;
         }
+
+        case PL_COMMAND_TAG_CANCEL_SCAN:
+            pl_bt_cancel_scan();
+            break;
 
         case PL_COMMAND_TAG_NONE:
         default:
