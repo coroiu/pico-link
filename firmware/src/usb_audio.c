@@ -11,11 +11,16 @@
 
 #include <string.h>
 
+#include "device/usbd_pvt.h" // usbd_edpt_busy -- bead pico-link-okx D9
 #include "tusb.h"
 
 #include "pcm_ring.h"
 #include "usb_audio.h"
 #include "usb_descriptors.h"
+
+// EP1 OUT, the isochronous audio endpoint -- matches usb_descriptors.c's
+// EPNUM_AUDIO_OUT and usb_pump.c's PL_EP_AUDIO_OUT (bead pico-link-okx D9).
+#define PL_EP_AUDIO_OUT 0x01u
 
 //--------------------------------------------------------------------+
 // State
@@ -67,6 +72,13 @@ static volatile uint32_t s_clk_get_valid;      // clock_get_request, AUDIO_CS_CT
 // audio_device.c:2239) is the only counter that actually answers "is the
 // host consuming our feedback" -- see the override below.
 static volatile uint32_t s_fb_done;
+
+// --- Instrumentation (bead pico-link-okx D7/D9). Plain volatile increments
+// only, same rule as everything else in this file's callbacks (0xC0 worker
+// IRQ context via tud_task()). ---
+static volatile uint32_t s_rx_bytes_total; // D7: sum of n_bytes_received, EVERY packet -- feeds the sof_isr/packets/rx_bytes conservation table
+static volatile uint32_t s_rx_short_packets; // D7: packets where n_bytes_received != 192 (one full 1ms 48kHz/16-bit/stereo UAC2 packet)
+static volatile uint32_t s_ep_out_busy_at_alt1_entry; // D9: usbd_edpt_busy(EP1 OUT) was already true the moment alt 1 was selected -- non-fatal capture of the panic precondition
 
 //--------------------------------------------------------------------+
 // Clock entity (UAC2_ENTITY_CLOCK)
@@ -202,6 +214,16 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
             // just any SET_INTERFACE for any interface (s_set_itf_calls
             // above already covers that broader question).
             s_set_itf_alt1_calls++;
+            // Bead pico-link-okx D9: non-fatal capture of the panic
+            // precondition (rp2040_usb.c:108's "ep %02X was already
+            // available", guarded by if (ep->active) in
+            // hw_endpoint_xfer_start) at the one other site besides the
+            // steady-state worker tick where an arm is attempted -- alt-1
+            // entry itself. Andreas's crashed board and Ruby's earlier
+            // round-3 panic both happened at/near this transition.
+            if (usbd_edpt_busy(rhport, PL_EP_AUDIO_OUT)) {
+                s_ep_out_busy_at_alt1_entry++;
+            }
         }
     }
     return true;
@@ -263,11 +285,19 @@ void tud_audio_fb_done_cb(uint8_t func_id) {
 // worker IRQ.
 bool tud_audio_rx_done_pre_read_cb(uint8_t rhport, uint16_t n_bytes_received, uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting) {
     (void)rhport;
-    (void)n_bytes_received;
     (void)func_id;
     (void)ep_out;
     (void)cur_alt_setting;
     packet_count++;
+    // Bead pico-link-okx D7: was previously discarded here. 192 bytes = 48
+    // stereo 16-bit sample-frames = one full 1ms UAC2 packet at 48kHz --
+    // see the bead's CORRECTION 2 for why "short packets" (macOS reducing
+    // its own send size) and "missing whole packets" (an unarmed endpoint)
+    // are mutually exclusive explanations this counter tells apart.
+    s_rx_bytes_total += n_bytes_received;
+    if (n_bytes_received != 192) {
+        s_rx_short_packets++;
+    }
     return true;
 }
 
@@ -448,4 +478,16 @@ uint32_t pl_usb_audio_clk_get_valid(void) {
 
 uint32_t pl_usb_audio_fb_done(void) {
     return s_fb_done;
+}
+
+uint32_t pl_usb_audio_rx_bytes_total(void) {
+    return s_rx_bytes_total;
+}
+
+uint32_t pl_usb_audio_rx_short_packets(void) {
+    return s_rx_short_packets;
+}
+
+uint32_t pl_usb_audio_ep_out_busy_at_alt1_entry(void) {
+    return s_ep_out_busy_at_alt1_entry;
 }

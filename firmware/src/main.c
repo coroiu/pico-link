@@ -32,6 +32,7 @@
 #include "input.h"
 #include "panic_recorder.h"
 #include "pico_link_ui.h"
+#include "pl_log_ring.h"
 #include "st7789.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
@@ -63,6 +64,11 @@ void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
 #define COLOR_BLUE 0x001F
 
 int main(void) {
+    // Bead pico-link-okx (F1): zero the console byte ring before ANYTHING
+    // else -- pl_log()/pl_log_locked() push into it unconditionally, and
+    // nothing downstream of this line may call either before it has run.
+    pl_log_ring_init();
+
     // M3: this project now owns TinyUSB's init/task loop (see
     // CMakeLists.txt linking `tinyusb_device`, and tusb_config.h/
     // usb_descriptors.c/.h's module docs). stdio_init_all() below still
@@ -78,11 +84,19 @@ int main(void) {
     };
     tusb_init(BOARD_TUD_RHPORT, &dev_init);
 
+    // Bead pico-link-okx (D12): turns on the RP2350's SOF hardware
+    // interrupt via TinyUSB's public SOF_CONSUMER_USER path (this build's
+    // AUDIO_FEEDBACK_METHOD_DISABLED means nothing else requests it -- see
+    // usb_pump.c's tud_sof_cb doc comment for the full chain, verified by
+    // reading pico-sdk 2.1.1's usbd.c/audio_device.c/dcd_rp2040.c). Needed
+    // for the sof_phase_hist instrument; not needed by anything else in
+    // this firmware. Must run after tusb_init() (usbd_sof_enable asserts
+    // the stack is initialized).
+    tud_sof_cb_enable(true);
+
     // Bead pico-link-tfj: brings up pl_usb_mutex and the 1ms-timer/0xC0-IRQ
-    // worker that services tud_task() from here on. Must run before
-    // stdio_init_all()/any pl_log() call -- pl_log()'s mutex has to exist
-    // first, and this firmware no longer calls tud_task() from the
-    // superloop at all (see below).
+    // worker that services tud_task() from here on. This firmware no
+    // longer calls tud_task() from the superloop at all (see below).
     pl_usb_pump_init();
 
     stdio_init_all();
@@ -423,15 +437,36 @@ int main(void) {
             );
         }
 
-        // Bead pico-link-tfj instrumentation -- see usb_pump.h's doc
-        // comment on pl_usb_pump_report for what the three counters mean.
-        pl_usb_pump_report();
+        // Bead pico-link-okx (D11): ONE shared ~1s report clock for both
+        // pl_usb_pump_report and pl_a2dp_report, replacing their two
+        // previously-independent rate-limit clocks -- see
+        // pl_usb_pump_report's doc comment (usb_pump.h) for why an
+        // unsynchronized pair of ~1.02s windows isn't good enough for this
+        // bead's cross-report rate comparisons (sof_isr/s vs packets/s vs
+        // enc_frames_total/s).
+        static uint64_t s_last_shared_report_us = 0;
+        uint64_t shared_now_us = time_us_64();
+        if (s_last_shared_report_us == 0 || shared_now_us - s_last_shared_report_us >= 1000000) {
+            uint32_t shared_report_dt_us =
+                s_last_shared_report_us != 0 ? (uint32_t)(shared_now_us - s_last_shared_report_us) : 0;
+            s_last_shared_report_us = shared_now_us;
 
-        // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
-        // report line. Thread context only (pl_a2dp_report does no
-        // BTstack calls, only pl_log + plain counter reads); rate-limits
-        // itself internally.
-        pl_a2dp_report();
+            // Bead pico-link-tfj instrumentation, extended by pico-link-okx
+            // -- see usb_pump.h's doc comment on pl_usb_pump_report.
+            pl_usb_pump_report(shared_report_dt_us);
+
+            // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
+            // report line. Thread context only (pl_a2dp_report does no
+            // BTstack calls, only pl_log + plain counter reads).
+            pl_a2dp_report(shared_report_dt_us);
+        }
+
+        // Bead pico-link-okx (F1): drains whatever pl_log()/pl_log_locked()
+        // queued this iteration to the actual console -- THREAD CONTEXT
+        // ONLY, never an IRQ or the 0xC0 worker (see pl_log_ring.h's module
+        // doc). Called every iteration, not rate-limited, so the ring stays
+        // close to empty between report bursts.
+        pl_log_ring_drain();
 
         // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
         // re-renders unconditionally every call -- see its doc comment in
