@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "hardware/sync.h"
+
 #include "btstack.h"
 
 #include "bt.h"
@@ -33,8 +35,8 @@
 static struct PlUi *g_ui;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
-// --- pico-link-6o2: a C-side SPSC ring decouples the BTstack packet handler
-// (producer) from the pl_ui_push_event call (consumer) ---
+// --- pico-link-6o2: a C-side ring decouples the BTstack packet handler
+// (IRQ producer) from the pl_ui_push_event call (single consumer) ---
 //
 // pl_bt_packet_handler runs in low_priority_irq_handler under
 // pico_cyw43_arch_threadsafe_background (firmware/CMakeLists.txt) -- i.e.
@@ -42,27 +44,38 @@ static btstack_packet_callback_registration_t hci_event_callback_registration;
 // from there. That could preempt the superloop mid-pl_ui_render and mutate
 // the model underneath it, and race the superloop's own Rust-heap
 // allocations. Same class of bug pico-link-5am already fixed for input
-// (see input.c), and the same fix shape: the three pl_bt_push_* helpers
-// below no longer call into Rust themselves -- they build a PlEvent and
-// memcpy it into this ring; pl_bt_drain_events (called from the superloop,
-// thread context, in main.c) is the only thing that ever calls
-// pl_ui_push_event for Bluetooth-domain events.
+// (see input.c): the three pl_bt_push_* helpers below no longer call into
+// Rust themselves -- they build a PlEvent and push it into this ring;
+// pl_bt_drain_events (called from the superloop, thread context, in
+// main.c) is the only thing that ever calls pl_ui_push_event for
+// Bluetooth-domain events.
 //
-// Single-producer (the packet handler, IRQ)/single-consumer (the superloop,
-// thread context) discipline, same as input.c's ring: each side owns
-// exactly one index (s_bt_ring_head/s_bt_ring_tail), so plain volatile
-// uint8_t reads/writes are sufficient -- there is no read-modify-write race
-// on either index, and a single-byte load/store is inherently atomic on
-// Cortex-M33. No additional DMB/barrier is needed beyond `volatile` because
-// this is a same-core producer/consumer pair (the IRQ preempts the
-// superloop on core 0; there is no second core touching this ring, and
-// core0-only is still true as of pico-link-6o2 -- the core1 UI split is
-// pico-link-yz6, not yet done): Cortex-M33 does not reorder the *program
-// order* of a single core's memory accesses relative to itself the way a
-// multi-core system would need a DMB to fix, so the only ordering hazard is
-// the *compiler* reordering across the IRQ boundary, which `volatile`
-// already prevents. This is the identical justification input.c already
-// uses and had reviewed; it is not repeated invention.
+// MPSC, not SPSC (review correction, pico-link-6o2): unlike input.c's ring,
+// which has exactly one push call site (the IRQ sampler), this ring has
+// TWO producer contexts -- pl_bt_start_scan and pl_bt_push_link_state are
+// called both from pl_bt_packet_handler (IRQ context: BTSTACK_EVENT_STATE/
+// HCI_STATE_WORKING and GAP_EVENT_INQUIRY_COMPLETE) and from
+// pl_bt_poll_commands (thread context, superloop: PL_COMMAND_TAG_START_SCAN
+// and PL_COMMAND_TAG_CONNECT). Plain volatile head/tail is NOT sufficient
+// here: pl_bt_ring_push's read-check-write-write sequence is a
+// read-modify-write on s_bt_ring_head, and if the IRQ producer preempts the
+// thread-context producer between its read and its final write, both
+// compute the same `head`, both write the same slot, and the loser's event
+// is silently lost WITHOUT incrementing s_bt_ring_drop_count -- a corrupted,
+// unreported drop, exactly the class of bug this bead exists to remove.
+//
+// Fix: pl_bt_ring_push runs its entire body -- including the name-buffer
+// memcpy -- inside one save_and_disable_interrupts/restore_interrupts
+// critical section, rather than a lock-free two-phase reserve/publish
+// split. The data copied per push is small and bounded (at most
+// sizeof(struct PlEvent) + PL_BT_RING_NAME_CAP bytes, ~272 bytes -- a few
+// microseconds at 150MHz), so the interrupt-disable window is short and
+// bounded; a reserve-then-commit scheme would avoid that window but adds
+// exactly the kind of subtle ordering surface this bug came from, for no
+// real latency win at this size. The consumer (pl_bt_drain_events) still
+// runs single-threaded from the superloop and only ever touches
+// s_bt_ring_tail, so it needs no lock of its own -- only the two producers
+// contend, and the critical section serializes them.
 //
 // PlEvent's DeviceDiscovered payload carries a borrowed `name` pointer
 // (valid, per pico_link_ui.h's doc comment, only for the duration of the
@@ -75,13 +88,16 @@ static btstack_packet_callback_registration_t hci_event_callback_registration;
 // only for the duration of the call" because the ring entry's storage is
 // static and outlives the call by construction.
 //
-// Capacity: 32, sized for a full inquiry burst, not just a single result.
-// GAP_EVENT_INQUIRY_RESULT can report the same or additional devices
-// repeatedly over the whole ~10s inquiry window (PL_INQUIRY_DURATION_UNITS
-// above), and the superloop only drains once per frame -- if a render+blit
-// stalls the loop (SPI blit time, see pico-link-14l), several results can
-// pile up before the next drain. 32 covers a burst well beyond the handful
-// of nearby BR/EDR devices realistically seen in one inquiry window, with
+// Capacity: 32 slots, 31 usable (one slot is always kept empty so a full
+// ring's next_head != tail is distinguishable from an empty ring's
+// head == tail -- the same head/tail discipline as input.c). Sized for a
+// full inquiry burst, not just a single result: GAP_EVENT_INQUIRY_RESULT
+// can report the same or additional devices repeatedly over the whole
+// ~10s inquiry window (PL_INQUIRY_DURATION_UNITS above), and the superloop
+// only drains once per frame -- if a render+blit stalls the loop (SPI blit
+// time, see pico-link-14l), several results can pile up before the next
+// drain. 31 usable slots covers a burst well beyond the handful of nearby
+// BR/EDR devices realistically seen in one inquiry window, with
 // LinkStateChanged/DevicesCleared events (one each per scan start/stop)
 // costing negligible extra slots against that budget. A ring of 4 (the
 // bead's called-out failure case) would not survive even a single dense
@@ -100,20 +116,27 @@ typedef struct {
 } pl_bt_ring_entry_t;
 
 static pl_bt_ring_entry_t s_bt_ring[PL_BT_RING_CAPACITY];
-static volatile uint8_t s_bt_ring_head; // producer-owned (IRQ packet handler)
-static volatile uint8_t s_bt_ring_tail; // consumer-owned (superloop drain)
-// Diagnostics only: counts events dropped because the ring was full when the
-// packet handler tried to push. Bumped from IRQ context (hence volatile,
-// plain increment -- single producer, no read-modify-write race with the
-// consumer which never writes this), read/reported from pl_bt_drain_events
-// in thread context. Never touch this from the packet handler with printf
-// -- see the drop-reporting note on pl_bt_drain_events below.
+static volatile uint8_t s_bt_ring_head; // producer-owned (IRQ or thread context, see above -- lock-protected)
+static volatile uint8_t s_bt_ring_tail; // consumer-owned (superloop drain only, no lock needed)
+// Diagnostics only: counts events dropped because the ring was full when a
+// producer tried to push. Bumped inside pl_bt_ring_push's critical section
+// (so it can never race with itself even with two producer contexts),
+// read/reported from pl_bt_drain_events in thread context. Never touch this
+// from the packet handler with printf -- see the drop-reporting note on
+// pl_bt_drain_events below.
 static volatile uint32_t s_bt_ring_drop_count;
 
-// Enqueues one event (IRQ context only). `name`/`name_len` are optional
-// (NULL/0 for every tag but DeviceDiscovered) and are memcpy'd into the
-// ring entry's own buffer -- never stored as a raw pointer -- for the
-// borrow-lifetime reason in the ring's doc comment above.
+// Enqueues one event. Called from both IRQ context (the packet handler) and
+// thread context (pl_bt_poll_commands) -- see the MPSC note above -- so the
+// whole check-and-write sequence runs inside one interrupt-disabled critical
+// section. `name`/`name_len` are optional (NULL/0 for every tag but
+// DeviceDiscovered) and are memcpy'd into the ring entry's own buffer --
+// never stored as a raw pointer -- for the borrow-lifetime reason in the
+// ring's doc comment above. `name_len` is clamped to PL_BT_RING_NAME_CAP
+// defensively (today's only caller already caps it, but a future caller
+// that doesn't must not overrun name_buf), and the clamped value is what's
+// written back into the event's own name_len field so a drained event is
+// self-consistent with what was actually copied.
 //
 // Overflow policy: drop the newest (this event), keep everything already
 // queued. Matches input.c's choice and for the same reason -- overwriting
@@ -122,19 +145,28 @@ static volatile uint32_t s_bt_ring_drop_count;
 // inquiry result is survivable; BTstack will report a still-present device
 // again on its next report within the same scan).
 static void pl_bt_ring_push(struct PlEvent event, const uint8_t *name, uint16_t name_len) {
+    if (name_len > PL_BT_RING_NAME_CAP) {
+        name_len = PL_BT_RING_NAME_CAP;
+    }
+    if (event.tag == PL_EVENT_TAG_DEVICE_DISCOVERED) {
+        event.payload.device_discovered.name_len = name_len;
+    }
+
+    uint32_t irq_state = save_and_disable_interrupts();
     uint8_t head = s_bt_ring_head;
     uint8_t next_head = (uint8_t)((head + 1) % PL_BT_RING_CAPACITY);
     if (next_head == s_bt_ring_tail) {
         s_bt_ring_drop_count++;
+        restore_interrupts(irq_state);
         return;
     }
     pl_bt_ring_entry_t *entry = &s_bt_ring[head];
     entry->event = event;
     if (name != NULL && name_len > 0) {
-        uint16_t copy_len = name_len > PL_BT_RING_NAME_CAP ? PL_BT_RING_NAME_CAP : name_len;
-        memcpy(entry->name_buf, name, copy_len);
+        memcpy(entry->name_buf, name, name_len);
     }
     s_bt_ring_head = next_head;
+    restore_interrupts(irq_state);
 }
 
 // Drains every event currently queued and makes the real pl_ui_push_event
@@ -178,9 +210,11 @@ void pl_bt_drain_events(struct PlUi *ui) {
 // (see pico_link_ui.h's doc comment on pl_ui_push_event), so a helper that
 // always sets it is cheap insurance against a call site accidentally
 // leaving it zero-initialized. These helpers run in IRQ context (the
-// packet handler) or thread context (pl_bt_poll_commands, via
-// pl_bt_push_link_state at the CONNECT case) -- either is fine now, since
-// neither calls into Rust directly any more.
+// packet handler) AND thread context (pl_bt_poll_commands, via
+// pl_bt_push_link_state at the CONNECT case, and pl_bt_start_scan at
+// START_SCAN) -- both are safe because pl_bt_ring_push serializes the two
+// producer contexts under a critical section (see its doc comment above),
+// not because neither calls into Rust any more.
 
 static void pl_bt_push_link_state(enum PlLinkState state) {
     struct PlEvent event = {
