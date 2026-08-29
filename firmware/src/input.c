@@ -12,32 +12,26 @@ typedef struct {
     PlIntentTag tag;
 } pl_input_pin_t;
 
-// Remapped for the corrected st7789.c MADCTL=0xA0 orientation (bead
-// pico-link-g7o, 2026-08-28 correction): the joystick is physically fixed
-// to the PCB, so the pin that ends up meaning NavIntent up/down/left/right
-// depends entirely on how the panel's MADCTL rotates the displayed image
-// relative to that fixed hardware.
-//
-// The prior mapping below (still visible in git history) was derived for
-// MADCTL=0x60. The st7789.c change from 0x60 to 0xA0 is its 180-degree
-// partner -- see the MADCTL comment there for why -- so this table is that
-// same prior mapping with a 180-degree flip applied: whatever a pin used to
-// mean now means its opposite (up<->down, left<->right). Left/right and
-// up/down are each other's antonyms under a 180-degree image rotation, so
-// this is the correct transform, not a guess -- but it was checked against
-// the actual PL_INPUT_PIN_* assignments in input.h (GP2/18/16/20 = up/down/
-// left/right) rather than trusted as arithmetic alone:
-//   PIN_UP    (GP2)  now means LEFT   (was RIGHT before the 180 flip)
-//   PIN_DOWN  (GP18) now means RIGHT  (was LEFT)
-//   PIN_LEFT  (GP16) now means DOWN   (was UP)
-//   PIN_RIGHT (GP20) now means UP     (was DOWN)
+// Re-derived from scratch for MADCTL=0x60 (bead pico-link-zzq, 2026-08-28),
+// which corner-pattern measurement showed to be an IDENTITY mapping on this
+// panel (see st7789.c's MADCTL comment) -- no rotation, no mirroring. The
+// joystick is physically fixed to the PCB, so the pin that ends up meaning
+// NavIntent up/down/left/right depends entirely on how the panel's MADCTL
+// rotates the displayed image relative to that fixed hardware; since 0x60
+// applies NO rotation, each pin means exactly what its name says, same as
+// the table that predates pico-link-g7o's (wrong) 90-degree remap. Do NOT
+// treat that prior remapped table as a starting point to patch -- it was
+// derived by rotating 90 CW from a 0x00 baseline while the commit that
+// introduced it claimed a 180-degree change from 0x60, two different and
+// inconsistent baselines (see bead pico-link-zzq comments) -- this table
+// was re-derived independently from the MEASURED 0x60=identity result.
 // UNVERIFIED ON HARDWARE -- this needs a physical press to confirm; see
-// bead pico-link-g7o's completion comment and pico-link-d7k.
+// bead pico-link-d7k.
 static const pl_input_pin_t PINS[PL_INPUT_PIN_COUNT] = {
-    {PL_INPUT_PIN_UP, PL_INTENT_TAG_LEFT},
-    {PL_INPUT_PIN_DOWN, PL_INTENT_TAG_RIGHT},
-    {PL_INPUT_PIN_LEFT, PL_INTENT_TAG_DOWN},
-    {PL_INPUT_PIN_RIGHT, PL_INTENT_TAG_UP},
+    {PL_INPUT_PIN_UP, PL_INTENT_TAG_UP},
+    {PL_INPUT_PIN_DOWN, PL_INTENT_TAG_DOWN},
+    {PL_INPUT_PIN_LEFT, PL_INTENT_TAG_LEFT},
+    {PL_INPUT_PIN_RIGHT, PL_INTENT_TAG_RIGHT},
     // Center joystick press and button A both mean Select -- see
     // pico_link_core::NavIntent::Select's doc comment.
     {PL_INPUT_PIN_PRESS, PL_INTENT_TAG_SELECT},

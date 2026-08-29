@@ -92,35 +92,51 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color) {
 
     uint8_t colmod_param = 0x55; // 16 bits/pixel, RGB565
     st7789_command(ST7789_CMD_COLMOD, &colmod_param, 1);
-    // MADCTL = 0xA0 (MY | MV, no MX) -- rotates the panel's addressing so
-    // the UI reads upright with the USB cable exiting to the right, per
-    // Andreas's hardware confirmation (pico-link-g7o).
+    // MADCTL = 0x60 (MX | MV, no MY) -- the only value of the four pure-
+    // rotation candidates {0x00, 0x60, 0xA0, 0xC0} that this specific panel
+    // renders correctly. Corrected 2026-08-28 (bead pico-link-zzq), a
+    // follow-up to pico-link-g7o: that bead's 0xA0 was chosen from a
+    // low-resolution webcam photo of TEXT, which cannot distinguish a
+    // 180-degree rotation from a horizontal mirror -- both read "reversed".
+    // This time was measured with an ASYMMETRIC CORNER TEST PATTERN (solid
+    // RED/GREEN/BLUE/WHITE quadrants, RED carrying N dots to identify the
+    // candidate) cycled through all four MADCTL values with the SAME
+    // physical setup, so the four results are directly comparable:
+    //   0x00 -- clean full-frame image, but a 90-degree-CCW rotation of
+    //           0x60's result (see below), not upright in this mounting.
+    //   0x60 -- clean full-frame image, IDENTITY mapping: the software's
+    //           top-left/top-right/bottom-left/bottom-right quadrants land
+    //           on the matching physical corners with no rotation and no
+    //           mirroring. Confirmed upright, cable exiting LEFT, matching
+    //           Andreas's independent by-hand inspection (the bead's "known
+    //           good" baseline, established BEFORE any camera was involved).
+    //   0xA0, 0xC0 -- NOT clean rotations on this panel: both render as a
+    //           corrupted three-band image (~80px / ~120px / ~40px column
+    //           bands instead of a clean 120/120 split), reproduced
+    //           identically across two full test cycles and unaffected by
+    //           reissuing CASET/RASET after the MADCTL write (ruled out a
+    //           stale address-counter as the cause) and by sweeping a CASET
+    //           column offset 0/20/40/60/80 (ruled out a simple GRAM-offset
+    //           fix at those values). Both corrupted candidates are exactly
+    //           the two with MY set, so the defect tracks the MY (row scan
+    //           direction) bit specifically, not MX or MV.
     //
-    // History, corrected 2026-08-28: the two earlier attempts (0xA0, then
-    // 0x60) were both judged by ROTATING THE CAPTURED PHOTO until the text
-    // read upright and noting where the cable pointed in that rotated
-    // view -- a broken measurement method, not a broken panel. It produced
-    // an internally impossible result (0xA0 recorded as "cable at top",
-    // 0x60 as "cable at left" -- two MADCTL values that are 180 degrees
-    // apart, since both set MV and differ only in MX vs MY, cannot
-    // legitimately give perpendicular cable positions). A RAW, unrotated
-    // capture of the then-flashed 0x60 build settled it directly: the UI
-    // was already upright with no rotation needed to read it, and the
-    // cable exits LEFT. 0xA0 is 0x60's 180-degree partner (both are pure
-    // MV-transpose rotations; MX vs MY selects which of the two 180-degree-
-    // apart results you get), so it is the clean 90-degree-equivalent swap
-    // that puts the cable on the RIGHT instead -- verified the same way,
-    // raw frame, no rotation, see bead comments. MX/MY here are pure
-    // orientation bits and don't touch the RGB/BGR bit (bit 3), which
-    // INVON below and the existing colour work are independent of.
+    // NET RESULT: no MADCTL value among the four pure rotations gives
+    // "upright, cable exiting right" on this hardware -- that would need a
+    // clean 180-degree rotation from 0x60, and both candidates that should
+    // supply it are the corrupted ones. Reverting to 0x60 (upright, cable
+    // LEFT) rather than shipping 0xA0's mirror or a known-corrupted 0xC0/
+    // 0xA0 image. The cable-exits-right requirement is tracked as follow-up
+    // work (needs the MY-addressing defect fixed first, a different bug
+    // than "pick the right MADCTL byte") -- see bead comments for the full
+    // four-candidate photo evidence.
     //
     // This panel is square (240x240), so the CASET/RASET window below is
-    // unaffected by MV's row/column exchange -- no per-rotation offset is
-    // needed to keep the fill full-frame and unshifted at 0xA0 (re-verified
-    // via raw, unrotated webcam capture, see bead comments). If a future
-    // panel swap needs one, that offset is added to caset_params/raset_params
-    // below, NOT here.
-    uint8_t madctl_param = 0xA0;
+    // unaffected by MV's row/column exchange for the WORKING candidates
+    // (0x00, 0x60) -- no per-rotation offset is needed for those. If a
+    // future fix for the MY defect needs one, it is added to
+    // caset_params/raset_params below, NOT here.
+    uint8_t madctl_param = 0x60;
     st7789_command(ST7789_CMD_MADCTL, &madctl_param, 1);
     // The Waveshare Pico-LCD-1.3 panel needs display inversion on, or
     // colours render photo-negative. Wrong colour alone wouldn't explain an
@@ -231,4 +247,23 @@ void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel
     // function's own next RAMWR, or any other register command) doesn't
     // silently get sent as a 16-bit frame.
     spi_set_format(s_spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+}
+
+void st7789_set_madctl(uint8_t madctl_param) {
+    st7789_command(ST7789_CMD_MADCTL, &madctl_param, 1);
+}
+
+void st7789_set_caset_offset(uint16_t x0) {
+    uint16_t x1 = x0 + (ST7789_WIDTH - 1);
+    uint8_t caset_params[4] = {(uint8_t)(x0 >> 8), (uint8_t)(x0 & 0xff), (uint8_t)(x1 >> 8), (uint8_t)(x1 & 0xff)};
+    st7789_command(ST7789_CMD_CASET, caset_params, sizeof(caset_params));
+}
+
+void st7789_reset_window(void) {
+    const uint16_t x_end = ST7789_WIDTH - 1;
+    const uint16_t y_end = ST7789_HEIGHT - 1;
+    uint8_t caset_params[4] = {0x00, 0x00, (uint8_t)(x_end >> 8), (uint8_t)(x_end & 0xff)};
+    st7789_command(ST7789_CMD_CASET, caset_params, sizeof(caset_params));
+    uint8_t raset_params[4] = {0x00, 0x00, (uint8_t)(y_end >> 8), (uint8_t)(y_end & 0xff)};
+    st7789_command(ST7789_CMD_RASET, raset_params, sizeof(raset_params));
 }

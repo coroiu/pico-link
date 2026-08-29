@@ -63,4 +63,30 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color);
 // the framebuffer memory this DMA is reading from) until this returns.
 void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel_count);
 
+// Re-issues the MADCTL command with a new parameter byte after init. Used
+// by the PL_DIAG_MADCTL_TEST diagnostic (main.c) to cycle candidates
+// without a full re-init/reset cycle; not used by normal boot (MADCTL is
+// set once inside st7789_init_and_fill). Safe to call any time after
+// st7789_init_and_fill has run -- the CASET/RASET window is already the
+// full 0..239 square on both axes, which is invariant under MADCTL's
+// row/column exchange since the panel is square.
+void st7789_set_madctl(uint8_t madctl_param);
+
+// Diagnostic-only (pico-link-zzq): re-issues CASET with an arbitrary
+// [x0, x0+239] column window instead of the fixed [0,239] st7789_init_and_fill
+// programs. Used to test whether this panel's MY-toggled addressing needs a
+// GRAM offset compensation (the classic ST7789-in-a-320-row-GRAM quirk) --
+// see the PL_DIAG_MADCTL_TEST block in main.c. Not used by normal boot.
+void st7789_set_caset_offset(uint16_t x0);
+
+// Diagnostic-only (pico-link-zzq): re-issues BOTH CASET and RASET to the
+// fixed full-frame [0,239]x[0,239] window. Tests the hypothesis that
+// changing MADCTL's row/column scan-direction bits at runtime (as the
+// PL_DIAG_MADCTL_TEST loop does, unlike normal boot which sets MADCTL once
+// before the one-time CASET/RASET in st7789_init_and_fill) leaves the
+// panel's internal address counter in a state inconsistent with the new
+// scan direction until the window commands are reissued -- st7789_blit_
+// framebuffer's RAMWR-only fast path assumes that never needs to happen.
+void st7789_reset_window(void);
+
 #endif // PICO_LINK_ST7789_H
