@@ -24,6 +24,7 @@
 
 #include "btstack.h"
 
+#include "a2dp.h"
 #include "bt.h"
 #include "pico_link_ui.h"
 #include "usb_pump.h"
@@ -245,6 +246,43 @@ static void pl_bt_push_device_discovered(const uint8_t *addr, const uint8_t *nam
     pl_bt_ring_push(event, name, name_len);
 }
 
+// --- M4 S1 additions (bead pico-link-cz0.5.2): exported so a2dp.c can push
+// through this same ring -- see bt.h's doc comment on why that's the right
+// seam (a2dp.c's A2DP/AVRCP packet handler is another IRQ-context producer,
+// same MPSC shape pico-link-6o2 already built this ring to handle).
+
+void pl_bt_push_link_state_connected(void) {
+    pl_bt_push_link_state(PL_LINK_STATE_CONNECTED);
+}
+
+void pl_bt_push_connect_step(uint32_t step) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_CONNECT_STEP_CHANGED,
+        .payload = {.connect_step_changed = {.step = step}},
+    };
+    pl_bt_ring_push(event, NULL, 0);
+}
+
+void pl_bt_push_connect_succeeded(bool degraded) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_CONNECT_SUCCEEDED,
+        .payload = {.connect_succeeded = {.degraded = degraded ? 1 : 0}},
+    };
+    pl_bt_ring_push(event, NULL, 0);
+}
+
+void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_CONNECT_FAILED,
+        .payload = {.connect_failed = {.reason = reason}},
+    };
+    memcpy(event.payload.connect_failed.addr, addr, 6);
+    pl_bt_ring_push(event, NULL, 0);
+}
+
 // --- HCI Read Local Version Information: the acceptance-criterion probe ---
 //
 // Fires once, the first time BTSTACK_EVENT_STATE reports HCI_STATE_WORKING
@@ -383,6 +421,11 @@ void pl_bt_init(struct PlUi *ui) {
     hci_event_callback_registration.callback = &pl_bt_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
+    // M4 S1 (bead pico-link-cz0.5.2): A2DP Source + AVRCP + SDP + class of
+    // device registration MUST happen before hci_power_control(HCI_POWER_ON)
+    // below -- see a2dp.h's doc comment on pl_a2dp_init.
+    pl_a2dp_init(ui);
+
     pl_log("BT: powering on HCI (async -- BTSTACK_EVENT_STATE/HCI_STATE_WORKING follows)\r\n");
     hci_power_control(HCI_POWER_ON);
 }
@@ -405,15 +448,18 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             break;
 
         case PL_COMMAND_TAG_CONNECT: {
-            // M2's acceptance criterion is that this is observable over
-            // CDC, not that a connection actually opens -- see bt.h's doc
-            // comment on this function.
+            // M4 S1 (bead pico-link-cz0.5.2): this used to be log-only
+            // (M2's acceptance criterion was just that the intent was
+            // observable over CDC). Now it actually opens an A2DP source
+            // stream -- see a2dp.c's module doc and design sec 4.3's event
+            // flow.
             const uint8_t *addr = command.payload.connect.addr;
             pl_log(
                 "BT: PL_CMD_CONNECT %02x:%02x:%02x:%02x:%02x:%02x\r\n",
                 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
             );
             pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
+            pl_a2dp_connect(addr);
             break;
         }
 

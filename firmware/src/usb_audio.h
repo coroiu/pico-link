@@ -16,6 +16,17 @@
 // pl_usb_audio_pcm_bytes_total.
 void pl_usb_audio_task(void);
 
+// M4 S1 (bead pico-link-cz0.5.2), design sec 2.1: computes and applies the
+// explicit USB audio feedback value from the PCM ring's own fill level.
+// MUST be called from the same 0xC0 worker IRQ as pl_usb_audio_task(),
+// after it -- see usb_audio.c's doc comment on this function and on
+// tud_audio_feedback_params_cb (AUDIO_FEEDBACK_METHOD_DISABLED tells
+// TinyUSB the application supplies this, not the class driver). This is a
+// hard dependency of M4, not optional instrumentation: without it, the
+// host runs the ISO OUT stream at an uncontrolled rate and the PCM ring
+// overruns within seconds once a consumer (a2dp.c) exists (design sec 2).
+void pl_usb_audio_feedback_task(void);
+
 // True once the host has selected the streaming alternate setting (alt 1)
 // on the audio streaming interface -- i.e. audio is actually flowing, not
 // just enumerated.
