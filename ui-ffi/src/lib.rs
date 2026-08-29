@@ -69,15 +69,22 @@ use pico_link_core::{App, Command, ConnectFailureReason, ConnectStep, DeviceEntr
 // (see the module doc's "Superloop on core0 only" -- everything here runs
 // on one core with no preemption other than interrupts, which is exactly
 // what disabling PRIMASK excludes for the critical section's duration).
-// `#[cfg(not(test))]`: under `cargo test -p ui-ffi` this crate builds with
-// `std` linked in (see the crate root's `cfg_attr(not(test), no_std)`), and
-// the heap arena below (the only thing that ever calls into
-// `critical_section`) is itself `#[cfg(not(test))]`'d away in favour of
-// std's own allocator -- so no `critical_section::Impl` is ever needed, or
-// registered, under test.
-#[cfg(not(test))]
+// `#[cfg(all(not(test), target_os = "none"))]`: under `cargo test -p ui-ffi`
+// this crate builds with `std` linked in (see the crate root's
+// `cfg_attr(not(test), no_std)`), and the heap arena below (the only thing
+// that ever calls into `critical_section`) is itself `#[cfg(not(test))]`'d
+// away in favour of std's own allocator -- so no `critical_section::Impl`
+// is ever needed, or registered, under test. Gated further on
+// `target_os = "none"` (true only for the bare-metal thumbv8m target, see
+// the panic handler's doc comment above for why `not(test)` alone is not
+// enough): the inline `asm!` blocks below are Armv8-M-only mnemonics
+// (`mrs`/`cpsid`/`cpsie`) that do not assemble for a host-native
+// `cargo build --workspace` (aarch64/x86_64), and are not needed there
+// either -- a plain host build never links this staticlib into a running
+// binary, so no `critical_section::Impl` ever needs to be resolved for it.
+#[cfg(all(not(test), target_os = "none"))]
 struct SingleCoreCriticalSection;
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 critical_section::set_impl!(SingleCoreCriticalSection);
 
 // SAFETY: `acquire`/`release` correctly save and restore the interrupt
@@ -85,7 +92,7 @@ critical_section::set_impl!(SingleCoreCriticalSection);
 // contract -- interrupts are disabled for the duration and restored to
 // exactly their prior state afterward, and these two calls are never
 // reordered or elided (`acquire` returns the token `release` consumes).
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 unsafe impl critical_section::Impl for SingleCoreCriticalSection {
     unsafe fn acquire() -> critical_section::RawRestoreState {
         let primask: u32;
@@ -184,11 +191,21 @@ fn ensure_heap_initialized() {
 // report and halt, never unwind across the `extern "C"` boundary into C
 // (which would be UB). Reports via the one call Rust is allowed to make
 // back into C, then loops forever -- there is nothing else a bare-metal
-// no_std panic handler can safely do. `#[cfg(not(test))]`: a crate linked
-// into a `std` test binary must not define its own `#[panic_handler]` --
-// std already provides one (ordinary unwinding panics, which `#[test]`
-// relies on for `#[should_panic]` and for reporting a failing assertion).
-#[cfg(not(test))]
+// no_std panic handler can safely do. Gated on `target_os = "none"` (true
+// only for the bare-metal thumbv8m target), not merely `not(test)`: a plain
+// host-native `cargo build --workspace` (no `--target`, `default-members`
+// notwithstanding -- `--workspace` overrides it) also satisfies
+// `not(test)`, but that build links against host `std` transitively (via
+// this crate's dependency graph), and `std` already defines the
+// `panic_impl` lang item. `#![no_std]` on this crate does not stop a
+// dependency elsewhere in the graph from pulling `std` in when targeting a
+// real OS -- only building for a target with no OS (`target_os = "none"`)
+// removes `std` from the graph structurally. A crate linked into a `std`
+// binary (host build or `#[cfg(test)]`) must not define its own
+// `#[panic_handler]` -- std already provides one (ordinary unwinding
+// panics, which `#[test]` relies on for `#[should_panic]` and for
+// reporting a failing assertion).
+#[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // A tiny fixed-size stack buffer, not a heap `alloc::format!` -- a
