@@ -1,18 +1,27 @@
-// Pico Link btstack_config.h -- M2 scope: bring the radio up through
-// pico-sdk's own HCI transport (pico_btstack_hci_transport_cyw43, the
-// ready-made piece the C-first pivot exists to use -- see
-// .planning/decisions/2026-08-27-c-first-pico-sdk-owns-main.md), read an
-// HCI Read Local Version response, run a GAP Classic inquiry, and log a
-// user-selected Connect intent. Classic-only, buffer sizes sized for a
-// scan plus a single ACL connection attempt -- NOT tuned for A2DP/LDAC
-// streaming; that is M4's job and these numbers will need to grow with it.
+// Pico Link btstack_config.h -- grown for M4 S1 (A2DP source, SBC) from its
+// M2 scope of bringing the radio up through pico-sdk's own HCI transport
+// (pico_btstack_hci_transport_cyw43, the ready-made piece the C-first pivot
+// exists to use -- see
+// .planning/decisions/2026-08-27-c-first-pico-sdk-owns-main.md). M2 sized
+// this file for inquiry plus a single logged connect intent; M4 needs a real
+// signalling (AVDTP) channel, a media (AVDTP) channel, AVRCP, and SDP --
+// see .planning/design/2026-08-29-a2dp-source-pipeline.md sec 9, which
+// names MAX_NR_L2CAP_CHANNELS/MAX_NR_L2CAP_SERVICES as "definitely too
+// small" at their old value of 1.
 //
 // Retyped from reading (never copying) BTstack's own
-// example/embedded/btstack_config.h shape and, per the bead's explicit
-// instruction, USBPods' btstack_config.h (read from a scratch clone
-// outside this repo tree -- copying it would inherit GPL-3 across the link
-// boundary). The values below are our own choice for our own scope, not a
-// transcription.
+// example/embedded/btstack_config.h shape and a2dp_source_demo.c, and per
+// the bead's explicit instruction, USBPods' btstack_config.h (read from a
+// scratch clone outside this repo tree -- copying it would inherit GPL-3
+// across the link boundary). The values below are our own choice for our
+// own scope, not a transcription. Per design sec 9: BTstack #errors loudly
+// by name for anything missing, so most of these were found by letting the
+// build fail and reading the error -- EXCEPT the ACL buffer counts
+// (MAX_NR_CONTROLLER_ACL_BUFFERS / HCI_HOST_ACL_PACKET_NUM), which throttle
+// SILENTLY (media-send backlog / pkt_fail, not a compile error) and were
+// raised from M2's inquiry-only floor of 3 on that basis, not measurement
+// yet -- sec 12.5 leaves the exact right number as an open hardware
+// question for a future tuning pass.
 #ifndef BTSTACK_CONFIG_H
 #define BTSTACK_CONFIG_H
 
@@ -34,34 +43,65 @@
 // Required by pico_btstack_hci_transport_cyw43 (btstack_hci_transport_cyw43.c).
 #define HCI_ACL_CHUNK_SIZE_ALIGNMENT 4
 
-// One inquiry scan, at most one outgoing connection attempt at a time --
-// this milestone never opens an L2CAP channel or SDP query, so those stay
-// at the floor of 1 rather than 0 (some BTstack internals assume at least
-// one service/channel slot exists).
+// One ACL connection at a time (still true for M4: one paired sink). L2CAP
+// channels now need to cover AVDTP signalling + AVDTP media + AVRCP (target
+// and controller) concurrently on that one connection, plus SDP queries
+// made against the sink while pairing -- design sec 9. L2CAP services
+// (registered PSMs) cover AVDTP, AVRCP, and SDP itself.
 #define MAX_NR_HCI_CONNECTIONS 1
-#define MAX_NR_L2CAP_CHANNELS 1
-#define MAX_NR_L2CAP_SERVICES 1
+#define MAX_NR_L2CAP_CHANNELS 6
+#define MAX_NR_L2CAP_SERVICES 4
 #define MAX_NR_BTSTACK_LINK_KEY_DB_MEMORY_ENTRIES 1
 #define MAX_NR_WHITELIST_ENTRIES 1
 #define MAX_NR_SM_LOOKUP_ENTRIES 1
 
 // pico_btstack_classic links btstack_link_key_db_tlv.c unconditionally
 // (flash-backed link key storage), which hard-errors at compile time
-// without this -- one link key is all M2 needs (no pairing/bonding flow
-// yet, just inquiry + a logged connect intent).
+// without this -- one link key is all this project needs (one paired sink
+// at a time, no multi-device bonding yet).
 #define NVM_NUM_LINK_KEYS 1
 
+// --- M4 additions: AVDTP/A2DP/AVRCP/SDP (design sec 9) ---
+//
+// One stream endpoint per codec_table.c row (S1: SBC only, so 1 -- table
+// grows, this must grow with it per design sec 4.1), one AVDTP connection
+// (the single paired sink), one A2DP-source-side connection tracked
+// implicitly through it, and AVRCP target + controller connections for the
+// same sink (registered per a2dp_source_demo.c's SDP/service shape -- see
+// a2dp.c's module doc for why AVRCP is plumbed even though S1 doesn't act
+// on transport controls yet).
+#define MAX_NR_AVDTP_STREAM_ENDPOINTS 1
+#define MAX_NR_AVDTP_CONNECTIONS 1
+#define MAX_NR_AVRCP_CONNECTIONS 1
+
+// SDP: four service records at boot (A2DP Source, AVRCP Target, AVRCP
+// Controller, Device ID -- matching a2dp_source_demo.c's
+// a2dp_source_and_avrcp_services_init()), plus enough query buffer space
+// for one on-demand SDP client query issued against the sink we're
+// connecting to (a2dp_source_establish_stream drives this internally to
+// discover the sink's AVDTP PSM).
+#define ENABLE_SDP
+#define SDP_CLIENT_MAX_ATTRIBUTE_VALUE_SIZE 512
+
 // Flow control + buffer limits to avoid overrunning the cyw43 shared SPI
-// bus -- the bead's banked hardware evidence proved the bus itself works
-// (read32_swapped round-trip), but that was register-level traffic, not
-// sustained HCI packet flow, so keep these conservative rather than
-// assuming headroom that hasn't been measured yet.
-#define MAX_NR_CONTROLLER_ACL_BUFFERS 3
+// bus. M2's floor of 3 was sized for inquiry-only traffic; sustained A2DP
+// media (one SBC media packet roughly every ~13ms, design sec 3.3) wants
+// more outstanding buffers so the link doesn't stall waiting on ACL credit
+// -- design sec 9 says start at 8 and tune against pkt_fail, since this is
+// the one class of limit that throttles SILENTLY rather than #error-ing at
+// compile time.
+#define MAX_NR_CONTROLLER_ACL_BUFFERS 8
 #define MAX_NR_CONTROLLER_SCO_PACKETS 3
 #define ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL
 #define HCI_HOST_ACL_PACKET_LEN 1024
-#define HCI_HOST_ACL_PACKET_NUM 3
+#define HCI_HOST_ACL_PACKET_NUM 8
 #define HCI_HOST_SCO_PACKET_LEN 120
 #define HCI_HOST_SCO_PACKET_NUM 3
+
+// ENABLE_A2DP_EXPLICIT_CONFIG is deliberately NOT defined here -- S1 relies
+// on BTstack's implicit codec auto-selection, which is hardcoded to SBC
+// when this is undefined (a2dp.c:591-626 in the vendored BTstack source).
+// S4 (LDAC) defines this and switches to codec_table-driven explicit
+// negotiation -- design sec 4.1.
 
 #endif // BTSTACK_CONFIG_H

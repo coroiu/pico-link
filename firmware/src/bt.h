@@ -5,6 +5,9 @@
 #ifndef PL_BT_H
 #define PL_BT_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "pico_link_ui.h"
 
 // Brings up the cyw43 radio's HCI transport and BTstack's Classic GAP
@@ -44,5 +47,35 @@ void pl_bt_poll_commands(struct PlUi *ui);
 // so a frame renders with the Bluetooth events that arrived before it, not
 // one frame late.
 void pl_bt_drain_events(struct PlUi *ui);
+
+// --- M4 S1 additions (bead pico-link-cz0.5.2): let a2dp.c push events
+// through this file's existing MPSC ring (see bt.c's pico-link-6o2 doc
+// comment) rather than duplicating that machinery. a2dp.c's A2DP/AVRCP
+// packet handler runs in the same IRQ context (cyw43/BTstack background,
+// 0xFF) bt.c's own HCI packet handler does, so pushing into the same ring
+// from there is exactly the MPSC case that ring already handles.
+
+// Pushes Event::LinkStateChanged{state: Connected} -- PL_LINK_STATE_IDLE/
+// SCANNING/CONNECTING are already reachable via bt.c's own call sites;
+// CONNECTED only becomes reachable once a2dp.c's A2DP_SUBEVENT_STREAM_STARTED
+// fires (design sec 4.3), so it is exposed here rather than duplicated.
+void pl_bt_push_link_state_connected(void);
+
+// Pushes Event::ConnectStepChanged(step). `step` is the raw wire value of
+// ui-ffi's PlConnectStep (Connecting=0, Pairing=1, SettingUpAudio=2,
+// NegotiatingCodec=3 -- see ui-ffi/src/lib.rs; cbindgen does not emit
+// C constants for this enum because no FFI struct field is typed as it,
+// only as a plain u32, so a2dp.c/a2dp.h define their own PL_CONNECT_STEP_*
+// constants matching those discriminants exactly).
+void pl_bt_push_connect_step(uint32_t step);
+
+// Pushes Event::ConnectSucceeded{degraded}.
+void pl_bt_push_connect_succeeded(bool degraded);
+
+// Pushes Event::ConnectFailed{addr, reason}. `reason` is the raw wire
+// value of ui-ffi's PlFailureReason (PL_FAILURE_REASON_* constants,
+// generated into pico_link_ui.h since PlConnectFailedPayload::reason IS a
+// real FFI field of that numeric type).
+void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
 
 #endif // PL_BT_H

@@ -79,6 +79,9 @@ add_executable(pico_link
     src/st7789.c
     src/input.c
     src/bt.c
+    src/a2dp.c
+    src/codec_table.c
+    src/codec_sbc.c
     src/panic_recorder.c
     src/usb_descriptors.c
     src/usb_audio.c
@@ -176,6 +179,10 @@ target_link_libraries(pico_link
     # pico_btstack_hci_transport_cyw43 and pico_btstack_base transitively.
     pico_btstack_classic
     pico_btstack_cyw43
+    # M4 S1 (bead pico-link-cz0.5.2): BTstack's own bluedroid-derived SBC
+    # encoder, ships in the pico-sdk (rp2_common/pico_btstack/CMakeLists.txt)
+    # -- no new fetch, no new submodule (design sec 11.6).
+    pico_btstack_sbc_encoder
     pico_cyw43_arch_threadsafe_background
     # M3: link the MARKED tinyusb_device target (not just the
     # tinyusb_device_unmarked that pico_enable_stdio_usb pulls in on its

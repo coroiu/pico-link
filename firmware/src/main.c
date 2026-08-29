@@ -24,6 +24,7 @@
 #include "pico/stdlib.h"
 #include "tusb.h"
 
+#include "a2dp.h"
 #include "bt.h"
 #include "input.h"
 #include "panic_recorder.h"
@@ -411,6 +412,12 @@ int main(void) {
         // Bead pico-link-tfj instrumentation -- see usb_pump.h's doc
         // comment on pl_usb_pump_report for what the three counters mean.
         pl_usb_pump_report();
+
+        // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
+        // report line. Thread context only (pl_a2dp_report does no
+        // BTstack calls, only pl_log + plain counter reads); rate-limits
+        // itself internally.
+        pl_a2dp_report();
 
         // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
         // re-renders unconditionally every call -- see its doc comment in
