@@ -23,17 +23,23 @@
 
 #include "bt.h"
 #include "input.h"
+#include "panic_recorder.h"
 #include "pico_link_ui.h"
 #include "st7789.h"
 
 // The one call in the Rust -> C direction (see pico_link_ui.h's doc comment
 // on pl_ui_panic_hook): Rust hands us a panic message on the way to
 // spinning forever, since it has no unwinder on this target and nothing
-// else safe to do. Report it over the CDC console -- the only I/O channel
-// available for this -- so a panic during bring-up is visible rather than
-// looking like a silent hang.
+// else safe to do. Deliberately does NOT printf here (bd pico-link-gap):
+// the recorder's whole point is to survive a panic WITHOUT depending on the
+// USB console, since USB is exactly what was observed dead alongside a
+// panic on 2026-08-28 -- printf-ing first would risk the documented
+// stdio-mutex-deadlock-after-a-fault failure mode before the record is even
+// safely written. pl_panic_record_rust arms the watchdog, records to
+// watchdog scratch + an uninitialized-RAM buffer, and reboots; the report
+// is printed by pl_panic_report_and_clear() on the *next* boot instead.
 void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
-    printf("\r\n!!! ui-ffi PANIC: %.*s\r\n", (int)len, (const char *)msg);
+    pl_panic_record_rust(msg, len);
 }
 
 #define PANEL_WIDTH ST7789_WIDTH
@@ -55,6 +61,13 @@ int main(void) {
     printf("\r\n=== pico_link firmware boot ===\r\n");
     printf("board: pimoroni_pico_plus2_w_rp2350\r\n");
     printf("pico-sdk owns main(); ui-ffi (Rust core) linked in over FFI.\r\n");
+
+    // bd pico-link-gap: report (and clear) a panic record left by the
+    // reboot that just happened, if there is one. Placed here -- after the
+    // CDC attach-grace sleep above, before anything else that could itself
+    // panic -- so the report has the best chance of a listener actually
+    // being attached, and so it isn't lost underneath later boot output.
+    pl_panic_report_and_clear();
 
     // Panel bring-up itself is proven on real hardware as of M1b (bd
     // pico-link-cz0.2). An earlier version of this M2 session's main.c
