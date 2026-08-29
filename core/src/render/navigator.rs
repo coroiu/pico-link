@@ -225,7 +225,7 @@ impl Navigator {
     pub fn render(&self, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         target.clear(palette::BACKGROUND)?;
         let chrome = compute_chrome(target.size());
-        self.current().render(&chrome, target)
+        self.current().render(&chrome, self.depth() > 1, target)
     }
 }
 
@@ -359,5 +359,54 @@ mod tests {
         // rendering actually did something (not just the background clear).
         let any_title_bar_surface = fb.pixels().any(|p| p.1 == palette::SURFACE);
         assert!(any_title_bar_surface);
+    }
+
+    // --- B liveness (pico-link-znb.5 / E2): a navigator fact, not a screen fact ---
+
+    fn b_slot_rect(chrome: &crate::render::chrome::ChromeLayout) -> embedded_graphics::primitives::Rectangle {
+        use crate::panel::Button;
+        let order = chrome.orientation.slot_order();
+        let index = order.iter().position(|&b| b == Button::B).expect("B is always in slot_order");
+        let slot_height = chrome.rail.size.height / 4;
+        embedded_graphics::primitives::Rectangle::new(
+            Point::new(chrome.rail.top_left.x, chrome.rail.top_left.y + (index as u32 * slot_height) as i32),
+            Size::new(chrome.rail.size.width, slot_height),
+        )
+    }
+
+    fn any_pixel_of_color_in_rect(
+        fb: &FrameBuffer565,
+        rect: embedded_graphics::primitives::Rectangle,
+        color: embedded_graphics::pixelcolor::Rgb565,
+    ) -> bool {
+        (rect.top_left.y..rect.top_left.y + rect.size.height as i32)
+            .any(|y| (rect.top_left.x..rect.top_left.x + rect.size.width as i32).any(|x| fb.pixel(Point::new(x, y)) == color))
+    }
+
+    #[test]
+    fn b_slot_is_dim_at_the_root_and_live_once_a_screen_is_pushed() {
+        let mut nav = Navigator::new(list_screen("root", 3));
+        let mut fb = FrameBuffer565::new(240, 240);
+        nav.render(&mut fb).unwrap();
+        let chrome = compute_chrome(fb.size());
+        let b_rect = b_slot_rect(&chrome);
+        assert!(
+            any_pixel_of_color_in_rect(&fb, b_rect, palette::DIVIDER),
+            "at depth 1 (root, un-poppable) B must render dim"
+        );
+        assert!(
+            !any_pixel_of_color_in_rect(&fb, b_rect, palette::TEXT_SECONDARY),
+            "at depth 1 B must not render live -- there is nothing behind the root to pop back to"
+        );
+
+        nav.push(list_screen("detail", 1));
+        let mut fb2 = FrameBuffer565::new(240, 240);
+        nav.render(&mut fb2).unwrap();
+        let chrome2 = compute_chrome(fb2.size());
+        let b_rect2 = b_slot_rect(&chrome2);
+        assert!(
+            any_pixel_of_color_in_rect(&fb2, b_rect2, palette::TEXT_SECONDARY),
+            "after a push, depth > 1, B must render live"
+        );
     }
 }

@@ -9,8 +9,11 @@
 //!   ([`FrameBuffer565`]), the app core's single render output.
 //! - [`widget`]: the retained-mode [`Widget`] trait, [`Action`], and
 //!   [`FocusEvent`].
-//! - [`chrome`]: fixed title/content/hint region layout
+//! - [`chrome`]: fixed title/content/rail region layout
 //!   ([`compute_chrome`]).
+//! - [`rail`]: the labelled A/B/X/Y button rail
+//!   ([`rail::draw_rail`]/[`ButtonLabel`]/[`ButtonLabels`]), drawn into the
+//!   chrome's rail region on every screen.
 //! - [`list`]: [`VerticalList`], the primary scrolling content widget.
 //! - [`menu`][]: [`MenuList`]/[`MenuItem`] — the chip-less, single-line
 //!   action-row style used by action menus and other single-line rows,
@@ -54,11 +57,12 @@ pub mod list;
 pub mod menu;
 pub mod message;
 pub mod navigator;
+pub mod rail;
 pub mod screen;
 pub mod theme;
 pub mod widget;
 
-pub use chrome::{compute_chrome, ChromeLayout};
+pub use chrome::{compute_chrome, compute_chrome_for, ChromeLayout};
 pub use confirm::ConfirmView;
 pub use framebuffer::FrameBuffer565;
 pub use hero::{BitrateStatus, CodecStatus, HeroStatusView};
@@ -66,5 +70,6 @@ pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};
 pub use menu::{MenuItem, MenuList};
 pub use message::MessageView;
 pub use navigator::Navigator;
+pub use rail::{Button, ButtonLabel, ButtonLabels};
 pub use screen::Screen;
 pub use widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Widget};

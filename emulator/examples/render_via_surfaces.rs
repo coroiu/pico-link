@@ -36,7 +36,7 @@ fn build_scene() -> Navigator {
         ListItem::new("Device info").with_sublabel("Pico Plus 2 W"),
     ];
     let list = VerticalList::new(items);
-    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back");
+    let root = Screen::new("Pico Link", vec![Box::new(list)]);
     let mut navigator = Navigator::new(root);
     navigator.dispatch(NavIntent::Down);
     navigator
