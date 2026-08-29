@@ -207,15 +207,30 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
     return true;
 }
 
-// The "hard part" this bead calls out: tell TinyUSB's audio class driver to
-// compute the explicit feedback value itself from OUT-FIFO fill level
-// (AUDIO_FEEDBACK_METHOD_FIFO_COUNT) rather than hand-rolling SOF-counting
-// clock math. This is the same method uac2_speaker_fb (the vendored
-// reference for the feedback endpoint) uses.
+// M4 S1 (bead pico-link-cz0.5.2), design sec 2/2.1 -- REPLACES M3's
+// AUDIO_FEEDBACK_METHOD_FIFO_COUNT. That method derived feedback from the
+// fill of TinyUSB's own 784-byte ISO-OUT software FIFO, but
+// pl_usb_audio_task() (below) drains that FIFO to empty every millisecond
+// -- TinyUSB therefore always saw a permanently-empty FIFO and commanded
+// the host toward maximum deviation, continuously. Harmless in M3 (nothing
+// downstream); fatal the moment a real consumer (a2dp.c's media timer)
+// exists, because the host then runs fast and the PCM ring overruns within
+// seconds. Confirmed on hardware before this change (bd pico-link-cz0.5.2's
+// dispatch comment): M3's `usb-audio: ... measured=194148 B/s` against a
+// 192000 nominal is exactly the signature of a host already reacting to
+// SOME feedback signal -- so the fix here is to make that signal correct
+// (computed from the PCM ring's own fill, design sec 2.1), not to prove
+// the endpoint is reachable at all.
+//
+// AUDIO_FEEDBACK_METHOD_DISABLED tells TinyUSB "the application computes
+// and calls tud_audio_fb_set() itself" -- see pl_usb_audio_feedback_task()
+// below, called from the 0xC0 worker (usb_pump.c) right after this file's
+// own pl_usb_audio_task() drain, per design sec 2.1's comment "we are
+// already there; ring fill is two loads and a mask".
 void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedback_params_t *feedback_param) {
     (void)func_id;
     (void)alt_itf;
-    feedback_param->method = AUDIO_FEEDBACK_METHOD_FIFO_COUNT;
+    feedback_param->method = AUDIO_FEEDBACK_METHOD_DISABLED;
     feedback_param->sample_freq = current_sample_rate;
 }
 
@@ -274,6 +289,49 @@ void pl_usb_audio_task(void) {
         }
         avail = tud_audio_available();
     }
+}
+
+// M4 S1, design sec 2.1: the explicit-feedback control loop. Called from
+// the 0xC0 worker IRQ (usb_pump.c), right after pl_usb_audio_task()'s
+// drain, once per ~1ms tick.
+//
+// P-only, deliberately (design sec 2.1's rationale): the plant (ring fill)
+// is a pure integrator of rate error, so a proportional controller is
+// stable with no anti-windup needed. +/-500ppm authority is ~10x a
+// realistic crystal mismatch (two decent crystals differ by well under
+// +/-100ppm) -- enough to correct sustained drift, deliberately too slow
+// to react to a transient (a 4.6KB fill error at full authority takes
+// ~48s to correct): transients are absorbed by the ring's capacity
+// (design sec 3.3), sustained drift by this loop. Conflating the two jobs
+// would give an oscillating buffer.
+//
+// The EMA exists because the consumer (a2dp.c's media timer, ~13ms
+// cadence once ring-fed) drains in bursts, so raw fill sawtooths by
+// roughly one tick's worth -- comparable to the target itself. Feeding raw
+// fill into a P controller would inject ~100Hz ripple into the feedback
+// value; the ~64ms EMA (>>6 each ~1ms tick) filters that out while still
+// tracking real drift within a couple of tick periods.
+//
+// PL_FB_NOMINAL_Q16 hardcodes 48.0 samples/frame (16.16 fixed point) --
+// correct because this build offers exactly one sample rate (48000Hz, see
+// sample_rates[] above); a future multi-rate build would need this
+// proportional to current_sample_rate/1000 instead.
+#define PL_FB_NOMINAL_Q16 (48u << 16)
+#define PL_FB_MAX_PPM 500
+
+static int32_t s_fb_fill_ema;
+
+void pl_usb_audio_feedback_task(void) {
+    s_fb_fill_ema += ((int32_t)pl_pcm_fill_bytes() - s_fb_fill_ema) >> 6;
+    int32_t err_bytes = s_fb_fill_ema - (int32_t)PL_PCM_TARGET_FILL_BYTES;
+    int32_t ppm = -(err_bytes * PL_FB_MAX_PPM) / (int32_t)PL_PCM_TARGET_FILL_BYTES;
+    if (ppm > PL_FB_MAX_PPM) {
+        ppm = PL_FB_MAX_PPM;
+    }
+    if (ppm < -PL_FB_MAX_PPM) {
+        ppm = -PL_FB_MAX_PPM;
+    }
+    tud_audio_fb_set((uint32_t)((int32_t)PL_FB_NOMINAL_Q16 + (int32_t)((int64_t)PL_FB_NOMINAL_Q16 * ppm / 1000000)));
 }
 
 bool pl_usb_audio_streaming(void) {

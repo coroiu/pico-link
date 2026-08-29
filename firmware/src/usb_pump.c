@@ -65,6 +65,14 @@ static void pl_usb_pump_worker_irq(void) {
     }
     pl_usb_audio_task();
 
+    // M4 S1 (bead pico-link-cz0.5.2), design sec 2.1: "in the 0xC0 worker
+    // after the drain (we are already there; ring fill is two loads and a
+    // mask)". Must run every tick this worker runs, not just while a
+    // consumer is attached -- the feedback loop has to already be correct
+    // before a2dp.c's stream exists, or the ring overruns the instant one
+    // does (see usb_audio.c's doc comment on tud_audio_feedback_params_cb).
+    pl_usb_audio_feedback_task();
+
     mutex_exit(&pl_usb_mutex);
 }
 
