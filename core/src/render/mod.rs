@@ -61,6 +61,7 @@ pub mod rail;
 pub mod screen;
 pub mod theme;
 pub mod widget;
+pub mod wizard;
 
 pub use chrome::{compute_chrome, compute_chrome_for, ChromeLayout};
 pub use confirm::ConfirmView;
@@ -73,3 +74,4 @@ pub use navigator::Navigator;
 pub use rail::{Button, ButtonLabel, ButtonLabels};
 pub use screen::Screen;
 pub use widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Widget};
+pub use wizard::{build_wizard_screen, WIZARD_TITLE};

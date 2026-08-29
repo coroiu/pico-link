@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::input::NavIntent;
+use crate::render::wizard::build_wizard_screen;
 use crate::render::{Action, FrameBuffer565, ListItem, ListItemKey, Navigator, Screen, VerticalList};
 
 /// The devices screen's "Scan for headphones" row's identity key. Not
@@ -82,6 +83,19 @@ pub enum Command {
     /// user reaches for a button, gets nothing, and concludes the device
     /// is frozen. See design section 21 Tier 1 row E1.
     CancelScan,
+    /// User-initiated: abort an in-flight connect attempt (phase 4
+    /// `Connecting` or phase 5 `NotResponding`, design section 9). Added
+    /// by pico-link-znb.7's code-review fix -- the wizard's B previously
+    /// only left the *screen*, leaving C's ACL/SSP/AVDTP attempt running
+    /// with nothing telling it to stop, still delivering
+    /// `ConnectStepChanged`/`ConnectRetrying`/`ConnectFailed`/
+    /// `ConnectSucceeded` events for an attempt the user already walked
+    /// away from. Whether C actually implements the abort (real
+    /// ACL/AVDTP teardown) or this stays plumbed-but-unhandled is a
+    /// separate, C-side decision -- see this bead's completion report;
+    /// `CancelScan` similarly needed its own follow-up bead
+    /// (pico-link-znb.2) for its C-side handling.
+    CancelConnect { addr: [u8; 6] },
 }
 
 /// Why a connect attempt failed, as reported by C over
@@ -141,13 +155,142 @@ impl ConnectFailureReason {
 /// `pl_ui_add_device`/`pl_ui_clear_devices` setters). `core` never
 /// originates these; it only folds them into [`BtModel`] and marks the app
 /// dirty -- see [`App::handle_event`].
+///
+/// The last four variants were added by pico-link-znb.7 (E5, the pairing
+/// wizard) -- the design's own "WHAT IS MISSING AND MUST BE ADDED"
+/// paragraph names exactly these three gaps (phase-4 sub-steps, the
+/// phase-5 retry/attempt counter, the phase-6 degraded-success outcome)
+/// plus the C-side auto-dismiss timer (design section 9 phase 6 / section
+/// 14's C9). Purely additive: every existing tag/payload is unchanged, so
+/// [`crate::app`]'s `PL_EVENT_ABI_VERSION`-equivalent guard in `ui-ffi`
+/// does **not** need a bump -- see that crate's module doc for the
+/// version-guard rule this follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     LinkStateChanged(LinkState),
     DeviceDiscovered(DeviceEntry),
     DevicesCleared,
     ConnectFailed { addr: [u8; 6], reason: ConnectFailureReason },
+    /// One of phase 4's four named sub-steps has begun (ACL connect,
+    /// SSP/link-key pairing, AVDTP stream setup, then codec negotiation --
+    /// see [`ConnectStep`]). Only meaningful while the wizard's phase is
+    /// [`WizardPhase::Connecting`] or [`WizardPhase::NotResponding`] (a
+    /// stray event outside that window -- e.g. arriving after the user
+    /// backed out -- is silently ignored; see
+    /// [`App::on_connect_step_changed`]).
+    ConnectStepChanged(ConnectStep),
+    /// C is about to retry the in-flight connect attempt after the ~6s
+    /// "not responding" surfacing point (design section 9 phase 5) --
+    /// carries the attempt number so the wizard's "Still trying (N)"
+    /// counter has something to increment. Like
+    /// [`Event::ConnectStepChanged`], a no-op outside the
+    /// `Connecting`/`NotResponding` phases.
+    ConnectRetrying { attempt: u16 },
+    /// The in-flight connect attempt succeeded. `degraded` distinguishes
+    /// phase 6's two outcomes: plain success (auto-dismisses) vs degraded
+    /// success (does not -- see [`Event::WizardAutoDismiss`]'s doc
+    /// comment for why that distinction matters enough to be its own
+    /// event rather than inferred from `LinkStateChanged(Connected)`
+    /// alone, which carries no fallback information).
+    ConnectSucceeded { degraded: bool },
+    /// C's own ~2s timer firing (design section 9 phase 6, section 14's
+    /// C9 "auto-dismiss timer event" -- explicitly *not* a core-owned
+    /// clock feature, see [`crate::app`]'s `now_us`/`tick` doc comments
+    /// for why timers stay on the C side of this seam). Pops the wizard
+    /// back to Devices **only** if the wizard is currently showing a
+    /// plain (non-degraded) success -- degraded success requires
+    /// acknowledgement and must never auto-dismiss (design section 9
+    /// phase 6), and this event arriving at any other time (a stray/late
+    /// timer, the user having already backed out) is a defensive no-op.
+    WizardAutoDismiss,
 }
+
+/// Phase 4's four named connect sub-steps (design section 9): naming the
+/// current one tells the user *and us* where a stalled connect attempt
+/// actually got stuck, which a single generic "Connecting..." spinner
+/// cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectStep {
+    /// ACL connect.
+    Connecting,
+    /// SSP / link-key pairing.
+    Pairing,
+    /// AVDTP stream endpoint discovery + configuration.
+    SettingUpAudio,
+    /// Codec negotiation.
+    NegotiatingCodec,
+}
+
+impl ConnectStep {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectStep::Connecting => "Connecting",
+            ConnectStep::Pairing => "Pairing",
+            ConnectStep::SettingUpAudio => "Setting up audio",
+            ConnectStep::NegotiatingCodec => "Negotiating codec",
+        }
+    }
+
+    /// The fixed display order phase 4 always shows the four steps in --
+    /// design section 9's "1 Connecting ... 2 Pairing ... 3 Setting up
+    /// audio ... 4 Negotiating codec".
+    #[must_use]
+    pub fn all() -> [ConnectStep; 4] {
+        [ConnectStep::Connecting, ConnectStep::Pairing, ConnectStep::SettingUpAudio, ConnectStep::NegotiatingCodec]
+    }
+}
+
+/// The pairing wizard's own phase state (design section 9 / bead
+/// pico-link-znb.7 / E5), independent of [`BtModel`]: `BtModel` is "what
+/// core knows about the Bluetooth link and discovered devices", while this
+/// is "which of the wizard's six phases is currently on screen and that
+/// phase's own local data" -- e.g. the scan list itself lives in
+/// `BtModel::devices` (read live, not duplicated here), but "the user is
+/// on the not-responding screen, this is attempt 3" has no other home.
+///
+/// Deliberately carries its own `addr`/`reason` on the phases that need
+/// them (`Connecting`/`NotResponding`/`Failed`) rather than re-reading
+/// `BtModel::last_connect_failure` at render time: both are populated from
+/// the exact same [`Event`] data, so there is no fidelity loss, and
+/// keeping the wizard screen's rendering self-contained here avoids
+/// needing to hand it a live reference to the whole `BtModel` just to read
+/// one field.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WizardPhase {
+    /// Phase 1: instructions, before any scanning. No timer, nothing
+    /// moving -- see the design's "the user is the one doing work" note.
+    #[default]
+    Instructions,
+    /// Phase 2: scanning (10.24s, C-timed) and/or showing whatever's
+    /// accumulated in `BtModel::devices` so far -- this phase covers both
+    /// "still actively scanning" and "scan finished, results on screen,
+    /// user is choosing one", since nothing about the rendered content
+    /// differs between them.
+    Scanning,
+    /// Phase 3: the scan ended (a C `LinkStateChanged(Idle)` event while
+    /// this phase was `Scanning`) with zero devices found.
+    NothingFound,
+    /// Phase 4: connecting, at the named sub-`step` currently in
+    /// progress. `addr` is carried so a subsequent retry (phase 5's "keep
+    /// trying") knows which device to reissue [`Command::Connect`] for.
+    Connecting { addr: [u8; 6], step: ConnectStep },
+    /// Phase 5: surfaced once a connect attempt has gone unanswered for
+    /// ~6s (a C-timed threshold -- core never decides this itself, it
+    /// only renders whatever [`Event::ConnectRetrying`] reports).
+    /// `attempt` is the free liveness counter design section 9 calls for.
+    NotResponding { addr: [u8; 6], attempt: u16 },
+    /// Phase 6, success outcome. `degraded` selects between the two
+    /// outcomes design section 9 draws a hard line between: plain success
+    /// (auto-dismisses via [`Event::WizardAutoDismiss`]) and degraded
+    /// success (requires acknowledgement, never auto-dismisses).
+    Succeeded { degraded: bool },
+    /// Phase 6, failure outcome. `reason` selects which of the five named
+    /// messages/remedies (design section 9's table) to show, and whether
+    /// a retry is offered at all (`reason.retryable()`).
+    Failed { addr: [u8; 6], reason: ConnectFailureReason },
+}
+
 
 /// The Bluetooth-domain state screens read to render themselves --
 /// everything [`App`] knows about the link and the discovered/attempted
@@ -201,6 +344,8 @@ fn build_devices_screen(
     prev_key: Option<ListItemKey>,
     prev_index: usize,
     commands: &Rc<RefCell<VecDeque<Command>>>,
+    wizard_phase: &Rc<RefCell<WizardPhase>>,
+    wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
 ) -> Screen {
     let mut items =
         vec![ListItem::new("Scan for headphones").with_sublabel(model.link_state.label()).with_key(SCAN_ROW_KEY)];
@@ -224,10 +369,27 @@ fn build_devices_screen(
 
     let devices_snapshot: Vec<DeviceEntry> = model.devices.clone();
     let commands_for_activate = Rc::clone(commands);
+    let wizard_phase_for_activate = Rc::clone(wizard_phase);
+    let wizard_devices_for_activate = Rc::clone(wizard_devices);
     let list = VerticalList::new(items)
         .on_activate_index(move |index| {
             if index == 0 {
-                commands_for_activate.borrow_mut().push_back(Command::StartScan);
+                // pico-link-znb.7 (E5): selecting "Scan" no longer queues
+                // `Command::StartScan` directly -- it opens the pairing
+                // wizard at phase 1 (instructions), which is what actually
+                // starts the scan once the user presses A there. Resetting
+                // `wizard_phase`/`wizard_devices` here (rather than only
+                // when the wizard widget itself is constructed) covers
+                // re-opening the wizard after a previous session ended in
+                // a terminal phase (Succeeded/Failed/NothingFound) --
+                // without this the wizard would briefly flash its last
+                // outcome before the user does anything.
+                *wizard_phase_for_activate.borrow_mut() = WizardPhase::Instructions;
+                wizard_devices_for_activate.borrow_mut().clear();
+                let phase = Rc::clone(&wizard_phase_for_activate);
+                let devices = Rc::clone(&wizard_devices_for_activate);
+                let commands = Rc::clone(&commands_for_activate);
+                return Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)));
             } else if let Some(device) = devices_snapshot.get(index - 1) {
                 commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
             }
@@ -265,6 +427,33 @@ pub struct App {
     /// stack, with no path back to `App` itself -- this is the shared
     /// mailbox between them.
     commands: Rc<RefCell<VecDeque<Command>>>,
+    /// The pairing wizard's phase (pico-link-znb.7 / E5) -- shared with
+    /// whatever `PairingWizardView` widget instance is currently on the
+    /// navigator's stack, the same `Rc<RefCell<_>>`-mailbox shape
+    /// `commands` uses above. Two-way: the widget itself mutates this
+    /// directly for user-input-driven transitions (pressing A/X), and
+    /// `App` mutates it directly from C events (`on_connect_step_changed`
+    /// and friends) -- either side's write is picked up by the widget's
+    /// next `render` because it reads through the same `Rc` rather than a
+    /// snapshot, so **no screen replacement is needed** for a phase
+    /// transition alone (contrast [`App::rebuild_root`], which fully
+    /// rebuilds the *devices* screen on every model change -- the wizard
+    /// screen, once pushed, is never rebuilt or replaced; only its shared
+    /// state changes underneath it). This is what design section 14/F8
+    /// means by "phase/wizard screen replaced by C events without
+    /// pushing" at the state level: no `Navigator` stack operation is
+    /// involved in a phase advance at all, pushing or otherwise.
+    wizard_phase: Rc<RefCell<WizardPhase>>,
+    /// A live mirror of `model.devices`, shared with the wizard widget the
+    /// same way `wizard_phase` is -- kept in lockstep by [`App::add_device`]/
+    /// [`App::clear_devices`] purely so the wizard's scan-list rendering
+    /// doesn't need a borrowed reference into `App` itself (which nothing
+    /// living inside `Navigator`'s stack can hold). A small, bounded clone
+    /// on every device event (the design's own Class-of-Device filter, E9,
+    /// keeps this list under ~12 entries) -- simplicity over cleverness,
+    /// matching this crate's existing "rebuilt from scratch" philosophy
+    /// for small lists (see [`build_devices_screen`]'s doc comment).
+    wizard_devices: Rc<RefCell<Vec<DeviceEntry>>>,
 }
 
 impl App {
@@ -276,9 +465,20 @@ impl App {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
+        let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
+        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let model = BtModel::default();
-        let navigator = Navigator::new(build_devices_screen(&model, None, 0, &commands));
-        Self { navigator, framebuffer: FrameBuffer565::new(width, height), dirty: true, model, now_us: 0, commands }
+        let navigator = Navigator::new(build_devices_screen(&model, None, 0, &commands, &wizard_phase, &wizard_devices));
+        Self {
+            navigator,
+            framebuffer: FrameBuffer565::new(width, height),
+            dirty: true,
+            model,
+            now_us: 0,
+            commands,
+            wizard_phase,
+            wizard_devices,
+        }
     }
 
     /// Refreshes the root (devices) screen to reflect the current
@@ -296,7 +496,14 @@ impl App {
     fn rebuild_root(&mut self) {
         let prev_key = self.navigator.root_selected_key();
         let prev_index = self.navigator.root_selected_index().unwrap_or(0);
-        self.navigator.replace_root(build_devices_screen(&self.model, prev_key, prev_index, &self.commands));
+        self.navigator.replace_root(build_devices_screen(
+            &self.model,
+            prev_key,
+            prev_index,
+            &self.commands,
+            &self.wizard_phase,
+            &self.wizard_devices,
+        ));
         self.dirty = true;
     }
 
@@ -308,10 +515,98 @@ impl App {
     /// updates what screens read.
     pub fn handle_event(&mut self, event: Event) {
         match event {
-            Event::LinkStateChanged(state) => self.set_link_state(state),
+            Event::LinkStateChanged(state) => {
+                self.set_link_state(state);
+                self.on_scan_ended_if_applicable(state);
+            }
             Event::DeviceDiscovered(device) => self.add_device(device.addr, device.name, device.rssi),
             Event::DevicesCleared => self.clear_devices(),
             Event::ConnectFailed { addr, reason } => self.record_connect_failure(addr, reason),
+            Event::ConnectStepChanged(step) => self.on_connect_step_changed(step),
+            Event::ConnectRetrying { attempt } => self.on_connect_retrying(attempt),
+            Event::ConnectSucceeded { degraded } => self.on_connect_succeeded(degraded),
+            Event::WizardAutoDismiss => self.on_wizard_auto_dismiss(),
+        }
+    }
+
+    /// Phase 2 -> phase 3 transition (design section 9): when the scan
+    /// ends (`link_state` reporting [`LinkState::Idle`] after having been
+    /// [`LinkState::Scanning`]) while the wizard is still on
+    /// [`WizardPhase::Scanning`] and nothing was found, moves it to
+    /// [`WizardPhase::NothingFound`]. A no-op in every other case --
+    /// devices *were* found (the phase just stays `Scanning`, now showing
+    /// a selectable list instead of an actively-filling one -- design
+    /// section 9 draws no rendering distinction between those), the
+    /// wizard isn't open, or it's already past phase 2 (e.g. the user
+    /// already selected a device and moved on to phase 4 before this
+    /// event arrived).
+    fn on_scan_ended_if_applicable(&mut self, state: LinkState) {
+        if state != LinkState::Idle {
+            return;
+        }
+        let mut phase = self.wizard_phase.borrow_mut();
+        if *phase == WizardPhase::Scanning && self.wizard_devices.borrow().is_empty() {
+            *phase = WizardPhase::NothingFound;
+            drop(phase);
+            self.dirty = true;
+        }
+    }
+
+    /// Folds one [`Event::ConnectStepChanged`] into [`WizardPhase`] --
+    /// only meaningful while the wizard is mid-connect (`Connecting` or
+    /// already surfaced as `NotResponding`, e.g. the step name changing
+    /// right as a retry succeeds); silently ignored otherwise, per
+    /// [`Event::ConnectStepChanged`]'s doc comment.
+    fn on_connect_step_changed(&mut self, step: ConnectStep) {
+        let mut phase = self.wizard_phase.borrow_mut();
+        match &*phase {
+            WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. } => {
+                *phase = WizardPhase::Connecting { addr: *addr, step };
+            }
+            _ => {}
+        }
+        drop(phase);
+        self.dirty = true;
+    }
+
+    /// Folds one [`Event::ConnectRetrying`] into [`WizardPhase`] -- the
+    /// phase 4 -> phase 5 transition (or a further phase-5 retry
+    /// incrementing its own counter), per [`Event::ConnectRetrying`]'s
+    /// doc comment.
+    fn on_connect_retrying(&mut self, attempt: u16) {
+        let mut phase = self.wizard_phase.borrow_mut();
+        match &*phase {
+            WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. } => {
+                *phase = WizardPhase::NotResponding { addr: *addr, attempt };
+            }
+            _ => {}
+        }
+        drop(phase);
+        self.dirty = true;
+    }
+
+    /// Folds one [`Event::ConnectSucceeded`] into [`WizardPhase`] -- the
+    /// phase 6 success outcome, from either `Connecting` or
+    /// `NotResponding`.
+    fn on_connect_succeeded(&mut self, degraded: bool) {
+        *self.wizard_phase.borrow_mut() = WizardPhase::Succeeded { degraded };
+        self.dirty = true;
+    }
+
+    /// Folds one [`Event::WizardAutoDismiss`] -- pops the wizard back to
+    /// Devices, but **only** if it's currently showing a plain
+    /// (non-degraded) success; see that event's doc comment for why this
+    /// guard exists. `Navigator::pop` is itself a no-op if the wizard
+    /// isn't actually on the stack (e.g. this event arrived after the
+    /// user already backed out via B), so no separate "is the wizard
+    /// open" check is needed here.
+    fn on_wizard_auto_dismiss(&mut self) {
+        let should_pop = matches!(*self.wizard_phase.borrow(), WizardPhase::Succeeded { degraded: false });
+        if should_pop {
+            self.navigator.pop();
+            *self.wizard_phase.borrow_mut() = WizardPhase::default();
+            self.wizard_devices.borrow_mut().clear();
+            self.dirty = true;
         }
     }
 
@@ -335,6 +630,10 @@ impl App {
         } else {
             self.model.devices.push(DeviceEntry { addr, name, rssi });
         }
+        // Kept in lockstep with `model.devices` -- see `wizard_devices`'s
+        // doc comment on why the wizard widget needs its own mirror
+        // rather than a borrow into `self.model`.
+        self.wizard_devices.borrow_mut().clone_from(&self.model.devices);
         self.rebuild_root();
     }
 
@@ -342,6 +641,7 @@ impl App {
     /// scan.
     pub fn clear_devices(&mut self) {
         self.model.devices.clear();
+        self.wizard_devices.borrow_mut().clear();
         self.rebuild_root();
     }
 
@@ -353,6 +653,14 @@ impl App {
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
         self.model.last_connect_failure = Some((addr, reason));
         self.model.link_state = LinkState::Idle;
+        // Phase 4/5 -> phase 6 (failure outcome). Unconditional (not
+        // gated on the wizard currently being open/mid-connect): a stray
+        // `ConnectFailed` with the wizard closed or already past this
+        // attempt just sets a phase nothing is currently rendering, which
+        // is harmless and gets overwritten the next time the wizard opens
+        // (`build_devices_screen`'s row-0 activation resets it to
+        // `Instructions`).
+        *self.wizard_phase.borrow_mut() = WizardPhase::Failed { addr, reason };
         self.rebuild_root();
     }
 
@@ -429,6 +737,13 @@ impl App {
     #[cfg(test)]
     pub(crate) fn push_command_for_test(&mut self, command: Command) {
         self.commands.borrow_mut().push_back(command);
+    }
+
+    /// Test-only: reads the pairing wizard's current phase. Not part of
+    /// the public API.
+    #[cfg(test)]
+    pub(crate) fn wizard_phase_for_test(&self) -> WizardPhase {
+        self.wizard_phase.borrow().clone()
     }
 
     /// Dispatches every polled `NavIntent` to the navigator, in order.
