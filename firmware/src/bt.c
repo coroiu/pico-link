@@ -33,15 +33,154 @@
 static struct PlUi *g_ui;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
+// --- pico-link-6o2: a C-side SPSC ring decouples the BTstack packet handler
+// (producer) from the pl_ui_push_event call (consumer) ---
+//
+// pl_bt_packet_handler runs in low_priority_irq_handler under
+// pico_cyw43_arch_threadsafe_background (firmware/CMakeLists.txt) -- i.e.
+// INTERRUPT CONTEXT -- and it used to call pl_ui_push_event (Rust) directly
+// from there. That could preempt the superloop mid-pl_ui_render and mutate
+// the model underneath it, and race the superloop's own Rust-heap
+// allocations. Same class of bug pico-link-5am already fixed for input
+// (see input.c), and the same fix shape: the three pl_bt_push_* helpers
+// below no longer call into Rust themselves -- they build a PlEvent and
+// memcpy it into this ring; pl_bt_drain_events (called from the superloop,
+// thread context, in main.c) is the only thing that ever calls
+// pl_ui_push_event for Bluetooth-domain events.
+//
+// Single-producer (the packet handler, IRQ)/single-consumer (the superloop,
+// thread context) discipline, same as input.c's ring: each side owns
+// exactly one index (s_bt_ring_head/s_bt_ring_tail), so plain volatile
+// uint8_t reads/writes are sufficient -- there is no read-modify-write race
+// on either index, and a single-byte load/store is inherently atomic on
+// Cortex-M33. No additional DMB/barrier is needed beyond `volatile` because
+// this is a same-core producer/consumer pair (the IRQ preempts the
+// superloop on core 0; there is no second core touching this ring, and
+// core0-only is still true as of pico-link-6o2 -- the core1 UI split is
+// pico-link-yz6, not yet done): Cortex-M33 does not reorder the *program
+// order* of a single core's memory accesses relative to itself the way a
+// multi-core system would need a DMB to fix, so the only ordering hazard is
+// the *compiler* reordering across the IRQ boundary, which `volatile`
+// already prevents. This is the identical justification input.c already
+// uses and had reviewed; it is not repeated invention.
+//
+// PlEvent's DeviceDiscovered payload carries a borrowed `name` pointer
+// (valid, per pico_link_ui.h's doc comment, only for the duration of the
+// pl_ui_push_event call) -- across a deferred ring, the pointer's original
+// backing (pl_bt_handle_inquiry_result's stack-local name_buf) is long gone
+// by drain time. So each ring entry embeds its own name buffer; the
+// producer memcpy's the name bytes in, and the consumer re-points
+// event.payload.device_discovered.name at the ring entry's own buffer
+// immediately before calling pl_ui_push_event -- still satisfying "borrowed
+// only for the duration of the call" because the ring entry's storage is
+// static and outlives the call by construction.
+//
+// Capacity: 32, sized for a full inquiry burst, not just a single result.
+// GAP_EVENT_INQUIRY_RESULT can report the same or additional devices
+// repeatedly over the whole ~10s inquiry window (PL_INQUIRY_DURATION_UNITS
+// above), and the superloop only drains once per frame -- if a render+blit
+// stalls the loop (SPI blit time, see pico-link-14l), several results can
+// pile up before the next drain. 32 covers a burst well beyond the handful
+// of nearby BR/EDR devices realistically seen in one inquiry window, with
+// LinkStateChanged/DevicesCleared events (one each per scan start/stop)
+// costing negligible extra slots against that budget. A ring of 4 (the
+// bead's called-out failure case) would not survive even a single dense
+// office's inquiry result burst.
+#define PL_BT_RING_CAPACITY 32
+// Matches pl_bt_handle_inquiry_result's own name_buf cap below (and
+// BTstack's gap_inquiry.c example) -- the EIR name field cannot exceed this.
+#define PL_BT_RING_NAME_CAP 240
+
+typedef struct {
+    struct PlEvent event;
+    // Backing storage for event.payload.device_discovered.name once
+    // event.tag == PL_EVENT_TAG_DEVICE_DISCOVERED; unused (and its contents
+    // meaningless) for every other tag -- see the ring's doc comment above.
+    uint8_t name_buf[PL_BT_RING_NAME_CAP];
+} pl_bt_ring_entry_t;
+
+static pl_bt_ring_entry_t s_bt_ring[PL_BT_RING_CAPACITY];
+static volatile uint8_t s_bt_ring_head; // producer-owned (IRQ packet handler)
+static volatile uint8_t s_bt_ring_tail; // consumer-owned (superloop drain)
+// Diagnostics only: counts events dropped because the ring was full when the
+// packet handler tried to push. Bumped from IRQ context (hence volatile,
+// plain increment -- single producer, no read-modify-write race with the
+// consumer which never writes this), read/reported from pl_bt_drain_events
+// in thread context. Never touch this from the packet handler with printf
+// -- see the drop-reporting note on pl_bt_drain_events below.
+static volatile uint32_t s_bt_ring_drop_count;
+
+// Enqueues one event (IRQ context only). `name`/`name_len` are optional
+// (NULL/0 for every tag but DeviceDiscovered) and are memcpy'd into the
+// ring entry's own buffer -- never stored as a raw pointer -- for the
+// borrow-lifetime reason in the ring's doc comment above.
+//
+// Overflow policy: drop the newest (this event), keep everything already
+// queued. Matches input.c's choice and for the same reason -- overwriting
+// an undrained slot would corrupt the consumer's in-progress read of it,
+// while dropping the newest loses exactly one event (a missed/duplicate
+// inquiry result is survivable; BTstack will report a still-present device
+// again on its next report within the same scan).
+static void pl_bt_ring_push(struct PlEvent event, const uint8_t *name, uint16_t name_len) {
+    uint8_t head = s_bt_ring_head;
+    uint8_t next_head = (uint8_t)((head + 1) % PL_BT_RING_CAPACITY);
+    if (next_head == s_bt_ring_tail) {
+        s_bt_ring_drop_count++;
+        return;
+    }
+    pl_bt_ring_entry_t *entry = &s_bt_ring[head];
+    entry->event = event;
+    if (name != NULL && name_len > 0) {
+        uint16_t copy_len = name_len > PL_BT_RING_NAME_CAP ? PL_BT_RING_NAME_CAP : name_len;
+        memcpy(entry->name_buf, name, copy_len);
+    }
+    s_bt_ring_head = next_head;
+}
+
+// Drains every event currently queued and makes the real pl_ui_push_event
+// (Rust) call for each, in thread-context order. Intended to be called once
+// per superloop iteration (see main.c), same convention as
+// pl_link_input_poll.
+//
+// Drop reporting: no printf inside the IRQ path (pico-link-icb probe 1
+// already showed that hangs the board), so the IRQ side only counts;
+// this function -- thread context -- prints, and only when the count has
+// actually grown since the last report, so a healthy run never prints
+// anything here.
+void pl_bt_drain_events(struct PlUi *ui) {
+    static uint32_t s_last_reported_drops = 0;
+
+    while (s_bt_ring_tail != s_bt_ring_head) {
+        uint8_t tail = s_bt_ring_tail;
+        pl_bt_ring_entry_t *entry = &s_bt_ring[tail];
+        struct PlEvent event = entry->event;
+        if (event.tag == PL_EVENT_TAG_DEVICE_DISCOVERED) {
+            event.payload.device_discovered.name = entry->name_buf;
+        }
+        pl_ui_push_event(ui, event);
+        s_bt_ring_tail = (uint8_t)((tail + 1) % PL_BT_RING_CAPACITY);
+    }
+
+    uint32_t drops = s_bt_ring_drop_count;
+    if (drops != s_last_reported_drops) {
+        printf("BT: event ring overflow, dropped %lu event(s) total\r\n", (unsigned long)drops);
+        s_last_reported_drops = drops;
+    }
+}
+
 // --- pico-link-a67: one PlEvent union in, replacing the old
 // pl_ui_set_link_state/pl_ui_add_device/pl_ui_clear_devices setter trio ---
 //
 // Small helpers so each call site below builds one PlEvent value and pushes
-// it, rather than repeating the version/tag/payload boilerplate. Every
-// PlEvent must carry PL_EVENT_ABI_VERSION -- pl_ui_push_event silently
-// no-ops on a mismatch (see pico_link_ui.h's doc comment on
-// pl_ui_push_event), so a helper that always sets it is cheap insurance
-// against a call site accidentally leaving it zero-initialized.
+// it (now via the ring above -- pico-link-6o2), rather than repeating the
+// version/tag/payload boilerplate. Every PlEvent must carry
+// PL_EVENT_ABI_VERSION -- pl_ui_push_event silently no-ops on a mismatch
+// (see pico_link_ui.h's doc comment on pl_ui_push_event), so a helper that
+// always sets it is cheap insurance against a call site accidentally
+// leaving it zero-initialized. These helpers run in IRQ context (the
+// packet handler) or thread context (pl_bt_poll_commands, via
+// pl_bt_push_link_state at the CONNECT case) -- either is fine now, since
+// neither calls into Rust directly any more.
 
 static void pl_bt_push_link_state(enum PlLinkState state) {
     struct PlEvent event = {
@@ -49,7 +188,7 @@ static void pl_bt_push_link_state(enum PlLinkState state) {
         .tag = PL_EVENT_TAG_LINK_STATE_CHANGED,
         .payload = {.link_state_changed = {.state = state}},
     };
-    pl_ui_push_event(g_ui, event);
+    pl_bt_ring_push(event, NULL, 0);
 }
 
 static void pl_bt_push_devices_cleared(void) {
@@ -58,16 +197,16 @@ static void pl_bt_push_devices_cleared(void) {
         .tag = PL_EVENT_TAG_DEVICES_CLEARED,
         .payload = {0},
     };
-    pl_ui_push_event(g_ui, event);
+    pl_bt_ring_push(event, NULL, 0);
 }
 
 static void pl_bt_push_device_discovered(const uint8_t *addr, const uint8_t *name, uint16_t name_len, int8_t rssi) {
     struct PlEvent event = {.version = PL_EVENT_ABI_VERSION, .tag = PL_EVENT_TAG_DEVICE_DISCOVERED};
     memcpy(event.payload.device_discovered.addr, addr, 6);
-    event.payload.device_discovered.name = name;
+    event.payload.device_discovered.name = NULL; // patched at drain time -- see pl_bt_drain_events
     event.payload.device_discovered.name_len = name_len;
     event.payload.device_discovered.rssi = rssi;
-    pl_ui_push_event(g_ui, event);
+    pl_bt_ring_push(event, name, name_len);
 }
 
 // --- HCI Read Local Version Information: the acceptance-criterion probe ---
