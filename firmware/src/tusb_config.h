@@ -16,6 +16,20 @@
 #ifndef PICO_LINK_TUSB_CONFIG_H
 #define PICO_LINK_TUSB_CONFIG_H
 
+// Bead pico-link-l60: this file REPLACES pico_stdio_usb's own
+// pico_stdio_usb/include/tusb_config.h, which is the ONLY place
+// PICO_STDIO_USB_* defaults (PICO_STDIO_USB_RESET_INTERFACE_SUPPORT_*,
+// PICO_STDIO_USB_RESET_RESET_TO_FLASH_DELAY_MS, etc.) come from -- that
+// header's own #include "pico/stdio_usb.h" is what a stock build relies on,
+// and losing it here is what silently compiled the BOOTSEL/FLASH reset
+// branches out of the build (see usb_reset.c/.h and
+// .planning/decisions -- .planning/design/2026-08-29-picotool-reset-composite.md
+// for the full mechanism). pico/stdio_usb.h defines only PICO_STDIO_USB_*
+// macros and prototypes -- no CFG_TUD_* -- so it cannot fight this file's
+// own class config below, and every default in it is #ifndef-guarded, so
+// this project's own -D overrides (CMakeLists.txt) still win.
+#include "pico/stdio_usb.h"
+
 #include "usb_descriptors.h"
 
 #ifdef __cplusplus
