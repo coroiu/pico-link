@@ -176,6 +176,14 @@ int main(void) {
         if (n > 0) {
             pl_ui_input(ui, intents, n);
         }
+#ifndef PL_DIAG_SKIP_BT
+        // Drains events the BTstack packet handler queued from IRQ context
+        // (pico-link-6o2) and makes the real pl_ui_push_event calls here, in
+        // thread context, before this frame ticks/renders -- so a device
+        // discovered or a link-state change is visible in the same frame
+        // it arrived, not one frame late.
+        pl_bt_drain_events(ui);
+#endif
         pl_ui_tick(ui, frame_start_us);
 
         const uint16_t *px = NULL;
