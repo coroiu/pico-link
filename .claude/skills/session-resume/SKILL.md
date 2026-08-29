@@ -1,17 +1,18 @@
 ---
 name: session-resume
-description: Pick up work at the start of a session - load the handoff, verify it still matches reality, and propose the next dispatch. Use when the user says session-resume, "let's continue", "where were we", "what's next", or opens a fresh context expecting work to carry on. The companion to session-close. Runs on the main thread; do NOT dispatch it to a subagent.
+description: Pick up work at the start of a session - load the handoff, verify it still matches reality, then dispatch the next task. Use when the user says session-resume, "let's continue", "where were we", "what's next", or opens a fresh context expecting work to carry on. The companion to session-close. Runs on the main thread; do NOT dispatch it to a subagent.
 ---
 
 # Session Resume
 
 The companion to `session-close`. That skill wrote a handoff for a competent
 stranger; you are that stranger. Your job is to load it, **check it is still
-true**, and propose one next action — not to start working immediately.
+true**, and then **get the next task moving** — orientation is the setup, not
+the deliverable.
 
-Work through all five steps, then report. Keep it cheap: this is orientation,
-not investigation. If it takes more than a handful of tool calls, you are doing
-step 4's job instead of step 4's dispatch.
+Work through all five steps in one turn. Keep steps 1-3 cheap: they are
+orientation, not investigation. If they take more than a handful of tool calls,
+you are doing the implementer's job instead of dispatching it.
 
 ## 1. Read the handoff first
 
@@ -59,7 +60,7 @@ Also skim the newest ADR in `.planning/decisions/`. When architecture has
 changed recently, older docs and older beads describe a world that no longer
 exists, and following them wastes a session.
 
-## 4. Propose one next action
+## 4. Decide the next action
 
 Name **one** thing to do next and why, with the bead ID. Prefer what the
 handoff named unless step 2 or 3 contradicted it — if it did, say what changed.
@@ -72,14 +73,30 @@ Before dispatching, restate for the implementer:
 If nothing is obviously next, say that plainly and list the decisions blocking
 the choice. Do not manufacture a task to look useful.
 
-## 5. Report, then wait
+## 5. Act, then report
 
-Lead with: where things stand in two or three lines, and the proposed next
-action. Then flag anything that needs the user's decision.
+**Default to acting.** Do not stop to ask "shall I start?" — if steps 1-4
+produced a clear next action, create the bead if one is needed and dispatch it
+in this same turn, then report what you dispatched. The user invoked resume
+because they want work to continue; making them type "yes, go" is a wasted
+round trip, and CLAUDE.md's *Orchestrator Autonomy* already covers this:
+reversible work (a branch, a worktree, a bead, a dispatch) is decided, not
+asked about.
 
-**Do not start the work in the same turn as proposing it** unless the user's
-message already told you to continue. Resuming is orientation; the user may
-have arrived with different priorities than the last session's handoff assumed.
+Report after dispatching. Lead with: where things stand in two or three lines,
+what you dispatched and why, then anything that genuinely needs the user's
+decision.
+
+**Stop and ask instead of dispatching** only when the CLAUDE.md *Ask* criteria
+apply: the choice is a product-priority call that changes what gets built; it
+is irreversible or outward-facing (a push, a force, a history rewrite); it
+needs a physical action only Andreas can take; or two readings of the situation
+lead to materially different work. Bundle those questions and attach a
+recommendation. If the user's own message arrived with a different priority
+than the handoff assumed, **their message wins** — resume against that.
+
+If step 4 found nothing obviously next, say so plainly and list the decisions
+blocking the choice. Do not manufacture a task to look busy.
 
 ## Rules
 
