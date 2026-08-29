@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::input::NavIntent;
+use crate::render::home::build_home_screen;
 use crate::render::wizard::build_wizard_screen;
 use crate::render::{Action, FrameBuffer565, ListItem, ListItemKey, Navigator, Screen, VerticalList};
 
@@ -292,6 +293,25 @@ pub enum WizardPhase {
 }
 
 
+/// Home's two faces (design section 4's Home exception, section 7 --
+/// bead `pico-link-znb.8`/E7). A **face**, not a pushed screen: Home is
+/// [`crate::render::Navigator`] depth 1 (design's "depth 0") on both
+/// faces, never depth 2, which is what keeps `B, B` a reliable escape
+/// from anywhere in the app (see [`build_home_screen`]'s module-level
+/// doc comment for the full argument). Lives in an `Rc<RefCell<_>>`
+/// shared with the `HomeView` widget instance the same way
+/// [`WizardPhase`] does -- see [`App::home_face`]'s doc comment for why
+/// that indirection is required (a fresh `HomeView` is constructed on
+/// every [`App::rebuild_root`], and the face must survive that).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HomeFace {
+    /// The hero/status display -- design section 6.
+    #[default]
+    Status,
+    /// The two-row Bluetooth/Settings menu -- design section 7.
+    Menu,
+}
+
 /// The Bluetooth-domain state screens read to render themselves --
 /// everything [`App`] knows about the link and the discovered/attempted
 /// devices, folded in one place from [`Event`]s. Kept as one struct (rather
@@ -339,7 +359,19 @@ pub type DeviceAddr = [u8; 6];
 /// now means something else. `prev_key` of `None`/not-found falls back to
 /// clamping `prev_index` -- see that method's doc comment for the exact
 /// rule. `(None, 0)` (first build) starts at row 0.
-fn build_devices_screen(
+/// The Devices screen's fixed title -- previously "Pico Link" from back
+/// when this screen was the navigator root (pre-`pico-link-znb.8`/E7);
+/// renamed now that it's reached by "A"/the menu face's "Bluetooth" row
+/// **from** Home, which owns the "Pico Link" brand title instead (design
+/// section 5's screen inventory). Also doubles as
+/// [`App::rebuild_root`]'s way of checking "is the screen currently
+/// sitting at stack index 1 the Devices screen" before refreshing it via
+/// [`crate::render::Navigator::replace_at`] -- the same pragmatic,
+/// title-string-as-identity approach [`crate::render::wizard::
+/// WIZARD_TITLE`] already uses one level up.
+pub(crate) const DEVICES_TITLE: &str = "Devices";
+
+pub(crate) fn build_devices_screen(
     model: &BtModel,
     prev_key: Option<ListItemKey>,
     prev_index: usize,
@@ -396,7 +428,22 @@ fn build_devices_screen(
             Action::None
         })
         .with_selected_identity(prev_key, prev_index);
-    Screen::new("Pico Link", vec![Box::new(list)])
+    Screen::new(DEVICES_TITLE, vec![Box::new(list)])
+}
+
+/// The Settings screen's fixed title. Placeholder content only (no rows)
+/// -- this bead (`pico-link-znb.8`/E7) exists to give Home's "Y"/menu-face
+/// "Settings" row a real, reachable destination so that affordance isn't
+/// labelled-but-broken (design section 4 rule 2), not to build Settings'
+/// actual content, which is separate, not-yet-scheduled work (the design's
+/// screen inventory lists it; persistence is Tier 2 E15). An empty
+/// [`Screen`] is a fully supported, already-tested shape --
+/// `Screen::new(title, vec![])` is exactly what
+/// `App::push_screen_for_test` uses today.
+pub(crate) const SETTINGS_TITLE: &str = "Settings";
+
+pub(crate) fn build_settings_screen() -> Screen {
+    Screen::new(SETTINGS_TITLE, vec![])
 }
 
 /// The application core: a [`Navigator`] built once over the devices root
@@ -454,6 +501,22 @@ pub struct App {
     /// matching this crate's existing "rebuilt from scratch" philosophy
     /// for small lists (see [`build_devices_screen`]'s doc comment).
     wizard_devices: Rc<RefCell<Vec<DeviceEntry>>>,
+    /// Which of Home's two faces (design section 4/7) is currently
+    /// showing -- shared with whatever `HomeView` widget instance is
+    /// currently the root screen's content, the same `Rc<RefCell<_>>`-
+    /// mailbox shape [`App::wizard_phase`] uses. This indirection is
+    /// required, not just consistent-for-its-own-sake: unlike the wizard
+    /// (pushed once, never rebuilt -- see `wizard.rs`'s module doc),
+    /// Home *is* rebuilt on every model change (it's the root screen, see
+    /// [`App::rebuild_root`]), so a face toggle recorded only on a
+    /// `HomeView` field would be silently discarded the next time a
+    /// Bluetooth event fires while the menu face is showing -- exactly
+    /// the defect class `pico-link-a67`'s `Navigator::replace_root` fix
+    /// already closed for screen-stack depth; this closes the same class
+    /// for this one piece of intra-screen state. Read (not written) fresh
+    /// by every freshly built `HomeView`, so the toggle survives a
+    /// rebuild with no navigator involvement.
+    home_face: Rc<RefCell<HomeFace>>,
 }
 
 impl App {
@@ -467,8 +530,10 @@ impl App {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
+        let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let model = BtModel::default();
-        let navigator = Navigator::new(build_devices_screen(&model, None, 0, &commands, &wizard_phase, &wizard_devices));
+        let navigator =
+            Navigator::new(build_home_screen(&model, &home_face, &commands, &wizard_phase, &wizard_devices));
         Self {
             navigator,
             framebuffer: FrameBuffer565::new(width, height),
@@ -478,10 +543,11 @@ impl App {
             commands,
             wizard_phase,
             wizard_devices,
+            home_face,
         }
     }
 
-    /// Refreshes the root (devices) screen to reflect the current
+    /// Refreshes the root (Home) screen to reflect the current
     /// [`BtModel`], via [`Navigator::replace_root`] -- **not**
     /// `Navigator::new`. That distinction is the whole point: replacing
     /// only the root leaves any screen the user has navigated *to* (pushed
@@ -493,17 +559,50 @@ impl App {
     /// stack on every Bluetooth event -- invisible with the one screen this
     /// crate builds today, fatal for the approved multi-screen design (see
     /// pico-link-a67 / pico-link-aii.1's defect 1).
+    ///
+    /// Since `pico-link-znb.8` (E7) also refreshes the Devices screen, if
+    /// one happens to be sitting at stack index 1 (identified by
+    /// [`DEVICES_TITLE`], the same pragmatic title-as-identity approach
+    /// the wizard already uses) -- **not** because Devices is scoped to
+    /// stay live-synced while browsed (design section 8's real "paired
+    /// device list" doesn't exist until `pico-link-a67`'s successor, E14),
+    /// but because Devices already showed exactly this
+    /// discovered-during-scan data when it *was* the root, and preserving
+    /// that (rather than silently regressing it) costs one more
+    /// `Navigator::replace_at` call.
     fn rebuild_root(&mut self) {
-        let prev_key = self.navigator.root_selected_key();
-        let prev_index = self.navigator.root_selected_index().unwrap_or(0);
-        self.navigator.replace_root(build_devices_screen(
+        // Home's own top-level widget (`HomeView`) carries no
+        // `ListItemKey`/index selection concept the way the old
+        // devices-as-root screen did -- which face is showing lives in
+        // `self.home_face` (read fresh by the freshly built `HomeView`
+        // below), and the menu face's two-row selection is minor enough
+        // (fixed content, two items) not to need identity-based
+        // carry-forward across a live Bluetooth event. So, unlike the
+        // pre-E7 version of this method, there is no `root_selected_key`/
+        // `root_selected_index` to thread through here for Home itself.
+        self.navigator.replace_root(build_home_screen(
             &self.model,
-            prev_key,
-            prev_index,
+            &self.home_face,
             &self.commands,
             &self.wizard_phase,
             &self.wizard_devices,
         ));
+
+        if self.navigator.title_at(1) == Some(DEVICES_TITLE) {
+            let devices_prev_key = self.navigator.selected_key_at(1);
+            let devices_prev_index = self.navigator.selected_index_at(1).unwrap_or(0);
+            self.navigator.replace_at(
+                1,
+                build_devices_screen(
+                    &self.model,
+                    devices_prev_key,
+                    devices_prev_index,
+                    &self.commands,
+                    &self.wizard_phase,
+                    &self.wizard_devices,
+                ),
+            );
+        }
         self.dirty = true;
     }
 
@@ -720,6 +819,18 @@ impl App {
         self.navigator.root_selected_index()
     }
 
+    /// Test-only: the Devices screen's own selection index, if it's
+    /// currently on the navigator stack at index 1 -- since
+    /// `pico-link-znb.8` (E7) made Home (not Devices) the root, this is
+    /// what most of this module's pre-E7 `root_selected_index` tests
+    /// actually needed to observe (Home's own top-level widget has no
+    /// `ListItemKey`/index selection concept -- see `render::home`'s
+    /// module doc). Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn devices_selected_index_for_test(&self) -> Option<usize> {
+        self.navigator.selected_index_at(1)
+    }
+
     /// Test-only: pushes an arbitrary screen onto the navigator stack, so
     /// tests can simulate "the user navigated away from root" without this
     /// bead building any real second screen (out of its scope -- see
@@ -798,6 +909,16 @@ impl App {
 mod tests {
     use super::*;
 
+    /// Home(1) -> Devices(2): since `pico-link-znb.8` (E7) made Home the
+    /// navigator root, reaching the Devices screen (whose list rows this
+    /// module's older tests exercise) takes two `Select`s -- centre
+    /// toggles Home to its menu face (Bluetooth pre-selected), centre
+    /// again activates that row.
+    fn open_devices(app: &mut App) {
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
+        app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+    }
+
     #[test]
     fn a_fresh_app_is_dirty_and_renders_the_initial_screen() {
         let app = App::new(240, 240);
@@ -837,6 +958,10 @@ mod tests {
         use embedded_graphics::prelude::Point;
 
         let mut app = App::new(240, 240);
+        // Home's status face has no focusable list of its own (Up/Down
+        // is unbound there in Tier 1 -- see `render::home`'s module doc),
+        // so this proof needs the Devices screen's list underneath it.
+        open_devices(&mut app);
 
         // x=200: past the chip/accent area and these short labels' text,
         // so it samples the row's plain elevated fill rather than a glyph
@@ -896,28 +1021,33 @@ mod tests {
     }
 
     #[test]
-    fn a_device_arriving_mid_navigation_does_not_reset_the_root_screens_selection() {
+    fn a_device_arriving_mid_navigation_does_not_reset_the_devices_screens_selection() {
         let mut app = App::new(240, 240);
+        open_devices(&mut app);
         // Two devices so there's a non-zero selection to move to and lose.
         app.add_device([1, 1, 1, 1, 1, 1], String::from("Device A"), -50);
         app.add_device([2, 2, 2, 2, 2, 2], String::from("Device B"), -60);
 
-        // Root list rows: 0 = "Scan for headphones", 1 = Device A, 2 = Device B.
+        // Devices list rows: 0 = "Scan for headphones", 1 = Device A, 2 = Device B.
         app.handle_input(vec![NavIntent::Down, NavIntent::Down]);
-        assert_eq!(app.root_selected_index(), Some(2), "selection should be on Device B's row");
+        assert_eq!(app.devices_selected_index_for_test(), Some(2), "selection should be on Device B's row");
 
-        // A third device arriving must not snap the selection back to row 0.
+        // A third device arriving must not snap the selection back to row 0
+        // -- proving `App::rebuild_root`'s `Navigator::replace_at(1, ...)`
+        // path (added alongside `replace_root` by `pico-link-znb.8`/E7,
+        // since Devices is no longer the root itself) carries the
+        // selection forward exactly the way `replace_root` always has.
         app.add_device([3, 3, 3, 3, 3, 3], String::from("Device C"), -70);
-        assert_eq!(app.root_selected_index(), Some(2), "a new device must not reset the user's selection");
+        assert_eq!(app.devices_selected_index_for_test(), Some(2), "a new device must not reset the user's selection");
 
         // Same for a link-state change while browsing.
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
-        assert_eq!(app.root_selected_index(), Some(2), "a link-state change must not reset the user's selection");
+        assert_eq!(app.devices_selected_index_for_test(), Some(2), "a link-state change must not reset the user's selection");
     }
 
     // --- pico-link-znb.4: selection carried by identity, not index ---
     //
-    // `a_device_arriving_mid_navigation_does_not_reset_the_root_screens_
+    // `a_device_arriving_mid_navigation_does_not_reset_the_devices_screens_
     // selection` above already proves the *index* doesn't move when the
     // App's own append-only device order (design section 9 rule 1: stable
     // sort, first-seen order, append at bottom, never re-sort by RSSI)
@@ -936,18 +1066,19 @@ mod tests {
     #[test]
     fn selecting_a_device_survives_further_devices_arriving_identified_by_address_not_just_index() {
         let mut app = App::new(240, 240);
+        open_devices(&mut app);
         let device_a = [1, 1, 1, 1, 1, 1];
         app.add_device(device_a, String::from("Device A"), -50);
 
-        // Root rows: 0 = Scan, 1 = Device A. Select Device A.
+        // Devices rows: 0 = Scan, 1 = Device A. Select Device A.
         app.handle_input(vec![NavIntent::Down]);
-        assert_eq!(app.root_selected_index(), Some(1));
+        assert_eq!(app.devices_selected_index_for_test(), Some(1));
         assert_eq!(app.model().devices[0].addr, device_a);
 
         app.add_device([2, 2, 2, 2, 2, 2], String::from("Device B"), -60);
         app.add_device([3, 3, 3, 3, 3, 3], String::from("Device C"), -70);
 
-        let selected = app.root_selected_index().expect("a device must still be selected");
+        let selected = app.devices_selected_index_for_test().expect("a device must still be selected");
         assert_eq!(
             app.model().devices[selected - 1].addr,
             device_a,
@@ -958,26 +1089,28 @@ mod tests {
     #[test]
     fn a_late_name_for_an_already_listed_device_replaces_its_row_in_place() {
         let mut app = App::new(240, 240);
+        open_devices(&mut app);
         let addr = [7, 7, 7, 7, 7, 7];
         app.add_device(addr, String::new(), -55); // nameless first report
 
         app.handle_input(vec![NavIntent::Down]); // select the device row
-        assert_eq!(app.root_selected_index(), Some(1));
+        assert_eq!(app.devices_selected_index_for_test(), Some(1));
 
         // The name resolves later, same address.
         app.add_device(addr, String::from("Sony WH-1000XM5"), -55);
 
         assert_eq!(app.model().devices.len(), 1, "a late name must update the existing row, not append a second one");
         assert_eq!(app.model().devices[0].name, "Sony WH-1000XM5");
-        assert_eq!(app.root_selected_index(), Some(1), "the late name must not disturb the selection");
+        assert_eq!(app.devices_selected_index_for_test(), Some(1), "the late name must not disturb the selection");
     }
 
     #[test]
     fn the_selected_devices_disappearing_clamps_selection_instead_of_resetting_to_row_zero() {
         let mut app = App::new(240, 240);
+        open_devices(&mut app);
         app.add_device([1, 1, 1, 1, 1, 1], String::from("Device A"), -50);
         app.handle_input(vec![NavIntent::Down]);
-        assert_eq!(app.root_selected_index(), Some(1));
+        assert_eq!(app.devices_selected_index_for_test(), Some(1));
 
         // The selected device drops out of the model entirely (e.g. a
         // future timeout/removal path -- simulated here via the one
@@ -990,7 +1123,7 @@ mod tests {
         // index (1) into the new list's bounds -- landing on row 1, not
         // snapping back past it to row 0.
         assert_eq!(
-            app.root_selected_index(),
+            app.devices_selected_index_for_test(),
             Some(1),
             "losing the selected row must clamp to the nearest surviving row, not reset to row 0"
         );
@@ -1041,5 +1174,123 @@ mod tests {
         app.push_command_for_test(Command::CancelScan);
         assert_eq!(app.poll_command(), Some(Command::CancelScan));
         assert_eq!(app.poll_command(), None, "the queue drains -- one poll per queued command");
+    }
+
+    // --- pico-link-znb.8 (E7): Home's two-face toggle ---
+    //
+    // Home has no test-only accessor for "which face is showing" (that's
+    // an internal `HomeView`/`HomeFace` implementation detail -- see
+    // `render::home`'s module doc), so these prove the toggle
+    // black-box, the same way `render_png_dump.rs` proves selection
+    // moves: by sampling the menu face's row-0 ("Bluetooth")
+    // selection-highlight pixel. The status face never paints
+    // `SURFACE_ELEVATED` at this coordinate (the hero widget draws no
+    // list-row fill there), so this single pixel distinguishes the two
+    // faces unambiguously.
+
+    /// x=200, y=18: the same "row 0's selection-highlight fill, clear of
+    /// any chip/glyph ink" sample point `handle_input_marks_dirty_and_
+    /// moving_selection_changes_the_rendered_framebuffer` and the
+    /// `emulator` HTTP/idle-wake e2e tests all use.
+    fn menu_face_row0_pixel(app: &mut App) -> embedded_graphics::pixelcolor::Rgb565 {
+        use embedded_graphics::prelude::Point;
+        app.render().pixel(Point::new(200, 18))
+    }
+
+    #[test]
+    fn centre_toggles_home_to_the_menu_face_and_back_without_pushing() {
+        use crate::render::theme::palette;
+
+        let mut app = App::new(240, 240);
+        assert_eq!(app.navigator_depth(), 1, "Home starts alone on the stack");
+        assert_ne!(menu_face_row0_pixel(&mut app), palette::SURFACE_ELEVATED, "the status face draws no selected list row");
+
+        app.handle_input(vec![NavIntent::Select]); // status -> menu
+        assert_eq!(app.navigator_depth(), 1, "toggling to the menu face must not push a screen");
+        assert_eq!(
+            menu_face_row0_pixel(&mut app),
+            palette::SURFACE_ELEVATED,
+            "the menu face's Bluetooth row (index 0) is selected by default"
+        );
+
+        app.handle_input(vec![NavIntent::Back]); // menu -> status
+        assert_eq!(app.navigator_depth(), 1, "returning to the status face must not pop a screen");
+        assert_ne!(
+            menu_face_row0_pixel(&mut app),
+            palette::SURFACE_ELEVATED,
+            "back on the menu face must return to the status face, not leave the menu showing"
+        );
+    }
+
+    #[test]
+    fn b_on_the_status_face_is_a_harmless_no_op_and_does_not_leave_home() {
+        let mut app = App::new(240, 240);
+        assert_eq!(app.navigator_depth(), 1);
+
+        app.handle_input(vec![NavIntent::Back]);
+        assert_eq!(app.navigator_depth(), 1, "B on Home's status face (nothing to back out of) must stay on Home");
+        assert_eq!(app.current_screen_title(), crate::render::home::HOME_TITLE);
+    }
+
+    #[test]
+    fn navigator_depth_stays_one_across_many_toggles() {
+        let mut app = App::new(240, 240);
+        for _ in 0..10 {
+            app.handle_input(vec![NavIntent::Select]); // status -> menu
+            assert_eq!(app.navigator_depth(), 1);
+            app.handle_input(vec![NavIntent::Back]); // menu -> status
+            assert_eq!(app.navigator_depth(), 1);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn up_and_down_do_nothing_on_homes_status_face_in_tier_1() {
+        use embedded_graphics::prelude::{OriginDimensions, Point};
+
+        let mut app = App::new(240, 240);
+
+        let width = app.render().size().width;
+        let sample_row = |app: &mut App| -> Vec<embedded_graphics::pixelcolor::Rgb565> {
+            let fb = app.render();
+            (0..width).map(|x| fb.pixel(Point::new(x as i32, 100))).collect()
+        };
+
+        let frame_before = sample_row(&mut app);
+
+        app.handle_input(vec![NavIntent::Up]);
+        app.handle_input(vec![NavIntent::Down]);
+        assert_eq!(app.navigator_depth(), 1, "Up/Down must not push or pop anything on Home");
+
+        let frame_after = sample_row(&mut app);
+        assert_eq!(
+            frame_before, frame_after,
+            "Up/Down are unbound on Home's status face in Tier 1 (no volume gauge, no binding -- design section 13's 'absent together, not inert')"
+        );
+    }
+
+    #[test]
+    fn a_live_bluetooth_event_does_not_flip_the_face_or_reset_the_navigator() {
+        use crate::render::theme::palette;
+
+        let mut app = App::new(240, 240);
+        app.handle_input(vec![NavIntent::Select]); // status -> menu
+        assert_eq!(menu_face_row0_pixel(&mut app), palette::SURFACE_ELEVATED, "menu face showing before the event");
+
+        // `App::rebuild_root` runs on every one of these -- proving the
+        // menu face (held in `App::home_face`, shared with the freshly
+        // rebuilt `HomeView` -- see `render::home`'s module doc) survives
+        // a root rebuild the same way pico-link-a67 already proved pushed
+        // screens survive one.
+        app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DevicesCleared);
+
+        assert_eq!(app.navigator_depth(), 1, "a live Bluetooth event must not push or pop anything");
+        assert_eq!(
+            menu_face_row0_pixel(&mut app),
+            palette::SURFACE_ELEVATED,
+            "a live Bluetooth event must not flip Home back to the status face"
+        );
     }
 }

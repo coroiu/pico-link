@@ -106,6 +106,34 @@ impl Navigator {
         self.stack[0].selected_key()
     }
 
+    /// Generalizes [`Navigator::root_selected_index`] to any stack depth --
+    /// e.g. `index == 1` for the Devices screen once Home (`index == 0`)
+    /// is the root (`pico-link-znb.8`/E7). `None` both for an
+    /// out-of-range `index` and for a screen with no focused widget /
+    /// selection concept, same as [`Screen::selected_index`].
+    #[must_use]
+    pub fn selected_index_at(&self, index: usize) -> Option<usize> {
+        self.stack.get(index).and_then(Screen::selected_index)
+    }
+
+    /// Generalizes [`Navigator::root_selected_key`] to any stack depth --
+    /// see [`Navigator::selected_index_at`]'s doc comment for why this is
+    /// needed once Devices is no longer the root screen.
+    #[must_use]
+    pub fn selected_key_at(&self, index: usize) -> Option<super::list::ListItemKey> {
+        self.stack.get(index).and_then(Screen::selected_key)
+    }
+
+    /// The screen title at `index`, if any -- used by a caller (e.g.
+    /// [`crate::app::App::rebuild_root`]) to check whether a specific
+    /// live-data-backed screen (e.g. Devices) is currently sitting at a
+    /// known stack position before refreshing it via
+    /// [`Navigator::replace_at`].
+    #[must_use]
+    pub fn title_at(&self, index: usize) -> Option<&str> {
+        self.stack.get(index).map(|screen| screen.title.as_str())
+    }
+
     /// Replaces **only** the root screen (`stack[0]`) with `screen`,
     /// leaving every screen pushed above it untouched — depth, contents,
     /// and their own focus/selection state all survive unchanged.
@@ -121,6 +149,28 @@ impl Navigator {
     pub fn replace_root(&mut self, mut screen: Screen) {
         screen.initialize_focus();
         self.stack[0] = screen;
+    }
+
+    /// Generalizes [`Navigator::replace_root`] to any stack depth --
+    /// refreshes the screen at `index` in place, leaving every other
+    /// stack entry (above or below it) untouched, same non-negotiable
+    /// property `replace_root` has for `index == 0`. A no-op if `index`
+    /// is out of range (the caller -- [`crate::app::App::rebuild_root`] --
+    /// is expected to have checked [`Navigator::title_at`] first, but this
+    /// stays defensive rather than panicking on a stale index).
+    ///
+    /// Exists because Devices is no longer always the root
+    /// (`pico-link-znb.8`/E7 makes Home the root and pushes Devices onto
+    /// it): a live Bluetooth event must still be able to refresh the
+    /// Devices screen while it's sitting one level down, exactly the way
+    /// `replace_root` already refreshes whatever *is* the root, without
+    /// disturbing anything pushed above it (e.g. the wizard, at index 2).
+    pub fn replace_at(&mut self, index: usize, mut screen: Screen) {
+        if index >= self.stack.len() {
+            return;
+        }
+        screen.initialize_focus();
+        self.stack[index] = screen;
     }
 
     fn apply_action(&mut self, action: Action) {
