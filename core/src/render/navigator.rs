@@ -194,6 +194,23 @@ impl Navigator {
                 self.apply_action(action);
             }
             NavIntent::Back => {
+                // Forward to the focused widget first, purely so it gets a
+                // chance to react as a **side effect** -- e.g. the pairing
+                // wizard's scanning phase queuing `Command::CancelScan`
+                // (design section 9: "B cancels the scan", pico-link-znb.7)
+                // before the screen it's shown on disappears. The
+                // *navigation* decision is unconditional and stays
+                // `Navigator`'s alone: B always pops (or no-ops at the
+                // root), regardless of what the widget returns, so its
+                // `Action` is deliberately discarded rather than run
+                // through `apply_action` -- a widget cannot use `Back` to
+                // push, and cannot prevent the pop. This is safe to add
+                // for every existing widget: every `on_intent` impl in
+                // this crate already matches `NavIntent::Back` as an
+                // explicit no-op returning `Action::None` (see
+                // `list::VerticalList`/`menu::MenuList`), so this forward
+                // changes nothing for them.
+                let _ = self.current_mut().forward_to_focused(intent);
                 self.pop();
             }
             NavIntent::Left | NavIntent::Right | NavIntent::ShortcutX | NavIntent::ShortcutY => {

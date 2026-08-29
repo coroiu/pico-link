@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 
 #[cfg(not(test))]
 use embedded_alloc::LlffHeap as Heap;
-use pico_link_core::{App, Command, ConnectFailureReason, DeviceEntry, Event, LinkState, NavIntent};
+use pico_link_core::{App, Command, ConnectFailureReason, ConnectStep, DeviceEntry, Event, LinkState, NavIntent};
 
 // --- critical-section implementation ---
 //
@@ -671,6 +671,45 @@ impl From<PlFailureReason> for ConnectFailureReason {
     }
 }
 
+/// Mirrors [`pico_link_core::ConnectStep`]'s four variants 1:1 (added by
+/// pico-link-znb.7 / E5, the pairing wizard's phase-4 named sub-steps).
+/// Explicit discriminants pinned for the same reason as [`PlLinkState`]'s.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlConnectStep {
+    Connecting = 0,
+    Pairing = 1,
+    SettingUpAudio = 2,
+    NegotiatingCodec = 3,
+}
+
+impl core::convert::TryFrom<u32> for PlConnectStep {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see [`PlLinkState`]'s
+    /// `TryFrom` impl for the full rationale (pico-link-ptu).
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlConnectStep::Connecting),
+            1 => Ok(PlConnectStep::Pairing),
+            2 => Ok(PlConnectStep::SettingUpAudio),
+            3 => Ok(PlConnectStep::NegotiatingCodec),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<PlConnectStep> for ConnectStep {
+    fn from(step: PlConnectStep) -> Self {
+        match step {
+            PlConnectStep::Connecting => ConnectStep::Connecting,
+            PlConnectStep::Pairing => ConnectStep::Pairing,
+            PlConnectStep::SettingUpAudio => ConnectStep::SettingUpAudio,
+            PlConnectStep::NegotiatingCodec => ConnectStep::NegotiatingCodec,
+        }
+    }
+}
+
 /// [`PlEvent`]'s payload when `tag == PlEventTag::LinkStateChanged`.
 ///
 /// `state` is a plain `u32`, not [`PlLinkState`] -- deliberately, for the
@@ -714,13 +753,47 @@ pub struct PlConnectFailedPayload {
     pub reason: u32,
 }
 
+/// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectStepChanged`.
+/// `step` is a plain `u32`, not [`PlConnectStep`] -- same reason as
+/// [`PlLinkStateChangedPayload::state`]; see that field's doc comment.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlConnectStepChangedPayload {
+    pub step: u32,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectRetrying`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlConnectRetryingPayload {
+    pub attempt: u16,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectSucceeded`.
+/// `degraded` is a plain `u8` (0/1), not `bool` -- this project's existing
+/// convention throughout this module is to keep every union-member field a
+/// plain integer type with no validity invariant of its own (a `bool` read
+/// from a garbage byte is already undefined behaviour in Rust; a `u8`
+/// isn't), same rationale as every `u32` tag/state/reason field above. Any
+/// nonzero value is treated as `true`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlConnectSucceededPayload {
+    pub degraded: u8,
+}
+
 /// Which variant of [`PlEventPayload`] is active in a given [`PlEvent`].
-/// `DevicesCleared` carries no data -- the payload union is simply unread
-/// for that tag (see [`PlEventPayload`]'s doc comment).
+/// `DevicesCleared`/`WizardAutoDismiss` carry no data -- the payload union
+/// is simply unread for those tags (see [`PlEventPayload`]'s doc comment).
 /// Explicit discriminants (pinned, not compiler-assigned) for the same
 /// reason as [`PlIntentTag`]'s: [`PlEvent::tag`] carries this value as a
 /// plain `u32`, and these numbers are the wire ABI. See
 /// [`PlEvent::tag`]'s doc comment.
+///
+/// The last four variants were added by pico-link-znb.7 (E5, the pairing
+/// wizard) -- purely additive, so [`PL_EVENT_ABI_VERSION`] is unchanged;
+/// see [`pico_link_core::Event`]'s doc comment for the design-doc
+/// rationale each one closes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlEventTag {
@@ -728,6 +801,10 @@ pub enum PlEventTag {
     DeviceDiscovered = 1,
     DevicesCleared = 2,
     ConnectFailed = 3,
+    ConnectStepChanged = 4,
+    ConnectRetrying = 5,
+    ConnectSucceeded = 6,
+    WizardAutoDismiss = 7,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -742,6 +819,10 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             1 => Ok(PlEventTag::DeviceDiscovered),
             2 => Ok(PlEventTag::DevicesCleared),
             3 => Ok(PlEventTag::ConnectFailed),
+            4 => Ok(PlEventTag::ConnectStepChanged),
+            5 => Ok(PlEventTag::ConnectRetrying),
+            6 => Ok(PlEventTag::ConnectSucceeded),
+            7 => Ok(PlEventTag::WizardAutoDismiss),
             _ => Err(()),
         }
     }
@@ -751,15 +832,18 @@ impl core::convert::TryFrom<u32> for PlEventTag {
 /// read is determined entirely by the sibling `tag` field on [`PlEvent`] --
 /// reading the wrong field is a logic bug, not a memory-safety one (every
 /// member is a plain, `Copy`, no-`Drop` payload struct), but is still
-/// meaningless data. `PlEventTag::DevicesCleared` has no payload of its
-/// own; the union simply isn't read for that tag, so no placeholder member
-/// is needed for it.
+/// meaningless data. `PlEventTag::DevicesCleared`/`WizardAutoDismiss` have
+/// no payload of their own; the union simply isn't read for those tags, so
+/// no placeholder member is needed for either.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union PlEventPayload {
     pub link_state_changed: PlLinkStateChangedPayload,
     pub device_discovered: PlDeviceDiscoveredPayload,
     pub connect_failed: PlConnectFailedPayload,
+    pub connect_step_changed: PlConnectStepChangedPayload,
+    pub connect_retrying: PlConnectRetryingPayload,
+    pub connect_succeeded: PlConnectSucceededPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -872,6 +956,33 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             };
             Event::ConnectFailed { addr: payload.addr, reason: reason.into() }
         }
+        PlEventTag::ConnectStepChanged => {
+            // SAFETY: `tag` says this union currently holds `connect_step_changed`.
+            let payload = unsafe { event.payload.connect_step_changed };
+            let step = match PlConnectStep::try_from(payload.step) {
+                Ok(step) => step,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            Event::ConnectStepChanged(step.into())
+        }
+        PlEventTag::ConnectRetrying => {
+            // SAFETY: `tag` says this union currently holds `connect_retrying`.
+            // Reading it is sound regardless of `attempt`'s value -- it's a
+            // plain `u16` with no validity invariant to violate.
+            let payload = unsafe { event.payload.connect_retrying };
+            Event::ConnectRetrying { attempt: payload.attempt }
+        }
+        PlEventTag::ConnectSucceeded => {
+            // SAFETY: `tag` says this union currently holds `connect_succeeded`.
+            // Reading it is sound regardless of `degraded`'s value -- see
+            // `PlConnectSucceededPayload`'s doc comment.
+            let payload = unsafe { event.payload.connect_succeeded };
+            Event::ConnectSucceeded { degraded: payload.degraded != 0 }
+        }
+        PlEventTag::WizardAutoDismiss => Event::WizardAutoDismiss,
     };
     ui.app.handle_event(core_event);
 }
@@ -1091,7 +1202,7 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            tag: 4, // one past ConnectFailed = 3, the highest legal PlEventTag
+            tag: 8, // one past WizardAutoDismiss = 7, the highest legal PlEventTag
             payload: bogus_payload,
         };
         unsafe {
@@ -1147,6 +1258,76 @@ mod tests {
     }
 
     #[test]
+    fn pl_ui_push_event_accepts_the_znb7_wizard_tags() {
+        // pico-link-znb.7 (E5): the four tags this bead added. Pushed
+        // through `pl_ui_push_event` with the wizard closed (no way to
+        // observe `WizardPhase` from this crate -- `pico_link_core::App`
+        // doesn't expose it publicly), so this proves what this crate
+        // *can* prove: every new tag/payload shape round-trips through the
+        // checked-conversion path without being rejected as malformed and
+        // without panicking, matching `pl_ui_push_event_accepts_every_legal_tag`'s
+        // existing shape for the pre-existing tags.
+        let ui = new_ui();
+        let events = [
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::ConnectStepChanged as u32,
+                payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: PlConnectStep::Pairing as u32 } },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::ConnectRetrying as u32,
+                payload: PlEventPayload { connect_retrying: PlConnectRetryingPayload { attempt: 3 } },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::ConnectSucceeded as u32,
+                payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { degraded: 1 } },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::WizardAutoDismiss as u32,
+                payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 0 } },
+            },
+        ];
+        unsafe {
+            for event in events {
+                pl_ui_push_event(ui, event);
+            }
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "every tag above is legal -- none should be counted as malformed");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_nested_connect_step() {
+        // Same gap as the nested link-state/failure-reason tests above,
+        // one layer deeper for the new `ConnectStepChanged` payload: the
+        // outer tag is legal, only the nested `step` value is garbage.
+        let ui = new_ui();
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::ConnectStepChanged as u32,
+            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 99 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range nested ConnectStep should be counted, not matched-on");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_connect_step_try_from_round_trips_every_legal_discriminant() {
+        let legal = [PlConnectStep::Connecting, PlConnectStep::Pairing, PlConnectStep::SettingUpAudio, PlConnectStep::NegotiatingCodec];
+        for step in legal {
+            assert!(PlConnectStep::try_from(step as u32).is_ok());
+        }
+        assert!(PlConnectStep::try_from(4u32).is_err());
+        assert!(PlConnectStep::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
     fn pl_intent_tag_try_from_round_trips_every_legal_discriminant() {
         let legal = [
             PlIntentTag::Up,
@@ -1168,11 +1349,20 @@ mod tests {
 
     #[test]
     fn pl_event_tag_try_from_round_trips_every_legal_discriminant() {
-        let legal = [PlEventTag::LinkStateChanged, PlEventTag::DeviceDiscovered, PlEventTag::DevicesCleared, PlEventTag::ConnectFailed];
+        let legal = [
+            PlEventTag::LinkStateChanged,
+            PlEventTag::DeviceDiscovered,
+            PlEventTag::DevicesCleared,
+            PlEventTag::ConnectFailed,
+            PlEventTag::ConnectStepChanged,
+            PlEventTag::ConnectRetrying,
+            PlEventTag::ConnectSucceeded,
+            PlEventTag::WizardAutoDismiss,
+        ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        assert!(PlEventTag::try_from(4u32).is_err());
+        assert!(PlEventTag::try_from(8u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
