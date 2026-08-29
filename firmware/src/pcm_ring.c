@@ -1,0 +1,121 @@
+// Pico Link firmware -- PCM ring implementation. See pcm_ring.h's module
+// doc for ownership rules; this file just implements them.
+#include "pcm_ring.h"
+
+#include <string.h>
+
+// PL_PCM_RING_CAPACITY is a power of two (checked below), so masking
+// replaces modulo for both indexing and the wraparound distance
+// computation (head - tail) & PL_PCM_RING_MASK.
+#define PL_PCM_RING_MASK (PL_PCM_RING_CAPACITY - 1u)
+
+_Static_assert((PL_PCM_RING_CAPACITY & PL_PCM_RING_MASK) == 0u,
+               "PL_PCM_RING_CAPACITY must be a power of two");
+_Static_assert((PL_PCM_RING_CAPACITY % PL_PCM_FRAME_BYTES) == 0u,
+               "PL_PCM_RING_CAPACITY must be a whole number of frames");
+
+// SRAM, not PSRAM -- see pcm_ring.h.
+static uint8_t s_ring[PL_PCM_RING_CAPACITY];
+static volatile uint32_t s_head; // producer-owned; index into s_ring, [0, PL_PCM_RING_CAPACITY)
+static volatile uint32_t s_tail; // consumer-owned; index into s_ring, [0, PL_PCM_RING_CAPACITY)
+static volatile uint32_t s_overrun_frames;
+static volatile uint32_t s_misaligned;
+
+void pl_pcm_push(const uint8_t *data, uint32_t len) {
+    if (len == 0) {
+        return;
+    }
+    if ((len % PL_PCM_FRAME_BYTES) != 0u) {
+        // Reject wholesale -- see pcm_ring.h's doc comment on why a partial
+        // accept is worse than a full reject.
+        s_misaligned++;
+        return;
+    }
+
+    uint32_t head = s_head; // producer's own index; only this side writes it
+    uint32_t tail = s_tail; // single aligned word read of the consumer's index; safe without a lock
+
+    // Capacity-1 usable, same convention as input.c/bt.c's rings: one slot
+    // stays permanently empty so a full ring is distinguishable from an
+    // empty one without a separate flag.
+    uint32_t used = (head - tail) & PL_PCM_RING_MASK;
+    uint32_t free_bytes = (PL_PCM_RING_CAPACITY - 1u) - used;
+    // Keep the usable region frame-aligned so `used` stays a multiple of
+    // PL_PCM_FRAME_BYTES on both sides.
+    free_bytes -= free_bytes % PL_PCM_FRAME_BYTES;
+
+    uint32_t accept_bytes = len;
+    if (accept_bytes > free_bytes) {
+        // Overflow: keep the front of this batch (already-elapsed audio),
+        // drop the NEWEST whole frames at the end of it, and count them.
+        // Never touch `tail` -- see pcm_ring.h's doc comment.
+        uint32_t dropped_bytes = accept_bytes - free_bytes;
+        s_overrun_frames += dropped_bytes / PL_PCM_FRAME_BYTES;
+        accept_bytes = free_bytes;
+    }
+    if (accept_bytes == 0) {
+        return;
+    }
+
+    uint32_t head_idx = head & PL_PCM_RING_MASK;
+    uint32_t first_chunk = PL_PCM_RING_CAPACITY - head_idx;
+    if (first_chunk > accept_bytes) {
+        first_chunk = accept_bytes;
+    }
+    memcpy(&s_ring[head_idx], data, first_chunk);
+    if (accept_bytes > first_chunk) {
+        memcpy(&s_ring[0], data + first_chunk, accept_bytes - first_chunk);
+    }
+
+    s_head = (head + accept_bytes) & PL_PCM_RING_MASK;
+}
+
+uint32_t pl_pcm_read(uint8_t *out, uint32_t max) {
+    max -= max % PL_PCM_FRAME_BYTES;
+    if (max == 0) {
+        return 0;
+    }
+
+    uint32_t tail = s_tail; // consumer's own index; only this side writes it
+    uint32_t head = s_head; // single aligned word read of the producer's index; safe without a lock
+
+    uint32_t used = (head - tail) & PL_PCM_RING_MASK;
+    uint32_t n = used < max ? used : max;
+    n -= n % PL_PCM_FRAME_BYTES;
+    if (n == 0) {
+        return 0;
+    }
+
+    uint32_t tail_idx = tail & PL_PCM_RING_MASK;
+    uint32_t first_chunk = PL_PCM_RING_CAPACITY - tail_idx;
+    if (first_chunk > n) {
+        first_chunk = n;
+    }
+    memcpy(out, &s_ring[tail_idx], first_chunk);
+    if (n > first_chunk) {
+        memcpy(out + first_chunk, &s_ring[0], n - first_chunk);
+    }
+
+    s_tail = (tail + n) & PL_PCM_RING_MASK;
+    return n;
+}
+
+uint32_t pl_pcm_fill_bytes(void) {
+    uint32_t head = s_head;
+    uint32_t tail = s_tail;
+    return (head - tail) & PL_PCM_RING_MASK;
+}
+
+void pl_pcm_reset(void) {
+    // Consumer side only -- reads the producer's head, writes only its own
+    // tail. Drops everything currently buffered.
+    s_tail = s_head;
+}
+
+uint32_t pl_pcm_overrun_frames(void) {
+    return s_overrun_frames;
+}
+
+uint32_t pl_pcm_misaligned(void) {
+    return s_misaligned;
+}

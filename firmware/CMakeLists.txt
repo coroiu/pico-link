@@ -83,6 +83,7 @@ add_executable(pico_link
     src/usb_descriptors.c
     src/usb_audio.c
     src/usb_pump.c
+    src/pcm_ring.c
     src/usb_reset.c
 )
 

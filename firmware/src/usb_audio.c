@@ -13,9 +13,9 @@
 
 #include "tusb.h"
 
+#include "pcm_ring.h"
 #include "usb_audio.h"
 #include "usb_descriptors.h"
-#include "usb_pump.h"
 
 //--------------------------------------------------------------------+
 // State
@@ -265,10 +265,10 @@ void pl_usb_audio_task(void) {
         uint16_t chunk = avail > sizeof(scratch) ? (uint16_t)sizeof(scratch) : avail;
         uint16_t n = tud_audio_read(scratch, chunk);
         pcm_bytes_total += n;
-        // Feed the pump's SRAM ring so a future consumer (M4's LDAC/I2S
-        // path) can drain it -- nothing drains it yet in M3, see
-        // pl_usb_pump_push_pcm's doc comment on drop-when-full.
-        pl_usb_pump_push_pcm(scratch, n);
+        // Feed the USB<->Bluetooth PCM ring so a future consumer (M4's A2DP
+        // media timer) can drain it -- nothing drains it yet in M3, see
+        // pl_pcm_push's doc comment on frame-granular drop-when-full.
+        pl_pcm_push(scratch, n);
         if (n < chunk) {
             break;
         }

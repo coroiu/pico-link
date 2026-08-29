@@ -10,6 +10,7 @@
 #include "pico/time.h"
 #include "tusb.h"
 
+#include "pcm_ring.h"
 #include "usb_audio.h"
 
 // The re-arm deadline is ~1ms (audiod_xfer_cb only re-arms the ISO OUT
@@ -20,27 +21,11 @@
 // cyw43/BTstack background IRQ (PICO_LOWEST_IRQ_PRIORITY, 0xFF).
 #define PL_USB_PUMP_IRQ_PRIORITY 0xC0
 
-// SRAM, not PSRAM -- see usb_pump.h. ~85ms of headroom at 192 bytes/ms
-// (48kHz 16-bit stereo), matching the sizing rationale pico-link-5am used
-// for the input ring.
-#define PL_PCM_RING_CAPACITY (16u * 1024u)
-
 // The ONLY console lock in this firmware -- see pl_log's doc comment.
 static mutex_t pl_usb_mutex;
 
 static int s_pump_irq_num = -1;
 static struct repeating_timer s_pump_timer;
-
-// SPSC ring: producer is the 0xC0 worker IRQ (pl_usb_pump_push_pcm, called
-// from usb_audio.c's pl_usb_audio_task while it runs inside the worker);
-// consumer is whatever thread-context code eventually calls
-// pl_usb_pump_read_pcm (nothing does yet in M3). Same ownership discipline
-// as input.c's ring: each side touches only its own index, so plain
-// volatile reads/writes are sufficient.
-static uint8_t s_pcm_ring[PL_PCM_RING_CAPACITY];
-static volatile uint32_t s_pcm_ring_head; // producer-owned (worker IRQ)
-static volatile uint32_t s_pcm_ring_tail; // consumer-owned (thread context)
-static volatile uint32_t s_pcm_ring_drop_count;
 
 // --- Instrumentation (bead pico-link-tfj: "do not flash without it") ---
 static volatile uint16_t s_avail_high_water; // tud_audio_available() high water, vs the 784-byte FIFO
@@ -48,35 +33,6 @@ static volatile uint32_t s_worst_interval_us; // worst gap between worker invoca
 static volatile uint32_t s_log_drop_count; // pl_log calls skipped, mutex contended
 static uint64_t s_last_worker_us;
 static uint64_t s_last_report_us;
-
-void pl_usb_pump_push_pcm(const uint8_t *data, uint32_t len) {
-    for (uint32_t i = 0; i < len; i++) {
-        uint32_t head = s_pcm_ring_head;
-        uint32_t next_head = (head + 1) % PL_PCM_RING_CAPACITY;
-        if (next_head == s_pcm_ring_tail) {
-            // Ring full -- drop rather than overwrite an undrained byte
-            // (same policy as input.c's debounce ring).
-            s_pcm_ring_drop_count++;
-            continue;
-        }
-        s_pcm_ring[head] = data[i];
-        s_pcm_ring_head = next_head;
-    }
-}
-
-uint32_t pl_usb_pump_read_pcm(uint8_t *out, uint32_t max) {
-    uint32_t n = 0;
-    while (n < max) {
-        uint32_t tail = s_pcm_ring_tail;
-        if (tail == s_pcm_ring_head) {
-            break; // caught up
-        }
-        out[n] = s_pcm_ring[tail];
-        s_pcm_ring_tail = (tail + 1) % PL_PCM_RING_CAPACITY;
-        n++;
-    }
-    return n;
-}
 
 // Runs at PL_USB_PUMP_IRQ_PRIORITY (0xC0) as a claimed user IRQ, pended by
 // the 1ms timer callback below -- never invoked directly from the timer
@@ -168,12 +124,13 @@ void pl_usb_pump_report(void) {
     }
     s_last_report_us = now_us;
     pl_log(
-        "usb-pump: packets=%lu avail_hwm=%u/784 worst_interval_us=%lu ring_drops=%lu log_drops=%lu\r\n",
+        "usb-pump: packets=%lu avail_hwm=%u/784 worst_interval_us=%lu ring_drops=%lu log_drops=%lu misaligned=%lu\r\n",
         (unsigned long)pl_usb_audio_packet_count(),
         (unsigned)s_avail_high_water,
         (unsigned long)s_worst_interval_us,
-        (unsigned long)s_pcm_ring_drop_count,
-        (unsigned long)s_log_drop_count
+        (unsigned long)pl_pcm_overrun_frames(),
+        (unsigned long)s_log_drop_count,
+        (unsigned long)pl_pcm_misaligned()
     );
     // Bead pico-link-icb probe 2: is SET_INTERFACE or any audio
     // control-entity request arriving at all? Answers the question

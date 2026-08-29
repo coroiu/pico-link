@@ -77,22 +77,10 @@ void pl_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // (see this file's module doc).
 void pl_log_locked(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-// Producer-side push into the pump's SRAM (NOT PSRAM -- an IRQ-context
-// write through the QMI XIP path is not a latency you want against a 1ms
-// deadline) SPSC PCM ring. Called only from usb_audio.c's
-// pl_usb_audio_task() while that runs inside the 0xC0 worker IRQ. Drops
-// bytes (counted) once the ring is full rather than overwrite an
-// undrained region -- same policy as input.c's debounce ring. Nothing
-// drains this ring yet in M3: the milestone's proof is that PCM arrives
-// and is read out of TinyUSB's FIFO fast enough to keep the ISO OUT
-// endpoint alive, not that anything downstream consumes it. M4's LDAC/I2S
-// consumer is the first real reader, via pl_usb_pump_read_pcm below.
-void pl_usb_pump_push_pcm(const uint8_t *data, uint32_t len);
-
-// Consumer-side drain of the PCM ring, for whatever thread-context code
-// eventually wants it (M4). Writes at most `max` bytes into `out` and
-// returns how many were written. Not called anywhere yet in M3.
-uint32_t pl_usb_pump_read_pcm(uint8_t *out, uint32_t max);
+// The PCM ring itself (M3's producer-only ring, hardened for M4) lives in
+// pcm_ring.h/.c, not here -- it is the USB/Bluetooth seam and belongs to
+// neither side. usb_audio.c's pl_usb_audio_task(), which this worker calls,
+// pushes into it via pl_pcm_push() directly. See pcm_ring.h.
 
 // Once-per-second instrumentation snapshot (rate-limits itself, so it's
 // cheap to call every superloop iteration): logs the cumulative audio
