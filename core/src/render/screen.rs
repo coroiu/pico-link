@@ -18,8 +18,8 @@ use embedded_graphics::{
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
+use crate::app::LinkState;
 use crate::input::NavIntent;
-use crate::platform::HidLinkState;
 
 use super::chrome::ChromeLayout;
 use super::framebuffer::FrameBuffer565;
@@ -66,7 +66,7 @@ fn text_width(font: &FontRenderer, text: &str) -> u32 {
 /// off-center at `icon_1x`'s small size even though it looked fine at
 /// `icon_2x`.
 ///
-/// Split out of `render` (alongside [`draw_ble_glyph`]) purely to keep
+/// Split out of `render` (alongside [`draw_link_glyph`]) purely to keep
 /// that function's line count in check.
 fn draw_shield_mark(title_left_x: i32, title_mid_y: i32, target: &mut FrameBuffer565) -> i32 {
     let shield_font = font::icon_1x();
@@ -88,7 +88,7 @@ fn draw_shield_mark(title_left_x: i32, title_mid_y: i32, target: &mut FrameBuffe
     shield_x + text_width(&shield_font, shield_str) as i32 + TITLE_ELEMENT_GAP
 }
 
-/// Draws the keyboard-output-link Bluetooth glyph immediately left of
+/// Draws the A2DP/Bluetooth link glyph immediately left of
 /// `right_cursor`, in a
 /// color derived from `link_state`, and returns the updated `right_cursor`
 /// after reserving this glyph's width plus [`TITLE_ELEMENT_GAP`] -- the
@@ -97,45 +97,36 @@ fn draw_shield_mark(title_left_x: i32, title_mid_y: i32, target: &mut FrameBuffe
 /// `render` itself (rather than inlined alongside those) purely to keep
 /// that function's line count in check; there is nothing else this helper
 /// needs to be independently reusable for.
-///
-/// # Panics
-///
-/// Never in practice: callers (`Screen::render`) always filter
-/// `HidLinkState::Unavailable` out before calling this — see that call
-/// site's `ble.filter(...)`. The `unreachable!` exists only because
-/// `HidLinkState` doesn't have a non-`Unavailable` subset type to express
-/// that at the type level.
-fn draw_ble_glyph(link_state: HidLinkState, right_cursor: i32, title_mid_y: i32, target: &mut FrameBuffer565) -> i32 {
-    let ble_color = match link_state {
-        HidLinkState::Connected => palette::BRAND_BRIGHT,
-        HidLinkState::Pairing => palette::STATUS_WARNING,
-        HidLinkState::Disconnected => palette::TEXT_SECONDARY,
-        HidLinkState::Unavailable => unreachable!("callers filter Unavailable out before calling draw_ble_glyph"),
+fn draw_link_glyph(link_state: LinkState, right_cursor: i32, title_mid_y: i32, target: &mut FrameBuffer565) -> i32 {
+    let link_color = match link_state {
+        LinkState::Connected => palette::BRAND_BRIGHT,
+        LinkState::Scanning | LinkState::Connecting => palette::STATUS_WARNING,
+        LinkState::Idle => palette::TEXT_SECONDARY,
     };
 
     // Same `icon_1x` + ink-bounding-box-centered-on-the-title-bar technique
     // the shield mark uses in `render` (see its own doc comment for why
     // `icon_1x`, not `icon_2x`, fits the fixed `TITLE_BAR_HEIGHT`-px bar
     // with room to spare).
-    let ble_font = font::icon_1x();
-    let mut ble_buf = [0_u8; 4];
-    let ble_str: &str = icon::BLUETOOTH.encode_utf8(&mut ble_buf);
-    let ble_width = text_width(&ble_font, ble_str) as i32;
-    let ble_x = right_cursor - ble_width;
-    let ble_ink = ble_font
-        .get_rendered_dimensions_aligned(ble_str, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
+    let link_font = font::icon_1x();
+    let mut link_buf = [0_u8; 4];
+    let link_str: &str = icon::BLUETOOTH.encode_utf8(&mut link_buf);
+    let link_width = text_width(&link_font, link_str) as i32;
+    let link_x = right_cursor - link_width;
+    let link_ink = link_font
+        .get_rendered_dimensions_aligned(link_str, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
         .unwrap_or(None);
-    let ble_y = ble_ink.map_or(title_mid_y, |ink| title_mid_y - (ink.top_left.y + ink.size.height as i32 / 2));
-    let _ = ble_font.render_aligned(
-        ble_str,
-        Point::new(ble_x, ble_y),
+    let link_y = link_ink.map_or(title_mid_y, |ink| title_mid_y - (ink.top_left.y + ink.size.height as i32 / 2));
+    let _ = link_font.render_aligned(
+        link_str,
+        Point::new(link_x, link_y),
         VerticalPosition::Top,
         HorizontalAlignment::Left,
-        FontColor::Transparent(ble_color),
+        FontColor::Transparent(link_color),
         target,
     );
 
-    right_cursor - ble_width - TITLE_ELEMENT_GAP
+    right_cursor - link_width - TITLE_ELEMENT_GAP
 }
 
 pub struct Screen {
@@ -173,6 +164,25 @@ impl Screen {
     #[must_use]
     pub fn widgets(&self) -> &[Box<dyn Widget>] {
         &self.widgets
+    }
+
+    /// The focused widget's own internal selection index, if any — see
+    /// `Widget::selected_index`'s doc comment for why this exists (letting
+    /// a rebuilt-from-model screen carry the user's selection forward
+    /// instead of resetting it).
+    #[must_use]
+    pub fn selected_index(&self) -> Option<usize> {
+        self.focused_index.and_then(|index| self.widgets[index].selected_index())
+    }
+
+    /// The focused widget's own currently selected row's identity key, if
+    /// any — see `Widget::selected_key`'s doc comment. The key-based
+    /// counterpart to [`Screen::selected_index`], for the same
+    /// carry-forward purpose but robust to the underlying list reordering,
+    /// growing, or shrinking between rebuilds.
+    #[must_use]
+    pub fn selected_key(&self) -> Option<super::list::ListItemKey> {
+        self.focused_index.and_then(|index| self.widgets[index].selected_key())
     }
 
     /// The currently focused widget's [`ChromeContribution`], if any.
@@ -305,7 +315,7 @@ impl Screen {
         let title_text = contribution.as_ref().and_then(|c| c.title.as_deref()).unwrap_or(self.title.as_str());
         let readout_text = contribution.as_ref().and_then(|c| c.readout.as_deref());
         let status = contribution.as_ref().and_then(|c| c.status);
-        let ble = contribution.as_ref().and_then(|c| c.ble);
+        let link = contribution.as_ref().and_then(|c| c.link);
         let hint_text = contribution.as_ref().and_then(|c| c.hint.as_deref()).unwrap_or(self.hint.as_str());
 
         // Vertically centered in the title bar via `VerticalPosition::Center`
@@ -335,14 +345,12 @@ impl Screen {
         }
 
         // Bluetooth glyph, immediately left of the status dot, per design
-        // spec. `Unavailable` omits the glyph entirely -- same as `ble`
-        // being `None` -- rather than drawing it
-        // in some "definitely not connected" color: a platform with no
-        // keyboard-output capability at all has nothing meaningful to
-        // report here, distinct from `Disconnected` ("capability exists,
-        // not paired yet").
-        if let Some(link_state) = ble.filter(|state| *state != HidLinkState::Unavailable) {
-            right_cursor = draw_ble_glyph(link_state, right_cursor, title_mid_y, target);
+        // spec. `link` being `None` omits the glyph entirely, rather than
+        // drawing it in some "definitely not connected" color: a widget
+        // with no link-state opinion at all has nothing meaningful to
+        // report here.
+        if let Some(link_state) = link {
+            right_cursor = draw_link_glyph(link_state, right_cursor, title_mid_y, target);
         }
 
         let readout_font = font::title();
@@ -453,17 +461,17 @@ mod tests {
         assert_eq!(fb.pixel(Point::new(0, 0)), palette::SURFACE);
     }
 
-    // --- BLE glyph ---
+    // --- Link glyph ---
 
     /// A single-purpose focusable widget whose only job is reporting a
-    /// caller-settable `ChromeContribution::ble` -- everything else is
+    /// caller-settable `ChromeContribution::link` -- everything else is
     /// `None`/default, so a test only ever samples pixels this specific
     /// glyph rendering could plausibly have painted (no status dot, no
     /// readout, a one-character title to keep the shield/title text away
     /// from the right edge this glyph draws into).
-    struct BleOnlyWidget(core::cell::Cell<Option<HidLinkState>>);
+    struct LinkOnlyWidget(core::cell::Cell<Option<LinkState>>);
 
-    impl Widget for BleOnlyWidget {
+    impl Widget for LinkOnlyWidget {
         fn measure(&self, _constraints: Size) -> Size {
             Size::zero()
         }
@@ -474,12 +482,12 @@ mod tests {
             true
         }
         fn chrome_contribution(&self) -> Option<ChromeContribution> {
-            Some(ChromeContribution { ble: self.0.get(), ..Default::default() })
+            Some(ChromeContribution { link: self.0.get(), ..Default::default() })
         }
     }
 
-    fn ble_screen(state: Option<HidLinkState>) -> Screen {
-        let mut screen = Screen::new("T", vec![Box::new(BleOnlyWidget(core::cell::Cell::new(state)))]);
+    fn link_screen(state: Option<LinkState>) -> Screen {
+        let mut screen = Screen::new("T", vec![Box::new(LinkOnlyWidget(core::cell::Cell::new(state)))]);
         screen.initialize_focus();
         screen
     }
@@ -487,7 +495,7 @@ mod tests {
     /// Renders `screen` into a fresh 240x240 framebuffer (the Pico Plus 2
     /// W panel, Epic B2) and reports whether `color` appears anywhere in
     /// the rightmost 20 columns of the title bar -- the glyph's drawing
-    /// region when (per `ble_screen`) there is no status dot/readout
+    /// region when (per `link_screen`) there is no status dot/readout
     /// ahead of it, so it lands flush against the title bar's right
     /// margin. Narrow and right-aligned enough to never collide with the
     /// "T" title text or the shield mark, both drawn from the left edge.
@@ -500,52 +508,45 @@ mod tests {
 
     #[test]
     fn connected_link_state_paints_the_glyph_in_the_brand_bright_color() {
-        let screen = ble_screen(Some(HidLinkState::Connected));
+        let screen = link_screen(Some(LinkState::Connected));
         assert!(
             any_pixel_near_the_right_title_edge(&screen, palette::BRAND_BRIGHT),
-            "a Connected link should paint the BLE glyph in BRAND_BRIGHT near the title bar's right edge"
+            "a Connected link should paint the glyph in BRAND_BRIGHT near the title bar's right edge"
         );
     }
 
     #[test]
-    fn pairing_link_state_paints_the_glyph_in_the_warning_color() {
-        let screen = ble_screen(Some(HidLinkState::Pairing));
+    fn scanning_link_state_paints_the_glyph_in_the_warning_color() {
+        let screen = link_screen(Some(LinkState::Scanning));
         assert!(
             any_pixel_near_the_right_title_edge(&screen, palette::STATUS_WARNING),
-            "a Pairing link should paint the BLE glyph in STATUS_WARNING"
+            "a Scanning link should paint the glyph in STATUS_WARNING (shared with Connecting -- both are 'in progress')"
         );
     }
 
     #[test]
-    fn disconnected_link_state_paints_the_glyph_in_the_muted_secondary_color() {
-        let screen = ble_screen(Some(HidLinkState::Disconnected));
+    fn idle_link_state_paints_the_glyph_in_the_muted_secondary_color() {
+        let screen = link_screen(Some(LinkState::Idle));
         assert!(
             any_pixel_near_the_right_title_edge(&screen, palette::TEXT_SECONDARY),
-            "a Disconnected link should paint the BLE glyph in TEXT_SECONDARY"
+            "an Idle link should paint the glyph in TEXT_SECONDARY"
         );
     }
 
     #[test]
-    fn unavailable_link_state_omits_the_glyph_entirely() {
-        let connected = ble_screen(Some(HidLinkState::Connected));
-        let unavailable = ble_screen(Some(HidLinkState::Unavailable));
-        let none = ble_screen(None);
+    fn no_link_state_omits_the_glyph_entirely() {
+        let connected = link_screen(Some(LinkState::Connected));
+        let none = link_screen(None);
 
         assert!(
             any_pixel_near_the_right_title_edge(&connected, palette::BRAND_BRIGHT),
             "sanity check: Connected does paint something to compare against"
         );
         assert!(
-            !any_pixel_near_the_right_title_edge(&unavailable, palette::BRAND_BRIGHT)
-                && !any_pixel_near_the_right_title_edge(&unavailable, palette::STATUS_WARNING)
-                && !any_pixel_near_the_right_title_edge(&unavailable, palette::TEXT_SECONDARY),
-            "Unavailable must omit the glyph -- no ble-glyph color anywhere near the right edge"
-        );
-        assert!(
             !any_pixel_near_the_right_title_edge(&none, palette::BRAND_BRIGHT)
                 && !any_pixel_near_the_right_title_edge(&none, palette::STATUS_WARNING)
                 && !any_pixel_near_the_right_title_edge(&none, palette::TEXT_SECONDARY),
-            "ble: None must omit the glyph exactly like Some(Unavailable)"
+            "link: None must omit the glyph -- no link-glyph color anywhere near the right edge"
         );
     }
 }

@@ -79,6 +79,7 @@ add_executable(pico_link
     src/st7789.c
     src/input.c
     src/bt.c
+    src/panic_recorder.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
@@ -126,6 +127,15 @@ target_compile_definitions(pico_link PRIVATE
     # matching USBPods' own working reference, everything runs on core0),
     # so PICO_CORE1_STACK_SIZE is left at the SDK default.
     PICO_STACK_SIZE=0xC000
+    # bd pico-link-gap, DEV AFFORDANCE (see panic_recorder.h's ship-marker
+    # note): routes pico-sdk's own panic()/assert path (the one that
+    # produced the bare "*** PANIC ***" banner with zero context on
+    # 2026-08-28) through our recorder instead of the stock
+    # puts+vprintf+_exit(1). pico_platform_panic's CMakeLists.txt adds
+    # panic.c as an INTERFACE source, i.e. it compiles as part of THIS
+    # target and sees this definition -- confirmed by reading
+    # pico_platform_panic/CMakeLists.txt rather than assumed.
+    PICO_PANIC_FUNCTION=pl_panic_c_hook
 )
 
 target_link_libraries(pico_link
@@ -133,6 +143,7 @@ target_link_libraries(pico_link
     hardware_spi
     hardware_dma
     hardware_gpio
+    hardware_watchdog
     ui_ffi
     # M2: the ready-made HCI transport this C-first pivot exists to use
     # (see bt.c's module doc). pico_btstack_cyw43 pulls in

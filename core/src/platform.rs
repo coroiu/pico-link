@@ -298,27 +298,6 @@ impl core::fmt::Debug for OutputRequestBody {
     }
 }
 
-/// Connection state of a wireless link (e.g. Bluetooth pairing/streaming),
-/// surfaced so the UI can show connection status and gate link-dependent
-/// actions on `Connected` rather than let a user try to act on a
-/// disconnected/nonexistent link. Carried over from this project's
-/// previous incarnation's BLE HID keyboard-output link; kept as a
-/// general-purpose connection-state indicator for Pico Link's own
-/// Bluetooth audio link — no capability trait exposes it yet (that's
-/// future wiring work), but the shape is ready to reuse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HidLinkState {
-    /// The platform has no wireless-link capability at all (e.g. a build
-    /// without Bluetooth support).
-    Unavailable,
-    /// The capability exists but no host is currently paired/connected.
-    Disconnected,
-    /// Pairing is in progress.
-    Pairing,
-    /// Paired and connected.
-    Connected,
-}
-
 /// Controls the device's deeper (below display-blank) power state — the
 /// deep-sleep tier of the idle-power policy. Implementations: a real
 /// board's deep-sleep actuator (wake on some GPIO input), the emulator's

@@ -20,14 +20,22 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::input::NavIntent;
-use crate::render::{Action, FrameBuffer565, ListItem, Navigator, Screen, VerticalList};
+use crate::render::{Action, FrameBuffer565, ListItem, ListItemKey, Navigator, Screen, VerticalList};
+
+/// The devices screen's "Scan for headphones" row's identity key. Not
+/// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
+/// instead — see [`ListItemKey::from`]'s doc comment for why this can
+/// never collide with a real device's key (a device key's top two bytes
+/// are always `0`; this sentinel's are always `0xFF`).
+const SCAN_ROW_KEY: ListItemKey = ListItemKey::from_bytes([0xFF; 8]);
 
 /// The Bluetooth link's coarse lifecycle state, as reported by C over
 /// [`App::set_link_state`] (`pl_ui_set_link_state` in the FFI surface).
 /// Platform-free: `core` has no idea BTstack exists, it only knows these
 /// four labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkState {
+    #[default]
     Idle,
     Scanning,
     Connecting,
@@ -46,10 +54,10 @@ impl LinkState {
 }
 
 /// One discovered Bluetooth device, as reported by C over
-/// [`App::add_device`] (`pl_ui_add_device` in the FFI surface). `addr` is a
-/// 6-byte Bluetooth device address, big-endian as BTstack itself reports it
-/// -- `core` never interprets the bytes, only round-trips them back out via
-/// [`Command::Connect`].
+/// [`Event::DeviceDiscovered`] (`pl_ui_push_event` in the FFI surface).
+/// `addr` is a 6-byte Bluetooth device address, big-endian as BTstack itself
+/// reports it -- `core` never interprets the bytes, only round-trips them
+/// back out via [`Command::Connect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceEntry {
     pub addr: [u8; 6],
@@ -65,7 +73,108 @@ pub struct DeviceEntry {
 pub enum Command {
     StartScan,
     Connect { addr: [u8; 6] },
+    /// User-initiated: stop an in-flight inquiry scan. The wizard screen
+    /// (pico-link-znb.7) binds this to B once it exists -- this bead only
+    /// delivers the command itself, no binding. Needed because the inquiry
+    /// scan runs a fixed 10.24s with nothing else to interrupt it: without
+    /// this, B does nothing during that window and, in the zero-results
+    /// case, the screen is empty for the whole 10.24s -- exactly when a
+    /// user reaches for a button, gets nothing, and concludes the device
+    /// is frozen. See design section 21 Tier 1 row E1.
+    CancelScan,
 }
+
+/// Why a connect attempt failed, as reported by C over
+/// [`Event::ConnectFailed`]. `core` has no Bluetooth stack of its own -- it
+/// only records the *category* of failure BTstack/the radio reported, for a
+/// (future) screen to render with an appropriate remedy.
+///
+/// Distinguishing these five (rather than a single generic "failed") is
+/// deliberate and driven by the approved on-device UI design
+/// (`.planning/design/2026-08-28-on-device-ui.md`): each has a different
+/// user-facing remedy, and [`ConnectFailureReason::retryable`] draws the one
+/// distinction that matters most -- some failures are worth an automatic or
+/// user-initiated retry, and two structurally are not (see that method's
+/// doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailureReason {
+    /// No response within the connection's page-timeout window (up to
+    /// 5.12s per BTstack's ACL page timeout) -- transient, worth retrying.
+    Timeout,
+    /// The remote device actively rejected the connection or pairing
+    /// (authentication failure, user declined on the headphone side, ...)
+    /// -- may be worth retrying if the user acts differently (e.g.
+    /// re-enters pairing mode), so not ruled out here.
+    Rejected,
+    /// AVDTP stream endpoint discovery found no A2DP sink service on the
+    /// device at all. This is a fixed capability of the remote device, not
+    /// a transient condition -- retrying the *same* device can never
+    /// succeed, hence [`ConnectFailureReason::retryable`] is `false`.
+    NoA2dpSink,
+    /// Pairing requires a PIN, and this product has no on-screen text
+    /// entry (confirmed speculative/out of scope -- see the capability
+    /// inventory on bead pico-link-aii.1). Retrying without a way to
+    /// supply the PIN can never succeed either, so this is also
+    /// non-retryable until text entry exists.
+    NeedsPin,
+    /// The radio/HCI layer itself reported an error (not a per-device
+    /// remote-side rejection) -- typically transient, worth retrying.
+    RadioError,
+}
+
+impl ConnectFailureReason {
+    /// Whether a retry of the *same* device could plausibly succeed.
+    /// `false` for [`Self::NoA2dpSink`] (a fixed capability of that
+    /// device -- it will never grow an A2DP sink between attempts) and
+    /// [`Self::NeedsPin`] (this product cannot supply a PIN today, so
+    /// nothing about a retry changes the outcome). The other three are
+    /// conditions that can plausibly differ on a second attempt.
+    #[must_use]
+    pub fn retryable(self) -> bool {
+        !matches!(self, Self::NoA2dpSink | Self::NeedsPin)
+    }
+}
+
+/// One inbound Bluetooth-domain event, as reported by C over
+/// [`App::handle_event`] (`pl_ui_push_event` in the FFI surface -- one
+/// tagged union in, replacing the old per-field `pl_ui_set_link_state`/
+/// `pl_ui_add_device`/`pl_ui_clear_devices` setters). `core` never
+/// originates these; it only folds them into [`BtModel`] and marks the app
+/// dirty -- see [`App::handle_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    LinkStateChanged(LinkState),
+    DeviceDiscovered(DeviceEntry),
+    DevicesCleared,
+    ConnectFailed { addr: [u8; 6], reason: ConnectFailureReason },
+}
+
+/// The Bluetooth-domain state screens read to render themselves --
+/// everything [`App`] knows about the link and the discovered/attempted
+/// devices, folded in one place from [`Event`]s. Kept as one struct (rather
+/// than loose fields on [`App`]) so it's unambiguous what "the model" means
+/// when a screen-building function takes `&BtModel`: this, and only this, is
+/// live application data; everything else a screen needs is either passed
+/// in explicitly (e.g. a carried-forward selection index) or is the
+/// screen's own widget state.
+///
+/// Deliberately grows by adding fields here, not by adding new `App`
+/// methods per field or new FFI setters per field -- see the module doc's
+/// "sustainable path" rationale (bead pico-link-a67 / pico-link-aii.1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BtModel {
+    pub link_state: LinkState,
+    pub devices: Vec<DeviceEntry>,
+    /// The most recent connect failure, if any (and not yet superseded by
+    /// a new attempt). Not yet rendered by any screen in this bead's scope
+    /// -- populated so the data exists and is representable ahead of the
+    /// screen that will read it, per pico-link-a67's explicit ask.
+    pub last_connect_failure: Option<(DeviceAddr, ConnectFailureReason)>,
+}
+
+/// A Bluetooth device address, aliased for readability at call sites that
+/// pair it with a [`ConnectFailureReason`].
+pub type DeviceAddr = [u8; 6];
 
 /// Builds the devices screen: a "Scan for headphones" row (its sublabel is
 /// the live [`LinkState`] label) followed by one row per discovered
@@ -75,39 +184,62 @@ pub enum Command {
 /// [`App::rebuild_root`]) rather than mutated in place -- simplest correct
 /// thing for a list this small, and it keeps the closures below trivially
 /// `'static` (each rebuild captures a fresh, owned snapshot).
-fn build_devices_screen(link_state: LinkState, devices: &[DeviceEntry], commands: &Rc<RefCell<VecDeque<Command>>>) -> Screen {
-    let mut items = vec![ListItem::new("Scan for headphones").with_sublabel(link_state.label())];
-    if devices.is_empty() {
+///
+/// Every row carries a [`ListItemKey`] -- [`SCAN_ROW_KEY`] for the fixed
+/// scan row, `device.addr` (via `From<[u8; 6]>`) for a device row -- so
+/// `prev_key`/`prev_index` (the outgoing screen's
+/// [`Navigator::root_selected_key`]/[`Navigator::root_selected_index`])
+/// can carry the user's selection forward **by identity** through
+/// [`VerticalList::with_selected_identity`]: a device arriving, being
+/// renamed in place, or a stale one dropping out of `model.devices` no
+/// longer moves the selection just because the *index* it used to occupy
+/// now means something else. `prev_key` of `None`/not-found falls back to
+/// clamping `prev_index` -- see that method's doc comment for the exact
+/// rule. `(None, 0)` (first build) starts at row 0.
+fn build_devices_screen(
+    model: &BtModel,
+    prev_key: Option<ListItemKey>,
+    prev_index: usize,
+    commands: &Rc<RefCell<VecDeque<Command>>>,
+) -> Screen {
+    let mut items =
+        vec![ListItem::new("Scan for headphones").with_sublabel(model.link_state.label()).with_key(SCAN_ROW_KEY)];
+    if model.devices.is_empty() {
         // A single-row list has nowhere for Up/Down to move the selection
         // to, which also reads as a dead screen to a first-time user --
         // an explicit "nothing found yet" row keeps the list navigable
         // and communicates the empty state instead of just looking inert.
+        // No key: it's a transient placeholder, not a persistent entity
+        // worth carrying a selection onto.
         items.push(ListItem::new("No devices found").with_sublabel("Select Scan to search"));
     }
-    for device in devices {
+    for device in &model.devices {
         let label = if device.name.is_empty() { String::from("(unknown device)") } else { device.name.clone() };
         let sublabel = format!(
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}  RSSI {}",
             device.addr[0], device.addr[1], device.addr[2], device.addr[3], device.addr[4], device.addr[5], device.rssi
         );
-        items.push(ListItem::new(label).with_sublabel(sublabel));
+        items.push(ListItem::new(label).with_sublabel(sublabel).with_key(ListItemKey::from(device.addr)));
     }
 
-    let devices_snapshot: Vec<DeviceEntry> = devices.to_vec();
+    let devices_snapshot: Vec<DeviceEntry> = model.devices.clone();
     let commands_for_activate = Rc::clone(commands);
-    let list = VerticalList::new(items).on_activate_index(move |index| {
-        if index == 0 {
-            commands_for_activate.borrow_mut().push_back(Command::StartScan);
-        } else if let Some(device) = devices_snapshot.get(index - 1) {
-            commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
-        }
-        Action::None
-    });
+    let list = VerticalList::new(items)
+        .on_activate_index(move |index| {
+            if index == 0 {
+                commands_for_activate.borrow_mut().push_back(Command::StartScan);
+            } else if let Some(device) = devices_snapshot.get(index - 1) {
+                commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
+            }
+            Action::None
+        })
+        .with_selected_identity(prev_key, prev_index);
     Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back")
 }
 
-/// The application core: a [`Navigator`] built once over a placeholder
-/// root screen, and the single [`FrameBuffer565`] it renders into.
+/// The application core: a [`Navigator`] built once over the devices root
+/// screen, the [`BtModel`] that screen (and any future ones) reads to
+/// render itself, and the single [`FrameBuffer565`] rendered into.
 pub struct App {
     navigator: Navigator,
     framebuffer: FrameBuffer565,
@@ -115,8 +247,18 @@ pub struct App {
     /// [`App::render`] call. The run loop uses this to skip
     /// `DisplaySurface::flush` on frames where nothing changed.
     dirty: bool,
-    link_state: LinkState,
-    devices: Vec<DeviceEntry>,
+    /// The live Bluetooth device/link state, folded in from [`Event`]s via
+    /// [`App::handle_event`]. Screens are built by *reading* this, not by
+    /// owning fragments of it themselves -- see [`BtModel`]'s doc comment.
+    model: BtModel,
+    /// C's own clock, threaded through from [`App::tick`]
+    /// (`pl_ui_tick`'s `now_us` in the FFI surface -- previously received
+    /// and silently discarded, see pico-link-a67). `core` never reads a
+    /// hardware timer itself (the platform seam owns that); this is purely
+    /// the latest value C has told it. Not yet consumed by any screen in
+    /// this bead's scope -- storing it is the fix pico-link-a67 asks for;
+    /// wiring a liveness/timeout indicator to it is future UI work.
+    now_us: u64,
     /// Queued by the devices screen's `on_activate_index` closures (see
     /// [`build_devices_screen`]), drained by [`App::poll_command`]. `Rc`+
     /// `RefCell` because the closures live inside the `Navigator`'s screen
@@ -134,49 +276,91 @@ impl App {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
-        let link_state = LinkState::Idle;
-        let devices = Vec::new();
-        let navigator = Navigator::new(build_devices_screen(link_state, &devices, &commands));
-        Self { navigator, framebuffer: FrameBuffer565::new(width, height), dirty: true, link_state, devices, commands }
+        let model = BtModel::default();
+        let navigator = Navigator::new(build_devices_screen(&model, None, 0, &commands));
+        Self { navigator, framebuffer: FrameBuffer565::new(width, height), dirty: true, model, now_us: 0, commands }
     }
 
-    /// Rebuilds the navigator from scratch over a fresh devices screen
-    /// reflecting the current `link_state`/`devices` -- see
-    /// [`build_devices_screen`]'s doc comment for why a full rebuild
-    /// rather than an in-place mutation.
+    /// Refreshes the root (devices) screen to reflect the current
+    /// [`BtModel`], via [`Navigator::replace_root`] -- **not**
+    /// `Navigator::new`. That distinction is the whole point: replacing
+    /// only the root leaves any screen the user has navigated *to* (pushed
+    /// above root) untouched -- same stack depth, same screen instance,
+    /// same focus/selection state on it -- and carries the outgoing root
+    /// screen's own selection forward via
+    /// [`Navigator::root_selected_index`] rather than resetting it to row
+    /// 0. Previously this called `Navigator::new`, discarding the whole
+    /// stack on every Bluetooth event -- invisible with the one screen this
+    /// crate builds today, fatal for the approved multi-screen design (see
+    /// pico-link-a67 / pico-link-aii.1's defect 1).
     fn rebuild_root(&mut self) {
-        self.navigator = Navigator::new(build_devices_screen(self.link_state, &self.devices, &self.commands));
+        let prev_key = self.navigator.root_selected_key();
+        let prev_index = self.navigator.root_selected_index().unwrap_or(0);
+        self.navigator.replace_root(build_devices_screen(&self.model, prev_key, prev_index, &self.commands));
         self.dirty = true;
     }
 
-    /// Records the Bluetooth link's coarse lifecycle state
-    /// (`pl_ui_set_link_state`'s core-side implementation) and refreshes
-    /// the devices screen's scan-row sublabel to match.
+    /// Folds one inbound Bluetooth-domain [`Event`] into [`BtModel`] and
+    /// refreshes the root screen (`pl_ui_push_event`'s core-side
+    /// implementation -- the single entry point replacing the old
+    /// `set_link_state`/`add_device`/`clear_devices` setter trio). `core`
+    /// never acts on these itself -- it has no Bluetooth stack -- it only
+    /// updates what screens read.
+    pub fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::LinkStateChanged(state) => self.set_link_state(state),
+            Event::DeviceDiscovered(device) => self.add_device(device.addr, device.name, device.rssi),
+            Event::DevicesCleared => self.clear_devices(),
+            Event::ConnectFailed { addr, reason } => self.record_connect_failure(addr, reason),
+        }
+    }
+
+    /// Records the Bluetooth link's coarse lifecycle state and refreshes
+    /// the devices screen's scan-row sublabel to match. Also reachable
+    /// directly (not just via [`App::handle_event`]) since it's a natural
+    /// unit for tests and for [`App::record_connect_failure`] to reuse.
     pub fn set_link_state(&mut self, state: LinkState) {
-        self.link_state = state;
+        self.model.link_state = state;
         self.rebuild_root();
     }
 
     /// Adds (or, if `addr` is already known, updates the name/rssi of) one
-    /// discovered device and refreshes the devices screen
-    /// (`pl_ui_add_device`'s core-side implementation). Update-in-place
+    /// discovered device and refreshes the devices screen. Update-in-place
     /// rather than appending a duplicate row: BTstack's inquiry reports the
     /// same device repeatedly as its RSSI/name resolve.
     pub fn add_device(&mut self, addr: [u8; 6], name: String, rssi: i8) {
-        if let Some(existing) = self.devices.iter_mut().find(|d| d.addr == addr) {
+        if let Some(existing) = self.model.devices.iter_mut().find(|d| d.addr == addr) {
             existing.name = name;
             existing.rssi = rssi;
         } else {
-            self.devices.push(DeviceEntry { addr, name, rssi });
+            self.model.devices.push(DeviceEntry { addr, name, rssi });
         }
         self.rebuild_root();
     }
 
-    /// Clears the discovered-device list, e.g. at the start of a fresh scan
-    /// (`pl_ui_clear_devices`'s core-side implementation).
+    /// Clears the discovered-device list, e.g. at the start of a fresh
+    /// scan.
     pub fn clear_devices(&mut self) {
-        self.devices.clear();
+        self.model.devices.clear();
         self.rebuild_root();
+    }
+
+    /// Records a failed connect attempt with its [`ConnectFailureReason`]
+    /// and returns the link to [`LinkState::Idle`] -- the attempt is over
+    /// either way, retryable or not; a future screen deciding whether to
+    /// offer a retry reads `reason.retryable()` off
+    /// `BtModel::last_connect_failure`, not the link state.
+    pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
+        self.model.last_connect_failure = Some((addr, reason));
+        self.model.link_state = LinkState::Idle;
+        self.rebuild_root();
+    }
+
+    /// Read-only access to the live Bluetooth model, for tests/diagnostics
+    /// and for any future FFI accessor that needs to read it back.
+    #[must_use]
+    pub fn model(&self) -> &BtModel {
+        &self.model
     }
 
     /// Pops the oldest queued user command, if any
@@ -186,11 +370,65 @@ impl App {
         self.commands.borrow_mut().pop_front()
     }
 
+    /// Records C's latest clock reading (`pl_ui_tick`'s core-side
+    /// implementation -- previously a no-op that discarded `now_us`
+    /// entirely, see pico-link-a67). Does not by itself mark the app dirty:
+    /// the clock advancing is not, on its own, a reason to redraw anything
+    /// today (no screen in this bead's scope reads it) -- a future
+    /// liveness/timeout indicator that *does* need to repaint purely from
+    /// elapsed time will call `mark_dirty` itself when it has a reason to.
+    pub fn tick(&mut self, now_us: u64) {
+        self.now_us = now_us;
+    }
+
+    /// The most recent `now_us` recorded via [`App::tick`]. `0` before the
+    /// first tick.
+    #[must_use]
+    pub fn now_us(&self) -> u64 {
+        self.now_us
+    }
+
     /// How many screens are on the navigator's stack (>= 1). Exposed for
     /// tests/diagnostics.
     #[must_use]
     pub fn navigator_depth(&self) -> usize {
         self.navigator.depth()
+    }
+
+    /// The currently visible screen's title. Exposed for tests/diagnostics
+    /// -- in particular, proving that a Bluetooth [`Event`] mid-navigation
+    /// doesn't silently pop the user back to the root screen (see
+    /// [`App::rebuild_root`]'s doc comment).
+    #[must_use]
+    pub fn current_screen_title(&self) -> &str {
+        &self.navigator.current().title
+    }
+
+    /// The root (devices) screen's own selection index, if it currently has
+    /// one. Exposed for tests/diagnostics -- proving an [`Event`] carries
+    /// the user's list selection forward instead of resetting it to row 0.
+    #[must_use]
+    pub fn root_selected_index(&self) -> Option<usize> {
+        self.navigator.root_selected_index()
+    }
+
+    /// Test-only: pushes an arbitrary screen onto the navigator stack, so
+    /// tests can simulate "the user navigated away from root" without this
+    /// bead building any real second screen (out of its scope -- see
+    /// pico-link-a67's scope-discipline note). Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn push_screen_for_test(&mut self, screen: Screen) {
+        self.navigator.push(screen);
+    }
+
+    /// Test-only: enqueues a [`Command`] directly, bypassing the UI
+    /// interaction that would normally queue one. `CancelScan` has no
+    /// binding built by this bead (the wizard screen in pico-link-znb.7
+    /// does that), so this is the only way to exercise its
+    /// [`App::poll_command`] round-trip today. Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn push_command_for_test(&mut self, command: Command) {
+        self.commands.borrow_mut().push_back(command);
     }
 
     /// Dispatches every polled `NavIntent` to the navigator, in order.
@@ -302,5 +540,191 @@ mod tests {
     fn navigator_starts_at_depth_one_with_the_placeholder_root_screen() {
         let app = App::new(240, 240);
         assert_eq!(app.navigator_depth(), 1);
+    }
+
+    // --- pico-link-a67: the navigator-preservation fix ---
+    //
+    // These are the single most valuable tests in this bead: the old
+    // `rebuild_root` called `Navigator::new`, which resets the stack to
+    // depth 1 over a brand-new root screen. That's invisible with only one
+    // screen ever on the stack (this crate's current shipped behavior) but
+    // fatal for the approved multi-screen design, where a Bluetooth event
+    // arriving while the user is browsing a pushed screen would silently
+    // eject them back to root. `push_screen_for_test` simulates "the user
+    // navigated away from root" without this bead building any real second
+    // screen.
+
+    #[test]
+    fn a_bluetooth_event_mid_navigation_does_not_reset_the_screen_stack() {
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(Screen::new("detail", vec![]));
+        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.current_screen_title(), "detail");
+
+        // Three different Event variants, all of which used to rebuild the
+        // whole Navigator via App::rebuild_root.
+        app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
+        assert_eq!(app.navigator_depth(), 2, "LinkStateChanged must not pop the pushed screen");
+        assert_eq!(app.current_screen_title(), "detail");
+
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40 }));
+        assert_eq!(app.navigator_depth(), 2, "DeviceDiscovered must not pop the pushed screen");
+        assert_eq!(app.current_screen_title(), "detail");
+
+        app.handle_event(Event::DevicesCleared);
+        assert_eq!(app.navigator_depth(), 2, "DevicesCleared must not pop the pushed screen");
+        assert_eq!(app.current_screen_title(), "detail");
+
+        app.handle_event(Event::ConnectFailed { addr: [1, 2, 3, 4, 5, 6], reason: ConnectFailureReason::Timeout });
+        assert_eq!(app.navigator_depth(), 2, "ConnectFailed must not pop the pushed screen");
+        assert_eq!(app.current_screen_title(), "detail");
+    }
+
+    #[test]
+    fn a_device_arriving_mid_navigation_does_not_reset_the_root_screens_selection() {
+        let mut app = App::new(240, 240);
+        // Two devices so there's a non-zero selection to move to and lose.
+        app.add_device([1, 1, 1, 1, 1, 1], String::from("Device A"), -50);
+        app.add_device([2, 2, 2, 2, 2, 2], String::from("Device B"), -60);
+
+        // Root list rows: 0 = "Scan for headphones", 1 = Device A, 2 = Device B.
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]);
+        assert_eq!(app.root_selected_index(), Some(2), "selection should be on Device B's row");
+
+        // A third device arriving must not snap the selection back to row 0.
+        app.add_device([3, 3, 3, 3, 3, 3], String::from("Device C"), -70);
+        assert_eq!(app.root_selected_index(), Some(2), "a new device must not reset the user's selection");
+
+        // Same for a link-state change while browsing.
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        assert_eq!(app.root_selected_index(), Some(2), "a link-state change must not reset the user's selection");
+    }
+
+    // --- pico-link-znb.4: selection carried by identity, not index ---
+    //
+    // `a_device_arriving_mid_navigation_does_not_reset_the_root_screens_
+    // selection` above already proves the *index* doesn't move when the
+    // App's own append-only device order (design section 9 rule 1: stable
+    // sort, first-seen order, append at bottom, never re-sort by RSSI)
+    // happens not to disturb it. These go one step further: they assert
+    // the selection resolves to the *same device address* (not just the
+    // same index -- proving the identity-key path, not an accident of
+    // append-only ordering), and cover the update-in-place and
+    // selection-vanishes cases the design also calls out. The "a new row
+    // gets inserted *before* the selected one" stress case -- which App's
+    // append-only ordering can never itself produce -- is exercised
+    // directly against `VerticalList::with_selected_identity` in
+    // `render::list::tests` instead, since that's the widget-level
+    // mechanism this all rests on and the ordering rule App builds atop it
+    // makes it unreachable at this level by design.
+
+    #[test]
+    fn selecting_a_device_survives_further_devices_arriving_identified_by_address_not_just_index() {
+        let mut app = App::new(240, 240);
+        let device_a = [1, 1, 1, 1, 1, 1];
+        app.add_device(device_a, String::from("Device A"), -50);
+
+        // Root rows: 0 = Scan, 1 = Device A. Select Device A.
+        app.handle_input(vec![NavIntent::Down]);
+        assert_eq!(app.root_selected_index(), Some(1));
+        assert_eq!(app.model().devices[0].addr, device_a);
+
+        app.add_device([2, 2, 2, 2, 2, 2], String::from("Device B"), -60);
+        app.add_device([3, 3, 3, 3, 3, 3], String::from("Device C"), -70);
+
+        let selected = app.root_selected_index().expect("a device must still be selected");
+        assert_eq!(
+            app.model().devices[selected - 1].addr,
+            device_a,
+            "the selected row must still resolve to Device A's address, not merely the same index"
+        );
+    }
+
+    #[test]
+    fn a_late_name_for_an_already_listed_device_replaces_its_row_in_place() {
+        let mut app = App::new(240, 240);
+        let addr = [7, 7, 7, 7, 7, 7];
+        app.add_device(addr, String::new(), -55); // nameless first report
+
+        app.handle_input(vec![NavIntent::Down]); // select the device row
+        assert_eq!(app.root_selected_index(), Some(1));
+
+        // The name resolves later, same address.
+        app.add_device(addr, String::from("Sony WH-1000XM5"), -55);
+
+        assert_eq!(app.model().devices.len(), 1, "a late name must update the existing row, not append a second one");
+        assert_eq!(app.model().devices[0].name, "Sony WH-1000XM5");
+        assert_eq!(app.root_selected_index(), Some(1), "the late name must not disturb the selection");
+    }
+
+    #[test]
+    fn the_selected_devices_disappearing_clamps_selection_instead_of_resetting_to_row_zero() {
+        let mut app = App::new(240, 240);
+        app.add_device([1, 1, 1, 1, 1, 1], String::from("Device A"), -50);
+        app.handle_input(vec![NavIntent::Down]);
+        assert_eq!(app.root_selected_index(), Some(1));
+
+        // The selected device drops out of the model entirely (e.g. a
+        // future timeout/removal path -- simulated here via the one
+        // removal primitive App has today, a full clear).
+        app.clear_devices();
+
+        // Only the Scan row and the "No devices found" placeholder remain
+        // (rows 0 and 1); the vanished key isn't found, so
+        // `with_selected_identity` falls back to clamping the previous
+        // index (1) into the new list's bounds -- landing on row 1, not
+        // snapping back past it to row 0.
+        assert_eq!(
+            app.root_selected_index(),
+            Some(1),
+            "losing the selected row must clamp to the nearest surviving row, not reset to row 0"
+        );
+    }
+
+    #[test]
+    fn connect_failure_reasons_representable_and_the_two_impossible_ones_are_marked_non_retryable() {
+        // The approved UI design names five distinct failure causes; two
+        // (no A2DP sink, needs a PIN) must offer no retry because retrying
+        // is structurally impossible -- see `ConnectFailureReason::retryable`'s
+        // doc comment.
+        assert!(ConnectFailureReason::Timeout.retryable());
+        assert!(ConnectFailureReason::Rejected.retryable());
+        assert!(ConnectFailureReason::RadioError.retryable());
+        assert!(!ConnectFailureReason::NoA2dpSink.retryable());
+        assert!(!ConnectFailureReason::NeedsPin.retryable());
+    }
+
+    #[test]
+    fn connect_failed_event_updates_the_model_and_returns_the_link_to_idle() {
+        let mut app = App::new(240, 240);
+        app.set_link_state(LinkState::Connecting);
+        let addr = [9, 9, 9, 9, 9, 9];
+
+        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink });
+
+        assert_eq!(app.model().last_connect_failure, Some((addr, ConnectFailureReason::NoA2dpSink)));
+        assert_eq!(app.model().link_state, LinkState::Idle);
+    }
+
+    #[test]
+    fn tick_records_now_us_instead_of_discarding_it() {
+        let mut app = App::new(240, 240);
+        assert_eq!(app.now_us(), 0);
+        app.tick(123_456);
+        assert_eq!(app.now_us(), 123_456);
+    }
+
+    #[test]
+    fn cancel_scan_command_round_trips_through_poll_command() {
+        // pico-link-znb.2 (E1): the wizard screen (pico-link-znb.7) that
+        // binds B to this doesn't exist yet, so this exercises the
+        // enqueue/drain path directly via the test-only helper rather than
+        // through UI input -- the same shape `pl_ui_poll_command` will see.
+        let mut app = App::new(240, 240);
+        assert_eq!(app.poll_command(), None, "no command queued yet");
+
+        app.push_command_for_test(Command::CancelScan);
+        assert_eq!(app.poll_command(), Some(Command::CancelScan));
+        assert_eq!(app.poll_command(), None, "the queue drains -- one poll per queued command");
     }
 }

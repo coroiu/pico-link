@@ -26,10 +26,23 @@ void pl_bt_init(struct PlUi *ui);
 // logs the requested address and sets the link state to Connecting (M2's
 // acceptance criterion is that this is observable over CDC -- actually
 // opening an ACL connection is out of scope here, left for the milestone
-// that does something with a successful connect). A no-op if no command is
+// that does something with a successful connect); PL_COMMAND_TAG_CANCEL_SCAN
+// (pico-link-znb.2) stops an in-flight GAP inquiry via gap_inquiry_stop(),
+// which itself raises GAP_EVENT_INQUIRY_COMPLETE and so returns the link to
+// Idle through the normal inquiry-complete path. A no-op if no command is
 // queued. Intended to be called once per UI frame (see main.c's periodic
 // timer) -- drains at most one command per call, so a caller that expects
 // several queued commands per frame should call this in a loop instead.
 void pl_bt_poll_commands(struct PlUi *ui);
+
+// Drains every Bluetooth-domain event queued by the BTstack packet handler
+// (which runs in IRQ context and only ever enqueues -- see bt.c's
+// pico-link-6o2 ring doc comment) and makes the corresponding
+// pl_ui_push_event calls from here, in thread context. Intended to be
+// called once per superloop iteration, same convention as
+// pl_link_input_poll/pl_ui_input -- call it before pl_ui_tick/pl_ui_render
+// so a frame renders with the Bluetooth events that arrived before it, not
+// one frame late.
+void pl_bt_drain_events(struct PlUi *ui);
 
 #endif // PL_BT_H

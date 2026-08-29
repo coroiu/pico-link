@@ -27,10 +27,12 @@ use core::convert::Infallible;
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
+use crate::app::LinkState;
 use crate::input::NavIntent;
-use crate::platform::{HidLinkState, OutputRequest};
+use crate::platform::OutputRequest;
 
 use super::framebuffer::FrameBuffer565;
+use super::list::ListItemKey;
 use super::screen::Screen;
 
 /// High-level focus state transitions, decoupled from whatever transport
@@ -129,16 +131,28 @@ pub struct ChromeContribution {
     /// A status-dot color to paint in the title bar, if this widget has an
     /// app-wide status worth surfacing there.
     pub status: Option<ChromeStatus>,
-    /// The keyboard-output link's connection state, if this widget has one
+    /// The A2DP/Bluetooth link's connection state, if this widget has one
     /// worth surfacing — rendered as a Bluetooth glyph immediately left
     /// of the `status` dot (see `super::screen::Screen::render`). A
     /// separate field rather than folding into `status`, per design
     /// review: link connectivity and general app status are independent
     /// axes of "state" that must be able to read differently on screen at
     /// the same time (e.g. synced *and* disconnected). `None` omits the
-    /// glyph, same as
-    /// `Some(HidLinkState::Unavailable)` — see `Screen::render`'s handling.
-    pub ble: Option<HidLinkState>,
+    /// glyph entirely — see `Screen::render`'s handling. Reuses
+    /// [`crate::app::LinkState`] (the same coarse Bluetooth lifecycle C
+    /// reports over `pl_ui_set_link_state`) rather than inventing a
+    /// separate chrome-only enum: the chrome doesn't need a fifth concept
+    /// of link state.
+    pub link: Option<LinkState>,
+    /// Whether the focused widget's codec link is currently in the
+    /// design's fallback state (`.planning/design/2026-08-28-on-device-ui.md`
+    /// section 6.2, link 3 of the five-link fallback chain: the X-rail
+    /// label switches from "link" to "why?" under fallback). This widget
+    /// carries no button-label text itself — the rail
+    /// (`pico-link-znb.5`/E2, which gives `ChromeContribution` its own
+    /// a/b/x/y label fields) reads this bit to decide which label to
+    /// show. Defaults to `false`.
+    pub fallback: bool,
 }
 
 /// A retained-mode UI element. Implementors own their own state (selection
@@ -201,6 +215,38 @@ pub trait Widget {
     /// dividers, and any widget with nothing dynamic to report don't need
     /// to implement this.
     fn chrome_contribution(&self) -> Option<ChromeContribution> {
+        None
+    }
+
+    /// This widget's own internal selection/cursor index, if it has one
+    /// (e.g. `VerticalList`'s selected row). `None` for widgets with no
+    /// such concept (static labels, dividers).
+    ///
+    /// Exists so a caller that rebuilds a screen's widgets from scratch on
+    /// every model change (e.g. `App::rebuild_root` over live device/link
+    /// data — see `pico_link_core::app`'s doc comments) can read back the
+    /// *old* widget's selection before discarding it, and carry it forward
+    /// into the freshly built replacement (`VerticalList::with_selected`)
+    /// instead of resetting the user's place in the list on every event.
+    fn selected_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// This widget's own currently selected row's identity key, if it has
+    /// one — see [`super::list::ListItem::key`] / [`ListItemKey`].
+    /// `None` for widgets with no keyed-identity concept (the default),
+    /// or when the currently selected row was never tagged with a key.
+    ///
+    /// Exists for the same reason [`Self::selected_index`] does, one
+    /// level more robust: a caller that rebuilds a screen's widgets from
+    /// scratch on every model change can read this back before discarding
+    /// the old widget, then carry it into the freshly built replacement's
+    /// selection-resolution call (`VerticalList::with_selected_identity`)
+    /// so a rebuild that reorders, inserts, or removes *other* rows
+    /// doesn't move the selection away from the row the user was actually
+    /// looking at — the failure mode a plain index-based carry-forward
+    /// has.
+    fn selected_key(&self) -> Option<ListItemKey> {
         None
     }
 }

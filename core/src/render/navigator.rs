@@ -83,6 +83,46 @@ impl Navigator {
         }
     }
 
+    /// The root screen's (`stack[0]`'s) own focused widget's selection
+    /// index, if any — see `Screen::selected_index`. Read by a caller
+    /// about to call [`Navigator::replace_root`], so the freshly built
+    /// replacement screen can be constructed with the same selection
+    /// carried forward.
+    #[must_use]
+    pub fn root_selected_index(&self) -> Option<usize> {
+        self.stack[0].selected_index()
+    }
+
+    /// The root screen's own focused widget's selection **key**, if any —
+    /// see `Screen::selected_key`/`Widget::selected_key`. Read alongside
+    /// [`Navigator::root_selected_index`] by a caller about to call
+    /// [`Navigator::replace_root`]: the key is the primary carry-forward
+    /// signal (survives the underlying list reordering/growing/shrinking),
+    /// the index is only the fallback for when no key resolves — see
+    /// `pico_link_core::render::list::VerticalList::with_selected_identity`'s
+    /// doc comment for the exact rule.
+    #[must_use]
+    pub fn root_selected_key(&self) -> Option<super::list::ListItemKey> {
+        self.stack[0].selected_key()
+    }
+
+    /// Replaces **only** the root screen (`stack[0]`) with `screen`,
+    /// leaving every screen pushed above it untouched — depth, contents,
+    /// and their own focus/selection state all survive unchanged.
+    ///
+    /// This is deliberately *not* [`Navigator::new`] followed by re-pushing
+    /// the rest of the stack: it exists specifically so a live-data-backed
+    /// root screen (the devices list, driven by Bluetooth events — see
+    /// `pico_link_core::app::App::rebuild_root`) can be refreshed on every
+    /// model change without evicting the user from whatever screen they've
+    /// navigated to. Rebuilding the whole `Navigator` here was a real
+    /// defect: any Bluetooth event while browsing a pushed screen would
+    /// silently pop the user back to root and reset their selection.
+    pub fn replace_root(&mut self, mut screen: Screen) {
+        screen.initialize_focus();
+        self.stack[0] = screen;
+    }
+
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::PushView(builder) => self.push(builder()),
