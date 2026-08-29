@@ -108,8 +108,20 @@ different jobs; conflating them gives an oscillating buffer.
 so raw fill sawtooths by roughly one tick's worth (~1.9 KB) — comparable to the target
 itself. Raw fill into a P controller gives ~±200 ppm of 100 Hz ripple.
 
-`tud_audio_fb_set()` only stores a value for TinyUSB's SOF ISR, so calling it from the
-0xC0 worker is intended usage.
+**CORRECTION (bead pico-link-pbv round 2 / pico-link-6vv, 2026-08-29):** the claim above
+is WRONG for pico-sdk 2.1.1's vendored TinyUSB. `tud_audio_n_fb_set`
+(`lib/tinyusb/src/class/audio/audio_device.c:2347-2358`) does not merely store a value --
+its only guard is `p_desc != NULL` (true from `SET_CONFIGURATION` onward), and it then
+calls `usbd_edpt_claim(rhport, audio->ep_fb)` and `audiod_fb_send()` ->
+`usbd_edpt_xfer(rhport, audio->ep_fb, fb_buf, 3)`. `audio->ep_fb` is `0` until the
+streaming alt-setting (alt 1) is selected and is explicitly reset to `0` on alt 0
+(`audio_device.c:1837`); neither `usbd_edpt_claim` nor `usbd_edpt_xfer` guards
+`epnum != 0`. So calling `tud_audio_fb_set()` while alt 0 is selected claims **EP0-OUT**,
+marks it busy, and queues a 3-byte OUT transfer on the **control endpoint** roughly a
+thousand times a second -- a plausible mechanism for the "EP0 half-open, board goes deaf"
+wedge this project already spent a session chasing. The caller (`usb_pump.c`'s 0xC0
+worker) MUST gate this call on `pl_usb_audio_streaming()` being true. See
+`pico-link-6vv`.
 
 ## 3. The PCM ring
 
