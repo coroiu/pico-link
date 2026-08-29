@@ -59,10 +59,6 @@ uint8_t pl_usb_audio_last_set_itf(void);
 // SET_INTERFACE the class driver routed to tud_audio_set_itf_cb.
 uint8_t pl_usb_audio_last_set_alt(void);
 
-// Cumulative count of clock_get_request calls (UAC2_ENTITY_CLOCK GET,
-// any control selector/request).
-uint32_t pl_usb_audio_clock_get_calls(void);
-
 // Cumulative count of feature_unit_get_request calls (UAC2_ENTITY_FEATURE_UNIT
 // GET, any control selector/request).
 uint32_t pl_usb_audio_fu_get_calls(void);
@@ -70,5 +66,41 @@ uint32_t pl_usb_audio_fu_get_calls(void);
 // Cumulative count of feature_unit_set_request calls (UAC2_ENTITY_FEATURE_UNIT
 // SET, any control selector/request).
 uint32_t pl_usb_audio_fu_set_calls(void);
+
+// --- Instrumentation (bead pico-link-icb probe 3, revision 2 of the fix) ---
+// Same rules as above: plain counters, updated from callbacks that already
+// run inside the 0xC0 worker IRQ; formatting happens only in
+// pl_usb_pump_report, outside that context.
+
+// Cumulative count of tud_audio_set_itf_cb firings specifically for
+// ITF_NUM_AUDIO_STREAMING with alt == 1 -- the streaming alt setting being
+// selected. This is the primary pass criterion for revision 2 of the fix:
+// pl_usb_audio_set_itf_calls() alone cannot distinguish "some SET_INTERFACE
+// arrived" from "the streaming alt setting was actually chosen".
+uint32_t pl_usb_audio_set_itf_alt1_calls(void);
+
+// Cumulative count of clock_set_request calls (UAC2_ENTITY_CLOCK SET, any
+// control selector/request) -- answers whether macOS ever sets the sample
+// rate, separate from whether it merely reads it.
+uint32_t pl_usb_audio_clock_set_calls(void);
+
+// Cumulative count of clock_get_request calls answering AUDIO_CS_CTRL_SAM_FREQ
+// / AUDIO_CS_REQ_CUR specifically (split out of the former combined
+// clock_get counter).
+uint32_t pl_usb_audio_clk_get_freq_cur(void);
+
+// Cumulative count of clock_get_request calls answering AUDIO_CS_CTRL_SAM_FREQ
+// / AUDIO_CS_REQ_RANGE specifically.
+uint32_t pl_usb_audio_clk_get_freq_range(void);
+
+// Cumulative count of clock_get_request calls answering AUDIO_CS_CTRL_CLK_VALID
+// specifically.
+uint32_t pl_usb_audio_clk_get_valid(void);
+
+// Cumulative count of tud_audio_feedback_interval_isr firings -- proves the
+// feedback endpoint is actually being serviced once the streaming alt
+// setting opens, i.e. that the fix in this revision is the thing now
+// working rather than just "macOS opened the pipe".
+uint32_t pl_usb_audio_fb_sends(void);
 
 #endif // PICO_LINK_USB_AUDIO_H

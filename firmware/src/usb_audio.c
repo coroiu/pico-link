@@ -42,21 +42,34 @@ static volatile uint32_t packet_count = 0;
 static volatile uint32_t s_set_itf_calls;
 static volatile uint8_t s_last_set_itf; // last wIndex low byte seen, any interface
 static volatile uint8_t s_last_set_alt; // last wValue low byte seen, any interface
-static volatile uint32_t s_clock_get_calls;
 static volatile uint32_t s_fu_get_calls;
 static volatile uint32_t s_fu_set_calls;
+
+// --- Instrumentation (bead pico-link-icb probe 3, revision 2 of the fix):
+// same rules as above -- plain volatile increments only, no formatting in
+// this file's callbacks (they run inside the 0xC0 worker IRQ). These prove
+// (a) the streaming alt setting 1 is actually selected, not just that SOME
+// SET_INTERFACE arrived, and (b) that the feedback endpoint fixed in this
+// revision is actually being serviced once alt 1 opens.
+static volatile uint32_t s_set_itf_alt1_calls; // SET_INTERFACE(ITF_NUM_AUDIO_STREAMING, 1) specifically -- primary pass criterion
+static volatile uint32_t s_clock_set_calls;    // clock_set_request calls -- does macOS ever set the rate?
+static volatile uint32_t s_clk_get_freq_cur;   // clock_get_request, AUDIO_CS_CTRL_SAM_FREQ / AUDIO_CS_REQ_CUR
+static volatile uint32_t s_clk_get_freq_range; // clock_get_request, AUDIO_CS_CTRL_SAM_FREQ / AUDIO_CS_REQ_RANGE
+static volatile uint32_t s_clk_get_valid;      // clock_get_request, AUDIO_CS_CTRL_CLK_VALID
+static volatile uint32_t s_fb_sends;           // tud_audio_feedback_interval_isr firings -- feedback EP actually serviced
 
 //--------------------------------------------------------------------+
 // Clock entity (UAC2_ENTITY_CLOCK)
 //--------------------------------------------------------------------+
 static bool clock_get_request(uint8_t rhport, audio_control_request_t const *request) {
-    s_clock_get_calls++;
     if (request->bControlSelector == AUDIO_CS_CTRL_SAM_FREQ) {
         if (request->bRequest == AUDIO_CS_REQ_CUR) {
+            s_clk_get_freq_cur++;
             audio_control_cur_4_t cur = {(int32_t)tu_htole32(current_sample_rate)};
             return tud_audio_buffer_and_schedule_control_xfer(rhport, (tusb_control_request_t const *)request, &cur, sizeof(cur));
         }
         if (request->bRequest == AUDIO_CS_REQ_RANGE) {
+            s_clk_get_freq_range++;
             audio_control_range_4_n_t(N_SAMPLE_RATES) range = {.wNumSubRanges = tu_htole16(N_SAMPLE_RATES)};
             for (uint8_t i = 0; i < N_SAMPLE_RATES; i++) {
                 range.subrange[i].bMin = (int32_t)sample_rates[i];
@@ -66,6 +79,7 @@ static bool clock_get_request(uint8_t rhport, audio_control_request_t const *req
             return tud_audio_buffer_and_schedule_control_xfer(rhport, (tusb_control_request_t const *)request, &range, sizeof(range));
         }
     } else if (request->bControlSelector == AUDIO_CS_CTRL_CLK_VALID && request->bRequest == AUDIO_CS_REQ_CUR) {
+        s_clk_get_valid++;
         audio_control_cur_1_t cur_valid = {.bCur = 1};
         return tud_audio_buffer_and_schedule_control_xfer(rhport, (tusb_control_request_t const *)request, &cur_valid, sizeof(cur_valid));
     }
@@ -74,6 +88,7 @@ static bool clock_get_request(uint8_t rhport, audio_control_request_t const *req
 
 static bool clock_set_request(uint8_t rhport, audio_control_request_t const *request, uint8_t const *buf) {
     (void)rhport;
+    s_clock_set_calls++;
     if (request->bRequest != AUDIO_CS_REQ_CUR || request->bControlSelector != AUDIO_CS_CTRL_SAM_FREQ) {
         return false;
     }
@@ -171,6 +186,13 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     s_last_set_alt = alt;
     if (itf == ITF_NUM_AUDIO_STREAMING) {
         streaming = (alt != 0);
+        if (alt == 1) {
+            // Bead pico-link-icb revision 2, primary pass criterion: this is
+            // specifically the streaming alt setting being selected, not
+            // just any SET_INTERFACE for any interface (s_set_itf_calls
+            // above already covers that broader question).
+            s_set_itf_alt1_calls++;
+        }
     }
     return true;
 }
@@ -195,6 +217,20 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedba
     (void)alt_itf;
     feedback_param->method = AUDIO_FEEDBACK_METHOD_FIFO_COUNT;
     feedback_param->sample_freq = current_sample_rate;
+}
+
+// Bead pico-link-icb revision 2: TinyUSB's weak default (audio_device.c:520)
+// does nothing. Overriding it with a plain counter proves the feedback
+// endpoint fixed in this revision is actually being serviced once alt 1
+// opens -- the difference between "macOS opened the pipe" and "macOS opened
+// it and we are feeding it". Fires from inside the 0xC0 worker IRQ
+// (TU_ATTR_FAST_FUNC, called from audio_device.c's SOF handling) -- plain
+// volatile increment only, no formatting here.
+TU_ATTR_FAST_FUNC void tud_audio_feedback_interval_isr(uint8_t func_id, uint32_t frame_number, uint8_t interval_shift) {
+    (void)func_id;
+    (void)frame_number;
+    (void)interval_shift;
+    s_fb_sends++;
 }
 
 // Fires once per received isochronous OUT packet, before this file's own
@@ -268,14 +304,34 @@ uint8_t pl_usb_audio_last_set_alt(void) {
     return s_last_set_alt;
 }
 
-uint32_t pl_usb_audio_clock_get_calls(void) {
-    return s_clock_get_calls;
-}
-
 uint32_t pl_usb_audio_fu_get_calls(void) {
     return s_fu_get_calls;
 }
 
 uint32_t pl_usb_audio_fu_set_calls(void) {
     return s_fu_set_calls;
+}
+
+uint32_t pl_usb_audio_set_itf_alt1_calls(void) {
+    return s_set_itf_alt1_calls;
+}
+
+uint32_t pl_usb_audio_clock_set_calls(void) {
+    return s_clock_set_calls;
+}
+
+uint32_t pl_usb_audio_clk_get_freq_cur(void) {
+    return s_clk_get_freq_cur;
+}
+
+uint32_t pl_usb_audio_clk_get_freq_range(void) {
+    return s_clk_get_freq_range;
+}
+
+uint32_t pl_usb_audio_clk_get_valid(void) {
+    return s_clk_get_valid;
+}
+
+uint32_t pl_usb_audio_fb_sends(void) {
+    return s_fb_sends;
 }

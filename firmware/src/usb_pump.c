@@ -167,13 +167,25 @@ void pl_usb_pump_report(void) {
     // control-entity request arriving at all? Answers the question
     // before trusting packets=0 above as "never streamed".
     pl_log(
-        "usb-audio-ctl: set_itf_calls=%lu last_itf=%u last_alt=%u clock_get=%lu fu_get=%lu fu_set=%lu streaming=%u\r\n",
+        "usb-audio-ctl: set_itf_calls=%lu last_itf=%u last_alt=%u fu_get=%lu fu_set=%lu streaming=%u\r\n",
         (unsigned long)pl_usb_audio_set_itf_calls(),
         (unsigned)pl_usb_audio_last_set_itf(),
         (unsigned)pl_usb_audio_last_set_alt(),
-        (unsigned long)pl_usb_audio_clock_get_calls(),
         (unsigned long)pl_usb_audio_fu_get_calls(),
         (unsigned long)pl_usb_audio_fu_set_calls(),
         (unsigned)pl_usb_audio_streaming()
+    );
+    // Bead pico-link-icb probe 3 (revision 2 of the fix): the primary pass
+    // criterion (set_itf_alt1_calls) plus the finer clock breakdown and the
+    // feedback-endpoint service count -- proves the fixed feedback endpoint
+    // is actually carrying traffic, not just that the alt setting opened.
+    pl_log(
+        "usb-audio-fix: set_itf_alt1_calls=%lu clock_set_calls=%lu clk_get_freq_cur=%lu clk_get_freq_range=%lu clk_get_valid=%lu fb_sends=%lu\r\n",
+        (unsigned long)pl_usb_audio_set_itf_alt1_calls(),
+        (unsigned long)pl_usb_audio_clock_set_calls(),
+        (unsigned long)pl_usb_audio_clk_get_freq_cur(),
+        (unsigned long)pl_usb_audio_clk_get_freq_range(),
+        (unsigned long)pl_usb_audio_clk_get_valid(),
+        (unsigned long)pl_usb_audio_fb_sends()
     );
 }
