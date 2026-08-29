@@ -22,6 +22,7 @@ use embedded_graphics::{
     Drawable,
 };
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
+use u8g2_fonts::FontRenderer;
 
 use crate::input::NavIntent;
 
@@ -378,6 +379,89 @@ pub(crate) enum RowChip {
 /// Returns `Infallible`'s uninhabited variant in practice — see
 /// [`super::widget::Widget::render`]'s doc comment for why the `Result`
 /// return exists at all.
+/// Ellipsis appended by [`truncate_label_to_width`] when a label is cut.
+///
+/// Three ASCII periods, not the Unicode `…` (U+2026), for the same reason
+/// [`hero.rs`](super::hero)'s own `truncate_to_width` uses ASCII: every
+/// `FontRenderer` in [`theme::font`] is built `with_ignore_unknown_chars(true)`,
+/// which silently *drops* glyphs missing from a `u8g2` font's embedded
+/// glyph set rather than erroring, and the `_tf` font subsets used here
+/// aren't guaranteed to carry the Unicode ellipsis codepoint. An ellipsis
+/// glyph that silently vanished would make a truncated label look merely
+/// short, not truncated; every font here embeds ASCII `.`, so three of
+/// them are guaranteed to render.
+const ELLIPSIS: &str = "...";
+
+/// The horizontal pixel footprint `render_aligned` would give `text` in
+/// `font` — duplicated from [`hero.rs`](super::hero)'s private
+/// `text_width` (itself duplicated from `screen.rs`) for the same "no
+/// shared home for a helper this small, used by only one module each"
+/// reason those two give.
+fn text_width(font: &FontRenderer, text: &str) -> u32 {
+    font.get_rendered_dimensions_aligned(text, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
+        .unwrap_or(None)
+        .map_or(0, |bbox| bbox.size.width)
+}
+
+/// Truncates `name` to fit within `max_width` px when set in `font`,
+/// appending [`ELLIPSIS`] when truncation actually happens — the width
+/// clamp `draw_row` was missing entirely (pico-link-ok1). Row labels come
+/// from live Bluetooth scan results, so their length is never in this
+/// widget's control; the previous code drew them left-aligned with no
+/// clamp at all, so a name a few characters over budget silently
+/// overflowed into the disclosure caret's slot.
+///
+/// Same shape as [`hero.rs`](super::hero)'s `truncate_to_width` (the
+/// device name's own "truncates with an ellipsis, never a marquee" rule),
+/// duplicated rather than shared for the reason [`text_width`]'s doc
+/// comment gives. Widths are measured, not assumed from a fixed
+/// characters-per-row count, because the row font is proportional: `i`
+/// and `M` do not cost the same px, and a per-font "average character
+/// width" would either under-truncate wide names or over-truncate narrow
+/// ones.
+///
+/// Returns `name` itself (as an owned `String`, since the caller needs a
+/// value it can render either way) when it already fits — the common
+/// case, so no truncation search runs at all.
+///
+/// If `max_width` is too small to fit even [`ELLIPSIS`] alone, returns an
+/// empty string rather than a misleading lone glyph or a half-drawn
+/// ellipsis: there's no readable state smaller than the ellipsis itself,
+/// and drawing nothing reads more clearly as "no room" than a fragment
+/// that looks like its own rendering bug. This never happens on the
+/// current 240px panel — `chip_size()` + `CHIP_TEXT_GAP` +
+/// `CARET_RIGHT_MARGIN` + a caret glyph still leaves comfortably more
+/// than three periods' worth of width — but a future narrower row
+/// (a nested list, a smaller panel) could reach it, so the branch exists
+/// deliberately rather than by omission.
+pub(crate) fn truncate_label_to_width(font: &FontRenderer, name: &str, max_width: i32) -> String {
+    if max_width <= 0 {
+        return String::new();
+    }
+    let Ok(max_width) = u32::try_from(max_width) else {
+        return String::new();
+    };
+    if text_width(font, name) <= max_width {
+        return String::from(name);
+    }
+    if text_width(font, ELLIPSIS) > max_width {
+        return String::new();
+    }
+    let mut end = name.len();
+    while end > 0 {
+        end -= 1;
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut candidate = String::from(&name[..end]);
+        candidate.push_str(ELLIPSIS);
+        if text_width(font, &candidate) <= max_width {
+            return candidate;
+        }
+    }
+    String::from(ELLIPSIS)
+}
+
 pub(crate) fn draw_row<D>(
     target: &mut D,
     row_rect: Rectangle,
@@ -415,8 +499,20 @@ where
     }
     let text_x = row_rect.top_left.x + text_left_offset();
 
+    // Reserved unconditionally, whether or not *this* row is selected —
+    // reserving it only when `selected` would make a row's available
+    // text width (and therefore its truncation point) change the moment
+    // focus lands on or leaves it, which would read as the label itself
+    // changing rather than the same label just losing/gaining a caret.
+    let mut caret_buf = [0_u8; 4];
+    let caret: &str = icon::CARET_RIGHT.encode_utf8(&mut caret_buf);
+    let caret_reserved_width = text_width(&font::icon_1x(), caret) as i32;
+    let available_text_width =
+        row_rect.size.width as i32 - text_left_offset() - CARET_RIGHT_MARGIN - caret_reserved_width;
+
+    let name_display = truncate_label_to_width(&font::name(), name, available_text_width);
     let _ = font::name().render_aligned(
-        name,
+        name_display.as_str(),
         Point::new(text_x, row_rect.top_left.y + name_top_offset()),
         VerticalPosition::Top,
         HorizontalAlignment::Left,
@@ -425,8 +521,9 @@ where
     );
 
     if let Some(username) = username {
+        let username_display = truncate_label_to_width(&font::username(), username, available_text_width);
         let _ = font::username().render_aligned(
-            username,
+            username_display.as_str(),
             Point::new(text_x, row_rect.top_left.y + username_top_offset()),
             VerticalPosition::Top,
             HorizontalAlignment::Left,
@@ -436,8 +533,6 @@ where
     }
 
     if selected {
-        let mut buf = [0_u8; 4];
-        let caret: &str = icon::CARET_RIGHT.encode_utf8(&mut buf);
         let caret_x = row_rect.top_left.x + row_rect.size.width as i32 - CARET_RIGHT_MARGIN;
         let caret_y = row_rect.top_left.y + row_rect.size.height as i32 / 2;
         let _ = font::icon_1x().render_aligned(
@@ -1093,5 +1188,87 @@ mod tests {
     fn selected_key_is_none_for_an_empty_list_or_an_unkeyed_row() {
         assert_eq!(VerticalList::new(vec![]).selected_key(), None);
         assert_eq!(VerticalList::new(items(3)).selected_key(), None, "plain ListItem::new rows carry no key");
+    }
+
+    // -- truncate_label_to_width (pico-link-ok1) --------------------------
+    //
+    // These exercise the pure function directly rather than rendering a
+    // full row: the widths involved come straight from the real
+    // `u8g2-fonts` glyph metrics (`text_width`), so a short/exact/
+    // overflow/pathological label is expressed relative to a *measured*
+    // budget rather than a hardcoded pixel number that would silently
+    // drift out of sync with the font.
+
+    #[test]
+    fn a_short_label_that_fits_is_returned_unchanged() {
+        let font = font::name();
+        let width = text_width(&font, "Pixel Buds") as i32;
+        // Generous headroom -- this is the "doesn't even need truncation"
+        // case, not a boundary test.
+        let result = truncate_label_to_width(&font, "Pixel Buds", width + 40);
+        assert_eq!(result, "Pixel Buds", "a label with room to spare must render untouched, no ellipsis");
+    }
+
+    #[test]
+    fn a_label_that_exactly_fills_the_width_is_returned_unchanged() {
+        let font = font::name();
+        let name = "Sony WH-1000XM5";
+        let exact_width = text_width(&font, name) as i32;
+        let result = truncate_label_to_width(&font, name, exact_width);
+        assert_eq!(result, name, "a label whose measured width equals the budget exactly must not be truncated");
+    }
+
+    #[test]
+    fn a_label_that_overflows_by_one_character_gets_truncated_with_an_ellipsis() {
+        let font = font::name();
+        let name = "Sony WH-1000XM5"; // fits at `exact_width`
+        let exact_width = text_width(&font, name) as i32;
+        // One pixel under "exactly fits" forces truncation even though
+        // only the last glyph's width worth of ink is actually over
+        // budget -- this is the "overflow by one character" case, not a
+        // drastic cut.
+        let budget = exact_width - 1;
+        let result = truncate_label_to_width(&font, name, budget);
+        assert_ne!(result, name, "a label one pixel over budget must be truncated");
+        assert!(result.ends_with(ELLIPSIS), "a truncated label must end in the ellipsis: got {result:?}");
+        assert!(name.starts_with(result.trim_end_matches(ELLIPSIS)), "the kept prefix must be a real prefix of the original label");
+        assert!(text_width(&font, &result) as i32 <= budget, "the truncated-plus-ellipsis result must itself fit the budget");
+    }
+
+    #[test]
+    fn a_pathological_long_label_still_fits_the_budget_and_keeps_the_ellipsis() {
+        let font = font::name();
+        let name = "Bang and Olufsen Beoplay H95 Wireless Over-Ear Headphones Extended Edition";
+        // A budget representative of the real row layout: about what's
+        // left after the chip, chip-text gap and caret reservation on a
+        // 240px-wide panel (see `available_text_width` in `draw_row`).
+        let budget = 150;
+        let result = truncate_label_to_width(&font, name, budget);
+        assert!(result.ends_with(ELLIPSIS), "a wildly-overflowing label must still end in the ellipsis: got {result:?}");
+        assert!(text_width(&font, &result) as i32 <= budget, "the result must fit the given budget: {result:?} measured wider than {budget}px");
+        assert!(result.len() < name.len(), "a pathologically long label must actually be shortened");
+    }
+
+    #[test]
+    fn a_budget_too_narrow_for_even_the_ellipsis_renders_nothing() {
+        let font = font::name();
+        // 1px cannot fit three periods in any real font; this exercises
+        // the documented "no readable state smaller than the ellipsis"
+        // fallback rather than drawing a stray fragment.
+        let result = truncate_label_to_width(&font, "Sennheiser Momentum 4 Wireless", 1);
+        assert_eq!(result, "", "an unfittable budget must render nothing, not a partial ellipsis or a stray glyph");
+    }
+
+    #[test]
+    fn a_non_positive_max_width_renders_nothing() {
+        let font = font::name();
+        assert_eq!(truncate_label_to_width(&font, "Anything", 0), "");
+        assert_eq!(truncate_label_to_width(&font, "Anything", -5), "");
+    }
+
+    #[test]
+    fn an_empty_label_stays_empty_regardless_of_width() {
+        let font = font::name();
+        assert_eq!(truncate_label_to_width(&font, "", 200), "");
     }
 }

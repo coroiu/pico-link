@@ -83,6 +83,28 @@ fn main() {
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: named_addr, name: String::from("Sony WH-1000XM5"), rssi: -45 }));
     save_zoomed_png(&mut app, &out_dir, "02_scanning_late_name_and_nameless");
 
+    // --- Phase 2b: real-world long device names (pico-link-ok1) --
+    // `VerticalList` row labels come from live BT scan results, so their
+    // length is never in this widget's control -- unlike "Sony
+    // WH-1000XM5" (phase 2, ~15 chars, the committed fixture that used to
+    // make the missing width clamp invisible), these two overflow the
+    // pre-fix ~14-15-character budget and must now truncate with an
+    // ellipsis rather than running into the disclosure caret.
+    let mut app = App::new(240, 240);
+    open_wizard(&mut app);
+    start_scan(&mut app);
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+        addr: [0xCC; 6],
+        name: String::from("Sennheiser Momentum 4 Wireless"),
+        rssi: -50,
+    }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+        addr: [0xDD; 6],
+        name: String::from("Bang and Olufsen Beoplay H95"),
+        rssi: -60,
+    }));
+    save_zoomed_png(&mut app, &out_dir, "02b_scanning_long_device_names");
+
     // --- Phase 3: nothing found ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
@@ -154,5 +176,5 @@ fn main() {
     app.handle_event(Event::ConnectSucceeded { degraded: true });
     save_zoomed_png(&mut app, &out_dir, "06g_succeeded_degraded");
 
-    println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());
+    println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());
 }
