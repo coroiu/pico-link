@@ -67,7 +67,13 @@ uint32_t pl_pcm_fill_bytes(void);
 // current head. Consumer side only -- touches only `tail`, per the SPSC
 // ownership rule above. For stream open/close (design sec 3.5's "resume"
 // priming and "host silent" reset), not for routine drain.
-void pl_pcm_reset(void);
+//
+// Bead pico-link-pbv (C2-6): returns the number of whole frames dropped, so
+// callers can accumulate a counted flush_frames total -- without this the
+// drain-vs-supply conservation check (bead's acceptance A1) cannot be
+// balanced, since every silent discard is otherwise an uncounted exit from
+// the ring.
+uint32_t pl_pcm_reset(void);
 
 // Cumulative whole frames dropped on overflow since boot. Design sec 7:
 // once the feedback loop works this should be permanently 0 -- any nonzero

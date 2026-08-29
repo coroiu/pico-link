@@ -35,13 +35,18 @@ typedef struct {
     uint32_t nominal_bitrate_bps;          // what the panel shows (S2)
     // Bead pico-link-pbv: worst-case wall-clock time one encode() call can
     // take, measured on real hardware plus margin -- NOT a live
-    // measurement (see a2dp.c's enc_max_us for that). This bounds
-    // frames_per_tick_cap (a2dp.c, computed at STREAM_ESTABLISHED as
-    // PL_A2DP_MAX_ENCODE_DWELL_US / worst_case_encode_us) so the media
-    // timer's per-tick IRQ dwell stays bounded even if credit-pacing
-    // (design sec 1) would otherwise allow more frames in one tick after a
-    // backlog. SBC's row sets 800 (measured max on real hardware was
-    // 574-582us across several runs; 800 is that plus margin, not a
+    // measurement (see a2dp.c's enc_max_us for that). Round 1 used this to
+    // derive a per-tick FRAME-COUNT dwell cap at STREAM_ESTABLISHED
+    // (PL_A2DP_MAX_ENCODE_DWELL_US / worst_case_encode_us); round 2 found
+    // that frame-count proxy indistinguishable from healthy in steady
+    // state and replaced it with a direct TIME check against
+    // PL_A2DP_MAX_ENCODE_DWELL_US inside the fill loop itself (a2dp.c's
+    // stop_dwell) -- worst_case_encode_us is kept here as the codec-table
+    // row's own honest declaration of its worst case (a future consumer,
+    // e.g. an admission check before enabling a slower codec, may still
+    // want it) but a2dp.c's dwell bound no longer reads it directly. SBC's
+    // row sets 800 (measured max on real hardware was 574-582us across
+    // several runs; 800 is that plus margin, not a
     // theoretical derivation -- see codec_sbc.c).
     uint32_t worst_case_encode_us;
 } pl_codec_frame_info_t;
