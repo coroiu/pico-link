@@ -225,7 +225,7 @@ fn build_devices_screen(
             Action::None
         })
         .with_selected_identity(prev_key, prev_index);
-    Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back")
+    Screen::new("Pico Link", vec![Box::new(list)])
 }
 
 /// The application core: a [`Navigator`] built once over the devices root

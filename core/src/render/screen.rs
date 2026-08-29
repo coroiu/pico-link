@@ -20,9 +20,11 @@ use u8g2_fonts::FontRenderer;
 
 use crate::app::LinkState;
 use crate::input::NavIntent;
+use crate::panel::Button;
 
 use super::chrome::ChromeLayout;
 use super::framebuffer::FrameBuffer565;
+use super::rail::{draw_rail, ButtonLabel, ButtonLabels};
 use super::theme::{font, icon, palette};
 use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Widget};
 
@@ -36,11 +38,12 @@ const TITLE_SIDE_MARGIN: i32 = 6;
 const TITLE_ELEMENT_GAP: i32 = 6;
 /// Diameter (px) of the title bar's sync-status dot.
 const STATUS_DOT_DIAMETER: u32 = 6;
-/// Left margin (px) for hint-bar text — bumped from the original `4` per
-/// a "more padding" design-review tweak; the hint font is already the
-/// smallest on screen, so it can afford a wider margin than body text
-/// without feeling squeezed against the edge.
-const HINT_SIDE_MARGIN: i32 = 8;
+
+/// B's rail text is always this constant — never per-screen authorable.
+/// Only B's *liveness* varies (see `Screen::render`'s `can_go_back`
+/// parameter); its text does not, because a per-screen B label is exactly
+/// how B stops meaning Back. See design section 4/rule 3.
+const BACK_LABEL: &str = "back";
 
 /// The horizontal pixel footprint `u8g2-fonts`' `render_aligned` would give
 /// `text` in `font` — used to right-align/clip chrome elements without
@@ -131,10 +134,18 @@ fn draw_link_glyph(link_state: LinkState, right_cursor: i32, title_mid_y: i32, t
 
 pub struct Screen {
     pub title: String,
-    /// Static hint text drawn in the hint bar, e.g. control legends. Not a
-    /// `Widget` — chrome furniture is intentionally simpler than the
-    /// content widget model.
-    pub hint: String,
+    /// Static button-rail labels, e.g. control legends. Not a `Widget` —
+    /// chrome furniture is intentionally simpler than the content widget
+    /// model. B is included in this struct's shape for symmetry, but per
+    /// [`BACK_LABEL`] its *text* is never actually read from here — only
+    /// its slot's presence/absence-of-override matters, and even that is
+    /// moot since B's liveness comes from `Navigator`, not `Screen`.
+    pub buttons: ButtonLabels,
+    /// Whether this screen handles `NavIntent::Back` internally (e.g. a
+    /// menu/status face toggle) rather than deferring to the navigator's
+    /// stack-depth pop. ORs into the B slot's liveness passed to
+    /// [`Screen::render`] — see `can_go_back`.
+    handles_back: bool,
     widgets: Vec<Box<dyn Widget>>,
     focused_index: Option<usize>,
 }
@@ -144,15 +155,32 @@ impl Screen {
     pub fn new(title: impl Into<String>, widgets: Vec<Box<dyn Widget>>) -> Self {
         Self {
             title: title.into(),
-            hint: String::new(),
+            buttons: ButtonLabels::default(),
+            handles_back: false,
             widgets,
             focused_index: None,
         }
     }
 
+    /// Sets this screen's static A/X/Y rail labels. B is deliberately not
+    /// a parameter here: its text is always [`BACK_LABEL`] and its
+    /// liveness is a navigator fact (stack depth), not a screen fact — see
+    /// the design's rule that B must not be per-screen overridable, and
+    /// [`Screen::handles_back`] for the one thing a screen *can* say about
+    /// B (that it wants to be treated as live even at depth 1).
     #[must_use]
-    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = hint.into();
+    pub fn with_button_labels(mut self, a: ButtonLabel, x: ButtonLabel, y: ButtonLabel) -> Self {
+        self.buttons = ButtonLabels { a, b: ButtonLabel::Inert, x, y };
+        self
+    }
+
+    /// Declares that this screen handles `NavIntent::Back` internally
+    /// (e.g. Home's menu<->status face toggle) — its B slot should read as
+    /// live even at navigator depth 1, where there is otherwise nothing to
+    /// pop back to.
+    #[must_use]
+    pub fn handles_back(mut self, handles: bool) -> Self {
+        self.handles_back = handles;
         self
     }
 
@@ -280,34 +308,54 @@ impl Screen {
         }
     }
 
+    /// Resolves one button's rail label: the focused widget's
+    /// [`ChromeContribution`] wins when it has an opinion (`Some(_)`,
+    /// including `Some(Inert)`), otherwise this screen's static
+    /// [`Screen::buttons`] label is used. B is special-cased: its text is
+    /// always [`BACK_LABEL`] and its liveness is `can_go_back` (already
+    /// `OR`ed with [`Screen::handles_back`] by the caller) rather than
+    /// anything either the widget or the screen authored for it.
+    fn resolve_button(&self, button: Button, contribution: Option<&ChromeContribution>, can_go_back: bool) -> ButtonLabel {
+        if button == Button::B {
+            return if can_go_back || self.handles_back { ButtonLabel::Live(String::from(BACK_LABEL)) } else { ButtonLabel::Inert };
+        }
+        match contribution.and_then(|c| c.button(button)) {
+            Some(label) => label.clone(),
+            None => self.buttons.get(button).clone(),
+        }
+    }
+
     /// Draws the title bar (shield mark, title, position readout, the
     /// keyboard-output-link Bluetooth glyph, sync status dot), the content
     /// widgets (stacked vertically, sized via
-    /// `Widget::measure`), and the hint bar — pulling live overrides from
-    /// the focused widget's [`ChromeContribution`] (see
+    /// `Widget::measure`), and the button rail — pulling live overrides
+    /// from the focused widget's [`ChromeContribution`] (see
     /// [`Self::chrome_contribution`]) over this screen's static
-    /// `title`/`hint` wherever the widget supplies one.
+    /// `title`/button labels wherever the widget supplies one.
+    ///
+    /// `can_go_back` is a navigator fact (`Navigator::depth() > 1`), not a
+    /// screen fact — see [`Screen::resolve_button`] and [`BACK_LABEL`]'s
+    /// doc comments for why B is resolved outside the normal
+    /// widget-then-screen fallback chain.
     pub(super) fn render(
         &self,
         chrome: &ChromeLayout,
+        can_go_back: bool,
         target: &mut FrameBuffer565,
     ) -> Result<(), Infallible> {
         chrome.title.into_styled(PrimitiveStyle::with_fill(palette::SURFACE)).draw(target)?;
 
-        // Hairline dividers along the title bar's bottom edge and the hint
-        // bar's top edge — the same `palette::DIVIDER` hairline the list
-        // rows use between unfocused rows, so chrome and content read as
-        // one consistent visual language rather than content borrowing a
-        // rule chrome doesn't also follow.
+        // Hairline divider along the title bar's bottom edge — the same
+        // `palette::DIVIDER` hairline the list rows use between unfocused
+        // rows, so chrome and content read as one consistent visual
+        // language rather than content borrowing a rule chrome doesn't
+        // also follow. The rail draws its own hairlines (inner edge +
+        // between slots) in `draw_rail`.
         if chrome.title.size.height > 0 {
             let divider = Rectangle::new(
                 Point::new(chrome.title.top_left.x, chrome.title.top_left.y + chrome.title.size.height as i32 - 1),
                 Size::new(chrome.title.size.width, 1),
             );
-            divider.into_styled(PrimitiveStyle::with_fill(palette::DIVIDER)).draw(target)?;
-        }
-        if chrome.hint.size.height > 0 {
-            let divider = Rectangle::new(chrome.hint.top_left, Size::new(chrome.hint.size.width, 1));
             divider.into_styled(PrimitiveStyle::with_fill(palette::DIVIDER)).draw(target)?;
         }
 
@@ -316,7 +364,6 @@ impl Screen {
         let readout_text = contribution.as_ref().and_then(|c| c.readout.as_deref());
         let status = contribution.as_ref().and_then(|c| c.status);
         let link = contribution.as_ref().and_then(|c| c.link);
-        let hint_text = contribution.as_ref().and_then(|c| c.hint.as_deref()).unwrap_or(self.hint.as_str());
 
         // Vertically centered in the title bar via `VerticalPosition::Center`
         // rather than a hand-picked baseline offset (the "+11" this
@@ -400,16 +447,14 @@ impl Screen {
             y += height as i32;
         }
 
-        if chrome.hint.size.height > 0 {
-            let hint_mid_y = chrome.hint.top_left.y + chrome.hint.size.height as i32 / 2;
-            let _ = font::hint().render_aligned(
-                hint_text,
-                Point::new(chrome.hint.top_left.x + HINT_SIDE_MARGIN, hint_mid_y),
-                VerticalPosition::Center,
-                HorizontalAlignment::Left,
-                FontColor::Transparent(palette::TEXT_SECONDARY),
-                target,
-            );
+        if chrome.rail.size.width > 0 {
+            let labels = ButtonLabels {
+                a: self.resolve_button(Button::A, contribution.as_ref(), can_go_back),
+                b: self.resolve_button(Button::B, contribution.as_ref(), can_go_back),
+                x: self.resolve_button(Button::X, contribution.as_ref(), can_go_back),
+                y: self.resolve_button(Button::Y, contribution.as_ref(), can_go_back),
+            };
+            draw_rail(chrome.rail, chrome.orientation, &labels, target)?;
         }
 
         Ok(())
@@ -456,7 +501,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, &mut fb).unwrap();
+        screen.render(&chrome, false, &mut fb).unwrap();
         // Title bar was filled with its background color.
         assert_eq!(fb.pixel(Point::new(0, 0)), palette::SURFACE);
     }
@@ -502,7 +547,7 @@ mod tests {
     fn any_pixel_near_the_right_title_edge(screen: &Screen, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, &mut fb).unwrap();
+        screen.render(&chrome, false, &mut fb).unwrap();
         (220..240).any(|x| (0..super::super::chrome::TITLE_BAR_HEIGHT as i32).any(|y| fb.pixel(Point::new(x, y)) == color))
     }
 
@@ -548,5 +593,209 @@ mod tests {
                 && !any_pixel_near_the_right_title_edge(&none, palette::TEXT_SECONDARY),
             "link: None must omit the glyph -- no link-glyph color anywhere near the right edge"
         );
+    }
+
+    // --- Button rail (pico-link-znb.5 / E2) ---
+
+    use crate::panel::{Button, PanelOrientation};
+
+    /// A single-purpose focusable widget whose only job is reporting a
+    /// caller-fixed set of `ChromeContribution` button overrides -- same
+    /// shape as `LinkOnlyWidget` above, one field per rail slot.
+    struct ButtonsOnlyWidget {
+        a: Option<ButtonLabel>,
+        b: Option<ButtonLabel>,
+        x: Option<ButtonLabel>,
+        y: Option<ButtonLabel>,
+    }
+
+    impl Widget for ButtonsOnlyWidget {
+        fn measure(&self, _constraints: Size) -> Size {
+            Size::zero()
+        }
+        fn render(&self, _area: Rectangle, _target: &mut FrameBuffer565) -> Result<(), Infallible> {
+            Ok(())
+        }
+        fn is_focusable(&self) -> bool {
+            true
+        }
+        fn chrome_contribution(&self) -> Option<ChromeContribution> {
+            Some(ChromeContribution {
+                a: self.a.clone(),
+                b: self.b.clone(),
+                x: self.x.clone(),
+                y: self.y.clone(),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Computes the exact slot rect for `button` under `chrome`'s
+    /// orientation -- the same arithmetic `render::rail::draw_rail` uses
+    /// internally (rail height / 4, `slot_order` for the physical index),
+    /// duplicated here deliberately so the test asserts against the
+    /// *design's* geometry, not against whatever `draw_rail` happens to
+    /// compute.
+    fn slot_rect(chrome: &ChromeLayout, button: Button) -> Rectangle {
+        let order = chrome.orientation.slot_order();
+        let index = order.iter().position(|&b| b == button).expect("every Button is in slot_order");
+        let slot_height = chrome.rail.size.height / 4;
+        Rectangle::new(
+            Point::new(chrome.rail.top_left.x, chrome.rail.top_left.y + (index as u32 * slot_height) as i32),
+            Size::new(chrome.rail.size.width, slot_height),
+        )
+    }
+
+    fn any_pixel_of_color_in_rect(fb: &FrameBuffer565, rect: Rectangle, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
+        (rect.top_left.y..rect.top_left.y + rect.size.height as i32)
+            .any(|y| (rect.top_left.x..rect.top_left.x + rect.size.width as i32).any(|x| fb.pixel(Point::new(x, y)) == color))
+    }
+
+    fn render_buttons_screen(orientation: PanelOrientation, widget: ButtonsOnlyWidget) -> (ChromeLayout, FrameBuffer565) {
+        let mut screen = Screen::new("T", vec![Box::new(widget)]);
+        screen.initialize_focus();
+        let chrome = super::super::chrome::compute_chrome_for(Size::new(240, 240), orientation);
+        let mut fb = FrameBuffer565::new(240, 240);
+        screen.render(&chrome, false, &mut fb).unwrap();
+        (chrome, fb)
+    }
+
+    /// The proof that the rail's parameterisation is real, not claimed:
+    /// under both orientations, a live A label's `TEXT_SECONDARY` pixels
+    /// land inside A's own slot rect and in **none** of the other three
+    /// slot rects. The negative half is what makes this a proof rather
+    /// than a "some pixel exists somewhere" smoke test.
+    #[test]
+    fn mirroring_the_orientation_moves_both_the_edge_and_the_slot_order() {
+        for orientation in [PanelOrientation::ButtonsRight, PanelOrientation::ButtonsLeft] {
+            let widget = ButtonsOnlyWidget {
+                a: Some(ButtonLabel::Live(String::from("devs"))),
+                b: Some(ButtonLabel::Inert),
+                x: Some(ButtonLabel::Inert),
+                y: Some(ButtonLabel::Inert),
+            };
+            let (chrome, fb) = render_buttons_screen(orientation, widget);
+
+            let a_rect = slot_rect(&chrome, Button::A);
+            assert!(
+                any_pixel_of_color_in_rect(&fb, a_rect, palette::TEXT_SECONDARY),
+                "A's own slot must contain TEXT_SECONDARY pixels under {orientation:?}"
+            );
+            for other in [Button::B, Button::X, Button::Y] {
+                let other_rect = slot_rect(&chrome, other);
+                assert!(
+                    !any_pixel_of_color_in_rect(&fb, other_rect, palette::TEXT_SECONDARY),
+                    "slot for {other:?} must contain no TEXT_SECONDARY pixels under {orientation:?} -- \
+                     a mirror bug would leak A's label into the wrong slot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn buttons_right_a_slot_is_top_right_buttons_left_a_slot_is_bottom_left() {
+        // Exact rects from the design doc section 5, restated here as the
+        // load-bearing numbers rather than an inequality.
+        let right = super::super::chrome::compute_chrome_for(Size::new(240, 240), PanelOrientation::ButtonsRight);
+        assert_eq!(slot_rect(&right, Button::A), Rectangle::new(Point::new(206, 16), Size::new(34, 56)));
+
+        let left = super::super::chrome::compute_chrome_for(Size::new(240, 240), PanelOrientation::ButtonsLeft);
+        assert_eq!(slot_rect(&left, Button::A), Rectangle::new(Point::new(0, 184), Size::new(34, 56)));
+    }
+
+    #[test]
+    fn a_live_button_paints_text_secondary_inside_its_own_slot() {
+        let widget = ButtonsOnlyWidget { a: None, b: Some(ButtonLabel::Inert), x: Some(ButtonLabel::Live(String::from("link"))), y: Some(ButtonLabel::Inert) };
+        let (chrome, fb) = render_buttons_screen(PanelOrientation::ButtonsRight, widget);
+        let x_rect = slot_rect(&chrome, Button::X);
+        assert!(any_pixel_of_color_in_rect(&fb, x_rect, palette::TEXT_SECONDARY));
+    }
+
+    #[test]
+    fn an_inert_button_paints_divider_and_never_text_secondary_in_its_own_slot() {
+        let widget = ButtonsOnlyWidget { a: None, b: Some(ButtonLabel::Inert), x: Some(ButtonLabel::Inert), y: Some(ButtonLabel::Inert) };
+        let (chrome, fb) = render_buttons_screen(PanelOrientation::ButtonsRight, widget);
+        let x_rect = slot_rect(&chrome, Button::X);
+        assert!(
+            any_pixel_of_color_in_rect(&fb, x_rect, palette::DIVIDER),
+            "an inert slot still draws its dim letter in DIVIDER"
+        );
+        assert!(
+            !any_pixel_of_color_in_rect(&fb, x_rect, palette::TEXT_SECONDARY),
+            "an inert slot must never contain TEXT_SECONDARY -- that would be indistinguishable from live"
+        );
+    }
+
+    #[test]
+    fn widget_none_defers_to_the_screens_static_label() {
+        // No widget opinion (`x: None`) + a screen static Live("link") ->
+        // the screen's label wins and its text paints.
+        let widget = ButtonsOnlyWidget { a: None, b: None, x: None, y: None };
+        let mut screen = Screen::new("T", vec![Box::new(widget)]).with_button_labels(
+            ButtonLabel::Inert,
+            ButtonLabel::Live(String::from("link")),
+            ButtonLabel::Inert,
+        );
+        screen.initialize_focus();
+        let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
+        let mut fb = FrameBuffer565::new(240, 240);
+        screen.render(&chrome, false, &mut fb).unwrap();
+
+        let x_rect = slot_rect(&chrome, Button::X);
+        assert!(
+            any_pixel_of_color_in_rect(&fb, x_rect, palette::TEXT_SECONDARY),
+            "widget x: None must defer to the screen's static Live(\"link\") label"
+        );
+    }
+
+    #[test]
+    fn widget_some_inert_overrides_the_screens_static_live_label() {
+        // Same screen static label as above, but the widget actively
+        // overrides X to Inert -- proving Option-of-Option isn't
+        // decoration: without this override the pixels from the previous
+        // test would still be there.
+        let widget = ButtonsOnlyWidget { a: None, b: None, x: Some(ButtonLabel::Inert), y: None };
+        let mut screen = Screen::new("T", vec![Box::new(widget)]).with_button_labels(
+            ButtonLabel::Inert,
+            ButtonLabel::Live(String::from("link")),
+            ButtonLabel::Inert,
+        );
+        screen.initialize_focus();
+        let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
+        let mut fb = FrameBuffer565::new(240, 240);
+        screen.render(&chrome, false, &mut fb).unwrap();
+
+        let x_rect = slot_rect(&chrome, Button::X);
+        assert!(
+            !any_pixel_of_color_in_rect(&fb, x_rect, palette::TEXT_SECONDARY),
+            "widget x: Some(Inert) must override the screen's static Live label -- its text must not paint"
+        );
+        assert!(
+            any_pixel_of_color_in_rect(&fb, x_rect, palette::DIVIDER),
+            "the overridden slot renders as inert (dim letter)"
+        );
+    }
+
+    #[test]
+    fn a_16_character_label_never_paints_left_of_the_rails_own_left_edge() {
+        let widget = ButtonsOnlyWidget {
+            a: Some(ButtonLabel::Live(String::from("abcdefghijklmnop"))),
+            b: Some(ButtonLabel::Inert),
+            x: Some(ButtonLabel::Inert),
+            y: Some(ButtonLabel::Inert),
+        };
+        let (chrome, fb) = render_buttons_screen(PanelOrientation::ButtonsRight, widget);
+
+        let background = embedded_graphics::pixelcolor::Rgb565::default();
+        let rail_left = chrome.rail.top_left.x;
+        for y in chrome.rail.top_left.y..(chrome.rail.top_left.y + chrome.rail.size.height as i32) {
+            for x in 0..rail_left {
+                assert_eq!(
+                    fb.pixel(Point::new(x, y)),
+                    background,
+                    "an oversized label bled a non-background pixel to ({x}, {y}), left of the rail's own edge at x={rail_left}"
+                );
+            }
+        }
     }
 }

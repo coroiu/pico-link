@@ -29,10 +29,12 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::app::LinkState;
 use crate::input::NavIntent;
+use crate::panel::Button;
 use crate::platform::OutputRequest;
 
 use super::framebuffer::FrameBuffer565;
 use super::list::ListItemKey;
+use super::rail::ButtonLabel;
 use super::screen::Screen;
 
 /// High-level focus state transitions, decoupled from whatever transport
@@ -102,20 +104,20 @@ pub enum ChromeStatus {
     Neutral,
 }
 
-/// What a focused widget wants the chrome (title bar + hint bar) to show
-/// on its behalf, for the current frame. Returned fresh from
+/// What a focused widget wants the chrome (title bar + button rail) to
+/// show on its behalf, for the current frame. Returned fresh from
 /// [`Widget::chrome_contribution`] on every render rather than pushed/
 /// cached, so a store-backed widget that reads its live state every frame
 /// always reports whatever the current frame's true state actually is.
 ///
 /// Each field is independently optional: a widget can override just the
-/// hint text and leave the title/readout/status to their screen-level
+/// button labels and leave the title/readout/status to their screen-level
 /// defaults ([`super::screen::Screen::render`] falls back to the screen's
-/// static `title`/`hint` for a `None`, and simply omits the readout/status
-/// dot when those are `None`). This is the seam a detail-view (or any
-/// other content) widget uses to supply its own live title and hint
-/// without `Screen`/`chrome.rs` needing to know anything list-specific or
-/// detail-specific.
+/// static `title`/button labels for a `None`, and simply omits the
+/// readout/status dot when those are `None`). This is the seam a
+/// detail-view (or any other content) widget uses to supply its own live
+/// title and button labels without `Screen`/`chrome.rs` needing to know
+/// anything list-specific or detail-specific.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChromeContribution {
     /// Overrides the screen's static title, if set (e.g. a detail view
@@ -125,9 +127,20 @@ pub struct ChromeContribution {
     /// A right-aligned position readout (e.g. `"2 / 5"`), if this widget
     /// has a meaningful position/count to report.
     pub readout: Option<String>,
-    /// Overrides the screen's static hint text, if set (e.g. contextual
-    /// control legends that change with content state).
-    pub hint: Option<String>,
+    /// Overrides the screen's static A-button rail label, if set. See the
+    /// three-state table on [`ChromeContribution::button`]'s doc comment:
+    /// `None` here is "no opinion, defer to the screen", not "inert" —
+    /// that distinction is `Some(ButtonLabel::Inert)`.
+    pub a: Option<ButtonLabel>,
+    /// Overrides the screen's static B-button rail label, if set. **B's
+    /// text is always the constant "back"** — only `Navigator` (via
+    /// `Screen::render`'s `can_go_back` parameter) decides B's
+    /// *liveness*; nothing here or on `Screen` should author B's text.
+    pub b: Option<ButtonLabel>,
+    /// Overrides the screen's static X-button rail label, if set.
+    pub x: Option<ButtonLabel>,
+    /// Overrides the screen's static Y-button rail label, if set.
+    pub y: Option<ButtonLabel>,
     /// A status-dot color to paint in the title bar, if this widget has an
     /// app-wide status worth surfacing there.
     pub status: Option<ChromeStatus>,
@@ -153,6 +166,28 @@ pub struct ChromeContribution {
     /// a/b/x/y label fields) reads this bit to decide which label to
     /// show. Defaults to `false`.
     pub fallback: bool,
+}
+
+impl ChromeContribution {
+    /// Looks up this contribution's override for `button`, if any, by
+    /// logical identity — the accessor the rail iterates through in
+    /// physical [`crate::panel::PanelOrientation::slot_order`] to resolve
+    /// each slot.
+    ///
+    /// Returns `None` when this contribution has no opinion (defer to the
+    /// screen's static label) — that is a distinct third state from
+    /// `Some(&ButtonLabel::Inert)` (actively dead on this widget's watch).
+    /// See the field doc comments above: flattening this to
+    /// `Option<String>` would lose that distinction.
+    #[must_use]
+    pub fn button(&self, button: Button) -> Option<&ButtonLabel> {
+        match button {
+            Button::A => self.a.as_ref(),
+            Button::B => self.b.as_ref(),
+            Button::X => self.x.as_ref(),
+            Button::Y => self.y.as_ref(),
+        }
+    }
 }
 
 /// A retained-mode UI element. Implementors own their own state (selection
@@ -207,7 +242,7 @@ pub trait Widget {
         Action::None
     }
 
-    /// This widget's contribution to the chrome (title bar + hint bar) for
+    /// This widget's contribution to the chrome (title bar + button rail) for
     /// the current frame, if any. Only ever consulted for the *focused*
     /// widget on a screen (see `Screen::chrome_contribution`) — an
     /// unfocused widget has no business overriding chrome that isn't

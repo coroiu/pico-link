@@ -14,6 +14,9 @@
 //!
 //! Current contents:
 //! - [`input`]: the frozen `NavIntent` semantic input vocabulary.
+//! - [`panel`]: [`panel::PANEL`], the single knob for which edge the
+//!   physical button column is mounted on — read by the button rail
+//!   (`render::chrome`/`render::rail`) and, later, the volume gauge.
 //! - [`platform`]: the `DisplaySurface`/`InputSource`/`Clock`/`Storage`/
 //!   `PowerControl` trait seams, plus the [`platform::Platform`] bundle
 //!   trait that groups them.
@@ -52,6 +55,7 @@ extern crate alloc;
 
 pub mod app;
 pub mod input;
+pub mod panel;
 pub mod platform;
 pub mod power;
 pub mod render;
@@ -59,5 +63,6 @@ pub mod run;
 
 pub use app::{App, BtModel, Command, ConnectFailureReason, DeviceEntry, Event, LinkState};
 pub use input::NavIntent;
+pub use panel::{Button, Edge, PanelOrientation, PANEL};
 pub use power::{IdlePowerSetting, DEFAULT_DEEP_SLEEP_TIMEOUT, DEFAULT_IDLE_TIMEOUT};
 pub use run::run;

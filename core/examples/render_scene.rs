@@ -15,7 +15,7 @@ fn main() {
         ListItem::new("Device info").with_sublabel("Pico Plus 2 W"),
     ];
     let list = VerticalList::new(items);
-    let root = Screen::new("Pico Link", vec![Box::new(list)]).with_hint("Up/Down  Select  Back");
+    let root = Screen::new("Pico Link", vec![Box::new(list)]);
     let mut navigator = Navigator::new(root);
 
     // Move selection once, so the PNG visibly shows the selection highlight
