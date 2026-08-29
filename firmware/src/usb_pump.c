@@ -149,6 +149,18 @@ void pl_log(const char *fmt, ...) {
     mutex_exit(&pl_usb_mutex);
 }
 
+// Bead pico-link-l60: see usb_pump.h's doc comment on the declaration --
+// this is for callers that already hold pl_usb_mutex (currently just
+// usb_reset.c, called from inside tud_task() inside the worker IRQ). No
+// mutex_try_enter/exit, no drop counting: the caller has already paid for
+// exclusive access.
+void pl_log_locked(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+}
+
 void pl_usb_pump_report(void) {
     uint64_t now_us = time_us_64();
     if (s_last_report_us != 0 && now_us - s_last_report_us < 1000000) {

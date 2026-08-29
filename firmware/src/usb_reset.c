@@ -40,7 +40,7 @@ static uint16_t resetd_open(uint8_t __unused rhport, tusb_desc_interface_t const
     // interface at all, before picotool ever sends a control request --
     // its absence on the one verification flash means M3/M4 (descriptor /
     // driver dispatch), not the compiled-out-branch bug this file fixes.
-    pl_log("usb-reset: itf bound itf=%u\r\n", (unsigned)itf_num);
+    pl_log_locked("usb-reset: itf bound itf=%u\r\n", (unsigned)itf_num);
 
     return drv_len;
 }
@@ -57,7 +57,7 @@ static bool resetd_control_xfer_cb(uint8_t __unused rhport, uint8_t stage, tusb_
     // "picotool asked and our handler was wrong" (M1) even if the request
     // doesn't match RESET_REQUEST_BOOTSEL/RESET_REQUEST_FLASH.
     if (stage == CONTROL_STAGE_SETUP) {
-        pl_log(
+        pl_log_locked(
             "usb-reset: ctrl bmReq=0x%02x bReq=0x%02x wValue=0x%04x wIndex=%u\r\n",
             (unsigned)request->bmRequestType,
             (unsigned)request->bRequest,

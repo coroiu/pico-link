@@ -31,7 +31,7 @@
 // PICO_STDIO_USB_RESET_INTERFACE_SUPPORT_*` gates removed (both branches are
 // now unconditional), the activity-LED path dropped (this board doesn't
 // wire one), and PICO_STDIO_USB_RESET_BOOTSEL_INTERFACE_DISABLE_MASK
-// replaced with the literal 0u it always defaulted to. Two `pl_log` lines
+// replaced with the literal 0u it always defaulted to. Two `pl_log_locked` lines
 // added for bead pico-link-l60's one-shot hardware verification -- see
 // usb_reset.c.
 #ifndef PICO_LINK_USB_RESET_H
