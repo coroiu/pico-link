@@ -125,6 +125,11 @@ static bool pl_codec_sbc_init(
     // the negotiated sample rate. E.g. ~119B/128 samples @ 48kHz -> ~357kbps.
     out_frame->nominal_bitrate_bps =
         pcm_frames > 0 ? (uint32_t)(((uint64_t)frame_bytes * 8u * (uint64_t)cfg.sampling_frequency) / pcm_frames) : 0;
+    // Bead pico-link-pbv: measured max real encode_signed_16 call on real
+    // hardware across several runs was 574-582us (a2dp.c's enc_max_us,
+    // pico-link-19c/asj/pbv sessions); 800 is that plus margin, not a
+    // theoretical derivation. See pl_codec_frame_info_t's doc comment.
+    out_frame->worst_case_encode_us = 800;
 
     return true;
 }

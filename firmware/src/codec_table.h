@@ -33,6 +33,17 @@ typedef struct {
     uint16_t pcm_frames_per_encoded_frame; // e.g. SBC 48k/8sb/16blk -> 128
     uint16_t encoded_frame_bytes;          // 0 == variable, query per-encode
     uint32_t nominal_bitrate_bps;          // what the panel shows (S2)
+    // Bead pico-link-pbv: worst-case wall-clock time one encode() call can
+    // take, measured on real hardware plus margin -- NOT a live
+    // measurement (see a2dp.c's enc_max_us for that). This bounds
+    // frames_per_tick_cap (a2dp.c, computed at STREAM_ESTABLISHED as
+    // PL_A2DP_MAX_ENCODE_DWELL_US / worst_case_encode_us) so the media
+    // timer's per-tick IRQ dwell stays bounded even if credit-pacing
+    // (design sec 1) would otherwise allow more frames in one tick after a
+    // backlog. SBC's row sets 800 (measured max on real hardware was
+    // 574-582us across several runs; 800 is that plus margin, not a
+    // theoretical derivation -- see codec_sbc.c).
+    uint32_t worst_case_encode_us;
 } pl_codec_frame_info_t;
 
 // One codec table row. Statically allocated (one instance per codec,

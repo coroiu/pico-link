@@ -9,13 +9,39 @@
 // storage-buffer accumulate-then-send pattern -- mirrors BlueKitchen's own
 // ${PICO_SDK_PATH}/lib/btstack/example/a2dp_source_demo.c, read directly
 // from the pico-sdk's vendored btstack submodule (never USBPods -- GPL-3
-// would taint this whole binary, including core/ui-ffi). The ONE
-// substantive divergence (sec 11.2): a2dp_demo_audio_timeout_handler's
-// samples_ready accounting (elapsed_time * sample_rate, feeding a
-// synthetic sine/mod source) is REPLACED, not copied -- our audio comes
-// from pcm_ring.h's ring (fed by usb_audio.c's real USB PCM), and encode
-// work is capped at PL_A2DP_MAX_FRAMES_PER_TICK per timer tick rather than
-// ever trying to "catch up" on an unbounded backlog (design sec 3.5).
+// would taint this whole binary, including core/ui-ffi).
+//
+// The divergence from the demo (sec 11.2), NARROWED after bead
+// pico-link-pbv -- the original wording here ("encode work is capped at
+// PL_A2DP_MAX_FRAMES_PER_TICK per timer tick") is what let a real bug
+// hide behind a plausible-sounding sentence for one whole milestone, so
+// stated precisely this time: the demo's a2dp_demo_audio_timeout_handler
+// derives elapsed_time * sample_rate to decide how many SAMPLES its
+// SYNTHETIC source produced this tick -- it doesn't need a per-tick frame
+// cap because a synthetic source can never build an unbounded backlog.
+// Our audio is real, ring-fed PCM (pcm_ring.h, from usb_audio.c's real USB
+// arrival), which CAN build a backlog (a stall, a late tick) -- so unlike
+// the demo, this file's drain genuinely needs both things design sec 1
+// requires: a real clock (samples_owed, credit-pacing accrued from
+// time_us_64() deltas at microsecond resolution -- pl_a2dp_ctx_t's doc
+// comment below) so steady-state throughput is exactly the RP2350
+// crystal's 375 SBC-frames/s regardless of tick jitter or MTU alignment,
+// AND a bounded per-tick dwell cap (frames_per_tick_cap, computed at
+// STREAM_ESTABLISHED from the negotiated payload size and the codec's
+// worst_case_encode_us -- codec_table.h) so a real backlog can never make
+// one IRQ dwell arbitrarily long. Before pico-link-pbv this file had ONLY
+// the second half (a fixed PL_A2DP_MAX_FRAMES_PER_TICK=5) and NO clock at
+// all -- pl_a2dp_fill_sbc_buffer was a pure data-driven drain, exactly
+// what design sec 1 (lines 44-48) names and forbids, and it only looked
+// stable because the accidental rate limiter (cap 5 x the negotiated
+// payload's frame-boundary interaction x the real ~91Hz tick rate = ~319
+// frames/s) happened to sit below the 375 frames/s real-time demand.
+// Raising the cap alone (to e.g. 7) would have removed that accidental
+// limiter without replacing it with a real one -- the ring would drain
+// faster than the host supplies, empty out, and look "fixed" for about
+// ten seconds before failing the other direction. See bead pico-link-pbv's
+// comment history for the measurement that found this and Ada's design
+// for the fix.
 //
 // IRQ-context contract (design sec 5): pl_a2dp_media_timer_handler,
 // pl_a2dp_fill_sbc_buffer, and pl_a2dp_send_media_packet run in the
@@ -41,6 +67,7 @@
 #include "codec_sbc.h"
 #include "codec_table.h"
 #include "pcm_ring.h"
+#include "usb_audio.h"
 #include "usb_pump.h"
 
 // Matches a2dp_source_demo.c's SBC_STORAGE_SIZE -- generous headroom over
@@ -52,9 +79,16 @@
 // A2DP media stream -- matches a2dp_source_demo.c's own AUDIO_TIMEOUT_MS.
 #define PL_A2DP_AUDIO_TIMEOUT_MS 10
 
-// design sec 3.5 / sec 5: cap encode work per tick at ~one media packet's
-// worth. Never "catch up" unboundedly.
-#define PL_A2DP_MAX_FRAMES_PER_TICK 5
+// Bead pico-link-pbv: PL_A2DP_MAX_FRAMES_PER_TICK (a fixed constant, 5) is
+// GONE -- replaced by s_ctx.frames_per_tick_cap, computed once per stream
+// at STREAM_ESTABLISHED from the negotiated payload size and the codec's
+// worst_case_encode_us (codec_table.h), bounding the same "one IRQ dwell
+// must stay bounded" property (design sec 3.5/5) but now correctly, in
+// terms of what was actually negotiated rather than a guessed constant.
+// This is a SAFETY bound on top of, not instead of, the real clock
+// (samples_owed credit-pacing below) -- see the module doc's sec 11.2
+// rewrite for why both are required together.
+#define PL_A2DP_MAX_ENCODE_DWELL_US 6000u
 
 // design sec 3.5 case 2 ("host silent"): no PCM available for >200ms while
 // streaming is not a fault (the user paused) -- auto-pause and re-prime
@@ -102,24 +136,71 @@ typedef struct {
     volatile uint32_t pkt_sent;
     volatile uint32_t pkt_fail;
 
-    // --- bead pico-link-pbv instrumentation: is the media timer firing at
-    // its intended ~10ms cadence, and is the fill loop actually draining
-    // PL_A2DP_MAX_FRAMES_PER_TICK frames per tick? Counters only, updated
+    // --- bead pico-link-pbv tick-cadence instrumentation: is the media
+    // timer firing at its intended ~10ms cadence? Counters only, updated
     // from IRQ context (same producer as the block above), read from
     // pl_a2dp_report (thread context) -- never pl_log from the hot path
-    // itself. worst_tick_interval_us/tick_count answer "how fast is the
-    // timer really firing"; frames_filled_total (divided by tick_count
-    // between two report samples) answers "how many frames/tick are we
-    // actually filling" against the PL_A2DP_MAX_FRAMES_PER_TICK=5 cap.
+    // itself. last_tick_us doubles as the credit-pacing clock's own
+    // elapsed-time source below -- one time_us_64() delta serves both.
     volatile uint64_t last_tick_us;
     volatile uint32_t worst_tick_interval_us;
     volatile uint32_t tick_count;
-    volatile uint32_t frames_filled_total;
+    // Cumulative frames actually encoded -- the RATE (delta between two
+    // pl_a2dp_report samples, ~1s apart) is what the pbv acceptance
+    // criterion calls "enc_frames": must read 375 +/- 2 per second in
+    // steady state once credit-pacing is correct. Renamed from
+    // frames_filled_total (pbv's original diagnostic-only name) to match
+    // the design's own vocabulary now that it is a real pass/fail signal,
+    // not just a diagnostic.
+    volatile uint32_t enc_frames_total;
     // Tests a specific hypothesis: does the fill loop stall waiting on
     // BTstack's async A2DP_SUBEVENT_STREAMING_CAN_SEND_MEDIA_PACKET_NOW
     // grant (the sbc_ready_to_send handoff below) for a meaningful
-    // fraction of ticks? Counter only.
+    // fraction of ticks? Counter only. Measured 0 for the entire pbv
+    // investigation run -- kept as an ongoing regression check.
     volatile uint32_t ticks_send_pending;
+
+    // --- bead pico-link-pbv FIX (Ada's design, accepted 2026-08-29):
+    // credit-pacing gives pl_a2dp_fill_sbc_buffer a real clock instead of
+    // being a pure data-driven drain (design sec 1, forbidden verbatim at
+    // .planning/design/2026-08-29-a2dp-source-pipeline.md lines 44-48).
+    // samples_owed is PCM SAMPLE-FRAMES (not SBC-encoded frames -- stays
+    // correct across codecs with a different pcm_frames_per_encoded_frame,
+    // e.g. a future LDAC row) owed and not yet encoded, accrued every
+    // media-timer tick from a REAL time_us_64() delta at microsecond
+    // resolution: owed_us_hz = elapsed_us * sample_rate_hz +
+    // samples_owed_rem_us (the sub-sample-frame remainder carried forward
+    // so long-run accrual has ZERO systematic drift from truncation --
+    // same idea as a2dp_source_demo.c's own acc_num_missed_samples, just
+    // at us instead of ms resolution). The fill loop may encode a frame
+    // only while samples_owed >= pcm_frames_per_encoded_frame, decrementing
+    // it by that amount each time -- so steady-state throughput is exactly
+    // sample_rate_hz/pcm_frames_per_encoded_frame (375/s at 48kHz/128),
+    // pinned to the RP2350 crystal, independent of tick cadence, MTU, or
+    // any per-tick cap. Both fields are RESET to 0 at STREAM_STARTED (not
+    // before -- accrual during IDLE/PRIMING is harmless and discarded
+    // there) so the credit clock always starts fresh exactly when real
+    // streaming begins, never carrying a fake backlog from however long
+    // priming took.
+    volatile uint32_t samples_owed;
+    volatile uint32_t samples_owed_rem_us;
+
+    // Computed once per stream at STREAM_ESTABLISHED (replaces the deleted
+    // PL_A2DP_MAX_FRAMES_PER_TICK constant) -- see PL_A2DP_MAX_ENCODE_DWELL_US's
+    // doc comment above. This is a SAFETY bound on top of the credit clock,
+    // not a substitute for it.
+    uint32_t frames_per_tick_cap;
+    // Falsifier counter (pico-link-pbv acceptance): nonzero in steady
+    // state would mean the dwell-safety cap, not the credit clock, is what
+    // is actually limiting throughput -- i.e. the fix did not really take.
+    volatile uint32_t ticks_cap_bound;
+
+    // Bead pico-link-pbv (C5): cumulative frames dropped by
+    // pl_pcm_trim_to() at the PRIMING->STREAMING transition -- see that
+    // call site. Acceptance requires this stay 0 in a healthy run; nonzero
+    // means priming is regularly overshooting the target fill by more than
+    // a trivial amount.
+    volatile uint32_t resync_drops;
 } pl_a2dp_ctx_t;
 
 static pl_a2dp_ctx_t s_ctx;
@@ -181,14 +262,23 @@ static void pl_a2dp_avrcp_controller_packet_handler(uint8_t packet_type, uint16_
     (void)size;
 }
 
-// Fills s_ctx.sbc_storage from the PCM ring, up to PL_A2DP_MAX_FRAMES_PER_TICK
-// encoded frames or until the storage buffer can't hold another whole
-// frame within max_media_payload_size, whichever comes first -- mirrors
-// a2dp_demo_fill_sbc_audio_buffer's two stop conditions exactly, with
-// "samples_ready >= needed" replaced by "the ring actually has that much
-// PCM buffered" (the sec 11.2 divergence). IRQ context (0xFF) -- see this
-// file's module doc. No allocation (s_pcm_scratch is static), no logging,
-// no blocking; codec->encode() carries the same contract (codec_table.h).
+// Fills s_ctx.sbc_storage from the PCM ring under CREDIT PACING (bead
+// pico-link-pbv fix -- see the module doc's sec 11.2 rewrite and
+// s_ctx.samples_owed's doc comment for why this replaced a pure
+// data-driven drain). IRQ context (0xFF) -- see this file's module doc.
+// No allocation (s_pcm_scratch is static), no logging, no blocking;
+// codec->encode() carries the same contract (codec_table.h).
+//
+// The three stop conditions are checked IN THIS ORDER -- credit, then
+// packet-full, then ring-empty -- because the order is what makes
+// `starved` (and therefore underrun_events/silent_ticks) mean anything.
+// Under credit pacing, frames_this_tick == 0 ROUTINELY means "the clock
+// owed less than one whole frame this tick" (normal -- most ticks fire
+// faster than one SBC frame's worth of real time, ~2.67ms at 48kHz/128),
+// NOT "the ring is empty". Only the ring-empty check, reached with the
+// clock AND packet room both still willing, is a real starvation signal
+// -- conflating the two would fire underrun_events (and eventually
+// a2dp_source_pause_stream) on ordinary ticks, mid-music.
 static void pl_a2dp_fill_sbc_buffer(void) {
     uint16_t frame_bytes = s_ctx.frame.encoded_frame_bytes;
     uint16_t pcm_frame_count = s_ctx.frame.pcm_frames_per_encoded_frame;
@@ -203,8 +293,27 @@ static void pl_a2dp_fill_sbc_buffer(void) {
     }
 
     uint8_t frames_this_tick = 0;
-    while (frames_this_tick < PL_A2DP_MAX_FRAMES_PER_TICK && pl_pcm_fill_bytes() >= pcm_bytes_needed &&
-           (uint32_t)(s_ctx.sbc_storage_count + frame_bytes) <= (uint32_t)s_ctx.max_media_payload_size) {
+    bool starved = false;
+    while (frames_this_tick < s_ctx.frames_per_tick_cap) {
+        // 1. Credit: has the real-time clock actually owed us a whole
+        // encoded frame's worth of samples yet? Most-common stop reason
+        // by far in steady state -- not a fault.
+        if (s_ctx.samples_owed < pcm_frame_count) {
+            break;
+        }
+        // 2. Packet-full: is there room for one more frame in the current
+        // AVDTP payload? Also not a fault -- just means it's time to send.
+        if ((uint32_t)(s_ctx.sbc_storage_count + frame_bytes) > (uint32_t)s_ctx.max_media_payload_size) {
+            break;
+        }
+        // 3. Ring-empty: the clock says we should encode and there is
+        // room to, but the ring genuinely has nothing to give us. This is
+        // the ONE true starvation signal.
+        if (pl_pcm_fill_bytes() < pcm_bytes_needed) {
+            starved = true;
+            break;
+        }
+
         uint32_t got = pl_pcm_read((uint8_t *)s_pcm_scratch, pcm_bytes_needed);
         if (got != pcm_bytes_needed) {
             break; // ring gave less than its own fill_bytes() promised -- shouldn't happen, defend anyway
@@ -225,16 +334,23 @@ static void pl_a2dp_fill_sbc_buffer(void) {
         }
 
         s_ctx.sbc_storage_count = (uint16_t)(s_ctx.sbc_storage_count + written);
+        s_ctx.samples_owed -= pcm_frame_count;
         frames_this_tick++;
     }
 
-    // Bead pico-link-pbv: cumulative frames actually filled, for computing
-    // an average frames/tick against PL_A2DP_MAX_FRAMES_PER_TICK's cap of
-    // 5 once divided by the tick_count delta between two report samples
-    // (pl_a2dp_report, thread context). Counter only.
-    s_ctx.frames_filled_total += frames_this_tick;
+    // Cumulative -- see enc_frames_total's doc comment on pl_a2dp_ctx_t
+    // for the acceptance-criterion rate this feeds.
+    s_ctx.enc_frames_total += frames_this_tick;
 
-    if (frames_this_tick == 0) {
+    // Falsifier counter: were we still going when the dwell-safety cap
+    // itself stopped us (as opposed to credit/packet/ring)? Nonzero in
+    // steady state means the cap, not the clock, is the real limiter --
+    // see PL_A2DP_MAX_ENCODE_DWELL_US's doc comment.
+    if (frames_this_tick == s_ctx.frames_per_tick_cap) {
+        s_ctx.ticks_cap_bound++;
+    }
+
+    if (starved) {
         s_ctx.underrun_events++;
         s_ctx.silent_ticks++;
     } else {
@@ -272,15 +388,30 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_add_timer(ts);
 
     // Bead pico-link-pbv: measure the REAL interval between calls to this
-    // handler, not the nominal PL_A2DP_AUDIO_TIMEOUT_MS. Counter only --
-    // no pl_log, matches usb_pump.c's own worst_interval_us pattern for
-    // exactly this class of measurement.
+    // handler, not the nominal PL_A2DP_AUDIO_TIMEOUT_MS -- no pl_log,
+    // matches usb_pump.c's own worst_interval_us pattern for exactly this
+    // class of measurement. The SAME elapsed_us also drives credit-pacing
+    // accrual below (s_ctx.samples_owed's doc comment) -- one
+    // time_us_64() delta, two consumers.
     uint64_t pbv_now_us = time_us_64();
     if (s_ctx.last_tick_us != 0) {
-        uint32_t pbv_interval_us = (uint32_t)(pbv_now_us - s_ctx.last_tick_us);
-        if (pbv_interval_us > s_ctx.worst_tick_interval_us) {
-            s_ctx.worst_tick_interval_us = pbv_interval_us;
+        uint32_t elapsed_us = (uint32_t)(pbv_now_us - s_ctx.last_tick_us);
+        if (elapsed_us > s_ctx.worst_tick_interval_us) {
+            s_ctx.worst_tick_interval_us = elapsed_us;
         }
+
+        // Credit-pacing accrual (bead pico-link-pbv fix). Accrues
+        // unconditionally every tick, including IDLE/PRIMING -- harmless,
+        // since STREAM_STARTED resets samples_owed/samples_owed_rem_us to
+        // 0, so accrual only ever matters from the instant real streaming
+        // begins. sample_rate_hz falls back to 48000 before the first
+        // codec negotiation has populated s_ctx.format (a2dp.c never
+        // reaches STREAMING before that anyway, so this only affects
+        // idle-tick bookkeeping that gets discarded regardless).
+        uint32_t sample_rate = s_ctx.format.sample_rate_hz != 0 ? s_ctx.format.sample_rate_hz : 48000u;
+        uint64_t owed_us_hz = (uint64_t)elapsed_us * sample_rate + s_ctx.samples_owed_rem_us;
+        s_ctx.samples_owed += (uint32_t)(owed_us_hz / 1000000u);
+        s_ctx.samples_owed_rem_us = (uint32_t)(owed_us_hz % 1000000u);
     }
     s_ctx.last_tick_us = pbv_now_us;
     s_ctx.tick_count++;
@@ -446,6 +577,49 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.rtp_timestamp = 0;
             s_ctx.silent_ticks = 0;
             s_ctx.pause_requested = false;
+
+            // Bead pico-link-pbv (C3): frames_per_tick_cap, replacing the
+            // deleted PL_A2DP_MAX_FRAMES_PER_TICK constant -- computed
+            // from what was ACTUALLY negotiated (this connection's real
+            // payload size and the codec row's measured worst-case encode
+            // time) rather than a guessed-at fixed number. Two
+            // independent ceilings, take the tighter: frames_per_packet
+            // (how many frames fit in one AVDTP payload -- no reason to
+            // ever fill more than that in one tick) and dwell_cap (how
+            // many encode() calls fit inside the IRQ-dwell safety budget,
+            // PL_A2DP_MAX_ENCODE_DWELL_US, at this codec's
+            // worst_case_encode_us). MAX(1, ...) so a degenerate
+            // negotiation (a tiny MTU) can never produce a cap of 0 and
+            // stall the drain entirely.
+            uint32_t frames_per_packet = s_ctx.frame.encoded_frame_bytes > 0
+                                              ? (uint32_t)s_ctx.max_media_payload_size / s_ctx.frame.encoded_frame_bytes
+                                              : 1u;
+            uint32_t dwell_cap = s_ctx.frame.worst_case_encode_us > 0
+                                      ? PL_A2DP_MAX_ENCODE_DWELL_US / s_ctx.frame.worst_case_encode_us
+                                      : frames_per_packet;
+            s_ctx.frames_per_tick_cap = btstack_max(1u, btstack_min(frames_per_packet, dwell_cap));
+            // Signalling context, not the media hot path -- pl_log is
+            // fine here (see this file's module doc). Startup-only line,
+            // not rate-limited: fires once per stream, same as the
+            // "stream established"/"codec=" lines already here.
+            pl_log(
+                "a2dp: frames_per_tick_cap=%lu (frames_per_packet=%lu dwell_cap=%lu worst_case_encode_us=%lu)\r\n",
+                (unsigned long)s_ctx.frames_per_tick_cap, (unsigned long)frames_per_packet, (unsigned long)dwell_cap,
+                (unsigned long)s_ctx.frame.worst_case_encode_us
+            );
+
+            // Bead pico-link-pbv (C1): without this, the ~31KB already
+            // sitting in the ring from before this connection (or from a
+            // reflash-then-reconnect cycle during testing) never drains --
+            // once the credit clock makes drain rate exactly equal supply
+            // rate by construction, the controller's own +/-500ppm
+            // authority (design sec 2.1) is the ONLY thing that can ever
+            // reduce fill, and 500ppm of 192 B/ms is ~0.096 B/ms: clearing
+            // a 31KB head start would take on the order of 280 SECONDS.
+            // pl_pcm_reset() before PRIMING starts is the fix -- see
+            // pcm_ring.h's doc comment; consumer-side, safe to call here.
+            pl_pcm_reset();
+
             pl_log("a2dp: stream established, max_media_payload_size=%d\r\n", s_ctx.max_media_payload_size);
             // design sec 3.5 case 3: prime before starting -- see this
             // file's PL_A2DP_MEDIA_PRIMING doc comment.
@@ -458,6 +632,25 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.state = PL_A2DP_MEDIA_STREAMING;
             s_ctx.silent_ticks = 0;
             s_ctx.pause_requested = false;
+            // Bead pico-link-pbv (C4): the credit-pacing clock starts
+            // fresh exactly at the instant real streaming begins -- any
+            // accrual from IDLE/PRIMING ticks (harmless, unconditional --
+            // see the media timer handler's doc comment) is discarded
+            // here rather than carried forward as a false backlog that
+            // would let the very first ticks of streaming burst ahead of
+            // real time.
+            s_ctx.samples_owed = 0;
+            s_ctx.samples_owed_rem_us = 0;
+            // Bead pico-link-pbv (C5): PRIMING's own wait condition is
+            // "fill >= target", checked once per ~10ms tick -- a few more
+            // USB packets can land between that check passing and this
+            // event actually arriving, so fill can be slightly ABOVE
+            // target here. Trim the overshoot down to exactly target so
+            // streaming starts at the intended ~24ms latency, not
+            // whatever it happened to overshoot to. Counted, not silent --
+            // acceptance requires this stay 0 in a healthy run (see
+            // resync_drops's doc comment on pl_a2dp_ctx_t).
+            s_ctx.resync_drops += pl_pcm_trim_to(PL_PCM_TARGET_FILL_BYTES);
             pl_log("a2dp: stream started\r\n");
             pl_bt_push_link_state_connected();
             // S1's table has exactly one row -- SBC is never "not the
@@ -617,16 +810,35 @@ void pl_a2dp_report(void) {
         "a2dp: enc_max_us=%lu pkt_sent=%lu pkt_fail=%lu misaligned=%lu\r\n", (unsigned long)s_ctx.enc_max_us,
         (unsigned long)s_ctx.pkt_sent, (unsigned long)s_ctx.pkt_fail, (unsigned long)pl_pcm_misaligned()
     );
-    // Bead pico-link-pbv: cumulative, never reset -- compute deltas
-    // between two consecutive report lines (1s apart) to get real tick
-    // rate (tick_count delta) and average frames/tick (frames_filled_total
-    // delta / tick_count delta) against the PL_A2DP_MAX_FRAMES_PER_TICK=5
-    // cap. worst_tick_interval_us is the worst single interval seen since
-    // streaming started (never reset, so it only ever grows -- a spike
-    // stays visible even if the average recovers).
+    // Cumulative, never reset -- compute deltas between two consecutive
+    // report lines (~1s apart) to get real tick rate (tick_count delta)
+    // and enc_frames RATE (enc_frames_total delta, the pbv acceptance
+    // criterion: must read 375 +/- 2 per second in steady state).
+    // worst_tick_interval_us is the worst single interval seen since
+    // streaming started (never reset, so a spike stays visible even if
+    // the average recovers) -- also falsifier #1 (pico-link-pbv): must
+    // stay below 2000us for the 0xC0 USB worker's own report
+    // (pl_usb_pump_report), a DIFFERENT counter than this one; if IT rises
+    // above 2000us after this fix ships, the priority-preemption model
+    // this fix relies on (usb_pump.c:20-22, worker at 0xC0 preempts this
+    // file's 0xFF encode loop) is wrong and the change should be reverted.
     pl_log(
-        "a2dp: tick_count=%lu worst_tick_interval_us=%lu frames_filled_total=%lu ticks_send_pending=%lu\r\n",
+        "a2dp: tick_count=%lu worst_tick_interval_us=%lu enc_frames_total=%lu ticks_send_pending=%lu\r\n",
         (unsigned long)s_ctx.tick_count, (unsigned long)s_ctx.worst_tick_interval_us,
-        (unsigned long)s_ctx.frames_filled_total, (unsigned long)s_ctx.ticks_send_pending
+        (unsigned long)s_ctx.enc_frames_total, (unsigned long)s_ctx.ticks_send_pending
+    );
+    // Bead pico-link-pbv fix instrumentation. fill_ema/fill_min come from
+    // usb_audio.c's feedback task (its own ~1ms sampling of
+    // pl_pcm_fill_bytes(), far finer-grained than this file's ~11ms tick)
+    // -- see design sec 2.1 for why the EMA, not raw fill, is the correct
+    // thing to evaluate the pass criterion against. Acceptance: fill_ema
+    // in 3456..5760, fill_min >= 1024, ovr_frames 0 and flat over >= 5
+    // minutes, resync_drops == 0. ticks_cap_bound nonzero in steady state
+    // is a falsifier (the dwell-safety cap, not the credit clock, would be
+    // the real limiter -- see frames_per_tick_cap's doc comment).
+    pl_log(
+        "a2dp: frames_per_tick_cap=%lu ticks_cap_bound=%lu resync_drops=%lu fill_ema=%ld fill_min=%lu\r\n",
+        (unsigned long)s_ctx.frames_per_tick_cap, (unsigned long)s_ctx.ticks_cap_bound,
+        (unsigned long)s_ctx.resync_drops, (long)pl_usb_audio_fb_fill_ema(), (unsigned long)pl_usb_audio_fill_min()
     );
 }

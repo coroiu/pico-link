@@ -320,9 +320,20 @@ void pl_usb_audio_task(void) {
 #define PL_FB_MAX_PPM 500
 
 static int32_t s_fb_fill_ema;
+// Bead pico-link-pbv (C6): running minimum of the raw (non-EMA'd) fill
+// level, sampled at this function's own ~1ms cadence -- the finest-grained
+// sampling of pl_pcm_fill_bytes() anywhere in this firmware, so the true
+// sawtooth trough is far more likely to be caught here than at a2dp.c's
+// coarser ~11ms media-timer cadence. UINT32_MAX sentinel means "never
+// sampled yet" (link not up / no streaming started).
+static uint32_t s_fill_min = 0xFFFFFFFFu;
 
 void pl_usb_audio_feedback_task(void) {
-    s_fb_fill_ema += ((int32_t)pl_pcm_fill_bytes() - s_fb_fill_ema) >> 6;
+    uint32_t fill_now = pl_pcm_fill_bytes();
+    if (fill_now < s_fill_min) {
+        s_fill_min = fill_now;
+    }
+    s_fb_fill_ema += ((int32_t)fill_now - s_fb_fill_ema) >> 6;
     int32_t err_bytes = s_fb_fill_ema - (int32_t)PL_PCM_TARGET_FILL_BYTES;
     int32_t ppm = -(err_bytes * PL_FB_MAX_PPM) / (int32_t)PL_PCM_TARGET_FILL_BYTES;
     if (ppm > PL_FB_MAX_PPM) {
@@ -332,6 +343,23 @@ void pl_usb_audio_feedback_task(void) {
         ppm = -PL_FB_MAX_PPM;
     }
     tud_audio_fb_set((uint32_t)((int32_t)PL_FB_NOMINAL_Q16 + (int32_t)((int64_t)PL_FB_NOMINAL_Q16 * ppm / 1000000)));
+}
+
+// Bead pico-link-pbv (C6): exposes the EMA pl_usb_audio_feedback_task
+// already computes every ~1ms, for pl_a2dp_report (thread context) to
+// print -- see design sec 2.1's doc comment on why the EMA, not raw fill,
+// is the correct thing to evaluate the closed-loop pass criterion against
+// (raw fill sawtooths by roughly one tick's worth, comparable to the
+// target itself).
+int32_t pl_usb_audio_fb_fill_ema(void) {
+    return s_fb_fill_ema;
+}
+
+// Bead pico-link-pbv (C6): the running minimum s_fill_min above. Read-only
+// snapshot, safe from thread context (pl_a2dp_report) -- a plain aligned
+// 32-bit read, same convention as every other counter in this file.
+uint32_t pl_usb_audio_fill_min(void) {
+    return s_fill_min;
 }
 
 bool pl_usb_audio_streaming(void) {

@@ -114,4 +114,21 @@ uint32_t pl_usb_audio_clk_get_valid(void);
 // working rather than just "macOS opened the pipe".
 uint32_t pl_usb_audio_fb_sends(void);
 
+// --- Instrumentation (bead pico-link-pbv, C6) ---
+// Both read the state pl_usb_audio_feedback_task() already maintains at
+// its own ~1ms cadence -- the finest-grained sampling of ring fill
+// anywhere in this firmware. Safe to call from thread context
+// (pl_a2dp_report); plain aligned reads, no locking needed.
+
+// The EMA fill level pl_usb_audio_feedback_task's P controller already
+// computes (design sec 2.1) -- the correct value to evaluate the
+// closed-loop pass criterion against, not the raw/instantaneous fill.
+int32_t pl_usb_audio_fb_fill_ema(void);
+
+// Running minimum of the raw fill level since boot (or since the last
+// value below UINT32_MAX -- there is no reset; a stream restart just
+// keeps tightening whatever minimum it already saw). Answers "did the
+// ring ever actually run dry", which the EMA alone cannot.
+uint32_t pl_usb_audio_fill_min(void);
+
 #endif // PICO_LINK_USB_AUDIO_H

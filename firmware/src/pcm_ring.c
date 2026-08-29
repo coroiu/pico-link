@@ -112,6 +112,23 @@ void pl_pcm_reset(void) {
     s_tail = s_head;
 }
 
+uint32_t pl_pcm_trim_to(uint32_t target_bytes) {
+    // Consumer side only -- same read-head/write-tail discipline as
+    // pl_pcm_reset() above, just a partial drop instead of a full one.
+    target_bytes -= target_bytes % PL_PCM_FRAME_BYTES;
+
+    uint32_t head = s_head;
+    uint32_t tail = s_tail;
+    uint32_t used = (head - tail) & PL_PCM_RING_MASK;
+    if (used <= target_bytes) {
+        return 0; // already at or under target -- the common case
+    }
+
+    uint32_t drop_bytes = used - target_bytes;
+    s_tail = (tail + drop_bytes) & PL_PCM_RING_MASK;
+    return drop_bytes / PL_PCM_FRAME_BYTES;
+}
+
 uint32_t pl_pcm_overrun_frames(void) {
     return s_overrun_frames;
 }
