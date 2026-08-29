@@ -17,7 +17,9 @@
 #include <stdio.h>
 
 #include "btstack.h"
+#include "hardware/gpio.h"
 #include "hardware/spi.h"
+#include "pico/bootrom.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 #include "tusb.h"
@@ -294,8 +296,41 @@ int main(void) {
     // added a flat 16ms on top of a body that was already the dominant
     // cost, for no reason -- it never actually paced anything to 60Hz.
     const uint64_t frame_budget_us = 16000;
+    // Bead pico-link-l60 (C): hardware-independent BOOTSEL escape hatch --
+    // hold X+Y to force BOOTSEL regardless of whether picotool's software
+    // reset path (usb_reset.c) works, so a bad flash never costs more than
+    // one physical replug ever again. Read raw GPIOs directly rather than
+    // going through pl_link_input_poll: that path is deliberately
+    // press-EDGE-only (see input.h's module doc) and cannot express a
+    // hold. Pull-ups are configured by pl_link_input_init() (called
+    // above), so 0 == pressed. Two simultaneous buttons is not a UI
+    // gesture, so this cannot collide with navigation, and it runs in
+    // thread context, not the 0xC0 IRQ worker.
+    //
+    // 60 loop iterations is NOT ~1s of wall-clock hold time here, despite
+    // the frame_budget_us above being 16000 -- that budget is a target,
+    // not a measured pace, and this file's own pico-link-tfj comments note
+    // the loop body (blit alone) measures ~38.6ms, well over budget most
+    // iterations. At that real pace 60 iterations is closer to 2-3s. The
+    // counter is left at 60 anyway (a slightly-longer-than-a-second hold
+    // is exactly what you want from an escape hatch -- it must not fire on
+    // an accidental two-button bump), but a hold that "hasn't triggered
+    // yet" at the 1s mark is expected, not evidence the hatch is broken.
+    uint32_t xy_held_frames = 0;
+    const uint32_t xy_held_frames_for_reset = 60; // ~2-3s at this loop's real (not budgeted) pace -- see comment above
+
     while (true) {
         uint64_t frame_start_us = time_us_64();
+
+        if (gpio_get(PL_INPUT_PIN_X) == 0 && gpio_get(PL_INPUT_PIN_Y) == 0) {
+            xy_held_frames++;
+            if (xy_held_frames >= xy_held_frames_for_reset) {
+                reset_usb_boot(0, 0);
+                // does not return
+            }
+        } else {
+            xy_held_frames = 0;
+        }
 
         size_t n = pl_link_input_poll(intents, 8);
         if (n > 0) {

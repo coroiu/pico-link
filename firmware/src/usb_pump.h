@@ -59,6 +59,24 @@ void pl_usb_pump_init(void);
 // the other.
 void pl_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// Bead pico-link-l60: for callers that are ALREADY running inside the 0xC0
+// worker IRQ with pl_usb_mutex held -- concretely, usb_reset.c's
+// resetd_open/resetd_control_xfer_cb, which are only ever reached from
+// tud_task(), which is only ever called from pl_usb_pump_worker_irq()
+// while it holds pl_usb_mutex (see usb_pump.c:97101). Calling plain
+// pl_log() from there is a guaranteed-every-time no-op: pl_usb_mutex is a
+// plain non-recursive mutex_t whose ownership check is by CORE NUMBER, not
+// call depth (pico/lock_core.h), so mutex_try_enter() returns false for
+// the very core that already owns it, and the message is silently counted
+// as a drop and never printed. This variant skips mutex_try_enter/exit
+// entirely and goes straight to vprintf -- correct ONLY when the caller
+// can prove it already holds the lock. Do NOT call this from anywhere
+// that isn't already inside the worker's critical section, and do NOT
+// make pl_usb_mutex recursive to paper over a future misuse -- the
+// non-reentrancy guard at usb_pump.c's mutex_try_enter is load-bearing
+// (see this file's module doc).
+void pl_log_locked(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 // Producer-side push into the pump's SRAM (NOT PSRAM -- an IRQ-context
 // write through the QMI XIP path is not a latency you want against a 1ms
 // deadline) SPSC PCM ring. Called only from usb_audio.c's

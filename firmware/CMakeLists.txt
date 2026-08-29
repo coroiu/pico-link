@@ -83,6 +83,7 @@ add_executable(pico_link
     src/usb_descriptors.c
     src/usb_audio.c
     src/usb_pump.c
+    src/usb_reset.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
@@ -101,7 +102,17 @@ pico_set_program_version(pico_link "0.1.0")
 pico_enable_stdio_usb(pico_link 1)
 pico_enable_stdio_uart(pico_link 0)
 target_compile_definitions(pico_link PRIVATE
-    PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=1
+    # Bead pico-link-l60: pico-sdk's own reset_interface.c is now compiled
+    # down to nothing (this flag guards its ENTIRE #if block, including the
+    # usbd_app_driver_get_cb definition) -- this project owns the reset
+    # class driver directly in src/usb_reset.c instead, unconditionally,
+    # because reset_interface.c's BOOTSEL/FLASH branches were silently
+    # compiled OUT by this project's own tusb_config.h replacing
+    # pico_stdio_usb's (see usb_reset.h's module doc for the full
+    # mechanism). Setting this to 0 also frees the strong
+    # usbd_app_driver_get_cb symbol for usb_reset.c to provide -- two
+    # definitions would be a link error.
+    PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=0
     # pico-sdk's stdio_usb gates ALL console output on DTR by default
     # (stdio_usb_connected() checks tud_cdc_connected(), which tracks DTR) --
     # stdio_usb_out_chars() silently drops everything while that's false.
@@ -171,9 +182,10 @@ target_link_libraries(pico_link
     # that tells pico_stdio_usb "the app owns tud_init()/descriptors now",
     # compiling OUT its own default tusb_config.h and descriptor callbacks
     # (see firmware/src/tusb_config.h's module doc) while KEEPING its
-    # stdio_usb.c I/O glue and reset_interface.c vendor-reset driver linked
-    # in. This is pico-sdk's own documented pattern for a custom composite
-    # device that still wants the CDC console + BOOTSEL-reset behavior.
+    # stdio_usb.c I/O glue linked in for the CDC console. The reset vendor-
+    # interface driver is now src/usb_reset.c, this project's own (bead
+    # pico-link-l60) -- pico-sdk's reset_interface.c is compiled to nothing
+    # via PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=0 above.
     tinyusb_device
 )
 
