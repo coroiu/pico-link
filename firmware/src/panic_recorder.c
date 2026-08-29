@@ -59,6 +59,7 @@
 // RAM buffer, and stdio.
 #include "panic_recorder.h"
 
+#include <assert.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -75,8 +76,9 @@
 // disambiguates: which kind determines how scratch[2] ("diag") and
 // scratch[1] ("address") are meant to be read back.
 #define PL_PANIC_MAGIC_RUST 0x504c5250u      // "PLRP" -- Rust panic via pl_ui_panic_hook
-#define PL_PANIC_MAGIC_C 0x504c4343u         // "PLCC" -- C-side panic()/assert (PICO_PANIC_FUNCTION)
+#define PL_PANIC_MAGIC_C 0x504c4343u         // "PLCC" -- C-side panic() (PICO_PANIC_FUNCTION)
 #define PL_PANIC_MAGIC_HARDFAULT 0x504c4846u // "PLHF" -- a real Cortex-M HardFault exception
+#define PL_PANIC_MAGIC_ASSERT 0x504c4153u    // "PLAS" -- plain assert() (bd pico-link-itf)
 
 // Short enough that a wedged recording path still recovers well inside the
 // "a bare *** PANIC *** cost a whole session" territory this bead exists to
@@ -171,7 +173,7 @@ void pl_panic_record_rust(const uint8_t *msg, uintptr_t len) {
     pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_RUST, 0, 0, msg, len);
 }
 
-// --- C-side panic()/assert entry point (PICO_PANIC_FUNCTION, wired in
+// --- C-side panic() entry point (PICO_PANIC_FUNCTION, wired in
 // CMakeLists.txt) -- this is the path that produced the bare "*** PANIC ***"
 // with zero further context on 2026-08-28 (pico_platform_panic/panic.c:65).
 // Fixing that exact failure mode is this function's whole job. ---
@@ -209,6 +211,54 @@ void __attribute__((noreturn)) __printflike(1, 0) pl_panic_c_hook(const char *fm
     // the bare banner gave us before.
     uint32_t caller = (uint32_t)(uintptr_t)__builtin_return_address(0);
     pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_C, caller, 0, (const uint8_t *)buf, (uintptr_t)n);
+}
+
+// --- assert() entry point (bd pico-link-itf) -- newlib's __assert_func is
+// WEAK (pico_clib_interface/newlib_interface.c:163) and this strong
+// definition overrides it at link time. Unlike panic()/PICO_PANIC_FUNCTION,
+// plain assert() does NOT go through pl_panic_c_hook above at all -- it is
+// a wholly separate newlib code path. Left unoverridden it prints once and
+// calls _exit(1), which (PICO_ENTER_USB_BOOT_ON_EXIT is not defined in this
+// project) spins forever in a bare __breakpoint() loop with NO watchdog
+// ever armed -- the exact silent-hang failure mode this file exists to
+// close. NDEBUG is not defined anywhere in firmware/CMakeLists.txt, so
+// assert() is live in the shipped build and reachable from our own code
+// and from anything inside linked pico-sdk/BTstack/TinyUSB that calls raw
+// assert(). Signature must match newlib's exactly (see <assert.h>) or this
+// override does not link against the weak symbol's call sites. ---
+void __attribute__((noreturn)) __assert_func(const char *file, int line, const char *func, const char *failedexpr) {
+    // Step 1 -- FIRST statement, before file/func/failedexpr are touched at
+    // all: arm the watchdog. Same reasoning as pl_panic_c_hook above --
+    // these are exactly the pointers a memory-corruption-triggered assert
+    // can hand us as garbage, and the formatting below walks them. Treat
+    // every one of them as untrusted and bound every read.
+    watchdog_enable(PL_PANIC_WATCHDOG_TIMEOUT_MS, /*pause_on_debug=*/false);
+
+    // A fixed stack buffer, not anything allocator-backed, same as
+    // pl_panic_c_hook. snprintf itself performs no allocation and is
+    // bounded by sizeof(buf) regardless of how long (or how bogus) the
+    // input strings are -- it will still walk a bad pointer until it finds
+    // a NUL or hits the field width, same residual risk pl_panic_c_hook
+    // already accepts for panic()'s fmt/args, and the watchdog armed above
+    // is exactly the backstop for that.
+    char buf[PL_PANIC_MSG_CAP];
+    int n = snprintf(buf, sizeof(buf), "assert \"%s\" failed: %s:%d%s%s",
+                      failedexpr != NULL ? failedexpr : "?",
+                      file != NULL ? file : "?",
+                      line,
+                      func != NULL ? " in " : "",
+                      func != NULL ? func : "");
+    if (n < 0) {
+        n = 0;
+    } else if ((size_t)n > sizeof(buf) - 1) {
+        n = (int)sizeof(buf) - 1;
+    }
+
+    // Same "closest thing to a PC available here" rationale as
+    // pl_panic_c_hook -- the caller's return address, i.e. roughly where
+    // assert() was invoked from.
+    uint32_t caller = (uint32_t)(uintptr_t)__builtin_return_address(0);
+    pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_ASSERT, caller, (uint32_t)line, (const uint8_t *)buf, (uintptr_t)n);
 }
 
 // --- HardFault entry point (weak isr_hardfault, pico_crt0/crt0.S) -- a
@@ -278,7 +328,8 @@ void pl_panic_report_and_clear(void) {
     // reflash cycle, none of which are power cycles), so a genuine cold
     // boot reads scratch[0] as 0, which matches none of our magics.
     uint32_t magic = watchdog_hw->scratch[0];
-    if (magic != PL_PANIC_MAGIC_RUST && magic != PL_PANIC_MAGIC_C && magic != PL_PANIC_MAGIC_HARDFAULT) {
+    if (magic != PL_PANIC_MAGIC_RUST && magic != PL_PANIC_MAGIC_C && magic != PL_PANIC_MAGIC_HARDFAULT &&
+        magic != PL_PANIC_MAGIC_ASSERT) {
         return;
     }
 
@@ -292,8 +343,14 @@ void pl_panic_report_and_clear(void) {
             printf("message: %s\r\n", s_panic_msg);
             break;
         case PL_PANIC_MAGIC_C:
-            printf("kind: C panic()/assert\r\n");
+            printf("kind: C panic()\r\n");
             printf("caller return address: 0x%08lx\r\n", (unsigned long)address);
+            printf("message: %s\r\n", s_panic_msg);
+            break;
+        case PL_PANIC_MAGIC_ASSERT:
+            printf("kind: assert()\r\n");
+            printf("caller return address: 0x%08lx\r\n", (unsigned long)address);
+            printf("line: %lu\r\n", (unsigned long)diag);
             printf("message: %s\r\n", s_panic_msg);
             break;
         case PL_PANIC_MAGIC_HARDFAULT:
