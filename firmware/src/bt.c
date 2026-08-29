@@ -472,3 +472,20 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             break;
     }
 }
+
+#ifdef PL_DEBUG_REMOTE
+// Bead pico-link-g48 -- see bt.h's doc comment on this declaration. Body
+// is deliberately identical to PL_COMMAND_TAG_CONNECT's case above, minus
+// the PlCommand/pl_ui_poll_command indirection: there is no discovered
+// DeviceEntry to select here (that is the whole point -- this bypasses
+// inquiry), so this is called directly from debug_remote.c instead of
+// going through the Rust command queue.
+void pl_bt_debug_connect(const uint8_t *addr) {
+    pl_log(
+        "BT: debug-remote CONNECT %02x:%02x:%02x:%02x:%02x:%02x (bypassing inquiry)\r\n",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+    );
+    pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
+    pl_a2dp_connect(addr);
+}
+#endif

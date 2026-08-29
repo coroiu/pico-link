@@ -8,6 +8,7 @@
 #include "pico/stdio.h"
 #include "pico/stdlib.h"
 
+#include "bt.h"
 #include "usb_pump.h"
 
 // Longest valid line is "NAV SHORTCUT" territory -- "NAV SELECT\n" (11
@@ -77,6 +78,53 @@ static bool parse_line(const char *line, PlIntent *out) {
     return false;
 }
 
+// Returns the hex value of one ASCII hex digit, or -1 if `c` isn't one.
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+// Bead pico-link-g48: parses "CONNECT <addr>" where <addr> is exactly 6
+// bytes of hex, optionally ':'-or-'-'-separated (e.g. "AABBCCDDEEFF" or
+// "AA:BB:CC:DD:EE:FF") -- anything else (wrong byte count, non-hex
+// characters, extra separators) is rejected outright rather than guessed
+// at. The address itself never touches static/global storage beyond this
+// one out-parameter -- it is host-supplied per call, never a constant in
+// this codebase (see bt.h's doc comment on pl_bt_debug_connect).
+static bool parse_connect_addr(const char *line, uint8_t addr[6]) {
+    if (strncmp(line, "CONNECT ", 8) != 0) {
+        return false;
+    }
+    const char *p = line + 8;
+    size_t byte_idx = 0;
+    while (*p != '\0' && byte_idx < 6) {
+        if (*p == ':' || *p == '-') {
+            p++;
+            continue;
+        }
+        int hi = hex_nibble(*p);
+        if (hi < 0) {
+            return false;
+        }
+        p++;
+        int lo = hex_nibble(*p);
+        if (lo < 0) {
+            return false;
+        }
+        p++;
+        addr[byte_idx++] = (uint8_t)((hi << 4) | lo);
+    }
+    return byte_idx == 6 && *p == '\0';
+}
+
 size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
     size_t emitted = 0;
     for (int budget = 0; budget < PL_DEBUG_REMOTE_MAX_BYTES_PER_POLL; budget++) {
@@ -90,7 +138,17 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
         if (c == '\n') {
             if (s_line_len > 0) {
                 s_line[s_line_len] = '\0';
-                if (emitted < max) {
+                uint8_t connect_addr[6];
+                if (parse_connect_addr(s_line, connect_addr)) {
+                    // Not a NavIntent -- dispatched directly to bt.c
+                    // rather than going through `out`/pl_ui_input, since
+                    // there is no discovered DeviceEntry backing it (see
+                    // bt.h's pl_bt_debug_connect doc comment). Still
+                    // thread-context-only, called from this same
+                    // main-loop poll.
+                    pl_log("debug-remote: CONNECT %s -> dispatched\r\n", s_line + 8);
+                    pl_bt_debug_connect(connect_addr);
+                } else if (emitted < max) {
                     PlIntent intent;
                     if (parse_line(s_line, &intent)) {
                         out[emitted++] = intent;

@@ -18,6 +18,8 @@ Wire protocol (one command per line, LF-terminated):
   NAV UP | NAV DOWN | NAV LEFT | NAV RIGHT
   NAV SELECT | NAV BACK | NAV X | NAV Y
   NAV JUMP <signed-int>
+  CONNECT <addr>   -- bead pico-link-g48: bypasses GAP inquiry and connects
+                       straight to a known BD_ADDR. See --connect below.
 
 Usage:
   python3 cdc_sender.py UP DOWN SELECT          # send three commands, exit
@@ -25,10 +27,22 @@ Usage:
   python3 cdc_sender.py SELECT --delay 0.5      # 0.5s pause between commands
   python3 cdc_sender.py --raw "NAV JUMP -3"      # send a raw protocol line verbatim
   python3 cdc_sender.py --vid 0x2e8a --pid 0xc  # override device match
+  python3 cdc_sender.py --connect AABBCCDDEEFF  # connect directly to a known device address
 
 Command shorthand accepted (case-insensitive): UP, DOWN, LEFT, RIGHT,
 SELECT, BACK, X, Y, JUMP:<n> (e.g. JUMP:-3). Each is turned into the matching
 `NAV ...` protocol line.
+
+--connect BD_ADDR (bead pico-link-g48): skips discovery entirely and asks
+the firmware to connect straight to that address -- useful when the target
+headset is on but not in pairing mode (so it will never show up in a scan)
+and you already know its address. The address is a CLI argument ONLY: it
+is read from argv, put on the wire, and never written to any file, default,
+or constant by this script or the firmware it talks to (the firmware
+persists no link keys either -- see firmware/src/bt.h's doc comment on
+pl_bt_debug_connect). Expect this to often end in a clean BTstack refusal
+against a device the board was never (or is no longer) paired with -- that
+is a valid, informative result, not a bug in this channel.
 
 Requires: `pip3 install pyusb` and libusb (`brew install libusb`). No sudo.
 """
@@ -88,6 +102,27 @@ def to_protocol_line(token: str) -> str:
     )
 
 
+def to_connect_line(addr: str) -> str:
+    """Turn a BD_ADDR string (bead pico-link-g48) into a `CONNECT ...`
+    protocol line. Accepts "AABBCCDDEEFF" or "AA:BB:CC:DD:EE:FF" /
+    "AA-BB-CC-DD-EE-FF". Raises ValueError on anything else -- this is
+    deliberately strict (exactly 6 bytes of hex) rather than best-effort,
+    since a malformed address silently truncated or padded would connect
+    to the wrong device.
+
+    The address is a CLI argument only -- it is read from argv, placed on
+    the wire, and discarded. Nothing in this file stores it as a default,
+    a constant, or writes it to any file (see bt.h's doc comment on the
+    firmware side, pl_bt_debug_connect, for why that matters)."""
+    hex_only = addr.strip().replace(":", "").replace("-", "")
+    if len(hex_only) != 12 or not all(c in "0123456789abcdefABCDEF" for c in hex_only):
+        raise ValueError(
+            f"--connect needs a 6-byte BD_ADDR, got {addr!r} "
+            f"(expected e.g. AABBCCDDEEFF or AA:BB:CC:DD:EE:FF)"
+        )
+    return f"CONNECT {hex_only.upper()}"
+
+
 def get_backend():
     for candidate in (
         None,
@@ -143,6 +178,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("commands", nargs="*", help="commands to send: UP/DOWN/LEFT/RIGHT/SELECT/BACK/X/Y/JUMP:<n>")
     ap.add_argument("--raw", action="append", default=[], help="send a raw protocol line verbatim (repeatable, interleaved in order given after positional commands)")
+    ap.add_argument(
+        "--connect",
+        default=None,
+        metavar="BD_ADDR",
+        help=(
+            "bead pico-link-g48: connect directly to this BD_ADDR, bypassing GAP inquiry "
+            "(e.g. --connect AABBCCDDEEFF or AA:BB:CC:DD:EE:FF). Sent last, after any "
+            "positional commands/--raw lines. The address is a CLI argument only -- never "
+            "stored anywhere by this tool."
+        ),
+    )
     ap.add_argument("--vid", type=lambda s: int(s, 0), default=None, help=f"USB vendor ID (default: try {DEFAULT_VID:#06x}, then any)")
     ap.add_argument("--pid", type=lambda s: int(s, 0), default=None, help=f"USB product ID (default: try {DEFAULT_PID:#06x}, then any)")
     ap.add_argument("--list", action="store_true", help="enumerate candidate devices and exit")
@@ -183,12 +229,18 @@ def main():
             lines.append(to_protocol_line(tok))
         for raw in args.raw:
             lines.append(raw.strip())
+        if args.connect is not None:
+            lines.append(to_connect_line(args.connect))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)
 
     if not lines:
-        print("No commands given -- nothing to send. Pass e.g. UP DOWN SELECT, or --raw 'NAV JUMP -3'.", file=sys.stderr)
+        print(
+            "No commands given -- nothing to send. Pass e.g. UP DOWN SELECT, --raw 'NAV JUMP -3', "
+            "or --connect AABBCCDDEEFF.",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     dev = devs[0]

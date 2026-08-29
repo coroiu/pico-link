@@ -26,6 +26,15 @@
 //   NAV UP / NAV DOWN / NAV LEFT / NAV RIGHT
 //   NAV SELECT / NAV BACK / NAV X / NAV Y
 //   NAV JUMP <signed-int>
+//   CONNECT <addr>   -- bead pico-link-g48: <addr> is 6 bytes of hex,
+//                        optionally ':'/'-'-separated (e.g. "AABBCCDDEEFF"
+//                        or "AA:BB:CC:DD:EE:FF"). Bypasses GAP inquiry
+//                        entirely and calls straight into bt.c's
+//                        pl_bt_debug_connect -- NOT a NavIntent, dispatched
+//                        directly rather than added to `out`. The address
+//                        is a per-call, host-supplied value only; it is
+//                        never stored as a constant anywhere in this
+//                        codebase (see bt.h's doc comment).
 // An unrecognized or malformed line is logged and ignored -- never fatal,
 // never wedges the poll loop. See tools/usb-console/cdc_sender.py for the
 // host-side counterpart.
