@@ -87,9 +87,20 @@ const GAP_BANNER_TO_STAT: i32 = 8;
 /// together, so the two can never drift out of sync with each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodecStatus {
-    /// No active link. The hero word renders as "-" in
-    /// [`palette::STATUS_ERROR`] (the same shorthand Andreas's own design
-    /// sketch uses — design section 6.2 quotes it verbatim: "`Codec: -`").
+    /// No active link. The hero word renders as "NO LINK" in
+    /// [`palette::STATUS_ERROR`] — design section 6's table names
+    /// `STATUS_ERROR` for "no link" in words, and that is what this
+    /// widget renders. Andreas's own design sketch shorthanded this state
+    /// as "`Codec: -`" (quoted verbatim in section 6.2's intro), but a
+    /// bare hyphen does not survive `font::hero()` at hero size: measured
+    /// via `core/examples/hero_font_probe.rs`'s method, the glyph is a
+    /// 9x5px mid-line dash (u8g2's real, present hyphen glyph — not a
+    /// missing-glyph tofu box), which reads as a tiny coloured smudge
+    /// rather than a legible hero word and fails the glance-across-a-room
+    /// requirement the hero is built for (bead `pico-link-znb.6` comment,
+    /// 2026-08-29). "NO LINK" measures 131x25px in `font::hero()`,
+    /// comfortably inside the 240px panel and the `HERO_SLOT_HEIGHT`
+    /// budget, same as every codec word.
     /// No bitrate line is drawn at all — absent, never frozen and never
     /// faked (design section 15); a "0 kbps" or a frozen last-known figure
     /// would both be lies about a link that no longer exists.
@@ -242,10 +253,10 @@ fn text_width(font: &FontRenderer, text: &str) -> u32 {
 /// Unicode ellipsis codepoint, and `with_ignore_unknown_chars(true)` would
 /// silently drop it if absent.
 fn truncate_to_width(font: &FontRenderer, text: &str, max_width: u32) -> String {
+    const ELLIPSIS: &str = "...";
     if text_width(font, text) <= max_width {
         return String::from(text);
     }
-    const ELLIPSIS: &str = "...";
     if text_width(font, ELLIPSIS) > max_width {
         return String::new();
     }
@@ -302,7 +313,7 @@ impl Widget for HeroStatusView {
         let hero_font = font::hero();
         let hero_y = name_y + name_line_h + GAP_NAME_TO_HERO;
         let (hero_text, hero_color) = match &self.status {
-            CodecStatus::NoLink => (String::from("-"), palette::STATUS_ERROR),
+            CodecStatus::NoLink => (String::from("NO LINK"), palette::STATUS_ERROR),
             CodecStatus::Connected { word, fallback, .. } => {
                 let color = if fallback.is_some() { palette::STATUS_WARNING } else { palette::TEXT_PRIMARY };
                 (word.clone(), color)

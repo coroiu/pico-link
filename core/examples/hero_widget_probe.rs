@@ -16,14 +16,15 @@
 //! to the current directory.
 
 use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::{Point, RgbColor, Size};
-use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::prelude::{Point, Primitive, RgbColor, Size};
+use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
+use embedded_graphics::Drawable;
 use pico_link_core::render::hero::{BitrateStatus, CodecStatus, HeroStatusView};
 use pico_link_core::render::{compute_chrome, FrameBuffer565, Widget};
 
 const SCALE: u32 = 4;
 
-fn render_state(name: &str, view: HeroStatusView) {
+fn render_state(name: &str, view: &HeroStatusView) {
     let mut fb = FrameBuffer565::new(240, 240);
     let chrome = compute_chrome(Size::new(240, 240));
     // Fill the whole panel BACKGROUND first, matching the real screen
@@ -31,9 +32,6 @@ fn render_state(name: &str, view: HeroStatusView) {
     // untouched content/hint background to whatever the widget draws --
     // this probe fills the full panel so any area the widget *doesn't*
     // touch reads as background, same as production).
-    use embedded_graphics::prelude::Primitive;
-    use embedded_graphics::primitives::PrimitiveStyleBuilder;
-    use embedded_graphics::Drawable;
     Rectangle::new(Point::zero(), Size::new(240, 240))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(pico_link_core::render::theme::palette::BACKGROUND).build())
         .draw(&mut fb)
@@ -66,7 +64,7 @@ fn main() {
     // 1. connected-nominal
     render_state(
         "1_connected_nominal",
-        HeroStatusView::new(
+        &HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Kbps(909) },
         )
@@ -76,7 +74,7 @@ fn main() {
     // 2. connected-idle (host silent -- must read "idle", never "0 kbps")
     render_state(
         "2_connected_idle",
-        HeroStatusView::new(
+        &HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Idle },
         )
@@ -86,7 +84,7 @@ fn main() {
     // 3. connected-fell-back-to-SBC (amber word + FALLBACK banner)
     render_state(
         "3_fell_back_to_sbc",
-        HeroStatusView::new(
+        &HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected {
                 word: "SBC".into(),
@@ -100,7 +98,7 @@ fn main() {
     // 4. MUTED (banner outranks FALLBACK; word stays amber underneath)
     render_state(
         "4_muted_over_fallback",
-        HeroStatusView::new(
+        &HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected {
                 word: "SBC".into(),
@@ -113,14 +111,14 @@ fn main() {
     );
 
     // 5. no-link
-    render_state("5_no_link", HeroStatusView::new("Sony WH-1000XM5", CodecStatus::NoLink));
+    render_state("5_no_link", &HeroStatusView::new("Sony WH-1000XM5", CodecStatus::NoLink));
 
     // 6. aptX HD -- the descender case. Longest advance width (125px)
     // *and* the 32px-tall mixed-case word this bead's whole vertical
     // budget is built around.
     render_state(
         "6_aptx_hd_descender",
-        HeroStatusView::new(
+        &HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected { word: "aptX HD".into(), fallback: None, bitrate: BitrateStatus::Kbps(576) },
         )
@@ -131,7 +129,7 @@ fn main() {
     // tallest hero word AND a banner both present, nothing else changed.
     render_state(
         "7_aptx_hd_with_banner",
-        HeroStatusView::new(
+        &HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected {
                 word: "aptX HD".into(),
@@ -145,7 +143,7 @@ fn main() {
     // 8. long device name -- ellipsis truncation, not overflow.
     render_state(
         "8_long_device_name",
-        HeroStatusView::new(
+        &HeroStatusView::new(
             "Sennheiser Momentum 4 Wireless Over-Ear Headphones",
             CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Kbps(990) },
         )
