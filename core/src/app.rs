@@ -73,6 +73,15 @@ pub struct DeviceEntry {
 pub enum Command {
     StartScan,
     Connect { addr: [u8; 6] },
+    /// User-initiated: stop an in-flight inquiry scan. The wizard screen
+    /// (pico-link-znb.7) binds this to B once it exists -- this bead only
+    /// delivers the command itself, no binding. Needed because the inquiry
+    /// scan runs a fixed 10.24s with nothing else to interrupt it: without
+    /// this, B does nothing during that window and, in the zero-results
+    /// case, the screen is empty for the whole 10.24s -- exactly when a
+    /// user reaches for a button, gets nothing, and concludes the device
+    /// is frozen. See design section 21 Tier 1 row E1.
+    CancelScan,
 }
 
 /// Why a connect attempt failed, as reported by C over
@@ -412,6 +421,16 @@ impl App {
         self.navigator.push(screen);
     }
 
+    /// Test-only: enqueues a [`Command`] directly, bypassing the UI
+    /// interaction that would normally queue one. `CancelScan` has no
+    /// binding built by this bead (the wizard screen in pico-link-znb.7
+    /// does that), so this is the only way to exercise its
+    /// [`App::poll_command`] round-trip today. Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn push_command_for_test(&mut self, command: Command) {
+        self.commands.borrow_mut().push_back(command);
+    }
+
     /// Dispatches every polled `NavIntent` to the navigator, in order.
     /// A no-op (including leaving `dirty` untouched) if `intents` is empty.
     pub fn handle_input(&mut self, intents: Vec<NavIntent>) {
@@ -693,5 +712,19 @@ mod tests {
         assert_eq!(app.now_us(), 0);
         app.tick(123_456);
         assert_eq!(app.now_us(), 123_456);
+    }
+
+    #[test]
+    fn cancel_scan_command_round_trips_through_poll_command() {
+        // pico-link-znb.2 (E1): the wizard screen (pico-link-znb.7) that
+        // binds B to this doesn't exist yet, so this exercises the
+        // enqueue/drain path directly via the test-only helper rather than
+        // through UI input -- the same shape `pl_ui_poll_command` will see.
+        let mut app = App::new(240, 240);
+        assert_eq!(app.poll_command(), None, "no command queued yet");
+
+        app.push_command_for_test(Command::CancelScan);
+        assert_eq!(app.poll_command(), Some(Command::CancelScan));
+        assert_eq!(app.poll_command(), None, "the queue drains -- one poll per queued command");
     }
 }

@@ -895,6 +895,11 @@ pub enum PlCommandTag {
     None = 0,
     StartScan = 1,
     Connect = 2,
+    /// pico-link-znb.2 (E1, MVP-blocking): user-initiated cancel of an
+    /// in-flight inquiry scan. Carries no payload -- see
+    /// [`PlCommandPayload`]'s doc comment; `pl_ui_poll_command` reuses the
+    /// zeroed `connect` payload for it, same as `StartScan`.
+    CancelScan = 3,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -947,6 +952,28 @@ fn pl_command_none() -> PlCommand {
 
 /// Pops the oldest user-initiated command queued by the devices screen
 /// (selecting "Scan" or a discovered device row), or a
+/// Maps one core-side [`Command`] to its wire [`PlCommand`] shape. A pure
+/// function (no `PlUi`/FFI involved) purely so this mapping -- the actual
+/// risk in this bead, per pico-link-znb.2 -- is unit-testable directly,
+/// without needing to drive a queued command through `App`'s private
+/// mailbox first (`CancelScan` has no UI binding yet to do that with; the
+/// wizard screen in pico-link-znb.7 adds one).
+fn pl_command_from(command: Command) -> PlCommand {
+    match command {
+        Command::StartScan => {
+            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::StartScan, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
+        }
+        Command::Connect { addr } => {
+            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::Connect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
+        }
+        Command::CancelScan => {
+            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::CancelScan, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
+        }
+    }
+}
+
+/// Pops the oldest user-initiated command queued by the devices screen
+/// (selecting "Scan" or a discovered device row), or a
 /// `PlCommandTag::None` command if none is pending -- callers should poll
 /// this once per main-loop iteration and drain it in a loop if more than
 /// one command might be queued between polls. Also returns
@@ -964,12 +991,7 @@ pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
     // SAFETY: caller contract above.
     let ui = &mut *ui;
     match ui.app.poll_command() {
-        Some(Command::StartScan) => {
-            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::StartScan, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
-        }
-        Some(Command::Connect { addr }) => {
-            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::Connect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
-        }
+        Some(command) => pl_command_from(command),
         None => pl_command_none(),
     }
 }
@@ -1279,5 +1301,32 @@ mod tests {
         }
         assert!(PlFailureReason::try_from(5u32).is_err());
         assert!(PlFailureReason::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn cancel_scan_command_maps_to_the_cancel_scan_tag_with_the_current_abi_version() {
+        // pico-link-znb.2 (E1): the wire-mapping half of the round trip
+        // core::app's `cancel_scan_command_round_trips_through_poll_command`
+        // proves on the `App`/`poll_command` side. `CancelScan` has no UI
+        // binding yet (the wizard screen in pico-link-znb.7 adds one), so
+        // this drives `pl_command_from` directly rather than through
+        // `pl_ui_poll_command` end to end.
+        let wire = pl_command_from(Command::CancelScan);
+        assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
+        assert_eq!(wire.tag as u32, PlCommandTag::CancelScan as u32);
+    }
+
+    #[test]
+    fn start_scan_and_connect_still_map_to_their_own_tags() {
+        // Regression guard: extracting `pl_command_from` out of
+        // `pl_ui_poll_command` (pico-link-znb.2) must not change the
+        // existing StartScan/Connect mappings.
+        let start = pl_command_from(Command::StartScan);
+        assert_eq!(start.tag as u32, PlCommandTag::StartScan as u32);
+
+        let addr = [1, 2, 3, 4, 5, 6];
+        let connect = pl_command_from(Command::Connect { addr });
+        assert_eq!(connect.tag as u32, PlCommandTag::Connect as u32);
+        assert_eq!(unsafe { connect.payload.connect.addr }, addr);
     }
 }

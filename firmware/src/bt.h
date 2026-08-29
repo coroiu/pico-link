@@ -26,7 +26,10 @@ void pl_bt_init(struct PlUi *ui);
 // logs the requested address and sets the link state to Connecting (M2's
 // acceptance criterion is that this is observable over CDC -- actually
 // opening an ACL connection is out of scope here, left for the milestone
-// that does something with a successful connect). A no-op if no command is
+// that does something with a successful connect); PL_COMMAND_TAG_CANCEL_SCAN
+// (pico-link-znb.2) stops an in-flight GAP inquiry via gap_inquiry_stop(),
+// which itself raises GAP_EVENT_INQUIRY_COMPLETE and so returns the link to
+// Idle through the normal inquiry-complete path. A no-op if no command is
 // queued. Intended to be called once per UI frame (see main.c's periodic
 // timer) -- drains at most one command per call, so a caller that expects
 // several queued commands per frame should call this in a loop instead.
