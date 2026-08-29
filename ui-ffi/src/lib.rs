@@ -1011,6 +1011,18 @@ pub enum PlCommandTag {
     /// [`PlCommandPayload`]'s doc comment; `pl_ui_poll_command` reuses the
     /// zeroed `connect` payload for it, same as `StartScan`.
     CancelScan = 3,
+    /// pico-link-znb.7 code-review fix: user-initiated abort of an
+    /// in-flight connect attempt (the wizard's phase 4/5, design section
+    /// 9 -- "B genuinely aborts", not just leaves the screen). Carries
+    /// the target `addr` via the same `connect` payload member
+    /// `PlCommandTag::Connect` uses. **Plumbed through this FFI surface
+    /// but deliberately left unhandled on the C side by this bead** --
+    /// real abort semantics (tearing down an in-flight ACL/SSP/AVDTP
+    /// attempt) is real BT work beyond this bead's scope, the same way
+    /// `CancelScan`'s C-side handling needed its own follow-up bead
+    /// (pico-link-znb.2). See this bead's completion report for the
+    /// explicit callout; file the C-side bead against this tag.
+    CancelConnect = 4,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -1079,6 +1091,9 @@ fn pl_command_from(command: Command) -> PlCommand {
         }
         Command::CancelScan => {
             PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::CancelScan, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
+        }
+        Command::CancelConnect { addr } => {
+            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::CancelConnect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
         }
     }
 }
@@ -1504,6 +1519,21 @@ mod tests {
         let wire = pl_command_from(Command::CancelScan);
         assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
         assert_eq!(wire.tag as u32, PlCommandTag::CancelScan as u32);
+    }
+
+    #[test]
+    fn cancel_connect_command_maps_to_the_cancel_connect_tag_and_carries_the_addr() {
+        // pico-link-znb.7's code-review fix: B during the wizard's
+        // connecting/not-responding phases now queues this instead of
+        // silently leaving the abandoned attempt running in C. Plumbed
+        // through the FFI surface by this bead; left unhandled C-side
+        // (see `PlCommandTag::CancelConnect`'s doc comment).
+        let addr = [0xAA; 6];
+        let wire = pl_command_from(Command::CancelConnect { addr });
+        assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
+        assert_eq!(wire.tag as u32, PlCommandTag::CancelConnect as u32);
+        // SAFETY: `wire.tag` above confirms the union currently holds `connect`.
+        assert_eq!(unsafe { wire.payload.connect.addr }, addr);
     }
 
     #[test]

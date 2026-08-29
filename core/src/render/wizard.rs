@@ -295,6 +295,20 @@ impl Widget for PairingWizardView {
                 self.commands.borrow_mut().push_back(Command::CancelScan);
                 Action::None
             }
+            // Code-review fix (post-merge-review of this bead): B was
+            // previously handled generically by `Navigator::dispatch`
+            // popping the screen with no side effect at all in phases
+            // 4/5 -- the screen disappeared but the abandoned ACL/SSP/
+            // AVDTP attempt kept running in C with nothing telling it to
+            // stop, still delivering `ConnectStepChanged`/
+            // `ConnectRetrying`/`ConnectFailed`/`ConnectSucceeded` events
+            // for a device the user already walked away from. Design
+            // section 9 phase 4: "B genuinely aborts" -- not "B leaves
+            // the screen". Mirrors the `CancelScan` arm above exactly.
+            (NavIntent::Back, WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. }) => {
+                self.commands.borrow_mut().push_back(Command::CancelConnect { addr });
+                Action::None
+            }
             (NavIntent::Up | NavIntent::Down | NavIntent::JumpBy(_), WizardPhase::Scanning) => {
                 self.sync_list();
                 self.list.borrow_mut().on_intent(intent)
@@ -688,22 +702,44 @@ mod tests {
     }
 
     #[test]
-    fn b_aborts_from_connecting() {
-        assert_back_aborts_from(|app| {
-            app.handle_input(vec![NavIntent::Select]);
-            app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [13; 6], name: String::new(), rssi: -40 }));
-            app.handle_input(vec![NavIntent::Select]);
-        });
+    fn b_aborts_from_connecting_and_queues_cancel_connect() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // -> Scanning
+        let addr = [13; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_input(vec![NavIntent::Select]); // -> Connecting
+        app.poll_command(); // drain StartScan
+        app.poll_command(); // drain Connect
+
+        app.handle_input(vec![NavIntent::Back]);
+        assert_eq!(app.navigator_depth(), 1, "B must pop the wizard back to Devices");
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::CancelConnect { addr }),
+            "B during the connecting phase must queue CancelConnect (design section 9: 'B genuinely aborts') --              leaving the screen without this leaves the abandoned ACL/SSP/AVDTP attempt running in C"
+        );
     }
 
     #[test]
-    fn b_aborts_from_not_responding() {
-        assert_back_aborts_from(|app| {
-            app.handle_input(vec![NavIntent::Select]);
-            app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [14; 6], name: String::new(), rssi: -40 }));
-            app.handle_input(vec![NavIntent::Select]);
-            app.handle_event(Event::ConnectRetrying { attempt: 1 });
-        });
+    fn b_aborts_from_not_responding_and_queues_cancel_connect() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // -> Scanning
+        let addr = [14; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_input(vec![NavIntent::Select]); // -> Connecting
+        app.handle_event(Event::ConnectRetrying { attempt: 1 }); // -> NotResponding
+        app.poll_command(); // drain StartScan
+        app.poll_command(); // drain Connect
+
+        app.handle_input(vec![NavIntent::Back]);
+        assert_eq!(app.navigator_depth(), 1, "B must pop the wizard back to Devices");
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::CancelConnect { addr }),
+            "B during the not-responding phase must queue CancelConnect, same as the connecting phase"
+        );
     }
 
     #[test]

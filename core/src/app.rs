@@ -83,6 +83,19 @@ pub enum Command {
     /// user reaches for a button, gets nothing, and concludes the device
     /// is frozen. See design section 21 Tier 1 row E1.
     CancelScan,
+    /// User-initiated: abort an in-flight connect attempt (phase 4
+    /// `Connecting` or phase 5 `NotResponding`, design section 9). Added
+    /// by pico-link-znb.7's code-review fix -- the wizard's B previously
+    /// only left the *screen*, leaving C's ACL/SSP/AVDTP attempt running
+    /// with nothing telling it to stop, still delivering
+    /// `ConnectStepChanged`/`ConnectRetrying`/`ConnectFailed`/
+    /// `ConnectSucceeded` events for an attempt the user already walked
+    /// away from. Whether C actually implements the abort (real
+    /// ACL/AVDTP teardown) or this stays plumbed-but-unhandled is a
+    /// separate, C-side decision -- see this bead's completion report;
+    /// `CancelScan` similarly needed its own follow-up bead
+    /// (pico-link-znb.2) for its C-side handling.
+    CancelConnect { addr: [u8; 6] },
 }
 
 /// Why a connect attempt failed, as reported by C over
