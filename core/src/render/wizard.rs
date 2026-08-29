@@ -441,20 +441,26 @@ impl Widget for PairingWizardView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ConnectFailureReason, ConnectStep, DeviceEntry, Event, LinkState, WizardPhase};
+    use crate::app::{App, ConnectFailureReason, ConnectStep, DeviceEntry, Event, LinkState, WizardPhase, DEVICES_TITLE};
     use crate::input::NavIntent;
 
+    /// Home(1) -> Devices(2) -> Wizard(3), all three `Select`s -- since
+    /// `pico-link-znb.8`/E7, Home (not Devices) is the navigator root, so
+    /// reaching the wizard takes one more step than it used to: centre
+    /// toggles Home to its menu face (Bluetooth pre-selected), centre
+    /// again activates that row (pushing Devices, "Scan for headphones"
+    /// pre-selected on a fresh screen), centre again opens the wizard.
     fn open_wizard(app: &mut App) {
-        // Row 0 ("Scan for headphones") is always selected on a fresh
-        // Devices screen.
-        app.handle_input(vec![NavIntent::Select]);
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
+        app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+        app.handle_input(vec![NavIntent::Select]); // "Scan for headphones" row -> pushes the wizard
     }
 
     #[test]
     fn selecting_scan_opens_the_wizard_at_the_instructions_phase() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
         assert_eq!(app.current_screen_title(), WIZARD_TITLE);
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Instructions);
     }
@@ -475,7 +481,7 @@ mod tests {
         app.handle_input(vec![NavIntent::Select]); // -> Scanning
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -40 }));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning);
-        assert_eq!(app.navigator_depth(), 2, "the wizard must still be the one screen at depth 2");
+        assert_eq!(app.navigator_depth(), 3, "the wizard must still be the top screen at Home(1)/Devices(2)/Wizard(3)");
     }
 
     #[test]
@@ -590,10 +596,10 @@ mod tests {
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
         app.handle_event(Event::ConnectSucceeded { degraded: false });
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
 
         app.handle_event(Event::WizardAutoDismiss);
-        assert_eq!(app.navigator_depth(), 1, "a plain success must auto-dismiss back to Devices");
+        assert_eq!(app.navigator_depth(), 2, "a plain success must auto-dismiss back to Devices");
     }
 
     #[test]
@@ -607,7 +613,7 @@ mod tests {
         app.handle_event(Event::ConnectSucceeded { degraded: true });
 
         app.handle_event(Event::WizardAutoDismiss);
-        assert_eq!(app.navigator_depth(), 2, "degraded success must require acknowledgement, never auto-dismiss");
+        assert_eq!(app.navigator_depth(), 3, "degraded success must require acknowledgement, never auto-dismiss");
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded: true });
     }
 
@@ -665,11 +671,11 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         phase_setup(&mut app);
-        assert_eq!(app.navigator_depth(), 2, "test setup should leave the wizard open");
+        assert_eq!(app.navigator_depth(), 3, "test setup should leave the wizard open");
 
         app.handle_input(vec![NavIntent::Back]);
-        assert_eq!(app.navigator_depth(), 1, "B must pop the wizard back to Devices");
-        assert_eq!(app.current_screen_title(), "Pico Link");
+        assert_eq!(app.navigator_depth(), 2, "B must pop the wizard back to Devices");
+        assert_eq!(app.current_screen_title(), DEVICES_TITLE);
     }
 
     #[test]
@@ -685,7 +691,7 @@ mod tests {
         app.poll_command(); // drain StartScan
 
         app.handle_input(vec![NavIntent::Back]);
-        assert_eq!(app.navigator_depth(), 1, "B must pop the wizard back to Devices");
+        assert_eq!(app.navigator_depth(), 2, "B must pop the wizard back to Devices");
         assert_eq!(
             app.poll_command(),
             Some(Command::CancelScan),
@@ -713,7 +719,7 @@ mod tests {
         app.poll_command(); // drain Connect
 
         app.handle_input(vec![NavIntent::Back]);
-        assert_eq!(app.navigator_depth(), 1, "B must pop the wizard back to Devices");
+        assert_eq!(app.navigator_depth(), 2, "B must pop the wizard back to Devices");
         assert_eq!(
             app.poll_command(),
             Some(Command::CancelConnect { addr }),
@@ -734,7 +740,7 @@ mod tests {
         app.poll_command(); // drain Connect
 
         app.handle_input(vec![NavIntent::Back]);
-        assert_eq!(app.navigator_depth(), 1, "B must pop the wizard back to Devices");
+        assert_eq!(app.navigator_depth(), 2, "B must pop the wizard back to Devices");
         assert_eq!(
             app.poll_command(),
             Some(Command::CancelConnect { addr }),
@@ -762,29 +768,30 @@ mod tests {
         });
     }
 
-    // --- Depth never exceeds 2, across every phase transition ---
+    // --- Depth never exceeds Home(1)/Devices(2)/Wizard(3) (design depth
+    // 2), across every phase transition ---
 
     #[test]
     fn the_wizard_never_exceeds_depth_two_across_every_phase() {
         let mut app = App::new(240, 240);
-        assert_eq!(app.navigator_depth(), 1);
+        assert_eq!(app.navigator_depth(), 1, "a fresh app starts on Home alone");
         open_wizard(&mut app);
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3, "Home(1)/Devices(2)/Wizard(3)");
 
         app.handle_input(vec![NavIntent::Select]); // -> Scanning
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
         let addr = [17; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::ConnectRetrying { attempt: 1 });
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::ConnectSucceeded { degraded: false });
-        assert_eq!(app.navigator_depth(), 2);
+        assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::WizardAutoDismiss);
-        assert_eq!(app.navigator_depth(), 1, "auto-dismiss returns to depth 1");
+        assert_eq!(app.navigator_depth(), 2, "auto-dismiss returns to Devices (Home(1)/Devices(2))");
     }
 }

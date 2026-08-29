@@ -882,6 +882,22 @@ mod tests {
         // dropped, NOT reach `app.handle_input`.
         let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(), Vec::new(), vec![NavIntent::Down]]);
         let mut app = App::new(240, 240);
+        // Home (the root screen since `pico-link-znb.8`/E7) has no
+        // focusable list on its default status face -- `Down` is
+        // deliberately unbound there (Tier 1 scope boundary: volume is
+        // Tier 2/E16). This test's proof only needs *some* focusable
+        // content whose selection visibly moves on `Down`, decoupled from
+        // whatever Home's own content happens to be -- a plain pushed
+        // `VerticalList` screen, the same shape `navigator.rs`'s own
+        // tests use, serves that purpose without coupling this run-loop
+        // test to Home's domain-specific input contract.
+        app.push_screen_for_test(crate::render::Screen::new(
+            "probe",
+            alloc::vec![alloc::boxed::Box::new(crate::render::VerticalList::new(alloc::vec![
+                crate::render::ListItem::new("row 0"),
+                crate::render::ListItem::new("row 1"),
+            ]))],
+        ));
 
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), Some(idle_timeout), None, || {

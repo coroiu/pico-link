@@ -127,8 +127,26 @@ fn injecting_a_navintent_over_http_moves_the_selection_and_is_observable_in_the_
     let highlight = palette::SURFACE_ELEVATED;
     let highlight_rgb8 = image::Rgb([highlight.r() << 3, highlight.g() << 2, highlight.b() << 3]);
 
-    // --- Frame 1: render the initial state (no input yet) and observe it
-    // via a real HTTP screenshot request. ---
+    // --- Navigate from Home (the root screen since `pico-link-znb.8`/E7)
+    // to the Devices screen, entirely over HTTP: Home's status face has
+    // no focusable list of its own (Up/Down is unbound there in Tier 1 --
+    // see `pico_link_core::render::home`'s module doc), so the row-
+    // selection proof below needs Devices' list underneath it. Centre
+    // toggles Home to its menu face (Bluetooth pre-selected), centre
+    // again activates that row, pushing Devices with its own row 0
+    // ("Scan for headphones") pre-selected. ---
+    let (status, body) = post(addr, "/api/input", b"\"Select\"");
+    assert_eq!(status, 200, "POST /api/input (Select, Home -> menu face) did not succeed: {}", String::from_utf8_lossy(&body));
+    let mut iterations = 0;
+    run_frames(&mut platform, &mut app, &mut iterations, 1);
+
+    let (status, body) = post(addr, "/api/input", b"\"Select\"");
+    assert_eq!(status, 200, "POST /api/input (Select, Bluetooth row -> Devices) did not succeed: {}", String::from_utf8_lossy(&body));
+    let mut iterations = 0;
+    run_frames(&mut platform, &mut app, &mut iterations, 1);
+
+    // --- Frame 1: render the initial state (no further input yet) and
+    // observe it via a real HTTP screenshot request. ---
     let mut iterations = 0;
     run_frames(&mut platform, &mut app, &mut iterations, 1);
 

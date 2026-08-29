@@ -95,6 +95,18 @@ fn driving_to_idle_blanks_the_headless_screenshot_and_an_injected_intent_restore
     let highlight = palette::SURFACE_ELEVATED;
     let highlight_rgb8 = image::Rgb([highlight.r() << 3, highlight.g() << 2, highlight.b() << 3]);
 
+    // Home (the root screen since `pico-link-znb.8`/E7) has no focusable
+    // list of its own on its status face (Up/Down is unbound there in
+    // Tier 1 -- see `pico_link_core::render::home`'s module doc), so this
+    // test's row-selection proof needs the Devices screen underneath it.
+    // Queued before `run` starts, so iteration 1's single `poll()` drains
+    // both and lands on Devices (row 0, "Scan for headphones",
+    // pre-selected) before `CHECKPOINT_INITIAL` captures its screenshot:
+    // centre toggles Home to its menu face (Bluetooth pre-selected),
+    // centre again activates that row, pushing Devices.
+    input_queue.lock().unwrap().push_back(NavIntent::Select);
+    input_queue.lock().unwrap().push_back(NavIntent::Select);
+
     let mut initial_screenshot: Option<image::RgbImage> = None;
     let mut idle_screenshot: Option<image::RgbImage> = None;
 
