@@ -101,6 +101,25 @@ typedef struct {
     volatile uint32_t enc_max_us;
     volatile uint32_t pkt_sent;
     volatile uint32_t pkt_fail;
+
+    // --- bead pico-link-pbv instrumentation: is the media timer firing at
+    // its intended ~10ms cadence, and is the fill loop actually draining
+    // PL_A2DP_MAX_FRAMES_PER_TICK frames per tick? Counters only, updated
+    // from IRQ context (same producer as the block above), read from
+    // pl_a2dp_report (thread context) -- never pl_log from the hot path
+    // itself. worst_tick_interval_us/tick_count answer "how fast is the
+    // timer really firing"; frames_filled_total (divided by tick_count
+    // between two report samples) answers "how many frames/tick are we
+    // actually filling" against the PL_A2DP_MAX_FRAMES_PER_TICK=5 cap.
+    volatile uint64_t last_tick_us;
+    volatile uint32_t worst_tick_interval_us;
+    volatile uint32_t tick_count;
+    volatile uint32_t frames_filled_total;
+    // Tests a specific hypothesis: does the fill loop stall waiting on
+    // BTstack's async A2DP_SUBEVENT_STREAMING_CAN_SEND_MEDIA_PACKET_NOW
+    // grant (the sbc_ready_to_send handoff below) for a meaningful
+    // fraction of ticks? Counter only.
+    volatile uint32_t ticks_send_pending;
 } pl_a2dp_ctx_t;
 
 static pl_a2dp_ctx_t s_ctx;
@@ -209,6 +228,12 @@ static void pl_a2dp_fill_sbc_buffer(void) {
         frames_this_tick++;
     }
 
+    // Bead pico-link-pbv: cumulative frames actually filled, for computing
+    // an average frames/tick against PL_A2DP_MAX_FRAMES_PER_TICK's cap of
+    // 5 once divided by the tick_count delta between two report samples
+    // (pl_a2dp_report, thread context). Counter only.
+    s_ctx.frames_filled_total += frames_this_tick;
+
     if (frames_this_tick == 0) {
         s_ctx.underrun_events++;
         s_ctx.silent_ticks++;
@@ -246,6 +271,20 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_set_timer(ts, PL_A2DP_AUDIO_TIMEOUT_MS);
     btstack_run_loop_add_timer(ts);
 
+    // Bead pico-link-pbv: measure the REAL interval between calls to this
+    // handler, not the nominal PL_A2DP_AUDIO_TIMEOUT_MS. Counter only --
+    // no pl_log, matches usb_pump.c's own worst_interval_us pattern for
+    // exactly this class of measurement.
+    uint64_t pbv_now_us = time_us_64();
+    if (s_ctx.last_tick_us != 0) {
+        uint32_t pbv_interval_us = (uint32_t)(pbv_now_us - s_ctx.last_tick_us);
+        if (pbv_interval_us > s_ctx.worst_tick_interval_us) {
+            s_ctx.worst_tick_interval_us = pbv_interval_us;
+        }
+    }
+    s_ctx.last_tick_us = pbv_now_us;
+    s_ctx.tick_count++;
+
     if (s_ctx.state == PL_A2DP_MEDIA_PRIMING) {
         if (pl_pcm_fill_bytes() >= PL_PCM_TARGET_FILL_BYTES) {
             a2dp_source_start_stream(s_ctx.a2dp_cid, s_ctx.local_seid);
@@ -263,6 +302,8 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
             s_ctx.sbc_ready_to_send = true;
             a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
         }
+    } else {
+        s_ctx.ticks_send_pending++;
     }
 
     // design sec 3.5 case 2: host silent -> not a fault. Auto-pause once,
@@ -575,5 +616,17 @@ void pl_a2dp_report(void) {
     pl_log(
         "a2dp: enc_max_us=%lu pkt_sent=%lu pkt_fail=%lu misaligned=%lu\r\n", (unsigned long)s_ctx.enc_max_us,
         (unsigned long)s_ctx.pkt_sent, (unsigned long)s_ctx.pkt_fail, (unsigned long)pl_pcm_misaligned()
+    );
+    // Bead pico-link-pbv: cumulative, never reset -- compute deltas
+    // between two consecutive report lines (1s apart) to get real tick
+    // rate (tick_count delta) and average frames/tick (frames_filled_total
+    // delta / tick_count delta) against the PL_A2DP_MAX_FRAMES_PER_TICK=5
+    // cap. worst_tick_interval_us is the worst single interval seen since
+    // streaming started (never reset, so it only ever grows -- a spike
+    // stays visible even if the average recovers).
+    pl_log(
+        "a2dp: tick_count=%lu worst_tick_interval_us=%lu frames_filled_total=%lu ticks_send_pending=%lu\r\n",
+        (unsigned long)s_ctx.tick_count, (unsigned long)s_ctx.worst_tick_interval_us,
+        (unsigned long)s_ctx.frames_filled_total, (unsigned long)s_ctx.ticks_send_pending
     );
 }
