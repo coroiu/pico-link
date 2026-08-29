@@ -80,6 +80,9 @@ add_executable(pico_link
     src/input.c
     src/bt.c
     src/panic_recorder.c
+    src/usb_descriptors.c
+    src/usb_audio.c
+    src/usb_pump.c
 )
 
 add_dependencies(pico_link pico_link_ui_header)
@@ -113,6 +116,17 @@ target_compile_definitions(pico_link PRIVATE
     # symptom as M2 despite the panel visibly rendering, which is what
     # exposed this as a tooling gap rather than a firmware hang.
     PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1
+    # Bead pico-link-tfj: pico_stdio_usb's own stdio_usb_out_chars() spins
+    # for up to PICO_STDIO_USB_STDOUT_TIMEOUT_US (default 500000, i.e.
+    # 500ms) waiting for tud_cdc_write_available() before giving up on one
+    # printf/pl_log call. Combined with PICO_STDIO_USB_CONNECTION_WITHOUT_DTR
+    # above (which makes stdio_usb_connected() true even with no reader
+    # attached), a listening test with no capture running could otherwise
+    # block the pl_usb_mutex -- and therefore the 0xC0 worker's
+    # mutex_try_enter -- for half a second on every single log line. 2ms is
+    # enough slack for a real reader without holding the mutex anywhere
+    # near the worker's 1ms re-arm deadline.
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=2000
     # M2: Bluetooth only, no Wi-Fi -- without this, cyw43.h unconditionally
     # pulls in lwip/netif.h (a build dependency we have no use for and
     # haven't wired up). Matches USBPods' own working reference.
@@ -151,6 +165,16 @@ target_link_libraries(pico_link
     pico_btstack_classic
     pico_btstack_cyw43
     pico_cyw43_arch_threadsafe_background
+    # M3: link the MARKED tinyusb_device target (not just the
+    # tinyusb_device_unmarked that pico_enable_stdio_usb pulls in on its
+    # own) -- this is what sets the LIB_TINYUSB_DEVICE=1 compile definition
+    # that tells pico_stdio_usb "the app owns tud_init()/descriptors now",
+    # compiling OUT its own default tusb_config.h and descriptor callbacks
+    # (see firmware/src/tusb_config.h's module doc) while KEEPING its
+    # stdio_usb.c I/O glue and reset_interface.c vendor-reset driver linked
+    # in. This is pico-sdk's own documented pattern for a custom composite
+    # device that still wants the CDC console + BOOTSEL-reset behavior.
+    tinyusb_device
 )
 
 pico_add_extra_outputs(pico_link)
