@@ -12,6 +12,12 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+# Bead pico-link-cd3: debug-only NavIntent injection over the CDC console,
+# so an agent can drive scan/connect without a human pressing the d-pad.
+# OFF by default -- must never be on in a shipping build. Enable with
+# `cmake -B build -DPL_DEBUG_REMOTE=ON`. See src/debug_remote.h.
+option(PL_DEBUG_REMOTE "Enable debug NavIntent injection over the CDC console (unattended hardware testing only)" OFF)
+
 # --- The Rust FFI seam (M1b, C-first pivot) ---
 #
 # `ui-ffi` is a `no_std` + `alloc` Rust staticlib (../ui-ffi) depending on
@@ -90,6 +96,10 @@ add_executable(pico_link
     src/usb_reset.c
 )
 
+if(PL_DEBUG_REMOTE)
+    target_sources(pico_link PRIVATE src/debug_remote.c)
+endif()
+
 add_dependencies(pico_link pico_link_ui_header)
 target_include_directories(pico_link PRIVATE ${PICO_LINK_UI_HEADER_DIR})
 
@@ -166,6 +176,12 @@ target_compile_definitions(pico_link PRIVATE
     # pico_platform_panic/CMakeLists.txt rather than assumed.
     PICO_PANIC_FUNCTION=pl_panic_c_hook
 )
+
+if(PL_DEBUG_REMOTE)
+    # Gates main.c's call into debug_remote.c (only compiled in above when
+    # PL_DEBUG_REMOTE is ON) -- see src/debug_remote.h's module doc.
+    target_compile_definitions(pico_link PRIVATE PL_DEBUG_REMOTE=1)
+endif()
 
 target_link_libraries(pico_link
     pico_stdlib
