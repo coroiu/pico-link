@@ -96,9 +96,23 @@ static const uint8_t usbd_desc_cfg[] = {
     // Interface number, string index, bytes/sample, bits/sample, EP out, EP out size, EP feedback, feedback EP size
     // 16-bit stereo @ up to 48kHz: TUD_AUDIO_EP_SIZE rounds up for rate
     // variance so the endpoint can carry a burst without dropping frames.
+    //
+    // Feedback EP size: high-speed devices use 4-byte 16.16 fixed-point;
+    // full-speed devices must use 3-byte 10.14 (USB 2.0 Sec.5.12.4.2) -- macOS
+    // (AppleUSBAudio) rejects the whole alternate setting if a full-speed
+    // feedback endpoint claims 4 bytes, per TinyUSB's own compatibility
+    // matrix (audio_device.c:1200-1214, OSX only in the 3-byte rows) and its
+    // uac2_speaker_fb example (usb_descriptors.c:162, "OS X needs 3 bytes
+    // feedback endpoint on FS"). RP2350 has no high-speed PHY so
+    // TUD_OPT_HIGH_SPEED is always false here, but this is written
+    // speed-conditional to document why, and to match upstream's shape.
+    // Paired with CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION in
+    // tusb_config.h, which must be 1 for this 3-byte size to actually carry
+    // 10.14-converted values -- see bead pico-link-icb.
     TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, STRID_AUDIO,
         CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX,
-        EPNUM_AUDIO_OUT, CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX, EPNUM_AUDIO_FB, 4),
+        EPNUM_AUDIO_OUT, CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX, EPNUM_AUDIO_FB,
+        (TUD_OPT_HIGH_SPEED ? 4 : 3)),
 
     // CDC: interface number, string index, EP notif addr & size, EP data out/in addr & size.
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
