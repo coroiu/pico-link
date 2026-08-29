@@ -35,8 +35,9 @@
 static struct PlUi *g_ui;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
-// --- pico-link-6o2: a C-side ring decouples the BTstack packet handler
-// (IRQ producer) from the pl_ui_push_event call (single consumer) ---
+// --- pico-link-6o2: a C-side ring decouples the event producers -- the
+// BTstack packet handler in IRQ context AND the command handler in thread
+// context -- from the pl_ui_push_event call (single consumer, superloop) ---
 //
 // pl_bt_packet_handler runs in low_priority_irq_handler under
 // pico_cyw43_arch_threadsafe_background (firmware/CMakeLists.txt) -- i.e.
