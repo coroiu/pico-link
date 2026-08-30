@@ -433,8 +433,12 @@ pub const SIGNAL_GLYPH_WIDTH: u32 =
 ///
 /// `rect`'s height sets each bar's height step (`rect.size.height *
 /// (index + 1) / SIGNAL_BAR_COUNT`); its width is expected to be at least
-/// [`SIGNAL_GLYPH_WIDTH`], though a narrower `rect` just clips the
-/// rightmost bar(s) rather than panicking.
+/// [`SIGNAL_GLYPH_WIDTH`]. A narrower `rect` is not honoured: this
+/// function ignores `rect.size.width` entirely and always lays out all
+/// `SIGNAL_BAR_COUNT` bars, so the overhanging bars are dropped only if
+/// they fall outside the *framebuffer*, which bounds-checks and discards
+/// out-of-range pixels rather than panicking. There is no rect-relative
+/// clipping.
 ///
 /// # Errors
 ///
