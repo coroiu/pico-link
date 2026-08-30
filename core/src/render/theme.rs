@@ -396,6 +396,71 @@ where
     Ok(())
 }
 
+/// Number of bars in [`draw_signal_bars`]'s glyph — fixed at the
+/// conventional "signal strength" count (design section 14, F10), not a
+/// parameter: a caller wanting a different resolution would also need a
+/// different `level` scale, which doesn't exist anywhere in this crate.
+const SIGNAL_BAR_COUNT: i32 = 4;
+/// Width (px) of a single bar.
+const SIGNAL_BAR_WIDTH: i32 = 4;
+/// Gap (px) between adjacent bars.
+const SIGNAL_BAR_GAP: i32 = 2;
+/// Total footprint (px) of the whole glyph — `SIGNAL_BAR_COUNT` bars plus
+/// the gaps between them, no gap after the last bar. Exposed so callers
+/// (e.g. `list.rs`'s row layout) can reserve exactly this much width
+/// without duplicating the arithmetic.
+pub const SIGNAL_GLYPH_WIDTH: u32 =
+    (SIGNAL_BAR_COUNT * SIGNAL_BAR_WIDTH + (SIGNAL_BAR_COUNT - 1) * SIGNAL_BAR_GAP) as u32;
+
+/// Draws a 4-bar signal-strength glyph, growing left to right and
+/// bottom-aligned within `rect` — the conventional "signal bars" shape
+/// (design section 14, F10: "4-bar signal glyph...unconditional for the
+/// scan list"). This replaces the ASCII `#`/`.` stand-in
+/// `wizard.rs`'s `signal_bars` used to build as a list row's plain-text
+/// sublabel (pico-link-0r3) — a deliberate stand-in for the design rule's
+/// *behavior*, never meant to ship as the pixel form.
+///
+/// `level` (clamped to `0..=SIGNAL_BAR_COUNT`) is the number of *filled*
+/// bars, counted from the left/shortest bar — i.e. the same "more bars
+/// lit = stronger signal" reading as every phone/wifi status icon, not a
+/// right-to-left or tallest-first count. Filled bars draw in
+/// [`palette::BRAND_BRIGHT`] (matching [`draw_icon_chip`]'s icon color, so
+/// this reads as the same family of themed glyph); unfilled bars draw in
+/// [`palette::DIVIDER`] (the theme's existing "present but inactive" tone,
+/// also used for disabled affordances) rather than being left unpainted —
+/// an all-bars-drawn glyph is what makes "zero bars" read as "no signal"
+/// instead of "nothing rendered here, is this a bug".
+///
+/// `rect`'s height sets each bar's height step (`rect.size.height *
+/// (index + 1) / SIGNAL_BAR_COUNT`); its width is expected to be at least
+/// [`SIGNAL_GLYPH_WIDTH`], though a narrower `rect` just clips the
+/// rightmost bar(s) rather than panicking.
+///
+/// # Errors
+///
+/// Returns `Infallible`'s uninhabited variant in practice — see
+/// [`super::widget::Widget::render`]'s doc comment for why the `Result`
+/// return exists at all.
+pub fn draw_signal_bars<D>(target: &mut D, rect: Rectangle, level: u8) -> Result<(), Infallible>
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    let level = i32::from(level.min(SIGNAL_BAR_COUNT as u8));
+    let bottom = rect.top_left.y + rect.size.height as i32;
+
+    for i in 0..SIGNAL_BAR_COUNT {
+        let bar_height = (rect.size.height as i32 * (i + 1) / SIGNAL_BAR_COUNT).max(1);
+        let x = rect.top_left.x + i * (SIGNAL_BAR_WIDTH + SIGNAL_BAR_GAP);
+        let y = bottom - bar_height;
+        let color = if i < level { palette::BRAND_BRIGHT } else { palette::DIVIDER };
+        Rectangle::new(Point::new(x, y), Size::new(SIGNAL_BAR_WIDTH as u32, bar_height as u32))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(target)?;
+    }
+
+    Ok(())
+}
+
 /// Width, in pixels, of the left accent bar [`draw_selection`] draws.
 pub const SELECTION_ACCENT_WIDTH: u32 = 4;
 
@@ -533,5 +598,60 @@ mod tests {
             (ink_center.y - rect_center.y).abs() <= 1,
             "chip glyph should be vertically centered: ink_center={ink_center:?} rect_center={rect_center:?}"
         );
+    }
+
+    /// Samples the top-center pixel of each of the four bar columns in a
+    /// `draw_signal_bars` glyph, for a `rect` tall enough that even the
+    /// shortest (leftmost) bar's top row is distinguishable from the
+    /// background -- the fill color at that single point is enough to
+    /// tell filled from unfilled without re-deriving the per-bar height
+    /// arithmetic here.
+    fn sample_bar_tops(fb: &FrameBuffer565, rect: Rectangle) -> [Rgb565; 4] {
+        let mut colors = [palette::BACKGROUND; 4];
+        for (i, color) in colors.iter_mut().enumerate() {
+            let bar_height = rect.size.height as i32 * (i as i32 + 1) / SIGNAL_BAR_COUNT;
+            let x = rect.top_left.x + i as i32 * (SIGNAL_BAR_WIDTH + SIGNAL_BAR_GAP);
+            let y = rect.top_left.y + rect.size.height as i32 - bar_height;
+            *color = fb.pixel(Point::new(x, y));
+        }
+        colors
+    }
+
+    #[test]
+    fn draw_signal_bars_zero_level_leaves_every_bar_unfilled() {
+        let mut fb = FrameBuffer565::new(30, 20);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(SIGNAL_GLYPH_WIDTH, 16));
+        draw_signal_bars(&mut fb, rect, 0).unwrap();
+        assert_eq!(sample_bar_tops(&fb, rect), [palette::DIVIDER; 4]);
+    }
+
+    #[test]
+    fn draw_signal_bars_full_level_fills_every_bar() {
+        let mut fb = FrameBuffer565::new(30, 20);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(SIGNAL_GLYPH_WIDTH, 16));
+        draw_signal_bars(&mut fb, rect, 4).unwrap();
+        assert_eq!(sample_bar_tops(&fb, rect), [palette::BRAND_BRIGHT; 4]);
+    }
+
+    #[test]
+    fn draw_signal_bars_partial_level_fills_only_the_low_bars() {
+        let mut fb = FrameBuffer565::new(30, 20);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(SIGNAL_GLYPH_WIDTH, 16));
+        draw_signal_bars(&mut fb, rect, 2).unwrap();
+        assert_eq!(
+            sample_bar_tops(&fb, rect),
+            [palette::BRAND_BRIGHT, palette::BRAND_BRIGHT, palette::DIVIDER, palette::DIVIDER]
+        );
+    }
+
+    #[test]
+    fn draw_signal_bars_clamps_a_level_above_the_bar_count() {
+        let mut fb = FrameBuffer565::new(30, 20);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(SIGNAL_GLYPH_WIDTH, 16));
+        // Must not panic on an out-of-range level -- `signal_bars`'
+        // caller derives this from raw RSSI, not a value this module
+        // controls.
+        draw_signal_bars(&mut fb, rect, 200).unwrap();
+        assert_eq!(sample_bar_tops(&fb, rect), [palette::BRAND_BRIGHT; 4]);
     }
 }

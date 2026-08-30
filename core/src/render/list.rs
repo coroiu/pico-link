@@ -89,6 +89,15 @@ pub struct ListItem {
     /// that wants "icon, no colored background" instead of "no chip at
     /// all". `None` (the default) keeps the letter chip. See [`RowChip`].
     pub icon: Option<char>,
+    /// Overrides the row's second (sublabel) line with a graphical 4-bar
+    /// signal-strength glyph ([`theme::draw_signal_bars`]) instead of
+    /// `sublabel`'s plain text — design section 14, F10, unconditional
+    /// for the pairing wizard's scan list (pico-link-0r3). `0..=4`; a
+    /// caller passing both this and `sublabel` gets the glyph, since a
+    /// row has exactly one second-line slot and the glyph is the more
+    /// specific request. `None` (the default) leaves the slot to
+    /// `sublabel`, unchanged from before this field existed.
+    pub signal_bars: Option<u8>,
     /// This row's stable identity, if the caller has one (e.g. a
     /// Bluetooth device address). `None` for rows with no natural
     /// identity (a static menu row, a transient placeholder) — such rows
@@ -104,6 +113,7 @@ impl ListItem {
             label: label.into(),
             sublabel: None,
             icon: None,
+            signal_bars: None,
             key: None,
         }
     }
@@ -111,6 +121,15 @@ impl ListItem {
     #[must_use]
     pub fn with_sublabel(mut self, sublabel: impl Into<String>) -> Self {
         self.sublabel = Some(sublabel.into());
+        self
+    }
+
+    /// Draws this row's second line as a 4-bar signal glyph instead of
+    /// text — see [`Self::signal_bars`]'s doc comment. `level` is not
+    /// clamped here; [`theme::draw_signal_bars`] clamps at draw time.
+    #[must_use]
+    pub fn with_signal_bars(mut self, level: u8) -> Self {
+        self.signal_bars = Some(level);
         self
     }
 
@@ -343,6 +362,25 @@ pub(crate) enum RowChip {
     Icon(char),
 }
 
+/// What [`draw_row`] draws in a row's second (sublabel) line slot — a
+/// row has exactly one such slot, so this is an enum (mutually exclusive
+/// content) rather than the two separate `Option`s [`ListItem`] itself
+/// carries (`sublabel`/`signal_bars`), which `draw_row`'s caller resolves
+/// down to one of these three per [`ListItem::signal_bars`]'s
+/// priority-over-`sublabel` doc comment. Folding two parameters into one
+/// also keeps `draw_row`'s argument count under `clippy::pedantic`'s
+/// `too_many_arguments` threshold.
+#[derive(Clone, Copy)]
+pub(crate) enum RowSecondLine<'a> {
+    /// No second line at all.
+    None,
+    /// Plain sublabel text, rendered with [`font::username`].
+    Text(&'a str),
+    /// A graphical 4-bar signal glyph (pico-link-0r3, design section 14
+    /// F10) via [`theme::draw_signal_bars`], instead of text.
+    SignalBars(u8),
+}
+
 /// Draws one list row's shared visual language: an optional hairline
 /// bottom divider, the chip, the bold name line, the muted username line,
 /// and — for the focused/selected row — the full-width selection fill
@@ -466,7 +504,7 @@ pub(crate) fn draw_row<D>(
     target: &mut D,
     row_rect: Rectangle,
     name: &str,
-    username: Option<&str>,
+    second_line: RowSecondLine<'_>,
     selected: bool,
     draw_divider: bool,
     chip: RowChip,
@@ -520,16 +558,26 @@ where
         target,
     );
 
-    if let Some(username) = username {
-        let username_display = truncate_label_to_width(&font::username(), username, available_text_width);
-        let _ = font::username().render_aligned(
-            username_display.as_str(),
-            Point::new(text_x, row_rect.top_left.y + username_top_offset()),
-            VerticalPosition::Top,
-            HorizontalAlignment::Left,
-            FontColor::Transparent(palette::TEXT_SECONDARY),
-            target,
-        );
+    match second_line {
+        RowSecondLine::SignalBars(level) => {
+            let bars_rect = Rectangle::new(
+                Point::new(text_x, row_rect.top_left.y + username_top_offset()),
+                Size::new(theme::SIGNAL_GLYPH_WIDTH, USERNAME_LINE_FOOTPRINT as u32),
+            );
+            theme::draw_signal_bars(target, bars_rect, level)?;
+        }
+        RowSecondLine::Text(username) => {
+            let username_display = truncate_label_to_width(&font::username(), username, available_text_width);
+            let _ = font::username().render_aligned(
+                username_display.as_str(),
+                Point::new(text_x, row_rect.top_left.y + username_top_offset()),
+                VerticalPosition::Top,
+                HorizontalAlignment::Left,
+                FontColor::Transparent(palette::TEXT_SECONDARY),
+                target,
+            );
+        }
+        RowSecondLine::None => {}
     }
 
     if selected {
@@ -805,11 +853,19 @@ impl Widget for VerticalList {
 
             let selected = self.focused && index == self.selected;
             let chip = item.icon.map_or(RowChip::Letter, RowChip::Icon);
+            // `signal_bars` wins over plain sublabel text when both are
+            // set on one item — see `ListItem::signal_bars`'s doc
+            // comment for why a row has exactly one second-line slot.
+            let second_line = match (item.signal_bars, item.sublabel.as_deref()) {
+                (Some(level), _) => RowSecondLine::SignalBars(level),
+                (None, Some(text)) => RowSecondLine::Text(text),
+                (None, None) => RowSecondLine::None,
+            };
             draw_row(
                 &mut clipped,
                 row_rect,
                 item.label.as_str(),
-                item.sublabel.as_deref(),
+                second_line,
                 selected,
                 !selected,
                 chip,
@@ -1089,6 +1145,72 @@ mod tests {
         let mut fb = FrameBuffer565::new(64, 40);
         let area = Rectangle::new(Point::new(0, 0), Size::new(64, 40));
         list.render(area, &mut fb).unwrap();
+    }
+
+    // --- pico-link-0r3: F10, the scan list's real 4-bar signal glyph ---
+
+    /// Scans the row's second (sublabel/signal-bars) line for any pixel
+    /// in `color` -- coarse ("is this color present at all in the slot",
+    /// not "exactly where") on purpose, since the goal here is telling
+    /// "a graphical glyph was drawn" apart from "plain text was drawn"
+    /// (which never paints `palette::BRAND_BRIGHT`/`palette::DIVIDER`,
+    /// only `palette::TEXT_SECONDARY` glyph ink), not pinning down the
+    /// bar layout `theme::draw_signal_bars`'s own tests already cover.
+    fn second_line_contains_color(fb: &FrameBuffer565, row_rect: Rectangle, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
+        let y_top = row_rect.top_left.y + username_top_offset();
+        let y_bottom = y_top + USERNAME_LINE_FOOTPRINT;
+        (row_rect.top_left.x..row_rect.top_left.x + row_rect.size.width as i32)
+            .any(|x| (y_top..y_bottom).any(|y| fb.pixel(Point::new(x, y)) == color))
+    }
+
+    #[test]
+    fn a_row_with_signal_bars_draws_the_graphical_glyph_not_sublabel_text() {
+        let list = VerticalList::new(vec![ListItem::new("Cans").with_signal_bars(3)]);
+        let mut fb = FrameBuffer565::new(240, ROW_HEIGHT);
+        let area = Rectangle::new(Point::new(0, 0), Size::new(240, ROW_HEIGHT));
+        list.render(area, &mut fb).unwrap();
+
+        assert!(
+            second_line_contains_color(&fb, area, theme::palette::BRAND_BRIGHT),
+            "a filled bar should paint BRAND_BRIGHT into the sublabel row"
+        );
+        assert!(
+            second_line_contains_color(&fb, area, theme::palette::DIVIDER),
+            "an unfilled bar (level 3 of 4) should paint DIVIDER into the sublabel row"
+        );
+    }
+
+    #[test]
+    fn zero_signal_bars_still_draws_the_glyph_not_a_blank_row() {
+        // The all-empty case matters on its own: this is exactly what a
+        // weak nearby device looks like, and it must read as "no signal"
+        // (four dim bars), not as "nothing rendered" (a rendering bug).
+        let list = VerticalList::new(vec![ListItem::new("Cans").with_signal_bars(0)]);
+        let mut fb = FrameBuffer565::new(240, ROW_HEIGHT);
+        let area = Rectangle::new(Point::new(0, 0), Size::new(240, ROW_HEIGHT));
+        list.render(area, &mut fb).unwrap();
+
+        assert!(
+            second_line_contains_color(&fb, area, theme::palette::DIVIDER),
+            "zero bars must still paint four dim bars, not leave the slot blank"
+        );
+        assert!(
+            !second_line_contains_color(&fb, area, theme::palette::BRAND_BRIGHT),
+            "zero bars must have no filled bar"
+        );
+    }
+
+    #[test]
+    fn signal_bars_take_priority_over_a_sublabel_set_on_the_same_item() {
+        let list = VerticalList::new(vec![ListItem::new("Cans").with_sublabel("-40 dBm").with_signal_bars(4)]);
+        let mut fb = FrameBuffer565::new(240, ROW_HEIGHT);
+        let area = Rectangle::new(Point::new(0, 0), Size::new(240, ROW_HEIGHT));
+        list.render(area, &mut fb).unwrap();
+
+        assert!(
+            second_line_contains_color(&fb, area, theme::palette::BRAND_BRIGHT),
+            "signal_bars must win over sublabel text when both are set on one item"
+        );
     }
 
     // --- pico-link-znb.4: stable identity across rebuilds ---
