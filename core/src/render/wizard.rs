@@ -126,6 +126,16 @@ const STEPS_TOP_PADDING: i32 = 20;
 /// Vertical spacing (px) between phase 4's four step lines.
 const STEP_ROW_HEIGHT: i32 = 26;
 
+/// Vertical gap (px) between the last connect-step line and the elapsed-
+/// time readout below it.
+const ELAPSED_GAP: i32 = 12;
+
+/// Refresh cadence for phase 4's elapsed-time readout -- see
+/// [`PairingWizardView::redraw_after`]. Coarse on purpose: the readout
+/// itself only has one-second resolution, so anything finer would just be
+/// extra renders of pixels that didn't change.
+const ELAPSED_REDRAW_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
+
 /// Draws phase 4 (connecting): all four named sub-steps
 /// ([`ConnectStep::all`]'s fixed order), each colored by whether it's
 /// already completed (`TEXT_SECONDARY`), the one currently in progress
@@ -133,8 +143,14 @@ const STEP_ROW_HEIGHT: i32 = 26;
 /// (not just the current one) is what lets the user see how far the
 /// attempt has gotten, per design section 9's "each step fails
 /// differently; naming the current one tells the user *and us* where it
-/// stalled".
-fn render_connecting_steps(area: Rectangle, current: ConnectStep, target: &mut FrameBuffer565) {
+/// stalled" -- plus, below them, an elapsed-seconds readout
+/// (`RenderCtx`/`WizardPhase::Connecting::started`'s first real consumer,
+/// pico-link-znb.10 step 6): this is the "the screen isn't hung, it's
+/// still working" liveness signal payoff 1 of the frame-scoped clock ADR
+/// names, replacing a step list that could otherwise sit static and
+/// indistinguishable from a wedge for the several real seconds a connect
+/// attempt can take.
+fn render_connecting_steps(area: Rectangle, current: ConnectStep, elapsed: core::time::Duration, target: &mut FrameBuffer565) {
     let center_x = area.top_left.x + area.size.width as i32 / 2;
     let steps = ConnectStep::all();
     let current_index = steps.iter().position(|&s| s == current).unwrap_or(0);
@@ -156,6 +172,17 @@ fn render_connecting_steps(area: Rectangle, current: ConnectStep, target: &mut F
             target,
         );
     }
+
+    let elapsed_y = area.top_left.y + STEPS_TOP_PADDING + name_top_offset() + steps.len() as i32 * STEP_ROW_HEIGHT + ELAPSED_GAP;
+    let elapsed_line = format!("{}s", elapsed.as_secs());
+    let _ = font::username().render_aligned(
+        elapsed_line.as_str(),
+        Point::new(center_x, elapsed_y),
+        VerticalPosition::Top,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(palette::TEXT_SECONDARY),
+        target,
+    );
 }
 
 /// The single content widget on the wizard [`Screen`], covering all six
@@ -373,6 +400,21 @@ impl Widget for PairingWizardView {
         Some(contribution)
     }
 
+    /// Requests a periodic redraw while phase 4 (Connecting) is showing,
+    /// so its elapsed-seconds readout (see [`render_connecting_steps`])
+    /// actually advances instead of freezing at whatever value happened to
+    /// be on screen when the last real event arrived. Every other phase
+    /// has nothing time-driven to show, so this returns `None` -- see the
+    /// frame-scoped clock ADR's "hacks to retire" section for why this
+    /// stays scoped rather than becoming an unconditional per-tick redraw.
+    fn redraw_after(&self, _ctx: &RenderCtx) -> Option<core::time::Duration> {
+        if matches!(*self.phase.borrow(), WizardPhase::Connecting { .. }) {
+            Some(ELAPSED_REDRAW_INTERVAL)
+        } else {
+            None
+        }
+    }
+
     fn selected_index(&self) -> Option<usize> {
         if matches!(*self.phase.borrow(), WizardPhase::Scanning { .. }) {
             Some(self.list.borrow().selected_index())
@@ -412,8 +454,8 @@ impl Widget for PairingWizardView {
                 self.sync_list();
                 self.list.borrow().render(area, ctx, target)?;
             }
-            WizardPhase::Connecting { step, .. } => {
-                render_connecting_steps(area, step, target);
+            WizardPhase::Connecting { step, started, .. } => {
+                render_connecting_steps(area, step, ctx.elapsed_since(started), target);
             }
             WizardPhase::NotResponding { attempt, .. } => {
                 MessageView::new("Not responding")
@@ -587,6 +629,41 @@ mod tests {
             app.wizard_phase_for_test(),
             WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: Instant::from_micros(1_500_000) },
             "a freshly entered Connecting phase must be stamped with App's real now_us at the instant it was entered"
+        );
+    }
+
+    #[test]
+    fn connecting_phase_liveness_end_to_end_tick_alone_marks_dirty_and_the_elapsed_readout_changes() {
+        // pico-link-znb.10 step 6's real consumer, as a regression test:
+        // the whole RenderCtx/redraw_after/event-timestamp seam, proven
+        // end to end through phase 4's elapsed-seconds readout. See
+        // `core/examples/wizard_liveness_probe.rs` for the zoomed-PNG
+        // version of this same scenario (this project's rendering-
+        // verification rule: a pixel-difference assertion alone is not
+        // sufficient evidence for a render change, only a necessary one).
+        let mut app = App::new(240, 240);
+        app.tick(0);
+        open_wizard(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // Instructions -> Scanning
+        let addr = [9; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
+        app.handle_input(vec![NavIntent::Select]); // Scanning -> Connecting, started == 0
+
+        app.tick(0);
+        let pixels_t0: Vec<_> = app.render().pixels().collect();
+        assert!(!app.dirty(), "render() must have cleared dirty");
+
+        // No input, no event -- purely the passage of time. This is
+        // exactly the case a naive "no timestamp seam" implementation
+        // cannot handle: nothing *happened*, but the screen must still
+        // show the connect attempt is still alive.
+        app.tick(2_000_000);
+        assert!(app.dirty(), "redraw_after must mark the app dirty from tick alone, 2s into a Connecting attempt");
+        let pixels_t1: Vec<_> = app.render().pixels().collect();
+
+        assert_ne!(
+            pixels_t0, pixels_t1,
+            "the elapsed-seconds readout must actually change the rendered pixels between t=0s and t=2s"
         );
     }
 
