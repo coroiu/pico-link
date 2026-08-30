@@ -743,10 +743,7 @@ impl App {
     fn stamp_pending_wizard_timestamp(&mut self) {
         let mut phase = self.wizard_phase.borrow_mut();
         match &mut *phase {
-            WizardPhase::Scanning { started } if *started == PENDING_TIMESTAMP => {
-                *started = Instant::from_micros(self.now_us);
-            }
-            WizardPhase::Connecting { started, .. } if *started == PENDING_TIMESTAMP => {
+            WizardPhase::Scanning { started } | WizardPhase::Connecting { started, .. } if *started == PENDING_TIMESTAMP => {
                 *started = Instant::from_micros(self.now_us);
             }
             _ => {}
