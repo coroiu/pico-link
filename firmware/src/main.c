@@ -156,8 +156,11 @@ int main(void) {
     pl_log("st7789_init_and_fill OK -- panel out of reset, backlight on\r\n");
 
 #ifdef PL_DIAG_COLOR_TEST
-    // Reusable diagnostic (undefined by default -- pass -DPL_DIAG_COLOR_TEST
-    // to CMAKE_C_FLAGS/CMAKE_CXX_FLAGS to enable): an exposure-immune
+    // Reusable diagnostic (off by default -- enable with a real CMake
+    // option, `cmake -B build -DPL_DIAG_COLOR_TEST=ON`, see
+    // firmware/CMakeLists.txt; NOT via CMAKE_C_FLAGS, which replaces
+    // rather than appends to the pico-sdk toolchain file's seeded
+    // -mcpu/-march flags -- pico-link-ukk): an exposure-immune
     // relative colour test, first run for pico-link-14l. Top half of the
     // panel in the theme BACKGROUND constant (core/src/render/theme.rs:47,
     // Rgb565::new(1,4,4) -> raw 0x0884), bottom half in pure white 0xFFFF,
@@ -185,6 +188,9 @@ int main(void) {
 #endif
 
 #ifdef PL_DIAG_MADCTL_TEST
+    // Reusable diagnostic (off by default -- enable with a real CMake
+    // option, `cmake -B build -DPL_DIAG_MADCTL_TEST=ON`, see
+    // firmware/CMakeLists.txt; NOT via CMAKE_C_FLAGS -- pico-link-ukk).
     // Diagnostic for pico-link-zzq: the merged 0xA0 "rotation" fix (bd
     // pico-link-g7o) actually MIRRORS the panel, and both the earlier 0x60
     // and 0xA0 attempts were judged by rotating a blurry photo until text
@@ -264,8 +270,11 @@ int main(void) {
 #endif
 
 #ifdef PL_DIAG_LDAC_BENCH
-    // Reusable diagnostic (undefined by default -- pass -DPL_DIAG_LDAC_BENCH
-    // to CMAKE_C_FLAGS/CMAKE_CXX_FLAGS to enable), bead pico-link-cz0.5.4
+    // Reusable diagnostic (off by default -- enable with a real CMake
+    // option, `cmake -B build -DPL_DIAG_LDAC_BENCH=ON`, see
+    // firmware/CMakeLists.txt; NOT via CMAKE_C_FLAGS, which replaces
+    // rather than appends to the pico-sdk toolchain file's seeded
+    // -mcpu/-march flags -- pico-link-ukk), bead pico-link-cz0.5.4
     // (LDAC L0). Pure CPU/heap measurement: no display, no BT, no A2DP --
     // runs before pl_ui_create()/cyw43_arch_init() below so nothing else is
     // competing for CPU or heap during the measurement. Deliberately does

@@ -27,6 +27,20 @@ option(PL_DEBUG_REMOTE "Enable debug NavIntent injection over the CDC console (u
 # coupling this seam should not acquire.
 option(PL_WATCHDOG "Arm the hardware watchdog + software supervisor" ON)
 
+# Bead pico-link-ukk: reusable diagnostics gated in main.c behind
+# PL_DIAG_* #ifdefs. All previously documented as "pass -DPL_DIAG_FOO via
+# CMAKE_C_FLAGS/CMAKE_CXX_FLAGS" -- that recipe is broken, because passing
+# -DCMAKE_C_FLAGS=... bare on the cmake command line REPLACES the pico-sdk
+# toolchain file's seeded -mcpu/-march flags instead of appending to them,
+# so the build either fails outright or silently compiles for the wrong
+# architecture. Real option()s + target_compile_definitions below instead,
+# same pattern as PL_WATCHDOG/PL_WDT_OBSERVE_ONLY above -- enable with e.g.
+# `cmake -B build -DPL_DIAG_LDAC_BENCH=ON`, never via CMAKE_C_FLAGS.
+option(PL_DIAG_COLOR_TEST "Halt-forever colour exposure test (pico-link-14l)" OFF)
+option(PL_DIAG_MADCTL_TEST "Halt-forever MADCTL rotation/mirroring test (pico-link-zzq)" OFF)
+option(PL_DIAG_LDAC_BENCH "Run the LDAC encoder CPU/heap benchmark at boot, then continue (pico-link-cz0.5.4)" OFF)
+option(PL_DIAG_SKIP_BT "Skip cyw43_arch_init/pl_bt_init at boot (BT-free diagnostic builds)" OFF)
+
 # --- The Rust FFI seam (M1b, C-first pivot) ---
 #
 # `ui-ffi` is a `no_std` + `alloc` Rust staticlib (../ui-ffi) depending on
@@ -218,6 +232,22 @@ if(PL_DEBUG_REMOTE)
     # Gates main.c's call into debug_remote.c (only compiled in above when
     # PL_DEBUG_REMOTE is ON) -- see src/debug_remote.h's module doc.
     target_compile_definitions(pico_link PRIVATE PL_DEBUG_REMOTE=1)
+endif()
+
+# Bead pico-link-ukk: PL_DIAG_* reusable diagnostics -- see the option()
+# block near the top of this file for why these are real CMake options
+# rather than CMAKE_C_FLAGS defines.
+if(PL_DIAG_COLOR_TEST)
+    target_compile_definitions(pico_link PRIVATE PL_DIAG_COLOR_TEST=1)
+endif()
+if(PL_DIAG_MADCTL_TEST)
+    target_compile_definitions(pico_link PRIVATE PL_DIAG_MADCTL_TEST=1)
+endif()
+if(PL_DIAG_LDAC_BENCH)
+    target_compile_definitions(pico_link PRIVATE PL_DIAG_LDAC_BENCH=1)
+endif()
+if(PL_DIAG_SKIP_BT)
+    target_compile_definitions(pico_link PRIVATE PL_DIAG_SKIP_BT=1)
 endif()
 
 target_link_libraries(pico_link
