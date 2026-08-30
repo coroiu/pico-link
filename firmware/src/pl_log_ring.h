@@ -44,11 +44,24 @@
 #ifndef PICO_LINK_LOG_RING_H
 #define PICO_LINK_LOG_RING_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
-// Zeroes the ring. Call once, at the very top of main(), before ANY
-// pl_log()/pl_log_locked() call anywhere in this firmware (including ones
-// made before pl_usb_pump_init()/stdio_init_all()).
+// Bead pico-link-okx (F3b): NO LONGER unconditionally zeroes the ring --
+// the underlying buffer and its write/read indices now live in
+// .uninitialized_data (NOLOAD), so a watchdog/software reset preserves
+// whatever was still queued when it happened. This function's job is now
+// to tell a genuine cold boot (or a power cycle that did not preserve
+// SRAM) apart from a warm reset with a valid backlog: on a cold boot it
+// resets the indices to 0 as before; on a warm reset it leaves them alone,
+// so the next pl_log_ring_drain() call emits the surviving backlog first,
+// followed by whatever this boot's own pl_log() calls push, in strict FIFO
+// order -- no separate "read the old tail" code path is needed. Call once,
+// at the very top of main() (right after pl_wdt_capture_boot_reason(),
+// bead pico-link-okx F4), before ANY pl_log()/pl_log_locked() call anywhere
+// in this firmware (including ones made before
+// pl_usb_pump_init()/stdio_init_all()). See pl_log_ring_recovered_backlog()
+// below for how a caller can log the fact that a backlog was recovered.
 void pl_log_ring_init(void);
 
 // Pushes `len` already-formatted bytes. Callable from any context (thread,
@@ -101,5 +114,20 @@ uint32_t pl_log_ring_drain_skips(void);
 // this ring has ever held. Never reset -- deltas aren't meaningful here,
 // only "how bad did it ever get" is. Surfaced in usb-pump-logring.
 uint32_t pl_log_ring_backlog_hwm(void);
+
+// Bead pico-link-okx (F3b): true iff pl_log_ring_init() found a valid
+// previous session's ring state (a warm reset, not a cold boot) and
+// preserved it rather than resetting the indices to 0. Valid only until
+// the next pl_log_ring_init() call (there is only ever one, at boot).
+// main.c uses this to log the recovery explicitly, before pushing its own
+// boot banner into the same ring, so a reader can see the boundary between
+// "what survived" and "what this boot said" even though the ring itself
+// makes no such distinction once both are queued.
+bool pl_log_ring_recovered_backlog(void);
+
+// How many unread bytes were sitting in the ring at the moment
+// pl_log_ring_init() ran, iff pl_log_ring_recovered_backlog() is true.
+// Meaningless (0) otherwise.
+uint32_t pl_log_ring_recovered_backlog_bytes(void);
 
 #endif // PICO_LINK_LOG_RING_H

@@ -74,7 +74,23 @@ int main(void) {
     // Bead pico-link-okx (F1): zero the console byte ring before ANYTHING
     // else -- pl_log()/pl_log_locked() push into it unconditionally, and
     // nothing downstream of this line may call either before it has run.
+    // Bead pico-link-okx (F3b): "zero" is no longer quite right -- see this
+    // function's own doc comment in pl_log_ring.h. A warm reset now KEEPS
+    // whatever backlog didn't get drained before the reset happened.
     pl_log_ring_init();
+
+    // Bead pico-link-okx (F3b): note the recovery explicitly, as the VERY
+    // FIRST thing pushed into the ring this boot -- pl_log() is safe to call
+    // this early (it only pushes bytes into the ring, see its own doc
+    // comment; no USB/stdio init required). Because the ring is strictly
+    // FIFO, this line (and therefore every byte still queued from the
+    // previous boot) is guaranteed to drain BEFORE the "=== pico_link
+    // firmware boot ===" banner a few lines down, giving a reader a clear
+    // marker for where the surviving backlog ends and this boot begins.
+    if (pl_log_ring_recovered_backlog()) {
+        pl_log("log-ring: recovered %lu unread byte(s) from the previous session (warm reset)\r\n",
+               (unsigned long)pl_log_ring_recovered_backlog_bytes());
+    }
 
     // M3: this project now owns TinyUSB's init/task loop (see
     // CMakeLists.txt linking `tinyusb_device`, and tusb_config.h/

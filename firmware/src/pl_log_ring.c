@@ -1,6 +1,7 @@
 // Pico Link firmware -- see pl_log_ring.h's module doc for the why.
 #include "pl_log_ring.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "hardware/sync.h"
@@ -11,15 +12,32 @@
 
 #define PL_LOG_RING_SIZE 4096u // power of two -- see the mask use below
 
-static char s_buf[PL_LOG_RING_SIZE];
+// Bead pico-link-okx (F3b): s_buf/s_write/s_read live in .uninitialized_data
+// (NOLOAD -- a watchdog reset does not clear SRAM, same mechanism
+// watchdog_sup.c's s_loop_trace/s_loop_ring/s_boot_seq already use and that
+// is proven to survive by that file's own reset path) so a reset that cut a
+// drain off mid-backlog does not destroy the very evidence of what the
+// board was saying as it died -- "the debug instrument is implicated in the
+// bug it was installed to find" (this bead's design comment, Ada,
+// 2026-08-30) no longer means the evidence is lost too. s_ring_magic
+// distinguishes a real prior session (keep s_write/s_read, let the next
+// drain emit the old backlog followed by this boot's own logging, in
+// strict FIFO order -- no separate "read the old tail" path is needed) from
+// a cold boot / a power cycle that did not preserve SRAM (start both at 0;
+// s_buf's actual garbage content is never read in that case, since
+// available = write - read = 0 until this session's own pushes advance
+// write past it).
+#define PL_LOG_RING_MAGIC 0x504c4c52u // "PLLR"
+static volatile uint32_t s_ring_magic __attribute__((section(".uninitialized_data.pl_log_ring_magic")));
+static char s_buf[PL_LOG_RING_SIZE] __attribute__((section(".uninitialized_data.pl_log_ring_buf")));
 // Byte offsets, monotonically increasing (never wrapped themselves -- only
 // the index into s_buf, via the mask, wraps). write is touched only inside
 // the push critical section; read is touched only by the single drainer.
 // Both are plain volatile, same "benign race, single writer per field"
 // convention as every other counter in this firmware (see e.g.
 // usb_audio.c's module doc).
-static volatile uint32_t s_write;
-static volatile uint32_t s_read;
+static volatile uint32_t s_write __attribute__((section(".uninitialized_data.pl_log_ring_write")));
+static volatile uint32_t s_read __attribute__((section(".uninitialized_data.pl_log_ring_read")));
 
 static volatile uint32_t s_bytes_dropped;
 static volatile uint32_t s_push_hold_us_total;
@@ -35,9 +53,33 @@ static volatile uint32_t s_push_hold_us_max;
 static volatile uint32_t s_drain_skips;
 static volatile uint32_t s_backlog_hwm;
 
+// Set by pl_log_ring_init() -- true iff a valid previous session's
+// backlog was found and preserved (not persistence-defeating-reset).
+// pl_log_ring_recovered_backlog_bytes() lets main.c log that fact once,
+// before pushing its own boot banner into the same ring.
+static bool s_recovered;
+static uint32_t s_recovered_bytes;
+
 void pl_log_ring_init(void) {
-    s_write = 0;
-    s_read = 0;
+    // Bead pico-link-okx (F3b): THE persistence check -- this must NOT
+    // unconditionally zero s_write/s_read (the pre-F3b body did exactly
+    // that, which would have silently defeated persistence the moment
+    // s_buf/s_write/s_read moved to NOLOAD: the bytes would still be
+    // sitting in SRAM but nothing would ever know to read them).
+    if (s_ring_magic == PL_LOG_RING_MAGIC) {
+        s_recovered = true;
+        s_recovered_bytes = s_write - s_read; // unsigned modular arithmetic, same convention as everywhere else in this file
+        // s_write/s_read intentionally NOT reset here -- see the module
+        // doc above.
+    } else {
+        // Cold boot, or a true power cycle that did not preserve SRAM.
+        s_write = 0;
+        s_read = 0;
+        s_recovered = false;
+        s_recovered_bytes = 0;
+    }
+    s_ring_magic = PL_LOG_RING_MAGIC;
+
     s_bytes_dropped = 0;
     s_push_hold_us_total = 0;
     s_push_hold_us_max = 0;
@@ -194,4 +236,12 @@ uint32_t pl_log_ring_drain_skips(void) {
 
 uint32_t pl_log_ring_backlog_hwm(void) {
     return s_backlog_hwm;
+}
+
+bool pl_log_ring_recovered_backlog(void) {
+    return s_recovered;
+}
+
+uint32_t pl_log_ring_recovered_backlog_bytes(void) {
+    return s_recovered_bytes;
 }
