@@ -7,6 +7,14 @@ with the caller, so a caller reading its own stdout to EOF can never be held
 open by it -- MEASURED: an inherited-stdout child holds the parent 6.01s vs
 0.01s redirected.
 
+CAVEAT, measured 2026-08-30 (bead pico-link-okx): do NOT use this to drive
+CoreAudio clients. os.setsid() detaches the child from the caller's session,
+and a session-less process cannot reach coreaudiod -- `afplay` then exits
+silently with NO stderr and plays nothing. This cost a full 20-trial storm
+that reported success while set_itf_alt1_calls stayed at 0. Detach the
+CAPTURE (libusb, the thing that can hang the session); drive audio from a
+normal session-attached shell.
+
 Usage: detach.py <stdout_log> <stderr_log> <hardkill_secs|0> -- <cmd> [args...]
 Prints the grandchild PID and exits immediately.
 """
