@@ -190,6 +190,28 @@ typedef struct {
     pl_codec_format_t format;
     pl_codec_frame_info_t frame;
 
+    // Bead pico-link-cz0.5.5 (LDAC L2): capability bits captured from
+    // A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CAPABILITY while BTstack
+    // walks the remote's SEPs, read back at
+    // A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE to drive the
+    // preference-ordered PL_CODECS walk (pl_a2dp_choose_codec). SBC-shaped
+    // only for now -- codec_table.c has no other row; L3 adds an OTHER-
+    // capability slot alongside this one when the LDAC row lands. First
+    // offering remote SEP wins (a real headphone offers SBC at most once).
+    // Reset at SIGNALING_CONNECTION_ESTABLISHED, the one point a fresh
+    // discovery pass begins.
+    struct {
+        bool sbc_offered;
+        uint8_t sbc_remote_seid;
+        uint8_t sbc_sampling_frequency_bitmap;
+        uint8_t sbc_channel_mode_bitmap;
+        uint8_t sbc_block_length_bitmap;
+        uint8_t sbc_subbands_bitmap;
+        uint8_t sbc_allocation_method_bitmap;
+        uint8_t sbc_min_bitpool_value;
+        uint8_t sbc_max_bitpool_value;
+    } discovered;
+
     pl_a2dp_media_state_t state;
     btstack_timer_source_t media_timer;
     bool timer_armed;
@@ -960,7 +982,98 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 break;
             }
             s_ctx.a2dp_cid = cid;
+            // Fresh discovery pass starting -- clear any capability bits
+            // left over from a previous connection attempt.
+            memset(&s_ctx.discovered, 0, sizeof(s_ctx.discovered));
             pl_log("a2dp: signaling connected, cid=0x%02x\r\n", cid);
+            break;
+        }
+
+        case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CAPABILITY: {
+            uint16_t cid = a2dp_subevent_signaling_media_codec_sbc_capability_get_a2dp_cid(packet);
+            if (cid != s_ctx.a2dp_cid) {
+                break;
+            }
+            // First offering remote SEP wins -- see s_ctx.discovered's doc
+            // comment.
+            if (!s_ctx.discovered.sbc_offered) {
+                s_ctx.discovered.sbc_offered = true;
+                s_ctx.discovered.sbc_remote_seid = a2dp_subevent_signaling_media_codec_sbc_capability_get_remote_seid(packet);
+                s_ctx.discovered.sbc_sampling_frequency_bitmap =
+                    a2dp_subevent_signaling_media_codec_sbc_capability_get_sampling_frequency_bitmap(packet);
+                s_ctx.discovered.sbc_channel_mode_bitmap =
+                    a2dp_subevent_signaling_media_codec_sbc_capability_get_channel_mode_bitmap(packet);
+                s_ctx.discovered.sbc_block_length_bitmap =
+                    a2dp_subevent_signaling_media_codec_sbc_capability_get_block_length_bitmap(packet);
+                s_ctx.discovered.sbc_subbands_bitmap = a2dp_subevent_signaling_media_codec_sbc_capability_get_subbands_bitmap(packet);
+                s_ctx.discovered.sbc_allocation_method_bitmap =
+                    a2dp_subevent_signaling_media_codec_sbc_capability_get_allocation_method_bitmap(packet);
+                s_ctx.discovered.sbc_min_bitpool_value = a2dp_subevent_signaling_media_codec_sbc_capability_get_min_bitpool_value(packet);
+                s_ctx.discovered.sbc_max_bitpool_value = a2dp_subevent_signaling_media_codec_sbc_capability_get_max_bitpool_value(packet);
+            }
+            break;
+        }
+
+        case A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE: {
+            uint16_t cid = a2dp_subevent_signaling_capabilities_complete_get_a2dp_cid(packet);
+            if (cid != s_ctx.a2dp_cid) {
+                break;
+            }
+
+            // Preference-ordered table walk (design sec 4.3,
+            // .planning/design/2026-08-30-ldac.md Q2/Q5): PL_CODECS is
+            // sorted by preference with SBC permanently last as the
+            // mandatory fallback floor (codec_table.h:97-99). Pick the
+            // first row the remote also offered and hand it to BTstack's
+            // matching a2dp_source_set_config_* -- which call depends on
+            // avdtp_codec_type, an AVDTP wire-level fact, not a
+            // codec-identity business-logic branch of the kind
+            // codec_table.c forbids. Only SBC is wired today; L3 adds an
+            // AVDTP_CODEC_NON_A2DP arm here for LDAC.
+            bool matched = false;
+            for (size_t i = 0; i < PL_CODEC_COUNT; i++) {
+                pl_codec_t *row = PL_CODECS[i];
+                if (row->avdtp_codec_type == AVDTP_CODEC_SBC) {
+                    if (!s_ctx.discovered.sbc_offered) {
+                        continue;
+                    }
+                    avdtp_stream_endpoint_t *local_ep = avdtp_get_stream_endpoint_for_seid(row->local_seid);
+                    if (local_ep == NULL) {
+                        pl_log("a2dp: no local stream endpoint for local_seid %u\r\n", row->local_seid);
+                        continue;
+                    }
+                    avdtp_configuration_sbc_t configuration;
+                    configuration.sampling_frequency =
+                        avdtp_choose_sbc_sampling_frequency(local_ep, s_ctx.discovered.sbc_sampling_frequency_bitmap);
+                    configuration.channel_mode = avdtp_choose_sbc_channel_mode(local_ep, s_ctx.discovered.sbc_channel_mode_bitmap);
+                    configuration.block_length = avdtp_choose_sbc_block_length(local_ep, s_ctx.discovered.sbc_block_length_bitmap);
+                    configuration.subbands = avdtp_choose_sbc_subbands(local_ep, s_ctx.discovered.sbc_subbands_bitmap);
+                    configuration.allocation_method =
+                        avdtp_choose_sbc_allocation_method(local_ep, s_ctx.discovered.sbc_allocation_method_bitmap);
+                    configuration.max_bitpool_value = avdtp_choose_sbc_max_bitpool_value(local_ep, s_ctx.discovered.sbc_max_bitpool_value);
+                    configuration.min_bitpool_value = avdtp_choose_sbc_min_bitpool_value(local_ep, s_ctx.discovered.sbc_min_bitpool_value);
+
+                    uint8_t status = a2dp_source_set_config_sbc(cid, row->local_seid, s_ctx.discovered.sbc_remote_seid, &configuration);
+                    if (status != ERROR_CODE_SUCCESS) {
+                        pl_log("a2dp: set_config_sbc FAILED status=0x%02x\r\n", status);
+                        continue;
+                    }
+                    matched = true;
+                    break;
+                }
+                // Future rows (e.g. AVDTP_CODEC_NON_A2DP for LDAC, L3) fall
+                // through here until their own set_config_* arm exists.
+            }
+
+            if (!matched) {
+                // Fail LOUDLY, not silently: under ENABLE_A2DP_EXPLICIT_CONFIG
+                // the state machine parks at A2DP_DISCOVERY_DONE waiting for
+                // us -- a no-suitable-codec path that just breaks means the
+                // stream silently never configures (the pico-link-r44 failure
+                // shape).
+                pl_log("a2dp: NO SUITABLE CODEC offered by remote, cid=0x%02x -- stream will not configure\r\n", cid);
+                pl_bt_push_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_NO_A2DP_SINK);
+            }
             break;
         }
 

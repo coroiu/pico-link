@@ -70,7 +70,14 @@
 // same sink (registered per a2dp_source_demo.c's SDP/service shape -- see
 // a2dp.c's module doc for why AVRCP is plumbed even though S1 doesn't act
 // on transport controls yet).
-#define MAX_NR_AVDTP_STREAM_ENDPOINTS 1
+// pico-link-cz0.5.5 (LDAC L2): raised from 1 -- codec_table.c still has
+// only the SBC row, but MAX_NR_AVDTP_STREAM_ENDPOINTS bounds how many rows
+// a2dp.c's endpoint-registration loop (pl_a2dp_init) can ever create, and
+// this bead's whole point is switching that loop over to explicit
+// negotiation ahead of L3 adding the LDAC row. Bump it now, not when L3
+// lands, so this bead can be built and reasoned about against its real
+// target shape.
+#define MAX_NR_AVDTP_STREAM_ENDPOINTS 2
 #define MAX_NR_AVDTP_CONNECTIONS 1
 #define MAX_NR_AVRCP_CONNECTIONS 1
 
@@ -98,10 +105,13 @@
 #define HCI_HOST_SCO_PACKET_LEN 120
 #define HCI_HOST_SCO_PACKET_NUM 3
 
-// ENABLE_A2DP_EXPLICIT_CONFIG is deliberately NOT defined here -- S1 relies
-// on BTstack's implicit codec auto-selection, which is hardcoded to SBC
-// when this is undefined (a2dp.c:591-626 in the vendored BTstack source).
-// S4 (LDAC) defines this and switches to codec_table-driven explicit
-// negotiation -- design sec 4.1.
+// pico-link-cz0.5.5 (LDAC L2): defined as of this bead -- switches off
+// BTstack's implicit SBC-hardcoded auto-selection (a2dp.c:591-626 in the
+// vendored BTstack source) and parks its state machine at
+// A2DP_DISCOVERY_DONE after A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE,
+// waiting for us to call a2dp_source_set_config_*. Our a2dp.c now handles
+// that event and runs the preference-ordered codec_table.c walk -- design
+// sec 4.1, .planning/design/2026-08-30-ldac.md Q2/Q5.
+#define ENABLE_A2DP_EXPLICIT_CONFIG
 
 #endif // BTSTACK_CONFIG_H
