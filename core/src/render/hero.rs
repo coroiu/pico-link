@@ -34,6 +34,7 @@ use embedded_graphics::Drawable;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::theme::{font, palette};
 use super::widget::{ChromeContribution, Widget};
@@ -275,7 +276,7 @@ fn truncate_to_width(font: &FontRenderer, text: &str, max_width: u32) -> String 
 }
 
 impl Widget for HeroStatusView {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         constraints
     }
 
@@ -285,7 +286,7 @@ impl Widget for HeroStatusView {
     /// [`Widget::render`]'s doc comment for why the `Result` return exists
     /// at all.
     #[allow(clippy::too_many_lines)]
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
         let center_x = area.top_left.x + area.size.width as i32 / 2;
 
@@ -414,7 +415,7 @@ impl Widget for HeroStatusView {
     /// [`ChromeContribution::fallback`] rather than painting the rail
     /// itself — the rail lives in `ChromeContribution`'s a/b/x/y fields,
     /// which is `pico-link-znb.5` (E2)'s job, not this widget's.
-    fn chrome_contribution(&self) -> Option<ChromeContribution> {
+    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
         Some(ChromeContribution { fallback: self.is_fallback(), ..Default::default() })
     }
 }
@@ -422,9 +423,14 @@ impl Widget for HeroStatusView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Instant;
     use crate::render::widget::FocusEvent;
 
     const AREA: Rectangle = Rectangle::new(Point::new(0, 0), Size::new(240, 206));
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     fn nominal() -> HeroStatusView {
         HeroStatusView::new(
@@ -436,7 +442,7 @@ mod tests {
 
     fn render(view: &HeroStatusView) -> FrameBuffer565 {
         let mut fb = FrameBuffer565::new(240, 206);
-        view.render(AREA, &mut fb).unwrap();
+        view.render(AREA, &test_ctx(), &mut fb).unwrap();
         fb
     }
 
@@ -597,13 +603,13 @@ mod tests {
                 bitrate: BitrateStatus::Kbps(328),
             },
         );
-        let contribution = view.chrome_contribution().expect("hero widget always reports a contribution");
+        let contribution = view.chrome_contribution(&test_ctx()).expect("hero widget always reports a contribution");
         assert!(contribution.fallback);
     }
 
     #[test]
     fn chrome_contribution_reports_fallback_false_when_nominal() {
-        let contribution = nominal().chrome_contribution().expect("hero widget always reports a contribution");
+        let contribution = nominal().chrome_contribution(&test_ctx()).expect("hero widget always reports a contribution");
         assert!(!contribution.fallback);
     }
 

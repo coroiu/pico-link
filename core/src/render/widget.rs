@@ -32,6 +32,7 @@ use crate::input::NavIntent;
 use crate::panel::Button;
 use crate::platform::OutputRequest;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::ListItemKey;
 use super::rail::ButtonLabel;
@@ -200,7 +201,7 @@ pub trait Widget {
     /// (see `Screen::render`); a widget is free to request less than
     /// `constraints` (e.g. a single-line label) or all of it (e.g. a list
     /// that should fill the remaining content area).
-    fn measure(&self, constraints: Size) -> Size;
+    fn measure(&self, constraints: Size, ctx: &RenderCtx) -> Size;
 
     /// Draws into `target`, constrained to `area`. Implementations that
     /// need to guard against overdraw (text overflow, an oversized row)
@@ -216,7 +217,12 @@ pub trait Widget {
     /// return exists only to match `Drawable`/`DrawTarget`'s signature so
     /// widget impls can use `?` freely when calling into embedded-graphics
     /// primitives.
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible>;
+    fn render(
+        &self,
+        area: Rectangle,
+        ctx: &RenderCtx,
+        target: &mut FrameBuffer565,
+    ) -> Result<(), Infallible>;
 
     /// Whether this widget can receive focus. Defaults to `false` (e.g.
     /// static labels, dividers).
@@ -249,7 +255,30 @@ pub trait Widget {
     /// "its" right now. Defaults to `None` (no override): static labels,
     /// dividers, and any widget with nothing dynamic to report don't need
     /// to implement this.
-    fn chrome_contribution(&self) -> Option<ChromeContribution> {
+    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
+        None
+    }
+
+    /// How much longer, from `ctx.now()`, this widget's next render call
+    /// could produce different pixels purely from the passage of time
+    /// (e.g. an elapsed-time readout, a spinner) — **not** from a
+    /// model/focus/input change, which already goes through the normal
+    /// `mark_dirty` path. `None` (the default) means "nothing about my
+    /// appearance depends on time"; static labels, lists, and every widget
+    /// with no time-varying content don't need to implement this.
+    ///
+    /// This is what lets [`App::tick`] (`crate::app::App::tick`) schedule a
+    /// redraw for a purely time-driven appearance change without either of
+    /// the two hacks this seam exists to retire: marking the app dirty on
+    /// every tick (which would defeat `Screen::render`'s flush-skip and
+    /// full-frame-blit a static screen every frame — see the frame-scoped
+    /// clock ADR's "hacks to retire" section) or leaving such a widget
+    /// permanently frozen between input events.
+    ///
+    /// See [`Screen::redraw_after`] for how a screen combines its widgets'
+    /// answers, and `.planning/decisions/2026-08-31-render-ctx-frame-
+    /// scoped-clock.md` for the full design.
+    fn redraw_after(&self, _ctx: &RenderCtx) -> Option<core::time::Duration> {
         None
     }
 

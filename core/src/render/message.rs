@@ -42,6 +42,7 @@ use embedded_graphics::{
 };
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::{name_top_offset, username_top_offset};
 use super::theme::{font, palette};
@@ -114,7 +115,7 @@ impl MessageView {
 }
 
 impl Widget for MessageView {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         constraints
     }
 
@@ -123,7 +124,7 @@ impl Widget for MessageView {
     /// Returns `Infallible`'s uninhabited variant in practice — see
     /// [`Widget::render`]'s doc comment for why the `Result` return exists
     /// at all.
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         render_message(area, self.icon, self.icon_color, &self.headline, self.headline_color, self.subline.as_deref(), target);
         Ok(())
     }
@@ -193,7 +194,12 @@ fn render_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Instant;
     use crate::render::FrameBuffer565;
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     // Content-area height: screen height minus `chrome::TITLE_BAR_HEIGHT`
     // (16) and `chrome::HINT_BAR_HEIGHT` (18) on the 240x240 Pico Plus 2 W
@@ -204,7 +210,7 @@ mod tests {
     #[test]
     fn a_headline_only_message_draws_ink_in_its_default_color() {
         let mut fb = FrameBuffer565::new(240, 240);
-        MessageView::new("Waiting for sync...").render(AREA, &mut fb).unwrap();
+        MessageView::new("Waiting for sync...").render(AREA, &test_ctx(), &mut fb).unwrap();
 
         let any_headline_ink = fb.pixels().any(|p| p.1 == palette::TEXT_PRIMARY);
         assert!(any_headline_ink, "the headline should have drawn something in the default text color");
@@ -213,7 +219,7 @@ mod tests {
     #[test]
     fn an_overridden_headline_color_draws_in_that_color_instead() {
         let mut fb = FrameBuffer565::new(240, 240);
-        MessageView::new("Sync error").with_headline_color(palette::STATUS_ERROR).render(AREA, &mut fb).unwrap();
+        MessageView::new("Sync error").with_headline_color(palette::STATUS_ERROR).render(AREA, &test_ctx(), &mut fb).unwrap();
 
         let any_error_ink = fb.pixels().any(|p| p.1 == palette::STATUS_ERROR);
         assert!(any_error_ink, "an overridden headline color should be visible");
@@ -224,10 +230,10 @@ mod tests {
     #[test]
     fn a_subline_is_optional_and_changes_the_rendered_output_when_present() {
         let mut fb_without = FrameBuffer565::new(240, 240);
-        MessageView::new("Nothing here yet").render(AREA, &mut fb_without).unwrap();
+        MessageView::new("Nothing here yet").render(AREA, &test_ctx(), &mut fb_without).unwrap();
 
         let mut fb_with = FrameBuffer565::new(240, 240);
-        MessageView::new("Nothing here yet").with_subline("Check back later").render(AREA, &mut fb_with).unwrap();
+        MessageView::new("Nothing here yet").with_subline("Check back later").render(AREA, &test_ctx(), &mut fb_with).unwrap();
 
         let without: Vec<Rgb565> = fb_without.pixels().map(|p| p.1).collect();
         let with: Vec<Rgb565> = fb_with.pixels().map(|p| p.1).collect();

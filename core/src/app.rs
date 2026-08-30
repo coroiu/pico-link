@@ -22,7 +22,7 @@ use core::cell::RefCell;
 use crate::input::NavIntent;
 use crate::render::home::build_home_screen;
 use crate::render::wizard::build_wizard_screen;
-use crate::render::{Action, FrameBuffer565, ListItem, ListItemKey, Navigator, Screen, VerticalList};
+use crate::render::{Action, FrameBuffer565, Instant, ListItem, ListItemKey, Navigator, RenderCtx, Screen, VerticalList};
 
 /// The devices screen's "Scan for headphones" row's identity key. Not
 /// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
@@ -274,15 +274,24 @@ pub enum WizardPhase {
     /// accumulated in `BtModel::devices` so far -- this phase covers both
     /// "still actively scanning" and "scan finished, results on screen,
     /// user is choosing one", since nothing about the rendered content
-    /// differs between them.
-    Scanning,
+    /// differs between them. `started` is when the scan began -- see the
+    /// frame-scoped clock ADR's "event timestamps" note: a timestamp is
+    /// domain state and belongs in the model, current time is not. Widget
+    /// code (`render::wizard`) has no clock of its own, so a freshly
+    /// entered `Scanning` phase carries [`PENDING_TIMESTAMP`] until
+    /// [`App`]'s own `now_us` backfills it -- see [`WizardPhase::
+    /// scanning_pending`].
+    Scanning { started: Instant },
     /// Phase 3: the scan ended (a C `LinkStateChanged(Idle)` event while
     /// this phase was `Scanning`) with zero devices found.
     NothingFound,
     /// Phase 4: connecting, at the named sub-`step` currently in
     /// progress. `addr` is carried so a subsequent retry (phase 5's "keep
     /// trying") knows which device to reissue [`Command::Connect`] for.
-    Connecting { addr: [u8; 6], step: ConnectStep },
+    /// `started` is when this connect attempt began -- same
+    /// pending-then-backfilled shape as `Scanning`'s own `started`, via
+    /// [`WizardPhase::connecting_pending`].
+    Connecting { addr: [u8; 6], step: ConnectStep, started: Instant },
     /// Phase 5: surfaced once a connect attempt has gone unanswered for
     /// ~6s (a C-timed threshold -- core never decides this itself, it
     /// only renders whatever [`Event::ConnectRetrying`] reports).
@@ -299,6 +308,38 @@ pub enum WizardPhase {
     Failed { addr: [u8; 6], reason: ConnectFailureReason },
 }
 
+/// Sentinel `started` value a widget-driven `WizardPhase` transition uses
+/// when it has no clock to stamp itself with. `render::wizard`'s
+/// `PairingWizardView` enters `Scanning`/`Connecting` directly from
+/// `on_focus`/`on_intent` (a d-pad press, not a Bluetooth [`Event`]), and
+/// neither of those gets a [`crate::render::RenderCtx`] -- deliberately:
+/// `Widget::render` is the only place time enters a widget, precisely so
+/// `render` stays a pure function of state/area/time (see the frame-scoped
+/// clock ADR) and mutating a timestamp from inside `render` would violate
+/// that. So the widget stamps `PENDING_TIMESTAMP` instead, and [`App`]
+/// (which does have `now_us`) backfills the real value immediately after
+/// dispatch -- see [`App::stamp_pending_wizard_timestamp`], called from
+/// both [`App::handle_input`] and [`App::handle_event`] since either path
+/// can produce a freshly entered phase.
+///
+/// `u64::MAX` rather than `0`: a genuinely-zero real timestamp (`now_us`
+/// before the very first tick, which every test in this module starts
+/// from) must never be confused with "not yet stamped".
+const PENDING_TIMESTAMP: Instant = Instant::from_micros(u64::MAX);
+
+impl WizardPhase {
+    /// Constructs a fresh `Scanning` phase with a not-yet-stamped
+    /// `started` -- see [`PENDING_TIMESTAMP`]'s doc comment.
+    pub(crate) fn scanning_pending() -> Self {
+        Self::Scanning { started: PENDING_TIMESTAMP }
+    }
+
+    /// Constructs a fresh `Connecting` phase with a not-yet-stamped
+    /// `started` -- see [`PENDING_TIMESTAMP`]'s doc comment.
+    pub(crate) fn connecting_pending(addr: [u8; 6], step: ConnectStep) -> Self {
+        Self::Connecting { addr, step, started: PENDING_TIMESTAMP }
+    }
+}
 
 /// Home's two faces (design section 4's Home exception, section 7 --
 /// bead `pico-link-znb.8`/E7). A **face**, not a pushed screen: Home is
@@ -515,6 +556,16 @@ pub struct App {
     /// this bead's scope -- storing it is the fix pico-link-a67 asks for;
     /// wiring a liveness/timeout indicator to it is future UI work.
     now_us: u64,
+    /// The next instant, if any, at which some widget on the current
+    /// screen says its own appearance would differ purely from elapsed
+    /// time -- recomputed by every [`App::render`] call from
+    /// [`Navigator::redraw_after`], and consulted by [`App::tick`] to mark
+    /// the app dirty exactly when it comes due. `None` means nothing
+    /// currently on screen has a time-driven opinion, so `tick` alone will
+    /// never mark this app dirty (see the frame-scoped clock ADR's "hacks
+    /// to retire" section for why `tick` does not just mark dirty
+    /// unconditionally).
+    next_redraw_at: Option<Instant>,
     /// Queued by the devices screen's `on_activate_index` closures (see
     /// [`build_devices_screen`]), drained by [`App::poll_command`]. `Rc`+
     /// `RefCell` because the closures live inside the `Navigator`'s screen
@@ -587,6 +638,7 @@ impl App {
             dirty: true,
             model,
             now_us: 0,
+            next_redraw_at: None,
             commands,
             wizard_phase,
             wizard_devices,
@@ -674,6 +726,28 @@ impl App {
             Event::WizardAutoDismiss => self.on_wizard_auto_dismiss(),
             Event::CodecChanged(codec) => self.set_connected_codec(codec),
         }
+        self.stamp_pending_wizard_timestamp();
+    }
+
+    /// Backfills [`WizardPhase::Scanning`]/[`WizardPhase::Connecting`]'s
+    /// `started` field with the real current time (`self.now_us`) if it's
+    /// still [`PENDING_TIMESTAMP`] -- see that constant's doc comment for
+    /// why the widget itself can't do this. Called after every
+    /// [`App::handle_input`] and [`App::handle_event`], since either path
+    /// can produce a freshly entered phase (`handle_input` for a direct
+    /// d-pad-driven transition, `handle_event` for the `NotResponding` ->
+    /// `Connecting` retry-succeeding case in [`App::on_connect_step_
+    /// changed`]). A no-op whenever the current phase isn't pending (the
+    /// overwhelmingly common case), or isn't `Scanning`/`Connecting` at
+    /// all.
+    fn stamp_pending_wizard_timestamp(&mut self) {
+        let mut phase = self.wizard_phase.borrow_mut();
+        match &mut *phase {
+            WizardPhase::Scanning { started } | WizardPhase::Connecting { started, .. } if *started == PENDING_TIMESTAMP => {
+                *started = Instant::from_micros(self.now_us);
+            }
+            _ => {}
+        }
     }
 
     /// Phase 2 -> phase 3 transition (design section 9): when the scan
@@ -692,7 +766,7 @@ impl App {
             return;
         }
         let mut phase = self.wizard_phase.borrow_mut();
-        if *phase == WizardPhase::Scanning && self.wizard_devices.borrow().is_empty() {
+        if matches!(*phase, WizardPhase::Scanning { .. }) && self.wizard_devices.borrow().is_empty() {
             *phase = WizardPhase::NothingFound;
             drop(phase);
             self.dirty = true;
@@ -707,8 +781,18 @@ impl App {
     fn on_connect_step_changed(&mut self, step: ConnectStep) {
         let mut phase = self.wizard_phase.borrow_mut();
         match &*phase {
-            WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. } => {
-                *phase = WizardPhase::Connecting { addr: *addr, step };
+            // Already `Connecting`: this is the same connect attempt
+            // continuing, so its `started` carries forward unchanged.
+            WizardPhase::Connecting { addr, started, .. } => {
+                *phase = WizardPhase::Connecting { addr: *addr, step, started: *started };
+            }
+            // Coming back from `NotResponding` (which carries no
+            // `started` of its own): the original attempt's start time is
+            // gone, so this re-enters as pending, same as a brand-new
+            // connect -- `stamp_pending_wizard_timestamp` (called by
+            // `handle_event` right after this) backfills it.
+            WizardPhase::NotResponding { addr, .. } => {
+                *phase = WizardPhase::connecting_pending(*addr, step);
             }
             _ => {}
         }
@@ -850,13 +934,24 @@ impl App {
 
     /// Records C's latest clock reading (`pl_ui_tick`'s core-side
     /// implementation -- previously a no-op that discarded `now_us`
-    /// entirely, see pico-link-a67). Does not by itself mark the app dirty:
-    /// the clock advancing is not, on its own, a reason to redraw anything
-    /// today (no screen in this bead's scope reads it) -- a future
-    /// liveness/timeout indicator that *does* need to repaint purely from
-    /// elapsed time will call `mark_dirty` itself when it has a reason to.
+    /// entirely, see pico-link-a67). Marks the app dirty exactly when
+    /// `now_us` reaches or passes [`App::next_redraw_at`] -- the
+    /// `redraw_after` seam's whole point (see the frame-scoped clock ADR):
+    /// a widget declares when it would next look different, rather than
+    /// this unconditionally marking dirty on every tick (which would
+    /// permanently cost the flush-skip and full-frame-blit a static screen
+    /// every tick, contending with audio over SPI on real hardware -- see
+    /// the ADR's "hacks to retire" section). Deliberately does **not**
+    /// clear `next_redraw_at` here: the next [`App::render`] recomputes it
+    /// from scratch, and until then it stays accurate for any repeated
+    /// `tick` call in the same frame.
     pub fn tick(&mut self, now_us: u64) {
         self.now_us = now_us;
+        if let Some(due) = self.next_redraw_at {
+            if Instant::from_micros(now_us) >= due {
+                self.dirty = true;
+            }
+        }
     }
 
     /// The most recent `now_us` recorded via [`App::tick`]. `0` before the
@@ -937,6 +1032,7 @@ impl App {
         for intent in intents {
             self.navigator.dispatch(intent);
         }
+        self.stamp_pending_wizard_timestamp();
         self.dirty = true;
     }
 
@@ -961,6 +1057,11 @@ impl App {
     /// the dirty flag, returning the freshly rendered framebuffer for the
     /// caller to hand to a `DisplaySurface::flush`.
     ///
+    /// Also recomputes [`App::next_redraw_at`] from
+    /// [`Navigator::redraw_after`] at this frame's `ctx` -- so a widget's
+    /// "I'll look different again in N" answer is always relative to the
+    /// instant that was actually just rendered, not a stale one.
+    ///
     /// # Panics
     ///
     /// Never, in practice: `Navigator::render`'s `Result` is over
@@ -968,9 +1069,11 @@ impl App {
     /// never fail to draw). The `expect` exists only because
     /// `Result::expect` is how that's asserted at the call site.
     pub fn render(&mut self) -> &FrameBuffer565 {
+        let ctx = RenderCtx::at(Instant::from_micros(self.now_us));
         self.navigator
-            .render(&mut self.framebuffer)
+            .render(&ctx, &mut self.framebuffer)
             .expect("core DrawTarget is Infallible");
+        self.next_redraw_at = self.navigator.redraw_after(&ctx).map(|duration| ctx.now() + duration);
         self.dirty = false;
         &self.framebuffer
     }
@@ -1231,6 +1334,67 @@ mod tests {
         assert_eq!(app.now_us(), 0);
         app.tick(123_456);
         assert_eq!(app.now_us(), 123_456);
+    }
+
+    /// A widget whose sole purpose is answering [`Widget::redraw_after`]
+    /// with a fixed [`Duration`] -- everything else is the trait's default
+    /// (a static, non-focusable, nothing-to-draw widget), so pushing one
+    /// via [`App::push_screen_for_test`] isolates exactly the
+    /// `redraw_after` -> `next_redraw_at` -> `tick` wiring under test, with
+    /// no other widget behaviour in the way.
+    struct FixedRedrawWidget(core::time::Duration);
+
+    impl crate::render::Widget for FixedRedrawWidget {
+        fn measure(&self, constraints: embedded_graphics::prelude::Size, _ctx: &crate::render::RenderCtx) -> embedded_graphics::prelude::Size {
+            constraints
+        }
+        fn render(
+            &self,
+            _area: embedded_graphics::primitives::Rectangle,
+            _ctx: &crate::render::RenderCtx,
+            _target: &mut FrameBuffer565,
+        ) -> Result<(), core::convert::Infallible> {
+            Ok(())
+        }
+        fn redraw_after(&self, _ctx: &crate::render::RenderCtx) -> Option<core::time::Duration> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn a_widget_requesting_a_redraw_leaves_the_app_clean_before_it_is_due_and_dirty_once_it_is() {
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(Screen::new("T", vec![Box::new(FixedRedrawWidget(core::time::Duration::from_millis(100)))]));
+
+        // Establishes next_redraw_at = now(0) + 100ms, and clears dirty
+        // (the just-pushed screen has just been rendered).
+        app.render();
+        assert!(!app.dirty());
+
+        app.tick(50_000); // 50ms: before the 100ms mark.
+        assert!(!app.dirty(), "must not go dirty before the widget's requested redraw instant is reached");
+
+        app.tick(150_000); // 150ms: past the 100ms mark.
+        assert!(app.dirty(), "must go dirty once now_us reaches/passes the widget's requested redraw instant");
+    }
+
+    #[test]
+    fn a_widget_with_no_time_driven_opinion_never_goes_dirty_from_tick_alone() {
+        let mut app = App::new(240, 240);
+        // MessageView never overrides redraw_after -- it inherits the
+        // trait's `None` default, exactly the "nothing to do with time"
+        // case this test exists to prove doesn't regress into the
+        // "tick always marks dirty" hack the ADR names as the thing to
+        // retire.
+        app.push_screen_for_test(Screen::new("T", vec![Box::new(crate::render::MessageView::new("hi"))]));
+
+        app.render();
+        assert!(!app.dirty());
+
+        // A tick arbitrarily far in the future must still not mark dirty:
+        // there is no `next_redraw_at` to ever come due.
+        app.tick(1_000_000_000);
+        assert!(!app.dirty(), "tick alone must never mark a time-indifferent screen dirty");
     }
 
     #[test]

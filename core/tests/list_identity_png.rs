@@ -25,9 +25,14 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 
 use embedded_graphics::prelude::{Point, RgbColor};
+use pico_link_core::platform::Instant;
 use pico_link_core::render::chrome::TITLE_BAR_HEIGHT;
 use pico_link_core::render::theme::palette;
-use pico_link_core::render::{FrameBuffer565, ListItem, ListItemKey, Navigator, Screen, VerticalList, Widget, ROW_HEIGHT};
+use pico_link_core::render::{FrameBuffer565, ListItem, ListItemKey, Navigator, RenderCtx, Screen, VerticalList, Widget, ROW_HEIGHT};
+
+fn test_ctx() -> RenderCtx {
+    RenderCtx::at(Instant::from_micros(0))
+}
 
 fn row_top(index: i32) -> i32 {
     TITLE_BAR_HEIGHT as i32 + index * ROW_HEIGHT as i32
@@ -69,7 +74,7 @@ fn selection_highlight_stays_on_the_same_device_row_as_new_devices_are_inserted_
     let screen1 = Screen::new("Pico Link", vec![Box::new(list1)]);
     let navigator1 = Navigator::new(screen1);
     let mut fb1 = FrameBuffer565::new(240, 240);
-    navigator1.render(&mut fb1).expect("core DrawTarget is Infallible");
+    navigator1.render(&test_ctx(), &mut fb1).expect("core DrawTarget is Infallible");
     dump_png(&fb1, "frame1-before-growth");
 
     // Row 1 ("Headphones") must show the selected-row elevated fill.
@@ -95,7 +100,7 @@ fn selection_highlight_stays_on_the_same_device_row_as_new_devices_are_inserted_
     let screen2 = Screen::new("Pico Link", vec![Box::new(list2)]);
     let navigator2 = Navigator::new(screen2);
     let mut fb2 = FrameBuffer565::new(240, 240);
-    navigator2.render(&mut fb2).expect("core DrawTarget is Infallible");
+    navigator2.render(&test_ctx(), &mut fb2).expect("core DrawTarget is Infallible");
     dump_png(&fb2, "frame2-after-growth");
 
     // The highlight must now be on row 2 (Headphones' new position)...

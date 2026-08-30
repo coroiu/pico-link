@@ -49,8 +49,20 @@
     clippy::cast_sign_loss
 )]
 
+// `RenderCtx` is `Copy`/8 bytes, so pedantic clippy would rather every
+// `measure`/`render`/`chrome_contribution`/`redraw_after` took it by
+// value. The frame-scoped clock ADR (`.planning/decisions/2026-08-31-
+// render-ctx-frame-scoped-clock.md`) specifies `&RenderCtx` deliberately
+// across every one of those signatures, so the next frame-scoped field
+// this type grows (dim state, a reduce-motion setting, a frame counter --
+// see `RenderCtx`'s own doc comment) doesn't force reconsidering pass-by-
+// value against `Copy`'s size threshold at every call site again. Allowed
+// module-wide rather than re-litigating it at each of the ~dozen sites.
+#![allow(clippy::trivially_copy_pass_by_ref)]
+
 pub mod chrome;
 pub mod confirm;
+pub mod ctx;
 pub mod framebuffer;
 pub mod hero;
 pub mod home;
@@ -66,7 +78,9 @@ pub mod wizard;
 
 pub use chrome::{compute_chrome, compute_chrome_for, ChromeLayout};
 pub use confirm::ConfirmView;
+pub use ctx::RenderCtx;
 pub use framebuffer::FrameBuffer565;
+pub use crate::platform::Instant;
 pub use hero::{BitrateStatus, CodecStatus, HeroStatusView};
 pub use home::{build_home_screen, HOME_TITLE};
 pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};

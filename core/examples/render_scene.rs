@@ -6,7 +6,8 @@
 //! Run with: `cargo run -p pico-link-core --example render_scene`
 //! Writes `render_scene.png` to the current directory.
 
-use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, Screen, VerticalList};
+use pico_link_core::platform::Instant;
+use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, RenderCtx, Screen, VerticalList};
 
 fn main() {
     let items = vec![
@@ -24,7 +25,8 @@ fn main() {
     navigator.dispatch(pico_link_core::NavIntent::Down);
 
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    let ctx = RenderCtx::at(Instant::from_micros(0));
+    navigator.render(&ctx, &mut framebuffer).expect("core DrawTarget is Infallible");
 
     let path = "render_scene.png";
     dump_png(&framebuffer, path);

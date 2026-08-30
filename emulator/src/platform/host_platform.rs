@@ -62,8 +62,8 @@ impl<D: DisplaySurface, I: InputSource> Platform for HostPlatform<D, I> {
 mod tests {
     use super::*;
     use crate::platform::{HeadlessSurface, NoopInput};
-    use pico_link_core::platform::{Clock, PowerControl, Storage};
-    use pico_link_core::render::{FrameBuffer565, Navigator, Screen};
+    use pico_link_core::platform::{Clock, Instant, PowerControl, Storage};
+    use pico_link_core::render::{FrameBuffer565, Navigator, RenderCtx, Screen};
     use uuid::Uuid;
 
     fn temp_storage_path(name: &str) -> std::path::PathBuf {
@@ -89,7 +89,8 @@ mod tests {
 
         let navigator = Navigator::new(Screen::new("Test", vec![]));
         let mut framebuffer = FrameBuffer565::new(10, 10);
-        navigator.render(&mut framebuffer).unwrap();
+        let ctx = RenderCtx::at(Instant::from_micros(0));
+        navigator.render(&ctx, &mut framebuffer).unwrap();
         platform.display().flush(&framebuffer).unwrap();
     }
 }

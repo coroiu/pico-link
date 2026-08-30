@@ -14,12 +14,17 @@
 #![allow(clippy::cast_possible_wrap)]
 
 use pico_link_core::input::NavIntent;
+use pico_link_core::platform::Instant;
 use pico_link_core::render::chrome::TITLE_BAR_HEIGHT;
 use pico_link_core::render::theme::palette;
-use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, Screen, VerticalList, ROW_HEIGHT};
+use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, RenderCtx, Screen, VerticalList, ROW_HEIGHT};
 use embedded_graphics::prelude::{Point, RgbColor};
 
 const ITEM_COUNT: i32 = 3;
+
+fn test_ctx() -> RenderCtx {
+    RenderCtx::at(Instant::from_micros(0))
+}
 
 fn build_scene() -> Navigator {
     let items = vec![
@@ -42,7 +47,7 @@ fn row_top(index: i32) -> i32 {
 fn scene_renders_expected_chrome_colors() {
     let navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
     // Title bar background, per Screen::render.
     assert_eq!(framebuffer.pixel(Point::new(0, 0)), palette::SURFACE);
@@ -71,7 +76,7 @@ fn dispatching_next_moves_the_selection_highlight_down_one_row() {
     navigator.dispatch(NavIntent::Down);
 
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
     // x=200: clear of the left selection accent bar and of any row text,
     // so this samples the plain elevated fill rather than the accent
@@ -102,7 +107,7 @@ const BOTTOM_PADDING_PX: i32 = 1;
 fn text_never_bleeds_past_a_rows_bottom_padding() {
     let navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
     for index in 0..ITEM_COUNT {
         let top = row_top(index);
@@ -142,13 +147,13 @@ fn an_unselected_rows_pixels_do_not_depend_on_which_other_row_is_selected() {
     let mut selecting_row1 = build_scene();
     selecting_row1.dispatch(NavIntent::Down);
     let mut frame_row1_selected = FrameBuffer565::new(240, 240);
-    selecting_row1.render(&mut frame_row1_selected).unwrap();
+    selecting_row1.render(&test_ctx(), &mut frame_row1_selected).unwrap();
 
     let mut selecting_row2 = build_scene();
     selecting_row2.dispatch(NavIntent::Down);
     selecting_row2.dispatch(NavIntent::Down);
     let mut frame_row2_selected = FrameBuffer565::new(240, 240);
-    selecting_row2.render(&mut frame_row2_selected).unwrap();
+    selecting_row2.render(&test_ctx(), &mut frame_row2_selected).unwrap();
 
     let row0_top = row_top(0);
     let row0_bottom = row0_top + ROW_HEIGHT as i32;
@@ -169,7 +174,7 @@ fn an_unselected_rows_pixels_do_not_depend_on_which_other_row_is_selected() {
 fn framebuffer_round_trips_through_a_real_png_encoder() {
     let navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
     let mut image = image::RgbImage::new(framebuffer.width(), framebuffer.height());
     for pixel in framebuffer.pixels() {

@@ -42,6 +42,7 @@ use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use crate::app::{Command, ConnectFailureReason, ConnectStep, DeviceEntry, WizardPhase};
 use crate::input::NavIntent;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::{name_top_offset, ListItem, ListItemKey, VerticalList};
 use super::message::MessageView;
@@ -125,6 +126,16 @@ const STEPS_TOP_PADDING: i32 = 20;
 /// Vertical spacing (px) between phase 4's four step lines.
 const STEP_ROW_HEIGHT: i32 = 26;
 
+/// Vertical gap (px) between the last connect-step line and the elapsed-
+/// time readout below it.
+const ELAPSED_GAP: i32 = 12;
+
+/// Refresh cadence for phase 4's elapsed-time readout -- see
+/// [`PairingWizardView::redraw_after`]. Coarse on purpose: the readout
+/// itself only has one-second resolution, so anything finer would just be
+/// extra renders of pixels that didn't change.
+const ELAPSED_REDRAW_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
+
 /// Draws phase 4 (connecting): all four named sub-steps
 /// ([`ConnectStep::all`]'s fixed order), each colored by whether it's
 /// already completed (`TEXT_SECONDARY`), the one currently in progress
@@ -132,8 +143,14 @@ const STEP_ROW_HEIGHT: i32 = 26;
 /// (not just the current one) is what lets the user see how far the
 /// attempt has gotten, per design section 9's "each step fails
 /// differently; naming the current one tells the user *and us* where it
-/// stalled".
-fn render_connecting_steps(area: Rectangle, current: ConnectStep, target: &mut FrameBuffer565) {
+/// stalled" -- plus, below them, an elapsed-seconds readout
+/// (`RenderCtx`/`WizardPhase::Connecting::started`'s first real consumer,
+/// pico-link-znb.10 step 6): this is the "the screen isn't hung, it's
+/// still working" liveness signal payoff 1 of the frame-scoped clock ADR
+/// names, replacing a step list that could otherwise sit static and
+/// indistinguishable from a wedge for the several real seconds a connect
+/// attempt can take.
+fn render_connecting_steps(area: Rectangle, current: ConnectStep, elapsed: core::time::Duration, target: &mut FrameBuffer565) {
     let center_x = area.top_left.x + area.size.width as i32 / 2;
     let steps = ConnectStep::all();
     let current_index = steps.iter().position(|&s| s == current).unwrap_or(0);
@@ -155,6 +172,17 @@ fn render_connecting_steps(area: Rectangle, current: ConnectStep, target: &mut F
             target,
         );
     }
+
+    let elapsed_y = area.top_left.y + STEPS_TOP_PADDING + name_top_offset() + steps.len() as i32 * STEP_ROW_HEIGHT + ELAPSED_GAP;
+    let elapsed_line = format!("{}s", elapsed.as_secs());
+    let _ = font::username().render_aligned(
+        elapsed_line.as_str(),
+        Point::new(center_x, elapsed_y),
+        VerticalPosition::Top,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(palette::TEXT_SECONDARY),
+        target,
+    );
 }
 
 /// The single content widget on the wizard [`Screen`], covering all six
@@ -229,7 +257,7 @@ fn build_scan_list(
         .on_activate_index(move |index| {
             if let Some(device) = devices_snapshot.get(index) {
                 commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
-                *phase_for_activate.borrow_mut() = WizardPhase::Connecting { addr: device.addr, step: ConnectStep::Connecting };
+                *phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
             }
             Action::None
         })
@@ -238,7 +266,7 @@ fn build_scan_list(
 }
 
 impl Widget for PairingWizardView {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         constraints
     }
 
@@ -267,10 +295,10 @@ impl Widget for PairingWizardView {
                 // this press and that event arriving.
                 self.devices.borrow_mut().clear();
                 self.commands.borrow_mut().push_back(Command::StartScan);
-                *self.phase.borrow_mut() = WizardPhase::Scanning;
+                *self.phase.borrow_mut() = WizardPhase::scanning_pending();
                 Action::None
             }
-            WizardPhase::Scanning => {
+            WizardPhase::Scanning { .. } => {
                 self.sync_list();
                 self.list.borrow_mut().on_focus(FocusEvent::Activated)
             }
@@ -292,7 +320,7 @@ impl Widget for PairingWizardView {
             // `Navigator::dispatch`'s `NavIntent::Back` arm forwards here
             // for precisely this side effect, then unconditionally pops
             // regardless of what's returned -- see that arm's doc comment.
-            (NavIntent::Back, WizardPhase::Scanning) => {
+            (NavIntent::Back, WizardPhase::Scanning { .. }) => {
                 self.commands.borrow_mut().push_back(Command::CancelScan);
                 Action::None
             }
@@ -310,7 +338,7 @@ impl Widget for PairingWizardView {
                 self.commands.borrow_mut().push_back(Command::CancelConnect { addr });
                 Action::None
             }
-            (NavIntent::Up | NavIntent::Down | NavIntent::JumpBy(_), WizardPhase::Scanning) => {
+            (NavIntent::Up | NavIntent::Down | NavIntent::JumpBy(_), WizardPhase::Scanning { .. }) => {
                 self.sync_list();
                 self.list.borrow_mut().on_intent(intent)
             }
@@ -322,12 +350,12 @@ impl Widget for PairingWizardView {
             // selecting the device fresh from the scan list would.
             (NavIntent::ShortcutX, WizardPhase::NotResponding { addr, .. }) => {
                 self.commands.borrow_mut().push_back(Command::Connect { addr });
-                *self.phase.borrow_mut() = WizardPhase::Connecting { addr, step: ConnectStep::Connecting };
+                *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
             (NavIntent::ShortcutX, WizardPhase::Failed { addr, reason }) if reason.retryable() => {
                 self.commands.borrow_mut().push_back(Command::Connect { addr });
-                *self.phase.borrow_mut() = WizardPhase::Connecting { addr, step: ConnectStep::Connecting };
+                *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
             // Degraded success's X ("Codec settings", design section 9
@@ -341,7 +369,7 @@ impl Widget for PairingWizardView {
         }
     }
 
-    fn chrome_contribution(&self) -> Option<ChromeContribution> {
+    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
         let phase = self.phase.borrow().clone();
         let mut contribution = ChromeContribution { y: Some(ButtonLabel::Inert), ..ChromeContribution::default() };
         match phase {
@@ -349,7 +377,7 @@ impl Widget for PairingWizardView {
                 contribution.a = Some(ButtonLabel::Live(String::from("scan")));
                 contribution.x = Some(ButtonLabel::Inert);
             }
-            WizardPhase::Scanning => {
+            WizardPhase::Scanning { .. } => {
                 // No A-rail label of its own -- matches the devices
                 // screen's own list, which likewise leaves A unlabelled
                 // (Select still activates the focused row regardless).
@@ -372,8 +400,23 @@ impl Widget for PairingWizardView {
         Some(contribution)
     }
 
+    /// Requests a periodic redraw while phase 4 (Connecting) is showing,
+    /// so its elapsed-seconds readout (see [`render_connecting_steps`])
+    /// actually advances instead of freezing at whatever value happened to
+    /// be on screen when the last real event arrived. Every other phase
+    /// has nothing time-driven to show, so this returns `None` -- see the
+    /// frame-scoped clock ADR's "hacks to retire" section for why this
+    /// stays scoped rather than becoming an unconditional per-tick redraw.
+    fn redraw_after(&self, _ctx: &RenderCtx) -> Option<core::time::Duration> {
+        if matches!(*self.phase.borrow(), WizardPhase::Connecting { .. }) {
+            Some(ELAPSED_REDRAW_INTERVAL)
+        } else {
+            None
+        }
+    }
+
     fn selected_index(&self) -> Option<usize> {
-        if matches!(*self.phase.borrow(), WizardPhase::Scanning) {
+        if matches!(*self.phase.borrow(), WizardPhase::Scanning { .. }) {
             Some(self.list.borrow().selected_index())
         } else {
             None
@@ -381,14 +424,14 @@ impl Widget for PairingWizardView {
     }
 
     fn selected_key(&self) -> Option<ListItemKey> {
-        if matches!(*self.phase.borrow(), WizardPhase::Scanning) {
+        if matches!(*self.phase.borrow(), WizardPhase::Scanning { .. }) {
             self.list.borrow().selected_key()
         } else {
             None
         }
     }
 
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let phase = self.phase.borrow().clone();
         match phase {
             WizardPhase::Instructions => {
@@ -399,40 +442,40 @@ impl Widget for PairingWizardView {
                 // choice.
                 MessageView::new("Enable pairing mode")
                     .with_subline("Hold power ~5s until it flashes")
-                    .render(area, target)?;
+                    .render(area, ctx, target)?;
             }
             WizardPhase::NothingFound => {
                 MessageView::new("No headphones found")
                     .with_headline_color(palette::STATUS_WARNING)
                     .with_subline("Press A to scan again")
-                    .render(area, target)?;
+                    .render(area, ctx, target)?;
             }
-            WizardPhase::Scanning => {
+            WizardPhase::Scanning { .. } => {
                 self.sync_list();
-                self.list.borrow().render(area, target)?;
+                self.list.borrow().render(area, ctx, target)?;
             }
-            WizardPhase::Connecting { step, .. } => {
-                render_connecting_steps(area, step, target);
+            WizardPhase::Connecting { step, started, .. } => {
+                render_connecting_steps(area, step, ctx.elapsed_since(started), target);
             }
             WizardPhase::NotResponding { attempt, .. } => {
                 MessageView::new("Not responding")
                     .with_headline_color(palette::STATUS_WARNING)
                     .with_subline(format!("Still trying ({attempt})"))
-                    .render(area, target)?;
+                    .render(area, ctx, target)?;
             }
             WizardPhase::Succeeded { degraded } => {
                 if degraded {
                     MessageView::new("Connected")
                         .with_headline_color(palette::STATUS_WARNING)
                         .with_subline("Using a fallback codec")
-                        .render(area, target)?;
+                        .render(area, ctx, target)?;
                 } else {
-                    MessageView::new("Connected").with_headline_color(palette::STATUS_SUCCESS).render(area, target)?;
+                    MessageView::new("Connected").with_headline_color(palette::STATUS_SUCCESS).render(area, ctx, target)?;
                 }
             }
             WizardPhase::Failed { reason, .. } => {
                 let (headline, subline) = failure_text(reason);
-                MessageView::new(headline).with_headline_color(palette::STATUS_ERROR).with_subline(subline).render(area, target)?;
+                MessageView::new(headline).with_headline_color(palette::STATUS_ERROR).with_subline(subline).render(area, ctx, target)?;
             }
         }
         Ok(())
@@ -444,6 +487,17 @@ mod tests {
     use super::*;
     use crate::app::{App, ConnectFailureReason, ConnectStep, DeviceEntry, Event, LinkState, WizardPhase, DEVICES_TITLE};
     use crate::input::NavIntent;
+    use crate::platform::Instant;
+
+    /// Every test in this module drives `App` without ever calling
+    /// `App::tick`, so `App`'s `now_us` stays at its constructed default
+    /// of 0 throughout -- meaning `stamp_pending_wizard_timestamp` always
+    /// backfills a freshly entered `Scanning`/`Connecting` phase's
+    /// `started` with exactly this value. Named so assertions read as "the
+    /// timestamp a fresh phase gets in these tests", not a magic literal.
+    fn untimed() -> Instant {
+        Instant::from_micros(0)
+    }
 
     /// Home(1) -> Devices(2) -> Wizard(3), all three `Select`s -- since
     /// `pico-link-znb.8`/E7, Home (not Devices) is the navigator root, so
@@ -502,7 +556,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         app.handle_input(vec![NavIntent::Select]);
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning);
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::StartScan));
     }
 
@@ -512,7 +566,7 @@ mod tests {
         open_wizard(&mut app);
         app.handle_input(vec![NavIntent::Select]); // -> Scanning
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -40 }));
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning);
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
         assert_eq!(app.navigator_depth(), 3, "the wizard must still be the top screen at Home(1)/Devices(2)/Wizard(3)");
     }
 
@@ -533,7 +587,7 @@ mod tests {
         app.handle_input(vec![NavIntent::Select]); // -> Scanning
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -40 }));
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning);
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
     }
 
     #[test]
@@ -544,9 +598,73 @@ mod tests {
         let addr = [3; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]); // activate the (only) row
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::StartScan));
         assert_eq!(app.poll_command(), Some(Command::Connect { addr }));
+    }
+
+    #[test]
+    fn a_freshly_entered_phase_is_stamped_with_the_real_current_time_not_zero() {
+        // Regression test for pico-link-znb.10 step 5: `WizardPhase::
+        // Scanning`/`Connecting` must carry the app's real current time as
+        // `started`, not the `PENDING_TIMESTAMP` sentinel the widget uses
+        // internally (it has no clock of its own -- see that constant's
+        // doc comment) and not a stale `0` from before `App::tick` was
+        // ever called.
+        let mut app = App::new(240, 240);
+        app.tick(999_000);
+        open_wizard(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // Instructions -> Scanning
+        assert_eq!(
+            app.wizard_phase_for_test(),
+            WizardPhase::Scanning { started: Instant::from_micros(999_000) },
+            "a freshly entered Scanning phase must be stamped with App's real now_us, not left pending or zero"
+        );
+
+        let addr = [7; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
+        app.tick(1_500_000);
+        app.handle_input(vec![NavIntent::Select]); // Scanning -> Connecting
+        assert_eq!(
+            app.wizard_phase_for_test(),
+            WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: Instant::from_micros(1_500_000) },
+            "a freshly entered Connecting phase must be stamped with App's real now_us at the instant it was entered"
+        );
+    }
+
+    #[test]
+    fn connecting_phase_liveness_end_to_end_tick_alone_marks_dirty_and_the_elapsed_readout_changes() {
+        // pico-link-znb.10 step 6's real consumer, as a regression test:
+        // the whole RenderCtx/redraw_after/event-timestamp seam, proven
+        // end to end through phase 4's elapsed-seconds readout. See
+        // `core/examples/wizard_liveness_probe.rs` for the zoomed-PNG
+        // version of this same scenario (this project's rendering-
+        // verification rule: a pixel-difference assertion alone is not
+        // sufficient evidence for a render change, only a necessary one).
+        let mut app = App::new(240, 240);
+        app.tick(0);
+        open_wizard(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // Instructions -> Scanning
+        let addr = [9; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
+        app.handle_input(vec![NavIntent::Select]); // Scanning -> Connecting, started == 0
+
+        app.tick(0);
+        let pixels_t0: Vec<_> = app.render().pixels().collect();
+        assert!(!app.dirty(), "render() must have cleared dirty");
+
+        // No input, no event -- purely the passage of time. This is
+        // exactly the case a naive "no timestamp seam" implementation
+        // cannot handle: nothing *happened*, but the screen must still
+        // show the connect attempt is still alive.
+        app.tick(2_000_000);
+        assert!(app.dirty(), "redraw_after must mark the app dirty from tick alone, 2s into a Connecting attempt");
+        let pixels_t1: Vec<_> = app.render().pixels().collect();
+
+        assert_ne!(
+            pixels_t0, pixels_t1,
+            "the elapsed-seconds readout must actually change the rendered pixels between t=0s and t=2s"
+        );
     }
 
     #[test]
@@ -559,10 +677,10 @@ mod tests {
         app.handle_input(vec![NavIntent::Select]);
 
         app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Pairing });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Pairing, started: untimed() });
 
         app.handle_event(Event::ConnectStepChanged(ConnectStep::SettingUpAudio));
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::SettingUpAudio });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::SettingUpAudio, started: untimed() });
     }
 
     #[test]
@@ -602,7 +720,7 @@ mod tests {
         app.poll_command(); // drain the first Connect
 
         app.handle_input(vec![NavIntent::ShortcutX]);
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::Connect { addr }));
     }
 
@@ -693,7 +811,7 @@ mod tests {
         app.poll_command();
 
         app.handle_input(vec![NavIntent::ShortcutX]);
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::Connect { addr }));
     }
 

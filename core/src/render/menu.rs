@@ -42,6 +42,7 @@ use u8g2_fonts::FontRenderer;
 
 use crate::input::NavIntent;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::theme::{self, font, icon, palette};
 use super::widget::{Action, FocusEvent, Widget};
@@ -330,7 +331,7 @@ impl MenuList {
 }
 
 impl Widget for MenuList {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         constraints
     }
 
@@ -368,7 +369,7 @@ impl Widget for MenuList {
         Action::None
     }
 
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
         let height = row_height();
 
@@ -389,6 +390,11 @@ impl Widget for MenuList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Instant;
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     fn items(n: usize) -> Vec<MenuItem> {
         (0..n).map(|i| MenuItem::new(format!("item-{i}"))).collect()
@@ -451,7 +457,7 @@ mod tests {
         let menu = MenuList::new(vec![MenuItem::new("Reveal"), MenuItem::new("Type password")]);
         let mut fb = FrameBuffer565::new(200, 100);
         let area = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
-        menu.render(area, &mut fb).unwrap();
+        menu.render(area, &test_ctx(), &mut fb).unwrap();
 
         let any_chip_fill = fb.pixels().any(|p| p.1 == palette::BRAND);
         assert!(!any_chip_fill, "the restyled menu must never draw the list-row letter-chip fill color");
@@ -463,7 +469,7 @@ mod tests {
         menu.on_focus(FocusEvent::Gained);
         let mut fb = FrameBuffer565::new(200, 100);
         let area = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
-        menu.render(area, &mut fb).unwrap();
+        menu.render(area, &test_ctx(), &mut fb).unwrap();
 
         let any_selection_ink = fb.pixels().any(|p| p.1 == palette::SURFACE_ELEVATED);
         assert!(any_selection_ink, "the focused row must show the shared selection fill");
@@ -479,7 +485,7 @@ mod tests {
         // row must draw its state label regardless.
         let mut fb = FrameBuffer565::new(200, 100);
         let area = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
-        menu.render(area, &mut fb).unwrap();
+        menu.render(area, &test_ctx(), &mut fb).unwrap();
 
         let any_label_ink = fb.pixels().any(|p| p.1 == palette::STATUS_SUCCESS);
         assert!(any_label_ink, "a trailing label must be visible even on an unselected row");
@@ -490,11 +496,11 @@ mod tests {
         let mut menu = MenuList::new(vec![MenuItem::new("Clear all items")]);
         let mut fb_unselected = FrameBuffer565::new(200, 100);
         let area = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
-        menu.render(area, &mut fb_unselected).unwrap();
+        menu.render(area, &test_ctx(), &mut fb_unselected).unwrap();
 
         menu.on_focus(FocusEvent::Gained);
         let mut fb_selected = FrameBuffer565::new(200, 100);
-        menu.render(area, &mut fb_selected).unwrap();
+        menu.render(area, &test_ctx(), &mut fb_selected).unwrap();
 
         let unselected_pixels: Vec<_> = fb_unselected.pixels().map(|p| p.1).collect();
         let selected_pixels: Vec<_> = fb_selected.pixels().map(|p| p.1).collect();
@@ -506,7 +512,7 @@ mod tests {
         let menu = MenuList::new(vec![MenuItem::new("Clear everything").with_label_color(palette::STATUS_ERROR)]);
         let mut fb = FrameBuffer565::new(200, 100);
         let area = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
-        menu.render(area, &mut fb).unwrap();
+        menu.render(area, &test_ctx(), &mut fb).unwrap();
 
         let any_error_ink = fb.pixels().any(|p| p.1 == palette::STATUS_ERROR);
         assert!(any_error_ink, "a custom label color must actually be used when drawing the row's text");

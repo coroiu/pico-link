@@ -39,6 +39,7 @@ use u8g2_fonts::FontRenderer;
 
 use crate::input::NavIntent;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::menu::{MenuItem, MenuList};
 use super::theme::{font, palette};
@@ -109,7 +110,7 @@ impl ConfirmView {
 }
 
 impl Widget for ConfirmView {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         constraints
     }
 
@@ -130,7 +131,7 @@ impl Widget for ConfirmView {
     /// Returns `Infallible`'s uninhabited variant in practice — see
     /// [`Widget::render`]'s doc comment for why the `Result` return exists
     /// at all.
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
         let center_x = area.top_left.x + area.size.width as i32 / 2;
         let mut y = area.top_left.y + HEADLINE_TOP_PADDING;
@@ -160,14 +161,19 @@ impl Widget for ConfirmView {
         let rows_top = area.top_left.y + self.headline_height();
         let rows_height = (area.top_left.y + area.size.height as i32 - rows_top).max(0) as u32;
         let rows_area = Rectangle::new(Point::new(area.top_left.x, rows_top), Size::new(area.size.width, rows_height));
-        self.list.render(rows_area, target)
+        self.list.render(rows_area, ctx, target)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Instant;
     use crate::render::theme::palette;
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     fn rows() -> Vec<MenuItem> {
         vec![MenuItem::new("Cancel"), MenuItem::new("Clear everything").with_label_color(palette::STATUS_ERROR)]
@@ -219,7 +225,7 @@ mod tests {
         // retired 320x170 panel's own 136.
         let mut fb = FrameBuffer565::new(240, 206);
         let area = Rectangle::new(Point::new(0, 0), Size::new(240, 206));
-        view.render(area, &mut fb).unwrap();
+        view.render(area, &test_ctx(), &mut fb).unwrap();
 
         let any_headline_ink = fb.pixels().any(|p| p.1 == palette::TEXT_PRIMARY);
         assert!(any_headline_ink, "the headline should have drawn something in the default text color");
@@ -233,7 +239,7 @@ mod tests {
         view.on_focus(FocusEvent::Gained);
         let mut fb = FrameBuffer565::new(240, 206);
         let area = Rectangle::new(Point::new(0, 0), Size::new(240, 206));
-        view.render(area, &mut fb).unwrap();
+        view.render(area, &test_ctx(), &mut fb).unwrap();
 
         let any_selection_ink = fb.pixels().any(|p| p.1 == palette::SURFACE_ELEVATED);
         assert!(any_selection_ink, "the single Back row must still render (and be selected)");
