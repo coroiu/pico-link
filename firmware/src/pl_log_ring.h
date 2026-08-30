@@ -58,11 +58,21 @@ void pl_log_ring_init(void);
 // partial line.
 void pl_log_ring_push(const char *data, uint32_t len);
 
-// Drains whatever is currently queued to stdio (vprintf's underlying
-// stream) via fwrite()+fflush(). THREAD CONTEXT ONLY -- call from the
-// superloop, never from an IRQ or the 0xC0 worker (this is exactly the call
-// that may block on a slow/absent CDC reader, which is the whole point of
-// keeping it out of every producer's critical path).
+// Drains whatever is currently queued directly to the CDC endpoint
+// (tud_cdc_write()/tud_cdc_write_flush()) -- NOT stdio/fwrite any more, see
+// bead pico-link-okx (F2). THREAD CONTEXT ONLY -- call from the superloop,
+// never from an IRQ or the 0xC0 worker.
+//
+// Bead pico-link-okx (F2): this is now BOUNDED and NON-BLOCKING -- no loop,
+// no timeout, no dependence on the host. It takes pl_usb_mutex via
+// pl_usb_lock_try() (usb_pump.h) for the duration of one bounded
+// memcpy-sized write and returns immediately either way. This replaces the
+// pre-F2 body, which called fwrite()+fflush() on stdout -- underneath,
+// pico_stdio_usb's stdio_usb_out_chars(), whose escape condition is
+// HOST-paced (see this bead's design comment, Ada, 2026-08-30, for the full
+// chain) -- that call could stall the superloop indefinitely on a host that
+// wasn't draining the CDC endpoint, which is the root cause this bead
+// exists to fix.
 void pl_log_ring_drain(void);
 
 // Cumulative bytes dropped because a push did not fit. Surfaced in
@@ -78,5 +88,18 @@ uint32_t pl_log_ring_bytes_dropped(void);
 // if this ever climbs, the push itself (not I/O) has become the hazard.
 uint32_t pl_log_ring_push_hold_us_total(void);
 uint32_t pl_log_ring_push_hold_us_max(void);
+
+// Bead pico-link-okx (F2): cumulative count of pl_log_ring_drain() calls
+// that found queued bytes but skipped this tick because pl_usb_lock_try()
+// failed (the 0xC0 worker held pl_usb_mutex). Expected to be small and
+// occasional; if it climbs, the worker is holding the lock long enough to
+// be worth investigating on its own (see usb_pump.c's pump_ticks_skipped,
+// the worker-side symmetric counter). Surfaced in usb-pump-logring.
+uint32_t pl_log_ring_drain_skips(void);
+
+// Lifetime high-water mark of (s_write - s_read), i.e. the largest backlog
+// this ring has ever held. Never reset -- deltas aren't meaningful here,
+// only "how bad did it ever get" is. Surfaced in usb-pump-logring.
+uint32_t pl_log_ring_backlog_hwm(void);
 
 #endif // PICO_LINK_LOG_RING_H

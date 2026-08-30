@@ -46,6 +46,7 @@
 #ifndef PICO_LINK_USB_PUMP_H
 #define PICO_LINK_USB_PUMP_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // Initializes the console mutex, claims a user IRQ at priority 0xC0,
@@ -55,6 +56,23 @@
 // ANY printf/pl_log call in this firmware (pl_log's mutex must exist
 // first) -- see main.c.
 void pl_usb_pump_init(void);
+
+// Bead pico-link-okx (F2/F2b): non-blocking, narrow accessors for
+// pl_usb_mutex, for the two seams that need to touch tud_cdc_*/tud_ready()
+// directly without re-entering tud_task() -- pl_log_ring_drain()
+// (pl_log_ring.c) and debug_remote.c's console-read poll. NEVER export the
+// mutex itself (pico/mutex.h's mutex_t), only these two narrow calls.
+//
+// pl_usb_lock_try() wraps mutex_try_enter(&pl_usb_mutex, NULL): never
+// blocks, returns false immediately if the 0xC0 worker currently holds the
+// lock -- the caller's contract is to skip this tick's work entirely (do
+// NOT spin/retry in the same call), not degrade into the old blocking
+// behaviour this bead exists to remove. Safe against priority inversion:
+// the IRQ side never waits on the thread side, so a skipped tick costs
+// exactly one tick of latency, nothing more, and is expected to be counted
+// by the caller.
+bool pl_usb_lock_try(void);
+void pl_usb_unlock(void);
 
 // The ONLY console entry point in this firmware -- printf-style, backed by
 // vsnprintf into a stack scratch buffer. Every bare printf() in

@@ -282,6 +282,18 @@ void pl_usb_pump_init(void) {
     add_repeating_timer_us(-PL_USB_PUMP_INTERVAL_US, pl_usb_pump_timer_callback, NULL, &s_pump_timer);
 }
 
+// Bead pico-link-okx (F2/F2b): see usb_pump.h's doc comment. Never blocks;
+// the 0xC0 worker's own tud_task() call (above) is the only other party
+// that ever holds this mutex, and it never waits on the thread side, so
+// there is no priority-inversion path here.
+bool pl_usb_lock_try(void) {
+    return mutex_try_enter(&pl_usb_mutex, NULL);
+}
+
+void pl_usb_unlock(void) {
+    mutex_exit(&pl_usb_mutex);
+}
+
 // Bead pico-link-okx (F1): formats into a stack scratch buffer, then hands
 // the bytes to pl_log_ring_push() -- see usb_pump.h's doc comment on
 // pl_log for the full rationale. 384 bytes (raised from 256, bead
@@ -460,8 +472,17 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
     // of microseconds always; if this ever climbs, the push itself (not
     // I/O, which is now outside every producer's critical path) has become
     // the hazard.
+    // Bead pico-link-okx (F2): drain_skips/backlog_hwm added -- "how much
+    // did the drain fall behind and how often did it get shut out of the
+    // lock" is now measured rather than inferred. drain_skips climbing in
+    // step with usb-pump-race's pump_ticks_skipped above would mean the
+    // console and the worker are contending on pl_usb_mutex more than
+    // expected (see this bead's risk note on pl_usb_lock_try's doc
+    // comment); backlog_hwm approaching PL_LOG_RING_SIZE (4096,
+    // pl_log_ring.c) means the drain cannot keep up with the push rate.
     pl_log(
-        "usb-pump-logring: push_hold_us_total=%lu push_hold_us_max=%lu\r\n",
-        (unsigned long)pl_log_ring_push_hold_us_total(), (unsigned long)pl_log_ring_push_hold_us_max()
+        "usb-pump-logring: push_hold_us_total=%lu push_hold_us_max=%lu drain_skips=%lu backlog_hwm=%lu\r\n",
+        (unsigned long)pl_log_ring_push_hold_us_total(), (unsigned long)pl_log_ring_push_hold_us_max(),
+        (unsigned long)pl_log_ring_drain_skips(), (unsigned long)pl_log_ring_backlog_hwm()
     );
 }
