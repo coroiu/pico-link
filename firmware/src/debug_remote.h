@@ -35,6 +35,27 @@
 //                        is a per-call, host-supplied value only; it is
 //                        never stored as a constant anywhere in this
 //                        codebase (see bt.h's doc comment).
+//   BOOTSEL          -- bead pico-link-vu4: logs the reason, then calls
+//                        reset_usb_boot(0, 0) (noreturn) to drop the board
+//                        straight into the USB mass-storage bootloader, so
+//                        a flash-verify loop no longer needs a human to
+//                        hold BOOTSEL. This routes around pico-link-d74
+//                        (the vendor CONTROL transfer on interface 4 that
+//                        STALLs on a healthy board) because it rides the
+//                        CDC BULK data path instead -- a different endpoint,
+//                        a different code path.
+//
+//                        THIS IS NOT A REPLACEMENT FOR PHYSICAL BOOTSEL AND
+//                        MUST NOT BE TREATED AS ONE. It only works because
+//                        pl_debug_remote_poll() is reached from the running
+//                        main loop -- a board that is wedged, panicking, or
+//                        stuck before this poll call is reached is
+//                        completely unreachable through this command, and
+//                        still needs a human at the desk holding the
+//                        physical BOOTSEL button. Do not trust this during
+//                        a hang hunt: if BOOTSEL-over-CDC doesn't work,
+//                        that is not new information about the hang, it's
+//                        the expected outcome of a wedged board.
 // An unrecognized or malformed line is logged and ignored -- never fatal,
 // never wedges the poll loop. See tools/usb-console/cdc_sender.py for the
 // host-side counterpart.

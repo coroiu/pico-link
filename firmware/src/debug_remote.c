@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "pico/bootrom.h"
 #include "pico/stdio.h"
 #include "pico/stdlib.h"
 
@@ -139,7 +140,21 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
             if (s_line_len > 0) {
                 s_line[s_line_len] = '\0';
                 uint8_t connect_addr[6];
-                if (parse_connect_addr(s_line, connect_addr)) {
+                if (strcmp(s_line, "BOOTSEL") == 0) {
+                    // Bead pico-link-vu4: routes around pico-link-d74 (the
+                    // vendor CONTROL transfer on interface 4 that STALLs on
+                    // a healthy board). This is CDC BULK data instead --
+                    // a different endpoint and code path, same structural
+                    // reason tools/usb-console/cdc_reader.py's direct-USB
+                    // read works where the tty and control paths don't.
+                    // Log BEFORE resetting -- reset_usb_boot() is noreturn,
+                    // so this is the last thing a capture will show, and
+                    // it's what distinguishes "rebooted to BOOTSEL on
+                    // purpose" from "the board just vanished/crashed".
+                    pl_log("debug-remote: BOOTSEL -> reset_usb_boot(0, 0)\r\n");
+                    reset_usb_boot(0, 0);
+                    // unreachable -- reset_usb_boot() does not return.
+                } else if (parse_connect_addr(s_line, connect_addr)) {
                     // Not a NavIntent -- dispatched directly to bt.c
                     // rather than going through `out`/pl_ui_input, since
                     // there is no discovered DeviceEntry backing it (see
