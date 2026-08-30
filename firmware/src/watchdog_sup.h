@@ -94,6 +94,60 @@ void pl_wdt_report(void);
 // the SDK's own arm marker and destroys the value this function reads.
 // Does not touch or clear scratch[0..3] -- that is panic_recorder's job
 // (pl_panic_report_and_clear(), which must also run before pl_wdt_arm()).
+// --- Superloop checkpoint trace (bead pico-link-okx round 3) --------------
+//
+// WHY THIS EXISTS. The 2026-08-30 soak took a HARDWARE watchdog expiry whose
+// boot line read "UNATTRIBUTED", and the reason is structural, not bad luck:
+//
+//   * pl_wdt_service() -- the ONLY caller of watchdog_update() -- runs at
+//     main.c's superloop (THREAD context).
+//   * All four pl_wdt_kick() sites run in INTERRUPT context: usb_pump.c's
+//     0xC0 user IRQ pended by the 1ms hardware timer (which PREEMPTS the
+//     superloop), bt.c's BTstack handler, a2dp.c's media timer.
+//
+// So when the superloop stalls, every subsystem counter keeps advancing
+// perfectly while watchdog_update() is never reached. The supervisor cannot
+// attribute a superloop stall BY CONSTRUCTION -- and a superloop stall is
+// exactly what it caught. Measured: the stall exceeded the 2000ms watchdog
+// budget while NO instrument on the board recorded anything above ~13ms.
+//
+// This is the missing half: a checkpoint id stamped as the loop walks its
+// body, kept in .uninitialized_data (NOLOAD -- survives a watchdog reset,
+// which does not clear SRAM) and read back on the next boot. It is the
+// loop's program counter by proxy. Deliberately NOT in watchdog scratch:
+// panic_recorder.c owns scratch[0..3] and pico-sdk's watchdog_enable/
+// watchdog_reboot own scratch[4..7], so all eight are already spoken for.
+//
+// PL_WDT_CP_BLIT_DMA_WAIT and PL_WDT_CP_BLIT_SPI_DRAIN exist to separate the
+// two UNBOUNDED waits found inside st7789_blit_framebuffer():
+// dma_channel_wait_for_finish_blocking() and the bare while(spi_is_busy())
+// spin. Neither has a timeout, both run every frame, and no counter watches
+// either. If the next expiry names one of them, that is the answer.
+typedef enum {
+    PL_WDT_CP_NONE = 0,
+    PL_WDT_CP_LOOP_TOP,
+    PL_WDT_CP_INPUT_POLL,
+    PL_WDT_CP_UI_INPUT,
+    PL_WDT_CP_DEBUG_REMOTE,
+    PL_WDT_CP_BT_DRAIN,
+    PL_WDT_CP_UI_TICK,
+    PL_WDT_CP_UI_RENDER,
+    PL_WDT_CP_BLIT_ENTER,
+    PL_WDT_CP_BLIT_DMA_WAIT,
+    PL_WDT_CP_BLIT_SPI_DRAIN,
+    PL_WDT_CP_BLIT_EXIT,
+    PL_WDT_CP_BT_POLL_CMDS,
+    PL_WDT_CP_BT_POLL_FFI,
+    PL_WDT_CP_BT_POLL_DISPATCH,
+    PL_WDT_CP_REPORT,
+    PL_WDT_CP_WDT_SERVICE,
+    PL_WDT_CP_COUNT
+} pl_wdt_checkpoint_t;
+
+// Stamps the current checkpoint. Cheap by design (a handful of stores) --
+// it runs ~14x per frame and must never be the thing that slows the loop.
+void pl_wdt_mark(pl_wdt_checkpoint_t cp);
+
 void pl_wdt_report_boot_reason(void);
 
 // Shared subsystem-id -> name lookup, used by both this module's own

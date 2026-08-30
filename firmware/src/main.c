@@ -370,6 +370,7 @@ int main(void) {
     const uint32_t xy_held_frames_for_reset = 60; // ~2-3s at this loop's real (not budgeted) pace -- see comment above
 
     while (true) {
+        pl_wdt_mark(PL_WDT_CP_LOOP_TOP);
         uint64_t frame_start_us = time_us_64();
 
         if (gpio_get(PL_INPUT_PIN_X) == 0 && gpio_get(PL_INPUT_PIN_Y) == 0) {
@@ -382,6 +383,7 @@ int main(void) {
             xy_held_frames = 0;
         }
 
+        pl_wdt_mark(PL_WDT_CP_INPUT_POLL);
         size_t n = pl_link_input_poll(intents, 8);
         if (n > 0) {
             pl_ui_input(ui, intents, n);
@@ -391,6 +393,7 @@ int main(void) {
         // console, feeding the SAME pl_ui_input call the GPIO scan above
         // does. Main-loop/thread-context only, same as pl_link_input_poll
         // -- see debug_remote.h's module doc for why that matters.
+        pl_wdt_mark(PL_WDT_CP_DEBUG_REMOTE);
         PlIntent debug_intents[4];
         size_t debug_n = pl_debug_remote_poll(debug_intents, 4);
         if (debug_n > 0) {
@@ -403,13 +406,16 @@ int main(void) {
         // thread context, before this frame ticks/renders -- so a device
         // discovered or a link-state change is visible in the same frame
         // it arrived, not one frame late.
+        pl_wdt_mark(PL_WDT_CP_BT_DRAIN);
         pl_bt_drain_events(ui);
 #endif
+        pl_wdt_mark(PL_WDT_CP_UI_TICK);
         pl_ui_tick(ui, frame_start_us);
 
         const uint16_t *px = NULL;
         uintptr_t px_len = 0;
         uint64_t render_start_us = time_us_64();
+        pl_wdt_mark(PL_WDT_CP_UI_RENDER);
         pl_ui_render(ui, &px, &px_len);
         uint64_t render_end_us = time_us_64();
 
@@ -423,6 +429,7 @@ int main(void) {
         uint64_t blit_end_us = time_us_64();
 
 #ifndef PL_DIAG_SKIP_BT
+        pl_wdt_mark(PL_WDT_CP_BT_POLL_CMDS);
         pl_bt_poll_commands(ui);
 #endif
 
@@ -505,6 +512,7 @@ int main(void) {
         // or IRQ (see watchdog_sup.h's module doc for why). Placed after
         // pl_a2dp_report() and before the pacing sleep below, per the
         // design doc's "Where the feed lives" section.
+        pl_wdt_mark(PL_WDT_CP_WDT_SERVICE);
         pl_wdt_service();
         pl_wdt_report();
 

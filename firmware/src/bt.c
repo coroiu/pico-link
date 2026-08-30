@@ -480,7 +480,13 @@ void pl_bt_init(struct PlUi *ui) {
 }
 
 void pl_bt_poll_commands(struct PlUi *ui) {
+    // Bead pico-link-okx round 3: the loop-trace named BT_POLL_CMDS as the
+    // last checkpoint before a >2s stall and a hardware watchdog expiry
+    // (n=1). These two marks split this function into the Rust FFI call and
+    // the C dispatch that follows, so the next expiry says which side.
+    pl_wdt_mark(PL_WDT_CP_BT_POLL_FFI);
     PlCommand command = pl_ui_poll_command(ui);
+    pl_wdt_mark(PL_WDT_CP_BT_POLL_DISPATCH);
 
     // Defensive ABI version check (pico-link-a67) -- Rust is the sole
     // producer of PlCommand and always sets this correctly today, but a

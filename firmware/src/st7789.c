@@ -5,6 +5,7 @@
 // easy to reintroduce in a from-scratch C port.
 
 #include "st7789.h"
+#include "watchdog_sup.h"
 
 #include <stdio.h>
 
@@ -184,6 +185,7 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color) {
 }
 
 void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel_count) {
+    pl_wdt_mark(PL_WDT_CP_BLIT_ENTER);
     (void)spi;
 
     // RAMWR in 8-bit mode (a single command byte), matching every other
@@ -231,6 +233,7 @@ void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel
     channel_config_set_write_increment(&c, false);
     channel_config_set_bswap(&c, false);
 
+    pl_wdt_mark(PL_WDT_CP_BLIT_DMA_WAIT);
     dma_channel_configure(s_dma_chan, &c, &spi_get_hw(s_spi)->dr, px, pixel_count, true);
     dma_channel_wait_for_finish_blocking(s_dma_chan);
 
@@ -239,6 +242,7 @@ void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel
     // not that the wire transfer completed) before dropping CS -- matches
     // the datasheet's requirement that CSX stay asserted for the whole
     // transaction.
+    pl_wdt_mark(PL_WDT_CP_BLIT_SPI_DRAIN);
     while (spi_is_busy(s_spi)) {
         tight_loop_contents();
     }
@@ -249,6 +253,7 @@ void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel
     // function's own next RAMWR, or any other register command) doesn't
     // silently get sent as a 16-bit frame.
     spi_set_format(s_spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    pl_wdt_mark(PL_WDT_CP_BLIT_EXIT);
 }
 
 void st7789_set_madctl(uint8_t madctl_param) {

@@ -91,6 +91,61 @@ const char *pl_wdt_subsys_name(pl_wdt_subsys_t s) {
     }
 }
 
+// Survives a watchdog reset: .uninitialized_data is NOLOAD, and a watchdog
+// reset does not clear SRAM. The magic distinguishes a real record from
+// cold-boot garbage.
+#define PL_LOOP_TRACE_MAGIC 0x4C4F4F50u  // "LOOP"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t checkpoint;      // last checkpoint reached
+    uint32_t prev_checkpoint; // the one before it -- shows direction of travel
+    uint32_t seq;             // superloop iteration count
+    uint32_t last_us;         // time_us_32() when the last mark was stamped
+    uint32_t loop_top_us;     // time_us_32() at the top of the current iteration
+} pl_loop_trace_t;
+
+static pl_loop_trace_t __attribute__((section(".uninitialized_data.pl_loop_trace")))
+    s_loop_trace;
+
+static const char *const PL_WDT_CP_NAMES[PL_WDT_CP_COUNT] = {
+    "NONE", "LOOP_TOP", "INPUT_POLL", "UI_INPUT", "DEBUG_REMOTE", "BT_DRAIN",
+    "UI_TICK", "UI_RENDER", "BLIT_ENTER", "BLIT_DMA_WAIT", "BLIT_SPI_DRAIN",
+    "BLIT_EXIT", "BT_POLL_CMDS", "BT_POLL_FFI", "BT_POLL_DISPATCH",
+    "REPORT", "WDT_SERVICE",
+};
+
+void pl_wdt_mark(pl_wdt_checkpoint_t cp) {
+    s_loop_trace.prev_checkpoint = s_loop_trace.checkpoint;
+    s_loop_trace.checkpoint = (uint32_t)cp;
+    s_loop_trace.last_us = time_us_32();
+    if (cp == PL_WDT_CP_LOOP_TOP) {
+        s_loop_trace.seq++;
+        s_loop_trace.loop_top_us = s_loop_trace.last_us;
+    }
+    s_loop_trace.magic = PL_LOOP_TRACE_MAGIC;
+}
+
+// Logs the surviving trace. Called from pl_wdt_report_boot_reason(). Reports
+// the STALL DURATION as (last_us - loop_top_us): how far into the iteration
+// the loop got before time stopped.
+static void pl_wdt_report_loop_trace(void) {
+    if (s_loop_trace.magic != PL_LOOP_TRACE_MAGIC) {
+        pl_log("wdt: loop-trace = none (cold boot or SRAM not preserved)\r\n");
+        return;
+    }
+    uint32_t cp = s_loop_trace.checkpoint;
+    uint32_t prev = s_loop_trace.prev_checkpoint;
+    const char *cpn = (cp < PL_WDT_CP_COUNT) ? PL_WDT_CP_NAMES[cp] : "?";
+    const char *prevn = (prev < PL_WDT_CP_COUNT) ? PL_WDT_CP_NAMES[prev] : "?";
+    pl_log("wdt: loop-trace LAST=%s PREV=%s seq=%u in_iter_us=%u\r\n",
+           cpn, prevn, (unsigned)s_loop_trace.seq,
+           (unsigned)(s_loop_trace.last_us - s_loop_trace.loop_top_us));
+    // Clear so the NEXT boot cannot re-report this one as fresh -- the
+    // "reflashing destroys the evidence" trap in reverse.
+    s_loop_trace.magic = 0;
+}
+
 void pl_wdt_kick(pl_wdt_subsys_t s) {
 #ifdef PL_WATCHDOG
     if ((unsigned)s < PL_WDT_COUNT) {
@@ -250,6 +305,7 @@ void pl_wdt_report(void) {
 #define PL_WDT_NON_REBOOT_MAGIC 0x6ab73121u
 
 void pl_wdt_report_boot_reason(void) {
+    pl_wdt_report_loop_trace();
 #ifdef PL_WATCHDOG
     // MUST run before pl_wdt_arm() -- arming overwrites scratch[4] with
     // PL_WDT_NON_REBOOT_MAGIC via watchdog_enable(), destroying the value
