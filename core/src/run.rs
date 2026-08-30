@@ -365,6 +365,17 @@ impl Runner {
             }
         }
 
+        // Forwards this step's sampled clock time into the app core so
+        // `App::now_us` (and, via it, `RenderCtx`) reflects real time under
+        // `run` -- see `.planning/decisions/2026-08-31-render-ctx-frame-
+        // scoped-clock.md`'s "standalone bug" note: before this, the only
+        // `App::tick` call sites in the repo were `ui-ffi`'s `pl_ui_tick`
+        // and one test, so `App::now_us` was permanently 0 in both the
+        // headless and windowed run modes. `App::tick` itself does not mark
+        // the app dirty (see its own doc comment), so this is safe to call
+        // unconditionally, every step, ahead of the `dirty()` gate below.
+        app.tick(frame_start.as_micros());
+
         // Blanked while `Asleep`: skip render+flush entirely rather than
         // rendering into a framebuffer nothing will show. `app.dirty()`
         // deliberately stays untouched by this gate (not cleared, not
@@ -843,6 +854,37 @@ mod tests {
             power: RecordingPower::new(false),
         };
         RecordingSetup { platform, clock, power_calls, flush_count }
+    }
+
+    #[test]
+    fn app_now_us_advances_under_run_instead_of_staying_permanently_zero() {
+        // Regression test for pico-link-04d: before this fix, the only
+        // `App::tick` call sites in the repo were `ui-ffi`'s `pl_ui_tick`
+        // and one direct `App` test -- `run`'s `Runner::step` sampled the
+        // clock (for idle/deep-sleep timing) but never forwarded it to the
+        // app, so `App::now_us` was permanently 0 in both the headless and
+        // windowed run modes. See `.planning/decisions/2026-08-31-render-
+        // ctx-frame-scoped-clock.md`'s "standalone bug" note.
+        let RecordingSetup { mut platform, clock, .. } = recording_platform(vec![vec![], vec![], vec![]]);
+        let mut app = App::new(240, 240);
+        assert_eq!(app.now_us(), 0, "sanity: a fresh App starts at now_us == 0");
+
+        let mut iterations = 0;
+        run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {
+            // Advance the clock by 10ms before every iteration (including
+            // the first -- `should_continue` runs before the loop body
+            // reads `platform.clock().now()` each time) so each `step`
+            // sees a strictly later `frame_start` than the last.
+            clock.advance(Duration::from_millis(10));
+            iterations += 1;
+            iterations <= 3
+        });
+
+        assert_eq!(
+            app.now_us(),
+            30_000,
+            "App::now_us must reflect the run loop's own sampled clock time, not stay stuck at 0"
+        );
     }
 
     #[test]
