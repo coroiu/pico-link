@@ -26,6 +26,7 @@ use u8g2_fonts::FontRenderer;
 
 use crate::input::NavIntent;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::theme::{self, font, icon, palette};
 use super::widget::{Action, FocusEvent, Widget};
@@ -762,7 +763,7 @@ impl VerticalList {
 }
 
 impl Widget for VerticalList {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         // A list fills whatever vertical space its screen gives it; it
         // manages overflow itself via scrolling, not by requesting more
         // height than is on offer.
@@ -816,7 +817,7 @@ impl Widget for VerticalList {
         Action::None
     }
 
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         // Real clipping (DrawTargetExt::clipped), not the retired
         // character-skip marquee: anything a row draws outside `area` —
         // an over-long label, a row scrolled partway off the top/bottom —
@@ -879,6 +880,11 @@ impl Widget for VerticalList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Instant;
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     fn items(n: usize) -> Vec<ListItem> {
         (0..n).map(|i| ListItem::new(format!("item-{i}"))).collect()
@@ -1001,7 +1007,7 @@ mod tests {
         let mut fb = FrameBuffer565::new(240, viewport_height);
 
         // Selection within the first screenful: no scroll needed.
-        list.render(area, &mut fb).unwrap();
+        list.render(area, &test_ctx(), &mut fb).unwrap();
         assert_eq!(list.top_index.get(), 0);
 
         // Selecting row 4 (0-indexed) means rows 0-3 no longer all fit;
@@ -1011,7 +1017,7 @@ mod tests {
         for _ in 0..4 {
             list.on_intent(NavIntent::Down);
         }
-        list.render(area, &mut fb).unwrap();
+        list.render(area, &test_ctx(), &mut fb).unwrap();
         assert_eq!(list.top_index.get(), 2);
 
         // The selected row's own top and bottom must both land inside
@@ -1038,12 +1044,12 @@ mod tests {
         for _ in 0..4 {
             list.on_intent(NavIntent::Down);
         }
-        list.render(area, &mut fb).unwrap(); // selected=4, top settles at 2
+        list.render(area, &test_ctx(), &mut fb).unwrap(); // selected=4, top settles at 2
         let top_after_scrolling_down = list.top_index.get();
         assert_eq!(top_after_scrolling_down, 2);
 
         list.on_intent(NavIntent::Up); // selected=3, still within [2, 5)
-        list.render(area, &mut fb).unwrap();
+        list.render(area, &test_ctx(), &mut fb).unwrap();
         assert_eq!(
             list.top_index.get(),
             top_after_scrolling_down,
@@ -1144,7 +1150,7 @@ mod tests {
         let list = VerticalList::new(items(50));
         let mut fb = FrameBuffer565::new(64, 40);
         let area = Rectangle::new(Point::new(0, 0), Size::new(64, 40));
-        list.render(area, &mut fb).unwrap();
+        list.render(area, &test_ctx(), &mut fb).unwrap();
     }
 
     // --- pico-link-0r3: F10, the scan list's real 4-bar signal glyph ---
@@ -1168,7 +1174,7 @@ mod tests {
         let list = VerticalList::new(vec![ListItem::new("Cans").with_signal_bars(3)]);
         let mut fb = FrameBuffer565::new(240, ROW_HEIGHT);
         let area = Rectangle::new(Point::new(0, 0), Size::new(240, ROW_HEIGHT));
-        list.render(area, &mut fb).unwrap();
+        list.render(area, &test_ctx(), &mut fb).unwrap();
 
         assert!(
             second_line_contains_color(&fb, area, theme::palette::BRAND_BRIGHT),
@@ -1188,7 +1194,7 @@ mod tests {
         let list = VerticalList::new(vec![ListItem::new("Cans").with_signal_bars(0)]);
         let mut fb = FrameBuffer565::new(240, ROW_HEIGHT);
         let area = Rectangle::new(Point::new(0, 0), Size::new(240, ROW_HEIGHT));
-        list.render(area, &mut fb).unwrap();
+        list.render(area, &test_ctx(), &mut fb).unwrap();
 
         assert!(
             second_line_contains_color(&fb, area, theme::palette::DIVIDER),
@@ -1205,7 +1211,7 @@ mod tests {
         let list = VerticalList::new(vec![ListItem::new("Cans").with_sublabel("-40 dBm").with_signal_bars(4)]);
         let mut fb = FrameBuffer565::new(240, ROW_HEIGHT);
         let area = Rectangle::new(Point::new(0, 0), Size::new(240, ROW_HEIGHT));
-        list.render(area, &mut fb).unwrap();
+        list.render(area, &test_ctx(), &mut fb).unwrap();
 
         assert!(
             second_line_contains_color(&fb, area, theme::palette::BRAND_BRIGHT),

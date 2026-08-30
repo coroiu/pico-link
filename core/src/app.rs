@@ -22,7 +22,7 @@ use core::cell::RefCell;
 use crate::input::NavIntent;
 use crate::render::home::build_home_screen;
 use crate::render::wizard::build_wizard_screen;
-use crate::render::{Action, FrameBuffer565, ListItem, ListItemKey, Navigator, Screen, VerticalList};
+use crate::render::{Action, FrameBuffer565, Instant, ListItem, ListItemKey, Navigator, RenderCtx, Screen, VerticalList};
 
 /// The devices screen's "Scan for headphones" row's identity key. Not
 /// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
@@ -968,8 +968,9 @@ impl App {
     /// never fail to draw). The `expect` exists only because
     /// `Result::expect` is how that's asserted at the call site.
     pub fn render(&mut self) -> &FrameBuffer565 {
+        let ctx = RenderCtx::at(Instant::from_micros(self.now_us));
         self.navigator
-            .render(&mut self.framebuffer)
+            .render(&ctx, &mut self.framebuffer)
             .expect("core DrawTarget is Infallible");
         self.dirty = false;
         &self.framebuffer

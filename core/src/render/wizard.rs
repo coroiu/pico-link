@@ -42,6 +42,7 @@ use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use crate::app::{Command, ConnectFailureReason, ConnectStep, DeviceEntry, WizardPhase};
 use crate::input::NavIntent;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::{name_top_offset, ListItem, ListItemKey, VerticalList};
 use super::message::MessageView;
@@ -238,7 +239,7 @@ fn build_scan_list(
 }
 
 impl Widget for PairingWizardView {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         constraints
     }
 
@@ -341,7 +342,7 @@ impl Widget for PairingWizardView {
         }
     }
 
-    fn chrome_contribution(&self) -> Option<ChromeContribution> {
+    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
         let phase = self.phase.borrow().clone();
         let mut contribution = ChromeContribution { y: Some(ButtonLabel::Inert), ..ChromeContribution::default() };
         match phase {
@@ -388,7 +389,7 @@ impl Widget for PairingWizardView {
         }
     }
 
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let phase = self.phase.borrow().clone();
         match phase {
             WizardPhase::Instructions => {
@@ -399,17 +400,17 @@ impl Widget for PairingWizardView {
                 // choice.
                 MessageView::new("Enable pairing mode")
                     .with_subline("Hold power ~5s until it flashes")
-                    .render(area, target)?;
+                    .render(area, ctx, target)?;
             }
             WizardPhase::NothingFound => {
                 MessageView::new("No headphones found")
                     .with_headline_color(palette::STATUS_WARNING)
                     .with_subline("Press A to scan again")
-                    .render(area, target)?;
+                    .render(area, ctx, target)?;
             }
             WizardPhase::Scanning => {
                 self.sync_list();
-                self.list.borrow().render(area, target)?;
+                self.list.borrow().render(area, ctx, target)?;
             }
             WizardPhase::Connecting { step, .. } => {
                 render_connecting_steps(area, step, target);
@@ -418,21 +419,21 @@ impl Widget for PairingWizardView {
                 MessageView::new("Not responding")
                     .with_headline_color(palette::STATUS_WARNING)
                     .with_subline(format!("Still trying ({attempt})"))
-                    .render(area, target)?;
+                    .render(area, ctx, target)?;
             }
             WizardPhase::Succeeded { degraded } => {
                 if degraded {
                     MessageView::new("Connected")
                         .with_headline_color(palette::STATUS_WARNING)
                         .with_subline("Using a fallback codec")
-                        .render(area, target)?;
+                        .render(area, ctx, target)?;
                 } else {
-                    MessageView::new("Connected").with_headline_color(palette::STATUS_SUCCESS).render(area, target)?;
+                    MessageView::new("Connected").with_headline_color(palette::STATUS_SUCCESS).render(area, ctx, target)?;
                 }
             }
             WizardPhase::Failed { reason, .. } => {
                 let (headline, subline) = failure_text(reason);
-                MessageView::new(headline).with_headline_color(palette::STATUS_ERROR).with_subline(subline).render(area, target)?;
+                MessageView::new(headline).with_headline_color(palette::STATUS_ERROR).with_subline(subline).render(area, ctx, target)?;
             }
         }
         Ok(())

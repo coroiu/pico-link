@@ -20,12 +20,16 @@
 //! or synthetic frame.
 
 use pico_link_core::input::NavIntent;
-use pico_link_core::platform::{DisplayPower, DisplaySurface};
+use pico_link_core::platform::{DisplayPower, DisplaySurface, Instant};
 use pico_link_core::render::theme::palette;
-use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, Screen, VerticalList};
+use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, RenderCtx, Screen, VerticalList};
 use embedded_graphics::prelude::RgbColor;
 use emulator::platform::minifb_surface::rasterize_scaled;
 use emulator::platform::HeadlessSurface;
+
+fn test_ctx() -> RenderCtx {
+    RenderCtx::at(Instant::from_micros(0))
+}
 
 /// Arbitrary scale > 1 for the full-sweep parity test, so it also proves
 /// upscaling doesn't desync the two surfaces' colors (only replicates them
@@ -58,7 +62,7 @@ fn unpack_argb(pixel: u32) -> (u8, u8, u8) {
 fn headless_png_and_minifb_buffer_agree_on_every_pixel() {
     let navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
     // Headless side: flush, encode, decode back to RGB8 pixels.
     let mut headless = HeadlessSurface::new();
@@ -111,7 +115,7 @@ fn known_chrome_colors_match_between_surfaces_at_scale_one() {
 
     let navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).unwrap();
+    navigator.render(&test_ctx(), &mut framebuffer).unwrap();
 
     let mut headless = HeadlessSurface::new();
     headless.flush(&framebuffer).unwrap();
@@ -149,7 +153,7 @@ fn headless_and_windowed_both_blank_to_black_when_powered_off() {
     // exercised through a live window.
     let navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
     // Headless: flush a real (non-blank) frame first, then power off --
     // proving `encode_png` discards the previously-captured real content

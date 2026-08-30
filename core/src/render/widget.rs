@@ -32,6 +32,7 @@ use crate::input::NavIntent;
 use crate::panel::Button;
 use crate::platform::OutputRequest;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::ListItemKey;
 use super::rail::ButtonLabel;
@@ -200,7 +201,7 @@ pub trait Widget {
     /// (see `Screen::render`); a widget is free to request less than
     /// `constraints` (e.g. a single-line label) or all of it (e.g. a list
     /// that should fill the remaining content area).
-    fn measure(&self, constraints: Size) -> Size;
+    fn measure(&self, constraints: Size, ctx: &RenderCtx) -> Size;
 
     /// Draws into `target`, constrained to `area`. Implementations that
     /// need to guard against overdraw (text overflow, an oversized row)
@@ -216,7 +217,12 @@ pub trait Widget {
     /// return exists only to match `Drawable`/`DrawTarget`'s signature so
     /// widget impls can use `?` freely when calling into embedded-graphics
     /// primitives.
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible>;
+    fn render(
+        &self,
+        area: Rectangle,
+        ctx: &RenderCtx,
+        target: &mut FrameBuffer565,
+    ) -> Result<(), Infallible>;
 
     /// Whether this widget can receive focus. Defaults to `false` (e.g.
     /// static labels, dividers).
@@ -249,7 +255,7 @@ pub trait Widget {
     /// "its" right now. Defaults to `None` (no override): static labels,
     /// dividers, and any widget with nothing dynamic to report don't need
     /// to implement this.
-    fn chrome_contribution(&self) -> Option<ChromeContribution> {
+    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
         None
     }
 

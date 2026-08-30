@@ -17,6 +17,7 @@ use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::OriginDimensions;
 
 use super::chrome::compute_chrome;
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::screen::Screen;
 use super::theme::palette;
@@ -289,18 +290,23 @@ impl Navigator {
     /// Never, in practice: `FrameBuffer565`'s `DrawTarget::Error` is
     /// `Infallible`. The `Result` return exists so this can use `?`
     /// against embedded-graphics `Drawable::draw` calls internally.
-    pub fn render(&self, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    pub fn render(&self, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         target.clear(palette::BACKGROUND)?;
         let chrome = compute_chrome(target.size());
-        self.current().render(&chrome, self.depth() > 1, target)
+        self.current().render(&chrome, self.depth() > 1, ctx, target)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Instant;
     use crate::render::list::{ListItem, VerticalList};
     use embedded_graphics::prelude::{OriginDimensions, Point, Size};
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     fn list_screen(title: &str, n: usize) -> Screen {
         let items = (0..n).map(|i| ListItem::new(format!("{title}-item-{i}"))).collect();
@@ -401,14 +407,14 @@ mod tests {
         let mut fb = FrameBuffer565::new(240, 240);
         let mut nav = Navigator::new(list_screen("List", 3));
 
-        nav.render(&mut fb).unwrap();
+        nav.render(&test_ctx(), &mut fb).unwrap();
         // x=20: past the 4px selection accent bar, so this samples the
         // row's plain elevated fill rather than the accent stripe.
         let row0_highlighted = fb.pixel(Point::new(20, 18));
         assert_eq!(row0_highlighted, palette::SURFACE_ELEVATED, "row 0 starts selected");
 
         nav.dispatch(NavIntent::Down);
-        nav.render(&mut fb).unwrap();
+        nav.render(&test_ctx(), &mut fb).unwrap();
         let row0_after_move = fb.pixel(Point::new(20, 18));
         assert_ne!(
             row0_after_move, palette::SURFACE_ELEVATED,
@@ -420,7 +426,7 @@ mod tests {
     fn render_works_end_to_end_on_a_fresh_navigator() {
         let mut fb = FrameBuffer565::new(240, 240);
         let nav = Navigator::new(list_screen("List", 3));
-        nav.render(&mut fb).unwrap();
+        nav.render(&test_ctx(), &mut fb).unwrap();
         assert_eq!(fb.size(), Size::new(240, 240));
         // Sanity: the title bar's surface fill was drawn somewhere, i.e.
         // rendering actually did something (not just the background clear).
@@ -454,7 +460,7 @@ mod tests {
     fn b_slot_is_dim_at_the_root_and_live_once_a_screen_is_pushed() {
         let mut nav = Navigator::new(list_screen("root", 3));
         let mut fb = FrameBuffer565::new(240, 240);
-        nav.render(&mut fb).unwrap();
+        nav.render(&test_ctx(), &mut fb).unwrap();
         let chrome = compute_chrome(fb.size());
         let b_rect = b_slot_rect(&chrome);
         assert!(
@@ -468,7 +474,7 @@ mod tests {
 
         nav.push(list_screen("detail", 1));
         let mut fb2 = FrameBuffer565::new(240, 240);
-        nav.render(&mut fb2).unwrap();
+        nav.render(&test_ctx(), &mut fb2).unwrap();
         let chrome2 = compute_chrome(fb2.size());
         let b_rect2 = b_slot_rect(&chrome2);
         assert!(

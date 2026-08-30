@@ -19,8 +19,9 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::{Point, Primitive, RgbColor, Size};
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::Drawable;
+use pico_link_core::platform::Instant;
 use pico_link_core::render::hero::{BitrateStatus, CodecStatus, HeroStatusView};
-use pico_link_core::render::{compute_chrome, FrameBuffer565, Widget};
+use pico_link_core::render::{compute_chrome, FrameBuffer565, RenderCtx, Widget};
 
 const SCALE: u32 = 4;
 
@@ -37,7 +38,8 @@ fn render_state(name: &str, view: &HeroStatusView) {
         .draw(&mut fb)
         .expect("core DrawTarget is Infallible");
 
-    view.render(chrome.content, &mut fb).expect("core DrawTarget is Infallible");
+    let ctx = RenderCtx::at(Instant::from_micros(0));
+    view.render(chrome.content, &ctx, &mut fb).expect("core DrawTarget is Infallible");
 
     let path = format!("hero_widget_probe_{name}.png");
     dump_png_scaled(&fb, &path, SCALE);

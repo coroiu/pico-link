@@ -23,6 +23,7 @@ use crate::input::NavIntent;
 use crate::panel::Button;
 
 use super::chrome::ChromeLayout;
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::rail::{draw_rail, ButtonLabel, ButtonLabels};
 use super::theme::{font, icon, palette};
@@ -220,8 +221,8 @@ impl Screen {
     /// multi-widget screen "whichever thing has the user's attention
     /// decides what the chrome says" is the same rule per-screen focus
     /// memory already uses for input.
-    pub(super) fn chrome_contribution(&self) -> Option<ChromeContribution> {
-        self.focused_index.and_then(|index| self.widgets[index].chrome_contribution())
+    pub(super) fn chrome_contribution(&self, ctx: &RenderCtx) -> Option<ChromeContribution> {
+        self.focused_index.and_then(|index| self.widgets[index].chrome_contribution(ctx))
     }
 
     /// Focuses the first focusable widget, if none is focused yet. Called
@@ -341,6 +342,7 @@ impl Screen {
         &self,
         chrome: &ChromeLayout,
         can_go_back: bool,
+        ctx: &RenderCtx,
         target: &mut FrameBuffer565,
     ) -> Result<(), Infallible> {
         chrome.title.into_styled(PrimitiveStyle::with_fill(palette::SURFACE)).draw(target)?;
@@ -359,7 +361,7 @@ impl Screen {
             divider.into_styled(PrimitiveStyle::with_fill(palette::DIVIDER)).draw(target)?;
         }
 
-        let contribution = self.chrome_contribution();
+        let contribution = self.chrome_contribution(ctx);
         let title_text = contribution.as_ref().and_then(|c| c.title.as_deref()).unwrap_or(self.title.as_str());
         let readout_text = contribution.as_ref().and_then(|c| c.readout.as_deref());
         let status = contribution.as_ref().and_then(|c| c.status);
@@ -439,11 +441,11 @@ impl Screen {
                 break;
             }
             let available = Size::new(chrome.content.size.width, (bottom - y) as u32);
-            let requested = widget.measure(available);
+            let requested = widget.measure(available, ctx);
             let height = requested.height.min(available.height);
 
             let area = Rectangle::new(Point::new(chrome.content.top_left.x, y), Size::new(chrome.content.size.width, height));
-            widget.render(area, target)?;
+            widget.render(area, ctx, target)?;
             y += height as i32;
         }
 
@@ -464,7 +466,12 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Instant;
     use crate::render::list::{ListItem, VerticalList};
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     fn list_screen(n: usize) -> Screen {
         let items = (0..n).map(|i| ListItem::new(format!("item-{i}"))).collect();
@@ -501,7 +508,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
         // Title bar was filled with its background color.
         assert_eq!(fb.pixel(Point::new(0, 0)), palette::SURFACE);
     }
@@ -517,16 +524,16 @@ mod tests {
     struct LinkOnlyWidget(core::cell::Cell<Option<LinkState>>);
 
     impl Widget for LinkOnlyWidget {
-        fn measure(&self, _constraints: Size) -> Size {
+        fn measure(&self, _constraints: Size, _ctx: &RenderCtx) -> Size {
             Size::zero()
         }
-        fn render(&self, _area: Rectangle, _target: &mut FrameBuffer565) -> Result<(), Infallible> {
+        fn render(&self, _area: Rectangle, _ctx: &RenderCtx, _target: &mut FrameBuffer565) -> Result<(), Infallible> {
             Ok(())
         }
         fn is_focusable(&self) -> bool {
             true
         }
-        fn chrome_contribution(&self) -> Option<ChromeContribution> {
+        fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
             Some(ChromeContribution { link: self.0.get(), ..Default::default() })
         }
     }
@@ -547,7 +554,7 @@ mod tests {
     fn any_pixel_near_the_right_title_edge(screen: &Screen, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
         (220..240).any(|x| (0..super::super::chrome::TITLE_BAR_HEIGHT as i32).any(|y| fb.pixel(Point::new(x, y)) == color))
     }
 
@@ -610,16 +617,16 @@ mod tests {
     }
 
     impl Widget for ButtonsOnlyWidget {
-        fn measure(&self, _constraints: Size) -> Size {
+        fn measure(&self, _constraints: Size, _ctx: &RenderCtx) -> Size {
             Size::zero()
         }
-        fn render(&self, _area: Rectangle, _target: &mut FrameBuffer565) -> Result<(), Infallible> {
+        fn render(&self, _area: Rectangle, _ctx: &RenderCtx, _target: &mut FrameBuffer565) -> Result<(), Infallible> {
             Ok(())
         }
         fn is_focusable(&self) -> bool {
             true
         }
-        fn chrome_contribution(&self) -> Option<ChromeContribution> {
+        fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
             Some(ChromeContribution {
                 a: self.a.clone(),
                 b: self.b.clone(),
@@ -656,7 +663,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome_for(Size::new(240, 240), orientation);
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
         (chrome, fb)
     }
 
@@ -739,7 +746,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
 
         let x_rect = slot_rect(&chrome, Button::X);
         assert!(
@@ -763,7 +770,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
 
         let x_rect = slot_rect(&chrome, Button::X);
         assert!(

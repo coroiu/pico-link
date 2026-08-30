@@ -21,8 +21,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use pico_link_core::input::NavIntent;
-use pico_link_core::platform::DisplaySurface;
-use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, Screen, VerticalList};
+use pico_link_core::platform::{DisplaySurface, Instant};
+use pico_link_core::render::{FrameBuffer565, ListItem, Navigator, RenderCtx, Screen, VerticalList};
 use emulator::platform::{HeadlessSurface, MinifbSurface};
 
 const WIDTH: u32 = 240;
@@ -47,7 +47,8 @@ fn main() {
 
     let navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(WIDTH, HEIGHT);
-    navigator.render(&mut framebuffer).expect("core DrawTarget is Infallible");
+    let ctx = RenderCtx::at(Instant::from_micros(0));
+    navigator.render(&ctx, &mut framebuffer).expect("core DrawTarget is Infallible");
 
     let mut headless = HeadlessSurface::new();
     headless.flush(&framebuffer).expect("HeadlessSurface::flush is Infallible");

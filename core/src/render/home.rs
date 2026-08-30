@@ -81,6 +81,7 @@ use embedded_graphics::primitives::Rectangle;
 use crate::app::{build_devices_screen, build_settings_screen, BtModel, Command, DeviceEntry, HomeFace, LinkState, WizardPhase};
 use crate::input::NavIntent;
 
+use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::hero::{BitrateStatus, CodecStatus, HeroStatusView};
 use super::menu::{MenuItem, MenuList};
@@ -201,7 +202,7 @@ impl HomeView {
 }
 
 impl Widget for HomeView {
-    fn measure(&self, constraints: Size) -> Size {
+    fn measure(&self, constraints: Size, _ctx: &RenderCtx) -> Size {
         constraints
     }
 
@@ -285,10 +286,10 @@ impl Widget for HomeView {
         }
     }
 
-    fn chrome_contribution(&self) -> Option<ChromeContribution> {
+    fn chrome_contribution(&self, ctx: &RenderCtx) -> Option<ChromeContribution> {
         match self.face() {
             HomeFace::Status => {
-                let mut contribution = self.hero.chrome_contribution().unwrap_or_default();
+                let mut contribution = self.hero.chrome_contribution(ctx).unwrap_or_default();
                 // "devs" is the design's literal label (section 4's rail
                 // table) -- see the module doc for why the actual
                 // immediate action is "open the menu face", not a direct
@@ -317,10 +318,10 @@ impl Widget for HomeView {
         }
     }
 
-    fn render(&self, area: Rectangle, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         match self.face() {
-            HomeFace::Status => self.hero.render(area, target),
-            HomeFace::Menu => self.menu.render(area, target),
+            HomeFace::Status => self.hero.render(area, ctx, target),
+            HomeFace::Menu => self.menu.render(area, ctx, target),
         }
     }
 }
@@ -329,6 +330,11 @@ impl Widget for HomeView {
 mod tests {
     use super::*;
     use crate::app::BtModel;
+    use crate::platform::Instant;
+
+    fn test_ctx() -> RenderCtx {
+        RenderCtx::at(Instant::from_micros(0))
+    }
 
     fn fresh_home_view() -> HomeView {
         let model = BtModel::default();
@@ -354,7 +360,7 @@ mod tests {
         view.on_focus(FocusEvent::Activated); // status -> menu
         assert_eq!(view.face(), HomeFace::Menu);
 
-        let contribution = view.chrome_contribution().expect("the menu face must have a chrome opinion");
+        let contribution = view.chrome_contribution(&test_ctx()).expect("the menu face must have a chrome opinion");
         assert!(
             matches!(contribution.a, Some(ButtonLabel::Live(_))),
             "A must render live on the menu face -- it activates the selected row, not a no-op"
@@ -366,7 +372,7 @@ mod tests {
         let view = fresh_home_view();
         assert_eq!(view.face(), HomeFace::Status);
 
-        let contribution = view.chrome_contribution().expect("the status face must have a chrome opinion");
+        let contribution = view.chrome_contribution(&test_ctx()).expect("the status face must have a chrome opinion");
         assert!(matches!(contribution.a, Some(ButtonLabel::Live(_))), "A must render live on the status face too (it toggles the face)");
     }
 }
