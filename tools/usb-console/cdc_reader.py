@@ -41,6 +41,8 @@ import argparse
 import sys
 import time
 import signal
+import os
+import threading
 
 try:
     import usb.core
@@ -146,6 +148,22 @@ def main():
             "Falls through to reading without DTR if it fails."
         ),
     )
+    ap.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help=(
+            "HARD wall-clock self-kill (bead pico-link-okx Q1). --duration is only a "
+            "LOOP CONDITION, so a single dev.read() that blocks past its own 200ms "
+            "timeout defeats it entirely and the process never exits. This arms a "
+            "daemon watchdog THREAD that calls os._exit() regardless of what the main "
+            "thread is doing. MEASURED: a watchdog thread does fire while the main "
+            "thread sits inside a long blocking ctypes call (ctypes drops the GIL), "
+            "exit code 75. Note this covers the finally-block bus teardown too -- "
+            "release_interface()/dispose_resources() are IOKit calls that can "
+            "themselves block on a wedged device."
+        ),
+    )
     ap.add_argument("--quiet", action="store_true", help="suppress the banner")
     ap.add_argument(
         "--stall-warn-secs",
@@ -161,6 +179,20 @@ def main():
         ),
     )
     args = ap.parse_args()
+
+    if args.max_seconds is not None and args.max_seconds > 0:
+        def _hard_wall(limit=args.max_seconds):
+            time.sleep(limit)
+            try:
+                sys.stderr.write(
+                    f"\n# HARD WALL: {limit:.1f}s elapsed, main thread did not exit "
+                    f"(most likely blocked inside libusb). os._exit(75).\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(75)
+        threading.Thread(target=_hard_wall, daemon=True, name="hardwall").start()
 
     backend = get_backend()
     if backend is None:

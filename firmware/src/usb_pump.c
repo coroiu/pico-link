@@ -102,6 +102,36 @@ void tud_sof_cb(uint32_t frame_count) {
     s_sof_isr_count++;
 }
 
+// TU_ATTR_WEAK override -- fires from inside tud_task() right after
+// usbd.c's process_set_config() on a successful SET_CONFIGURATION
+// (usbd.c:793-809). Bead pico-link-1av: main.c's original
+// tud_sof_cb_enable(true) at boot (before enumeration) does not survive
+// enumeration -- usbd.c:793 calls configuration_reset(), which
+// tu_varclr()s the whole _usbd_dev struct (usbd.c:552) including the
+// sof_consumer bitfield the boot-time call set, and configuration_reset()
+// runs on EVERY DCD_EVENT_BUS_RESET (via usbd_reset(), usbd.c:559) and
+// EVERY SET_CONFIGURATION (usbd.c:793), i.e. on every real enumeration.
+// tud_mount_cb() is called at usbd.c:809, strictly AFTER that reset, so
+// re-issuing the enable here is the first point after each (re-)mount
+// where it sticks. This is the actual fix for D12's sof_isr reading 0 for
+// an entire capture -- the boot-time call in main.c was clobbered before
+// the host ever got a chance to see it.
+//
+// SET_INTERFACE (alt-setting change, e.g. entering/leaving the audio
+// streaming alt) does NOT call configuration_reset() -- usbd.c's
+// process_set_interface() only resets/opens the driver's own endpoints,
+// it never touches _usbd_dev via tu_varclr(). So sof_consumer survives
+// alt-set changes and no tud_umount_cb/resume_cb re-arm is needed for
+// that case. A real bus reset (physical replug, hub reset, or the host
+// deliberately resetting the port) DOES go through usbd_reset() ->
+// configuration_reset(), clearing sof_consumer again -- but that always
+// culminates in a fresh SET_CONFIGURATION and therefore a fresh
+// tud_mount_cb() call, which re-arms it. So mounting alone is sufficient;
+// no separate tud_umount_cb/tud_resume_cb override is needed.
+void tud_mount_cb(void) {
+    tud_sof_cb_enable(true);
+}
+
 // Runs at PL_USB_PUMP_IRQ_PRIORITY (0xC0) as a claimed user IRQ, pended by
 // the 1ms timer callback below -- never invoked directly from the timer
 // itself, see usb_pump.h's module doc for why.

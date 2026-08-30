@@ -92,6 +92,15 @@ int main(void) {
     // for the sof_phase_hist instrument; not needed by anything else in
     // this firmware. Must run after tusb_init() (usbd_sof_enable asserts
     // the stack is initialized).
+    //
+    // Bead pico-link-1av: this call ALONE does not survive enumeration --
+    // usbd.c's configuration_reset() (called on the first real
+    // SET_CONFIGURATION, and on every subsequent bus reset) tu_varclr()s
+    // the whole _usbd_dev struct, wiping the sof_consumer bit this sets.
+    // Kept here anyway so sof_isr/sof_phase_hist have data even before the
+    // first enumeration; usb_pump.c's tud_mount_cb() override is the call
+    // that actually keeps it armed post-enumeration -- see that function's
+    // doc comment for the full chain.
     tud_sof_cb_enable(true);
 
     // Bead pico-link-tfj: brings up pl_usb_mutex and the 1ms-timer/0xC0-IRQ
