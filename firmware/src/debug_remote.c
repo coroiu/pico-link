@@ -8,6 +8,7 @@
 #include "pico/bootrom.h"
 #include "pico/stdio.h"
 #include "pico/stdlib.h"
+#include "tusb.h"
 
 #include "bt.h"
 #include "usb_pump.h"
@@ -128,8 +129,32 @@ static bool parse_connect_addr(const char *line, uint8_t addr[6]) {
 
 size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
     size_t emitted = 0;
+
+    // Bead pico-link-okx (F2b): getchar_timeout_us(0) went through
+    // pico_stdio_usb's stdio_usb_in_chars(), which calls tud_task() from
+    // THREAD context under stdio_usb_mutex -- a second re-entrancy hole
+    // alongside the one F2 closed for the log drain (tud_task() is not
+    // reentrant, and the 0xC0 worker in usb_pump.c also calls it, under a
+    // DIFFERENT mutex -- see this bead's design comment, Ada, 2026-08-30).
+    // Read the CDC RX FIFO directly instead, under the same
+    // pl_usb_lock_try() seam pl_log_ring_drain() uses (usb_pump.h):
+    // non-blocking, no tud_task() call from here, and if the 0xC0 worker
+    // holds the lock this whole poll is skipped -- the next call, a frame
+    // or so later, tries again. Held for the WHOLE poll (not per byte):
+    // tud_cdc_read() never blocks internally, so one lock/unlock pair per
+    // superloop iteration is strictly less contention than re-acquiring it
+    // up to PL_DEBUG_REMOTE_MAX_BYTES_PER_POLL times.
+    if (!pl_usb_lock_try()) {
+        return 0;
+    }
+    if (!tud_ready()) {
+        pl_usb_unlock();
+        return 0;
+    }
+
     for (int budget = 0; budget < PL_DEBUG_REMOTE_MAX_BYTES_PER_POLL; budget++) {
-        int c = getchar_timeout_us(0);
+        uint8_t byte;
+        int c = (tud_cdc_read(&byte, 1) == 1) ? (int)byte : PICO_ERROR_TIMEOUT;
         if (c == PICO_ERROR_TIMEOUT) {
             break; // caught up -- nothing more waiting right now
         }
@@ -192,5 +217,6 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
             s_line_len = 0;
         }
     }
+    pl_usb_unlock();
     return emitted;
 }

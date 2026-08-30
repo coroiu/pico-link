@@ -226,7 +226,11 @@ int main(void) {
     // and WHITE do not (or vice versa) -- which is the tell.
     static const uint8_t s_madctl_candidates[4] = {0x00, 0x60, 0xA0, 0xC0};
     static uint16_t s_madctl_test_buf[PANEL_WIDTH * PANEL_HEIGHT];
-    printf("PL_DIAG_MADCTL_TEST: cycling MADCTL 0x00/0x60/0xA0/0xC0, ~5s each, corner pattern\r\n");
+    // Bead pico-link-okx (F2b): converted from printf to pl_log for
+    // consistency with the rest of this firmware's console output --
+    // low-priority (this is a diagnostic-only build path), done to keep
+    // this the last raw printf() call site.
+    pl_log("PL_DIAG_MADCTL_TEST: cycling MADCTL 0x00/0x60/0xA0/0xC0, ~5s each, corner pattern\r\n");
     while (true) {
         for (int idx = 0; idx < 4; idx++) {
             uint8_t madctl = s_madctl_candidates[idx];
@@ -268,7 +272,7 @@ int main(void) {
             }
 
             st7789_blit_framebuffer(spi1, s_madctl_test_buf, PANEL_WIDTH * PANEL_HEIGHT);
-            printf("PL_DIAG_MADCTL_TEST: candidate %d/4 -- MADCTL=0x%02X, %d dot(s) in RED corner\r\n",
+            pl_log("PL_DIAG_MADCTL_TEST: candidate %d/4 -- MADCTL=0x%02X, %d dot(s) in RED corner\r\n",
                    idx + 1, madctl, idx + 1);
 
             sleep_ms(5000);

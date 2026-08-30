@@ -48,6 +48,34 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h> // MUST precede the printf poison macro below -- see its comment
+
+// Bead pico-link-okx (F2b), "make it stay fixed, not just fixed": every
+// direct printf() call in this firmware bypassed pl_log()'s ring and went
+// straight to blocking stdio -- three separate call sites (pl_log_ring.c's
+// old drain body, panic_recorder.c, main.c's MADCTL diagnostic) had to be
+// found and converted by hand for this bead. This poison macro makes a
+// fourth one a compile error instead of a silent regression the next time
+// someone reaches for the obvious function name.
+//
+// The #include <stdio.h> line directly above is load-bearing for safety,
+// not just for this file: because C header inclusion is idempotent
+// (include guards), whichever .c file first drags in <stdio.h> -- whether
+// via this header or its own #include <stdio.h> -- gets the REAL printf()
+// declaration fully parsed before this macro can apply to it. Any *later*
+// `#include <stdio.h>` in that same translation unit is then a silent
+// no-op, so the declaration is never re-parsed under the poisoned name.
+// Reordering this relative to the macro below would let the macro corrupt
+// stdio.h's own declaration wherever usb_pump.h happens to be included
+// first.
+//
+// _Pragma("GCC error ...") inside a function-like macro fires only when the
+// macro is actually EXPANDED (i.e. at an actual printf(...) call site), not
+// merely by including this header -- verified: a TU that includes this
+// header and never calls printf() compiles clean; one that does gets a
+// hard compile error naming this line. snprintf/vsnprintf/fprintf etc. are
+// untouched -- only the exact token `printf` is replaced.
+#define printf(...) (_Pragma("GCC error \"printf() is poisoned -- use pl_log()/pl_log_locked() instead (bead pico-link-okx F2b); see usb_pump.h\""))
 
 // Initializes the console mutex, claims a user IRQ at priority 0xC0,
 // installs it as the TinyUSB servicing worker, and starts the 1ms

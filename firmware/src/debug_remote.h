@@ -9,9 +9,12 @@
 // existing CDC console and turning them into `PlIntent` values.
 //
 // HARD CONSTRAINTS (see bead pico-link-cd3 and CLAUDE.md):
-//  - Reads happen from the MAIN LOOP only, via getchar_timeout_us(0) called
-//    from main.c's superloop -- never from interrupt context. This module
-//    calls into Rust (indirectly, via the PlIntent values main.c feeds to
+//  - Reads happen from the MAIN LOOP only, via tud_cdc_read() under
+//    usb_pump.h's pl_usb_lock_try() seam (bead pico-link-okx F2b -- see
+//    that bead's design comment for why getchar_timeout_us(0) was replaced:
+//    it called tud_task() re-entrantly from thread context), called from
+//    main.c's superloop -- never from interrupt context. This module calls
+//    into Rust (indirectly, via the PlIntent values main.c feeds to
 //    pl_ui_input) only through that same thread-context call site; nothing
 //    here itself touches Rust or IRQ state.
 //  - Compile-gated behind the PL_DEBUG_REMOTE CMake option (OFF by
@@ -67,7 +70,8 @@
 #include "pico_link_ui.h"
 
 // Drains whatever bytes are currently available on the CDC console's RX
-// side (non-blocking -- getchar_timeout_us(0) per byte, bounded per call),
+// side (non-blocking -- tud_cdc_read() under pl_usb_lock_try(), bounded per
+// call; skips the whole call if the lock is unavailable, see usb_pump.h),
 // accumulates them into a line buffer, and parses any complete lines seen
 // this call into `out`. Writes at most `max` intents and returns how many
 // were written. Cheap and safe to call every superloop iteration alongside
