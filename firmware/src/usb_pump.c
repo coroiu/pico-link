@@ -12,6 +12,7 @@
 
 #include "pcm_ring.h"
 #include "usb_audio.h"
+#include "watchdog_sup.h"
 
 // The re-arm deadline is ~1ms (audiod_xfer_cb only re-arms the ISO OUT
 // endpoint from inside tud_task()), not the ~4ms the 784-byte software
@@ -47,6 +48,12 @@ static void pl_usb_pump_worker_irq(void) {
     }
     s_last_worker_us = now_us;
 
+    // Bead pico-link-ufh: proves the 1ms timer -> 0xC0 IRQ path itself is
+    // still firing, independent of whether tud_task() below is reached --
+    // see watchdog_sup.h's module doc for why this is split from the
+    // PL_WDT_USB_TASK kick after tud_task().
+    pl_wdt_kick(PL_WDT_USB_TIMER);
+
     // tud_task() is not reentrant. If pl_log() is mid-vprintf (holding
     // pl_usb_mutex) on the other side of this same mutex, skip this tick
     // entirely rather than block -- it runs again in ~1ms regardless.
@@ -55,6 +62,10 @@ static void pl_usb_pump_worker_irq(void) {
     }
 
     tud_task();
+    // Bead pico-link-ufh: proves tud_task() is actually being reached, not
+    // just that the timer/IRQ plumbing is alive -- see PL_WDT_USB_TIMER's
+    // kick above for why these are two separate counters.
+    pl_wdt_kick(PL_WDT_USB_TASK);
 
     // Peek (does not consume) before pl_usb_audio_task()'s drain loop, so
     // the high-water mark reflects the fill level tud_task() just left

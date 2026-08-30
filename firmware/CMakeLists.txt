@@ -18,6 +18,15 @@ pico_sdk_init()
 # `cmake -B build -DPL_DEBUG_REMOTE=ON`. See src/debug_remote.h.
 option(PL_DEBUG_REMOTE "Enable debug NavIntent injection over the CDC console (unattended hardware testing only)" OFF)
 
+# Bead pico-link-ufh: software+hardware watchdog supervisor. Armed by
+# default in EVERY build, including debug -- a watchdog only armed in
+# release is a watchdog whose behaviour is never exercised before it ships
+# (see .planning/design/2026-08-30-watchdog.md, "Debug vs release").
+# Deliberately NOT gated on PL_DEBUG_REMOTE -- that is a flash-tooling flag
+# and coupling watchdog arming to it would be exactly the accidental
+# coupling this seam should not acquire.
+option(PL_WATCHDOG "Arm the hardware watchdog + software supervisor" ON)
+
 # --- The Rust FFI seam (M1b, C-first pivot) ---
 #
 # `ui-ffi` is a `no_std` + `alloc` Rust staticlib (../ui-ffi) depending on
@@ -94,10 +103,25 @@ add_executable(pico_link
     src/usb_pump.c
     src/pcm_ring.c
     src/usb_reset.c
+    src/watchdog_sup.c
 )
 
 if(PL_DEBUG_REMOTE)
     target_sources(pico_link PRIVATE src/debug_remote.c)
+endif()
+
+if(PL_WATCHDOG)
+    # Rollout step 6 (design doc): observe-only first flash. pl_wdt_service()
+    # feeds unconditionally and only REPORTS staleness -- never trips a
+    # reset -- until step 7 explicitly undefines this after a hardware
+    # session has turned the deadline table from judgement into
+    # measurement. Flip by removing this option or building with
+    # -DPL_WDT_OBSERVE_ONLY=OFF once step 7 is ready (see watchdog_sup.c).
+    option(PL_WDT_OBSERVE_ONLY "Watchdog supervisor reports staleness but never trips a reset" ON)
+    target_compile_definitions(pico_link PRIVATE PL_WATCHDOG=1)
+    if(PL_WDT_OBSERVE_ONLY)
+        target_compile_definitions(pico_link PRIVATE PL_WDT_OBSERVE_ONLY=1)
+    endif()
 endif()
 
 add_dependencies(pico_link pico_link_ui_header)

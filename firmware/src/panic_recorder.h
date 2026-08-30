@@ -34,6 +34,22 @@ void pl_panic_report_and_clear(void);
 // call. Arms the watchdog, records, and reboots -- never returns.
 void pl_panic_record_rust(const uint8_t *msg, uintptr_t len);
 
+// --- Watchdog supervisor breadcrumb (bead pico-link-ufh) ---
+//
+// "PLWD" -- a distinct magic from the four panic kinds above, so
+// pl_panic_report_and_clear() can tell a supervised stale-subsystem trip
+// apart from an actual panic/hardfault/assert on the next boot.
+#define PL_PANIC_MAGIC_WDT 0x504c5744u
+
+// Called ONLY from watchdog_sup.c's pl_wdt_service(), on a subsystem stale
+// past its deadline. Deliberately a SEPARATE entry point from
+// pl_panic_arm_record_and_reboot() (panic_recorder.c) -- it must not touch
+// scratch[3] (the panic recorder's own retry/BOOTSEL-escalation flag) and
+// must never call reset_usb_boot: a watchdog trip must always come back
+// through the regular flash boot path, never into BOOTSEL in the field.
+// Writes scratch[0..2] only, then watchdog_reboot(0, 0, ...). Never returns.
+void pl_panic_record_watchdog_stale(uint32_t subsys, uint32_t stale_ms) __attribute__((noreturn));
+
 #ifdef __cplusplus
 }
 #endif

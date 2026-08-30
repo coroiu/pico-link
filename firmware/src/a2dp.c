@@ -97,6 +97,7 @@
 #include "pcm_ring.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
+#include "watchdog_sup.h"
 
 // Matches a2dp_source_demo.c's SBC_STORAGE_SIZE -- generous headroom over
 // any real AVDTP media MTU (~650-1013B typical), -1 reserved for the SBC
@@ -553,6 +554,13 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_set_timer(ts, PL_A2DP_AUDIO_TIMEOUT_MS);
     btstack_run_loop_add_timer(ts);
 
+    // Bead pico-link-ufh: proves the A2DP media timer is ticking. Enabled
+    // only while streaming (see the STREAM_STARTED/SUSPENDED/RELEASED/
+    // SIGNALING_CONNECTION_RELEASED handlers below) -- a single volatile
+    // increment, not a pl_log call, so this does not violate this file's
+    // IRQ-context contract above.
+    pl_wdt_kick(PL_WDT_MEDIA);
+
     // Bead pico-link-pbv: measure the REAL interval between calls to this
     // handler, not the nominal PL_A2DP_AUDIO_TIMEOUT_MS -- no pl_log,
     // matches usb_pump.c's own worst_interval_us pattern for exactly this
@@ -912,6 +920,11 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
         }
 
         case A2DP_SUBEVENT_STREAM_STARTED:
+            // Bead pico-link-ufh: PL_WDT_MEDIA is only meaningful while
+            // actually streaming -- enabling it re-bases its deadline, so a
+            // stream that was idle/priming beforehand is never judged stale
+            // against history from before real streaming began.
+            pl_wdt_set_enabled(PL_WDT_MEDIA, true);
             s_ctx.state = PL_A2DP_MEDIA_STREAMING;
             s_ctx.silent_ticks = 0;
             s_ctx.pause_requested = false;
@@ -956,6 +969,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             break;
 
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
+            pl_wdt_set_enabled(PL_WDT_MEDIA, false);
             pl_log("a2dp: stream suspended (auto_resume=%d)\r\n", s_ctx.auto_resume ? 1 : 0);
             s_ctx.sbc_storage_count = 0;
             s_ctx.sbc_ready_to_send = false;
@@ -968,6 +982,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             break;
 
         case A2DP_SUBEVENT_STREAM_RELEASED:
+            pl_wdt_set_enabled(PL_WDT_MEDIA, false);
             pl_log("a2dp: stream released\r\n");
             s_ctx.state = PL_A2DP_MEDIA_IDLE;
             s_ctx.codec = NULL;
@@ -980,6 +995,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             break;
 
         case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
+            pl_wdt_set_enabled(PL_WDT_MEDIA, false);
             pl_log("a2dp: signaling connection released\r\n");
             s_ctx.a2dp_cid = 0;
             s_ctx.codec = NULL;

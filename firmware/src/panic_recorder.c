@@ -70,6 +70,10 @@
 #include "pico/bootrom.h"
 #include "pico/platform/sections.h"
 
+// For pl_wdt_subsys_name() only (the WDT breadcrumb case below) -- no
+// circular dependency: watchdog_sup.h does not include this file.
+#include "watchdog_sup.h"
+
 // --- Tier 1: the contract -- watchdog scratch[0..3]. ---
 
 // Three panic kinds, one field to hold them because the magic itself
@@ -171,6 +175,27 @@ pl_panic_arm_record_and_reboot(uint32_t magic, uint32_t address, uint32_t diag, 
 
 void pl_panic_record_rust(const uint8_t *msg, uintptr_t len) {
     pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_RUST, 0, 0, msg, len);
+}
+
+// --- Watchdog supervisor breadcrumb (bead pico-link-ufh) ---
+//
+// Deliberately does NOT call pl_panic_arm_record_and_reboot() above: that
+// function writes scratch[3] (the panic recorder's retry/BOOTSEL-escalation
+// flag) and, on a non-zero retry, calls reset_usb_boot(). A watchdog trip
+// must never poison scratch[3] -- doing so would misdiagnose the NEXT
+// genuine panic as "recursive, unresolved" and route it to BOOTSEL in a
+// user's hands -- and must never itself reach BOOTSEL either. So this is a
+// separate, narrower entry point: scratch[0..2] only, plain
+// watchdog_reboot(0, 0, ...) (pc=0 -> regular flash boot, not BOOTSEL).
+void __attribute__((noreturn)) pl_panic_record_watchdog_stale(uint32_t subsys, uint32_t stale_ms) {
+    watchdog_hw->scratch[0] = PL_PANIC_MAGIC_WDT;
+    watchdog_hw->scratch[1] = subsys;
+    watchdog_hw->scratch[2] = stale_ms;
+    // scratch[3] deliberately untouched.
+    watchdog_reboot(0, 0, PL_PANIC_REBOOT_DELAY_MS);
+    while (true) {
+        tight_loop_contents();
+    }
 }
 
 // --- C-side panic() entry point (PICO_PANIC_FUNCTION, wired in
@@ -329,7 +354,7 @@ void pl_panic_report_and_clear(void) {
     // boot reads scratch[0] as 0, which matches none of our magics.
     uint32_t magic = watchdog_hw->scratch[0];
     if (magic != PL_PANIC_MAGIC_RUST && magic != PL_PANIC_MAGIC_C && magic != PL_PANIC_MAGIC_HARDFAULT &&
-        magic != PL_PANIC_MAGIC_ASSERT) {
+        magic != PL_PANIC_MAGIC_ASSERT && magic != PL_PANIC_MAGIC_WDT) {
         return;
     }
 
@@ -357,6 +382,11 @@ void pl_panic_report_and_clear(void) {
             printf("kind: HardFault\r\n");
             printf("faulting PC: 0x%08lx\r\n", (unsigned long)address);
             printf("CFSR: 0x%08lx\r\n", (unsigned long)diag);
+            break;
+        case PL_PANIC_MAGIC_WDT:
+            printf("kind: watchdog supervisor -- stale subsystem\r\n");
+            printf("subsystem: %s (id %lu)\r\n", pl_wdt_subsys_name((pl_wdt_subsys_t)address), (unsigned long)address);
+            printf("observed staleness: %lums\r\n", (unsigned long)diag);
             break;
         default:
             break;
