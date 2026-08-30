@@ -284,12 +284,15 @@ void pl_usb_pump_init(void) {
 
 // Bead pico-link-okx (F1): formats into a stack scratch buffer, then hands
 // the bytes to pl_log_ring_push() -- see usb_pump.h's doc comment on
-// pl_log for the full rationale. 256 bytes covers every report line in
-// this firmware today with headroom (the longest, usb-audio-fix's line, is
-// under 160 chars); vsnprintf truncates safely if a future line is longer,
-// it never overflows.
+// pl_log for the full rationale. 384 bytes (raised from 256, bead
+// pico-link-okx F4, to fit watchdog_sup.c's collapsed 8-entry ring-dump
+// lines) covers every report line in this firmware today with headroom;
+// vsnprintf truncates safely if a future line is longer, it never
+// overflows.
 void pl_log(const char *fmt, ...) {
-    char scratch[256];
+    // Bead pico-link-okx (F4): raised from 256 to 384 to fit the collapsed
+    // 8-entry-per-line wdt ring dump (watchdog_sup.c) without truncation.
+    char scratch[384];
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(scratch, sizeof(scratch), fmt, args);
@@ -310,7 +313,9 @@ void pl_log(const char *fmt, ...) {
 // hazard left to route around -- this is now a plain alias. See
 // usb_pump.h's doc comment on the declaration.
 void pl_log_locked(const char *fmt, ...) {
-    char scratch[256];
+    // Bead pico-link-okx (F4): raised from 256 to 384 to fit the collapsed
+    // 8-entry-per-line wdt ring dump (watchdog_sup.c) without truncation.
+    char scratch[384];
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(scratch, sizeof(scratch), fmt, args);

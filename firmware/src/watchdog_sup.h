@@ -177,6 +177,25 @@ typedef enum {
 // it runs ~14x per frame and must never be the thing that slows the loop.
 void pl_wdt_mark(pl_wdt_checkpoint_t cp);
 
+// Bead pico-link-okx (F4): snapshots watchdog_hw->reason/scratch[0]/
+// scratch[4] into module-private state and bumps the NOLOAD boot_seq
+// counter. Call as the LITERAL FIRST STATEMENT of main() -- before
+// pl_log_ring_init(), before anything -- so no other code in this firmware
+// can run first and disturb the registers this reads. Replaces the old
+// "pl_wdt_report_boot_reason() MUST run before pl_wdt_arm()" landmine
+// (enforced only by a comment) with a snapshot taken before there is
+// anything left to race against. Also must run before
+// pl_panic_report_and_clear() clears scratch[0..3], for the same reason the
+// old single function did.
+void pl_wdt_capture_boot_reason(void);
+
+// Formats the snapshot pl_wdt_capture_boot_reason() took -- does not touch
+// watchdog_hw itself any more. Safe to call any time after the capture
+// call above; its position in main() is no longer load-bearing for
+// correctness, only for boot-log ordering. Also reports the persisted
+// checkpoint loop-trace ring (moved to run LAST within this function, bead
+// pico-link-okx F4, so the higher-priority boot-reason line survives even
+// if the console is still degraded when the longer ring dump runs).
 void pl_wdt_report_boot_reason(void);
 
 // Shared subsystem-id -> name lookup, used by both this module's own

@@ -65,6 +65,12 @@ void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
 #define COLOR_BLUE 0x001F
 
 int main(void) {
+    // Bead pico-link-okx (F4): THE literal first statement of main() --
+    // snapshots watchdog_hw->reason/scratch[] before anything else in this
+    // firmware (including pl_log_ring_init() right below) can run and
+    // possibly disturb them. See watchdog_sup.h's doc comment on this call.
+    pl_wdt_capture_boot_reason();
+
     // Bead pico-link-okx (F1): zero the console byte ring before ANYTHING
     // else -- pl_log()/pl_log_locked() push into it unconditionally, and
     // nothing downstream of this line may call either before it has run.
@@ -121,12 +127,14 @@ int main(void) {
 
     // Bead pico-link-ufh: classify *why* the board booted (power-on vs. an
     // unattributed hardware watchdog expiry vs. a deliberate
-    // watchdog_reboot) from the raw watchdog_hw->reason/scratch[4]
-    // registers. MUST run before pl_wdt_arm() (below) -- arming stamps
-    // scratch[4] and destroys the value this reads -- and before
-    // pl_panic_report_and_clear() clears scratch[0..3], since it peeks
-    // scratch[0] to avoid double-reporting a supervised WDT trip that
-    // pl_panic_report_and_clear() is about to print in full.
+    // watchdog_reboot). Bead pico-link-okx (F4): the register read this
+    // used to do live now happened at the top of this function via
+    // pl_wdt_capture_boot_reason() -- this call only formats that snapshot,
+    // so it is no longer racing pl_wdt_arm()'s scratch[4] stamp. Kept here
+    // (before pl_panic_report_and_clear(), below) purely for boot-log
+    // ordering: it peeks the ALREADY-CAPTURED scratch[0] value to avoid
+    // double-reporting a supervised WDT trip that pl_panic_report_and_clear()
+    // is about to print in full.
     pl_wdt_report_boot_reason();
 
     // bd pico-link-gap: report (and clear) a panic record left by the
