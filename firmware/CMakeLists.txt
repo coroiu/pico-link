@@ -12,6 +12,31 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+# --- Vendored SDK patch enforcement (bead pico-link-06m) -------------------
+# The SDK lives OUTSIDE this repo, so a patch we depend on is untracked and
+# machine-local. Silent divergence between "the SDK on one laptop" and "the
+# SDK in version control" is exactly the trap this check exists to prevent, so
+# this is a FATAL_ERROR and not a warning: an unpatched build boots, runs, and
+# then hard-locks in an IRQ path on the first arm/complete race, which is
+# indistinguishable from any other wedge and costs a physical BOOTSEL press.
+# See firmware/sdk-patches/README.md.
+set(_pl_rp2040_usb "${PICO_SDK_PATH}/lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c")
+if(NOT EXISTS "${_pl_rp2040_usb}")
+    message(FATAL_ERROR "Cannot find ${_pl_rp2040_usb} -- is PICO_SDK_PATH right?")
+endif()
+file(READ "${_pl_rp2040_usb}" _pl_rp2040_usb_src)
+string(FIND "${_pl_rp2040_usb_src}" "pl_ep_double_arm_count" _pl_patch_pos)
+if(_pl_patch_pos EQUAL -1)
+    message(FATAL_ERROR
+        "pico-sdk is MISSING the vendored patch 01-tinyusb-rp2040-double-arm.\n"
+        "  Run:  tools/apply-sdk-patches.sh\n"
+        "Without it, TinyUSB panic()s from an IRQ path on an endpoint\n"
+        "double-arm and the board hard-locks, needing a physical BOOTSEL press.\n"
+        "See firmware/sdk-patches/README.md.")
+endif()
+message(STATUS "pico-link: vendored SDK patch 01-tinyusb-rp2040-double-arm is applied")
+# ---------------------------------------------------------------------------
+
 # Bead pico-link-cd3: debug-only NavIntent injection over the CDC console,
 # so an agent can drive scan/connect without a human pressing the d-pad.
 # OFF by default -- must never be on in a shipping build. Enable with

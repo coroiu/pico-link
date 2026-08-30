@@ -1,0 +1,17 @@
+--- a/lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c
++++ b/lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c
+@@ -105,7 +105,13 @@
+     value |= or_mask;
+     if (or_mask & USB_BUF_CTRL_AVAIL) {
+       if (*ep->buffer_control & USB_BUF_CTRL_AVAIL) {
+-        panic("ep %02X was already available", ep->ep_addr);
++        // pico-link (bead pico-link-06m): was
++        //   panic("ep %02X was already available", ep->ep_addr);
++        // panic() is a pico-sdk function (NDEBUG does not elide it) called
++        // from an IRQ path, ending in __breakpoint() -- a hard lockup needing
++        // a physical BOOTSEL. USBPods comments this out; we COUNT it instead
++        // so the race stays measurable. See firmware/sdk-patches/README.md.
++        pl_ep_double_arm_count[((ep->ep_addr & 0x0fu) << 1) | ((ep->ep_addr & 0x80u) ? 1u : 0u)]++;
+       }
+       *ep->buffer_control = value & ~USB_BUF_CTRL_AVAIL;
+       // 4.1.2.5.1 Con-current access: 12 cycles (should be good for 48*12Mhz = 576Mhz) after write to buffer control

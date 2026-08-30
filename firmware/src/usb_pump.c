@@ -97,6 +97,18 @@ static volatile uint32_t s_sof_phase_hist[PL_SOF_PHASE_BUCKETS];
 // tud_task() (usbd.c's event-queue drain), i.e. from within this file's
 // worker. See s_last_sof_us's doc comment above for why this hook was
 // chosen over the one the design named.
+// Bead pico-link-06m: incremented from INSIDE the patched pico-sdk TinyUSB
+// (rp2040_usb.c, _hw_endpoint_buffer_control_update32) where stock TinyUSB
+// instead calls panic("ep %02X was already available") -- an endpoint buffer
+// re-armed while USB_BUF_CTRL_AVAIL was still set, i.e. the arm/complete race.
+// Stock behaviour is a hard lockup from an IRQ path; counting it instead keeps
+// the board alive AND makes the race's rate observable for the first time,
+// which is the actual question bead pico-link-okx is asking. Indexed
+// [ep_num << 1 | dir], dir 1 = IN. volatile: written from IRQ context.
+// tools/apply-sdk-patches.sh installs the SDK side; firmware/CMakeLists.txt
+// fails the configure if it is missing.
+volatile unsigned int pl_ep_double_arm_count[32];
+
 void tud_sof_cb(uint32_t frame_count) {
     (void)frame_count;
     s_last_sof_us = time_us_64();
@@ -337,6 +349,28 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
         (unsigned long)s_ep_out_state_flipped_in_task,
         (unsigned long)s_sof_isr_count
     );
+
+    // Bead pico-link-06m: the arm/complete race made visible. Stock TinyUSB
+    // panics here and hard-locks the board from an IRQ path; the vendored SDK
+    // patch counts instead. A nonzero total means the race is REAL on this
+    // hardware; whether it is BENIGN is a separate question, answered by
+    // whether ingestion (usb-pump packets= / usb_audio measured=) degrades in
+    // step with it. Lifetime totals, not windowed -- the event is expected to
+    // be rare and clustered around alt-set/teardown, so a windowed counter
+    // would read 0 for most reports and hide the clustering.
+    {
+        unsigned long da_total = 0;
+        for (unsigned i = 0; i < 32; i++) {
+            da_total += (unsigned long)pl_ep_double_arm_count[i];
+        }
+        pl_log(
+            "usb-pump-dblarm: total=%lu ep0out=%lu ep0in=%lu audio_out=%lu\r\n",
+            da_total,
+            (unsigned long)pl_ep_double_arm_count[0],
+            (unsigned long)pl_ep_double_arm_count[1],
+            (unsigned long)pl_ep_double_arm_count[(PL_EP_AUDIO_OUT & 0x0fu) << 1]
+        );
+    }
     // D12, the lead instrument (Ada's design addendum 2026-08-29): the SOF-
     // to-worker-tick phase histogram, 8 buckets of 128us each spanning the
     // full ~1ms SOF period. ROTATING bucket occupancy across successive
