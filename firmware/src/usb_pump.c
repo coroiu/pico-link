@@ -109,6 +109,15 @@ static volatile uint32_t s_sof_phase_hist[PL_SOF_PHASE_BUCKETS];
 // fails the configure if it is missing.
 volatile unsigned int pl_ep_double_arm_count[32];
 
+// Bead pico-link-06m, SECOND patched site: hw_endpoint_xfer_continue() in the
+// same SDK file, where stock TinyUSB panics with "Can't continue xfer on
+// inactive ep". A buffer-status completion arriving for an endpoint that was
+// torn down mid-transfer -- exactly what an abrupt alt0 teardown produces, and
+// the likelier door the historical teardown wedges went through, since the
+// double-arm site fires at stream START. Deliberately a SEPARATE counter from
+// pl_ep_double_arm_count so the two sites are distinguishable in one report.
+volatile unsigned int pl_ep_inactive_xfer_count[32];
+
 void tud_sof_cb(uint32_t frame_count) {
     (void)frame_count;
     s_last_sof_us = time_us_64();
@@ -369,6 +378,17 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
             (unsigned long)pl_ep_double_arm_count[0],
             (unsigned long)pl_ep_double_arm_count[1],
             (unsigned long)pl_ep_double_arm_count[(PL_EP_AUDIO_OUT & 0x0fu) << 1]
+        );
+        unsigned long inact_total = 0;
+        for (unsigned i = 0; i < 32; i++) {
+            inact_total += (unsigned long)pl_ep_inactive_xfer_count[i];
+        }
+        pl_log(
+            "usb-pump-inactxfer: total=%lu ep0out=%lu ep0in=%lu audio_out=%lu\r\n",
+            inact_total,
+            (unsigned long)pl_ep_inactive_xfer_count[0],
+            (unsigned long)pl_ep_inactive_xfer_count[1],
+            (unsigned long)pl_ep_inactive_xfer_count[(PL_EP_AUDIO_OUT & 0x0fu) << 1]
         );
     }
     // D12, the lead instrument (Ada's design addendum 2026-08-29): the SOF-

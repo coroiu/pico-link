@@ -42,3 +42,52 @@ the `usb-pump-race:` line), indexed by endpoint number and direction. That
 turns a fatal, unmeasurable event into a per-endpoint rate we can watch.
 
 Beads: pico-link-06m (the panic), rides with pico-link-okx.
+
+## 02-tinyusb-rp2040-inactive-xfer.patch
+
+`rp2040_usb.c:315`, `hw_endpoint_xfer_continue()`. Stock TinyUSB calls
+`panic("Can't continue xfer on inactive ep %02X")` when a buffer-status
+completion arrives for an endpoint whose `ep->active` is 0 -- a stale
+completion for an endpoint torn down mid-transfer, which is exactly what an
+abrupt alt0 teardown produces. Same arm/complete disorder as patch 01, a
+different fatal exit, same IRQ path, same hard lockup.
+
+This is arguably the MORE likely door the historical teardown wedges went
+through, because the double-arm site (01) fires at stream START while this one
+fires at stream TEARDOWN.
+
+Recovery is deliberately **not** "count and fall through":
+
+  * falling through runs `_hw_endpoint_xfer_sync(ep)` against torn-down state;
+  * returning `true` would hand the stack a bogus `dcd_event_xfer_complete()`
+    carrying a stale `xferred_len`.
+
+So it counts into `pl_ep_inactive_xfer_count[]` (a SEPARATE counter from patch
+01's, so the two sites are distinguishable in one report line -- see
+`usb-pump-inactxfer:`), releases the entry lock, and returns `false`. The
+caller then neither completes nor resets the transfer, which is the correct
+handling of "there is no transfer here". The `buf_status` bit is already
+cleared by `dcd_rp2040.c:157` before the call, so returning cannot cause an
+interrupt storm.
+
+Verified in the linked binary: no `bl panic` remains in the function; the
+counter increment and `return false` are compiled in at `0x20001078`.
+
+## Deliberately NOT patched: dcd_rp2040.c:333 `panic("Unhandled IRQ")`
+
+Assessed 2026-08-30 and left FATAL on purpose. `if (status ^ handled) panic(...)`
+fires when a USB interrupt bit is asserted that the handler has no code for --
+and therefore **does not clear**. Counting and returning would leave the
+interrupt asserted, so the ISR would immediately re-enter: an unbounded
+interrupt storm that starves the main loop and wedges the board anyway, but
+silently and with no diagnosis. A loud death is strictly more diagnosable than
+a silent livelock.
+
+This is the structural difference from patches 01 and 02: in both of those the
+interrupt source is already acknowledged (01 proceeds to write the buffer
+control as normal; 02's `buf_status` bit is cleared by the caller), so
+continuing is genuinely recoverable. Here it is not.
+
+If this ever fires, the right change is a BREADCRUMB -- record `status ^ handled`
+to the watchdog scratch registers before dying -- not a counter. Do not silence
+it.
