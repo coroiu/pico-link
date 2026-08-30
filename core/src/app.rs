@@ -515,6 +515,16 @@ pub struct App {
     /// this bead's scope -- storing it is the fix pico-link-a67 asks for;
     /// wiring a liveness/timeout indicator to it is future UI work.
     now_us: u64,
+    /// The next instant, if any, at which some widget on the current
+    /// screen says its own appearance would differ purely from elapsed
+    /// time -- recomputed by every [`App::render`] call from
+    /// [`Navigator::redraw_after`], and consulted by [`App::tick`] to mark
+    /// the app dirty exactly when it comes due. `None` means nothing
+    /// currently on screen has a time-driven opinion, so `tick` alone will
+    /// never mark this app dirty (see the frame-scoped clock ADR's "hacks
+    /// to retire" section for why `tick` does not just mark dirty
+    /// unconditionally).
+    next_redraw_at: Option<Instant>,
     /// Queued by the devices screen's `on_activate_index` closures (see
     /// [`build_devices_screen`]), drained by [`App::poll_command`]. `Rc`+
     /// `RefCell` because the closures live inside the `Navigator`'s screen
@@ -587,6 +597,7 @@ impl App {
             dirty: true,
             model,
             now_us: 0,
+            next_redraw_at: None,
             commands,
             wizard_phase,
             wizard_devices,
@@ -850,13 +861,24 @@ impl App {
 
     /// Records C's latest clock reading (`pl_ui_tick`'s core-side
     /// implementation -- previously a no-op that discarded `now_us`
-    /// entirely, see pico-link-a67). Does not by itself mark the app dirty:
-    /// the clock advancing is not, on its own, a reason to redraw anything
-    /// today (no screen in this bead's scope reads it) -- a future
-    /// liveness/timeout indicator that *does* need to repaint purely from
-    /// elapsed time will call `mark_dirty` itself when it has a reason to.
+    /// entirely, see pico-link-a67). Marks the app dirty exactly when
+    /// `now_us` reaches or passes [`App::next_redraw_at`] -- the
+    /// `redraw_after` seam's whole point (see the frame-scoped clock ADR):
+    /// a widget declares when it would next look different, rather than
+    /// this unconditionally marking dirty on every tick (which would
+    /// permanently cost the flush-skip and full-frame-blit a static screen
+    /// every tick, contending with audio over SPI on real hardware -- see
+    /// the ADR's "hacks to retire" section). Deliberately does **not**
+    /// clear `next_redraw_at` here: the next [`App::render`] recomputes it
+    /// from scratch, and until then it stays accurate for any repeated
+    /// `tick` call in the same frame.
     pub fn tick(&mut self, now_us: u64) {
         self.now_us = now_us;
+        if let Some(due) = self.next_redraw_at {
+            if Instant::from_micros(now_us) >= due {
+                self.dirty = true;
+            }
+        }
     }
 
     /// The most recent `now_us` recorded via [`App::tick`]. `0` before the
@@ -961,6 +983,11 @@ impl App {
     /// the dirty flag, returning the freshly rendered framebuffer for the
     /// caller to hand to a `DisplaySurface::flush`.
     ///
+    /// Also recomputes [`App::next_redraw_at`] from
+    /// [`Navigator::redraw_after`] at this frame's `ctx` -- so a widget's
+    /// "I'll look different again in N" answer is always relative to the
+    /// instant that was actually just rendered, not a stale one.
+    ///
     /// # Panics
     ///
     /// Never, in practice: `Navigator::render`'s `Result` is over
@@ -972,6 +999,7 @@ impl App {
         self.navigator
             .render(&ctx, &mut self.framebuffer)
             .expect("core DrawTarget is Infallible");
+        self.next_redraw_at = self.navigator.redraw_after(&ctx).map(|duration| ctx.now() + duration);
         self.dirty = false;
         &self.framebuffer
     }
@@ -1232,6 +1260,67 @@ mod tests {
         assert_eq!(app.now_us(), 0);
         app.tick(123_456);
         assert_eq!(app.now_us(), 123_456);
+    }
+
+    /// A widget whose sole purpose is answering [`Widget::redraw_after`]
+    /// with a fixed [`Duration`] -- everything else is the trait's default
+    /// (a static, non-focusable, nothing-to-draw widget), so pushing one
+    /// via [`App::push_screen_for_test`] isolates exactly the
+    /// `redraw_after` -> `next_redraw_at` -> `tick` wiring under test, with
+    /// no other widget behaviour in the way.
+    struct FixedRedrawWidget(core::time::Duration);
+
+    impl crate::render::Widget for FixedRedrawWidget {
+        fn measure(&self, constraints: embedded_graphics::prelude::Size, _ctx: &crate::render::RenderCtx) -> embedded_graphics::prelude::Size {
+            constraints
+        }
+        fn render(
+            &self,
+            _area: embedded_graphics::primitives::Rectangle,
+            _ctx: &crate::render::RenderCtx,
+            _target: &mut FrameBuffer565,
+        ) -> Result<(), core::convert::Infallible> {
+            Ok(())
+        }
+        fn redraw_after(&self, _ctx: &crate::render::RenderCtx) -> Option<core::time::Duration> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn a_widget_requesting_a_redraw_leaves_the_app_clean_before_it_is_due_and_dirty_once_it_is() {
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(Screen::new("T", vec![Box::new(FixedRedrawWidget(core::time::Duration::from_millis(100)))]));
+
+        // Establishes next_redraw_at = now(0) + 100ms, and clears dirty
+        // (the just-pushed screen has just been rendered).
+        app.render();
+        assert!(!app.dirty());
+
+        app.tick(50_000); // 50ms: before the 100ms mark.
+        assert!(!app.dirty(), "must not go dirty before the widget's requested redraw instant is reached");
+
+        app.tick(150_000); // 150ms: past the 100ms mark.
+        assert!(app.dirty(), "must go dirty once now_us reaches/passes the widget's requested redraw instant");
+    }
+
+    #[test]
+    fn a_widget_with_no_time_driven_opinion_never_goes_dirty_from_tick_alone() {
+        let mut app = App::new(240, 240);
+        // MessageView never overrides redraw_after -- it inherits the
+        // trait's `None` default, exactly the "nothing to do with time"
+        // case this test exists to prove doesn't regress into the
+        // "tick always marks dirty" hack the ADR names as the thing to
+        // retire.
+        app.push_screen_for_test(Screen::new("T", vec![Box::new(crate::render::MessageView::new("hi"))]));
+
+        app.render();
+        assert!(!app.dirty());
+
+        // A tick arbitrarily far in the future must still not mark dirty:
+        // there is no `next_redraw_at` to ever come due.
+        app.tick(1_000_000_000);
+        assert!(!app.dirty(), "tick alone must never mark a time-indifferent screen dirty");
     }
 
     #[test]

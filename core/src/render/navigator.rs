@@ -295,6 +295,14 @@ impl Navigator {
         let chrome = compute_chrome(target.size());
         self.current().render(&chrome, self.depth() > 1, ctx, target)
     }
+
+    /// Delegates to the currently visible screen's
+    /// [`Screen::redraw_after`] -- only the screen on top of the stack is
+    /// ever on-screen, so only its widgets' time-driven answers matter.
+    #[must_use]
+    pub fn redraw_after(&self, ctx: &RenderCtx) -> Option<core::time::Duration> {
+        self.current().redraw_after(ctx)
+    }
 }
 
 #[cfg(test)]

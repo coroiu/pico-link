@@ -259,6 +259,29 @@ pub trait Widget {
         None
     }
 
+    /// How much longer, from `ctx.now()`, this widget's next render call
+    /// could produce different pixels purely from the passage of time
+    /// (e.g. an elapsed-time readout, a spinner) — **not** from a
+    /// model/focus/input change, which already goes through the normal
+    /// `mark_dirty` path. `None` (the default) means "nothing about my
+    /// appearance depends on time"; static labels, lists, and every widget
+    /// with no time-varying content don't need to implement this.
+    ///
+    /// This is what lets [`App::tick`] (`crate::app::App::tick`) schedule a
+    /// redraw for a purely time-driven appearance change without either of
+    /// the two hacks this seam exists to retire: marking the app dirty on
+    /// every tick (which would defeat `Screen::render`'s flush-skip and
+    /// full-frame-blit a static screen every frame — see the frame-scoped
+    /// clock ADR's "hacks to retire" section) or leaving such a widget
+    /// permanently frozen between input events.
+    ///
+    /// See [`Screen::redraw_after`] for how a screen combines its widgets'
+    /// answers, and `.planning/decisions/2026-08-31-render-ctx-frame-
+    /// scoped-clock.md` for the full design.
+    fn redraw_after(&self, _ctx: &RenderCtx) -> Option<core::time::Duration> {
+        None
+    }
+
     /// This widget's own internal selection/cursor index, if it has one
     /// (e.g. `VerticalList`'s selected row). `None` for widgets with no
     /// such concept (static labels, dividers).

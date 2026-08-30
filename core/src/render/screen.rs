@@ -225,6 +225,17 @@ impl Screen {
         self.focused_index.and_then(|index| self.widgets[index].chrome_contribution(ctx))
     }
 
+    /// The soonest any of this screen's widgets say their own appearance
+    /// could next change purely from elapsed time -- the min over every
+    /// widget's [`Widget::redraw_after`], not just the focused one (unlike
+    /// [`Screen::chrome_contribution`]): an unfocused widget's on-screen
+    /// pixels still need to stay live (e.g. a background status widget
+    /// ticking a live duration while a list has focus). `None` if no
+    /// widget on this screen has a time-driven opinion.
+    pub(super) fn redraw_after(&self, ctx: &RenderCtx) -> Option<core::time::Duration> {
+        self.widgets.iter().filter_map(|widget| widget.redraw_after(ctx)).min()
+    }
+
     /// Focuses the first focusable widget, if none is focused yet. Called
     /// when a screen is first pushed onto the stack. A no-op if focus was
     /// already established (which is how per-screen focus memory works:
