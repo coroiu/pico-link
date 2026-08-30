@@ -147,6 +147,19 @@ def main():
         ),
     )
     ap.add_argument("--quiet", action="store_true", help="suppress the banner")
+    ap.add_argument(
+        "--stall-warn-secs",
+        type=float,
+        default=5.0,
+        help=(
+            "bead pico-link-okx: print a real-time '# STALL' warning to stderr if no bytes "
+            "have been received for this many seconds (default 5s), and a final liveness "
+            "summary on exit. A long capture that dies early (killed process, wedged board, "
+            "USB drop) is otherwise indistinguishable from a healthy one until someone reads "
+            "the log after the fact -- this makes it visible while the capture is still "
+            "running, in the first stall window, not at analysis time. 0 disables."
+        ),
+    )
     args = ap.parse_args()
 
     backend = get_backend()
@@ -245,6 +258,20 @@ def main():
 
         signal.signal(signal.SIGINT, handle_sigint)
 
+        # Bead pico-link-okx: liveness tracking, independent of anything the
+        # firmware prints -- a truncated capture (killed process, wedged
+        # board, USB drop, this tool's own process being torn down by
+        # something outside the capture loop) must be visible WHILE it is
+        # happening, not discovered later by parsing report lines. total_bytes
+        # and start_time give an honest "how long did this actually run and
+        # how much did it actually receive" answer that does not depend on
+        # trusting the deadline was reached.
+        start_time = time.time()
+        last_data_time = start_time
+        last_stall_warn_time = None
+        total_bytes = 0
+        stall_warn_secs = args.stall_warn_secs if args.stall_warn_secs > 0 else None
+
         deadline = (time.time() + args.duration) if args.duration is not None else None
         while not stop["flag"]:
             if deadline is not None and time.time() >= deadline:
@@ -254,11 +281,26 @@ def main():
             except usb.core.USBError as e:
                 # errno 60 / ETIMEDOUT is the expected "no data this tick" case.
                 if e.errno in (60, 110):
+                    if stall_warn_secs is not None:
+                        now = time.time()
+                        since = now - last_data_time
+                        if since >= stall_warn_secs and (
+                            last_stall_warn_time is None or now - last_stall_warn_time >= stall_warn_secs
+                        ):
+                            print(
+                                f"# STALL: no bytes received for {since:.1f}s "
+                                f"(total_bytes={total_bytes}, elapsed={now - start_time:.1f}s)",
+                                file=sys.stderr,
+                            )
+                            sys.stderr.flush()
+                            last_stall_warn_time = now
                     continue
                 if stop["flag"]:
                     break
                 raise
             chunk = bytes(data)
+            last_data_time = time.time()
+            total_bytes += len(chunk)
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
             if outfile:
@@ -279,6 +321,20 @@ def main():
         usb.util.dispose_resources(dev)
         if not args.quiet:
             print("\n# released interface, no tty was ever opened", file=sys.stderr)
+            # Bead pico-link-okx: an honest summary independent of the
+            # --duration argument -- if this ran for far less than
+            # requested, or the last byte arrived long before exit, that is
+            # the whole story right here, no log-parsing required.
+            try:
+                elapsed = time.time() - start_time
+                since_last = time.time() - last_data_time
+                print(
+                    f"# summary: elapsed={elapsed:.1f}s total_bytes={total_bytes} "
+                    f"since_last_byte={since_last:.1f}s requested_duration={args.duration}",
+                    file=sys.stderr,
+                )
+            except NameError:
+                pass  # failed before start_time was set (e.g. bad --out path)
 
 
 if __name__ == "__main__":
