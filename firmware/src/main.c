@@ -30,6 +30,7 @@
 #include "debug_remote.h"
 #endif
 #include "input.h"
+#include "ldac_bench.h"
 #include "panic_recorder.h"
 #include "pico_link_ui.h"
 #include "st7789.h"
@@ -53,6 +54,23 @@
 void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
     pl_panic_record_rust(msg, len);
 }
+
+// Bead pico-link-cz0.5.4 (LDAC L0) BUILD-ENVIRONMENT WORKAROUND -- NOT part
+// of this bead's scope. This machine's shared pico-sdk install
+// (~/.pico-sdk/sdk/2.1.1) has instrumentation patches applied globally from
+// the unmerged bd-pico-link-okx branch (bead pico-link-06m,
+// firmware/sdk-patches/, not present on main): rp2040_usb.c now has two
+// `extern volatile unsigned int` counter arrays,
+// pl_ep_double_arm_count[32] and pl_ep_inactive_xfer_count[32], normally
+// DEFINED by that branch's firmware/src/usb_pump.c. This worktree branched
+// from main, which has neither the patch files nor that definition, so a
+// build here fails to link against the (globally, machine-wide) already-
+// patched SDK. Defined here with dummy storage ONLY so this bead's on-target
+// benchmark can build and run. This is not this bead's fix for that
+// instrumentation -- merging pico-link-06m/okx (or reverting the SDK patch)
+// obsoletes this block; do not extend or rely on it elsewhere.
+volatile unsigned int pl_ep_double_arm_count[32];
+volatile unsigned int pl_ep_inactive_xfer_count[32];
 
 #define PANEL_WIDTH ST7789_WIDTH
 #define PANEL_HEIGHT ST7789_HEIGHT
@@ -243,6 +261,23 @@ int main(void) {
             sleep_ms(5000);
         }
     }
+#endif
+
+#ifdef PL_DIAG_LDAC_BENCH
+    // Reusable diagnostic (undefined by default -- pass -DPL_DIAG_LDAC_BENCH
+    // to CMAKE_C_FLAGS/CMAKE_CXX_FLAGS to enable), bead pico-link-cz0.5.4
+    // (LDAC L0). Pure CPU/heap measurement: no display, no BT, no A2DP --
+    // runs before pl_ui_create()/cyw43_arch_init() below so nothing else is
+    // competing for CPU or heap during the measurement. Deliberately does
+    // NOT halt afterward (unlike PL_DIAG_COLOR_TEST/PL_DIAG_MADCTL_TEST
+    // above) -- falls through into the normal boot flow so
+    // pl_debug_remote_poll() keeps servicing the main loop and a `BOOTSEL`
+    // CDC command still works for the NEXT reflash. A halted board cannot
+    // respond to CDC BOOTSEL (debug_remote only polls from a live main
+    // loop -- see debug_remote.h), which cost a physical BOOTSEL press
+    // once already during this bead's own measurement.
+    pl_ldac_bench_run();
+    pl_log("PL_DIAG_LDAC_BENCH: done, continuing normal boot\r\n");
 #endif
 
     // --- The Rust UI ---

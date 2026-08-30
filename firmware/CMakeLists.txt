@@ -89,6 +89,13 @@ add_library(ui_ffi STATIC IMPORTED GLOBAL)
 set_target_properties(ui_ffi PROPERTIES IMPORTED_LOCATION ${UI_FFI_LIB})
 add_dependencies(ui_ffi ui_ffi_build)
 
+# Bead pico-link-cz0.5.4 (LDAC L0): Sony/libldac (Apache-2.0), encoder only,
+# vendored under firmware/vendor/libldac -- see that directory's
+# PROVENANCE.md. Linked alongside pico_btstack_sbc_encoder below. NOT wired
+# into the A2DP media path yet (design doc .planning/design/2026-08-30-ldac.md
+# Q1 -- that is L3, pico-link-cz0.5.6).
+add_subdirectory(vendor/libldac)
+
 add_executable(pico_link
     src/main.c
     src/st7789.c
@@ -104,6 +111,12 @@ add_executable(pico_link
     src/pcm_ring.c
     src/usb_reset.c
     src/watchdog_sup.c
+    # Bead pico-link-cz0.5.4 (LDAC L0): temporary on-target benchmark, see
+    # ldac_bench.h's module doc. Always compiled in (like codec_sbc.c);
+    # pl_ldac_bench_run() is only ever CALLED under PL_DIAG_LDAC_BENCH
+    # (main.c), so it costs flash but changes no runtime behaviour when the
+    # flag is off.
+    src/ldac_bench.c
 )
 
 if(PL_DEBUG_REMOTE)
@@ -223,6 +236,10 @@ target_link_libraries(pico_link
     # encoder, ships in the pico-sdk (rp2_common/pico_btstack/CMakeLists.txt)
     # -- no new fetch, no new submodule (design sec 11.6).
     pico_btstack_sbc_encoder
+    # Bead pico-link-cz0.5.4 (LDAC L0): the vendored Sony/libldac encoder
+    # (firmware/vendor/libldac). Linked in for the offline on-target
+    # benchmark (PL_DIAG_LDAC_BENCH in main.c) only -- no A2DP wiring yet.
+    pl_ldac_enc
     pico_cyw43_arch_threadsafe_background
     # M3: link the MARKED tinyusb_device target (not just the
     # tinyusb_device_unmarked that pico_enable_stdio_usb pulls in on its
