@@ -100,10 +100,29 @@
 #include "usb_pump.h"
 #include "watchdog_sup.h"
 
-// Matches a2dp_source_demo.c's SBC_STORAGE_SIZE -- generous headroom over
-// any real AVDTP media MTU (~650-1013B typical), -1 reserved for the SBC
-// media payload header byte (num_frames), see pl_a2dp_send_media_packet.
-#define SBC_STORAGE_SIZE 1030
+// Bead pico-link-85v (D1): renamed from SBC_STORAGE_SIZE -- generous
+// headroom over any real AVDTP media MTU (~650-1013B typical), -1 reserved
+// for the media payload header byte (num_frames), see pl_a2dp_slot_t. The
+// old SBC_ prefix was a codec-identity smell in a file forbidden from
+// having one (module doc, constraint 2) -- this is a payload-storage
+// ceiling, not an SBC property. Same value, 1030, matches
+// a2dp_source_demo.c's own SBC_STORAGE_SIZE.
+#define PL_A2DP_PAYLOAD_SLOT_BYTES 1030
+
+// Bead pico-link-85v (D2): tx queue depth. N = 1 (head, being filled) +
+// B_tick (sealed this tick) + B_tick (unsent from last tick), where
+// B_tick = ceil(dwell_budget / (worst_case_encode_us * frames_per_packet)).
+// At the compile-time backstop (PL_A2DP_MAX_ENCODE_DWELL_US = 6000us):
+//   SBC:      ceil(6000 / (800 * 7))  = ceil(1.07) = 2
+//   LDAC HQ:  ceil(6000 / (1100 * 3)) = ceil(1.82) = 2  (see
+//             .planning/design/2026-08-30-ldac.md's tightened ~1100us/frame
+//             stopping rule, amended by this same design's D4 consequence)
+// N = 1 + 2*2 = 5. Recomputed per-stream at STREAM_ESTABLISHED against the
+// actually-negotiated frames_per_packet and the active codec row's
+// worst_case_encode_us -- see that handler for the loud WARNING if the
+// live derivation would exceed this compile-time count (pico-link-r44
+// lesson: a silent clamp is worse than a loud one).
+#define PL_A2DP_TX_QUEUE_SLOTS 5
 
 // design sec 1: our own crystal, via btstack_run_loop timers, paces the
 // A2DP media stream -- matches a2dp_source_demo.c's own AUDIO_TIMEOUT_MS.
@@ -126,6 +145,12 @@
 // together.
 #define PL_A2DP_MAX_ENCODE_DWELL_US 6000u
 
+// Bead pico-link-85v (D4): work-bound multiplier -- the fill loop never
+// needs more than CATCHUP_K times the work real time has owed it; beyond
+// that is not catch-up, it is running ahead of the sink. K=2 retires a
+// backlog at twice real time: a 100ms stall absorbs in 100ms.
+#define PL_A2DP_CATCHUP_K 2u
+
 // design sec 3.5 case 2 ("host silent"): no PCM available for >200ms while
 // streaming is not a fault (the user paused) -- auto-pause and re-prime
 // rather than starving the link forever. 200ms / 10ms tick = 20 ticks.
@@ -140,6 +165,20 @@ typedef enum {
     PL_A2DP_MEDIA_PRIMING,
     PL_A2DP_MEDIA_STREAMING,
 } pl_a2dp_media_state_t;
+
+// Bead pico-link-85v (D1): one fixed payload slot. byte 0 of data[] is a
+// reserved media-payload header (the SBC media header / frame-count byte
+// today); do not hardcode that offset anywhere new -- route it through
+// pl_a2dp_usable_payload (this file, below), the single correction point.
+// pico-link-cz0.5.6 moves ownership of that header byte to the codec via
+// pl_codec_frame_info_t's header_bytes field; this slot shape does not
+// change when that lands.
+typedef struct {
+    uint8_t data[PL_A2DP_PAYLOAD_SLOT_BYTES];
+    uint16_t len;    // bytes INCLUDING the reserved header byte
+    uint16_t frames; // accumulated during fill -- NOT derived by division (D5)
+    uint32_t rtp_ts; // stamped at SEAL, not at send
+} pl_a2dp_slot_t;
 
 typedef struct {
     uint16_t a2dp_cid;
@@ -156,10 +195,37 @@ typedef struct {
     bool timer_armed;
 
     int max_media_payload_size;
-    uint32_t rtp_timestamp;
-    uint8_t sbc_storage[SBC_STORAGE_SIZE];
-    uint16_t sbc_storage_count;
-    bool sbc_ready_to_send;
+    // Bead pico-link-85v (D1): rtp_next replaces the old rtp_timestamp --
+    // stamped into a slot at SEAL time (not at send), and advanced by
+    // frames*pcm_frames_per_encoded_frame at seal, not at send. Preserved
+    // across STREAM_SUSPENDED (auto-resume continues one timeline); reset
+    // to 0 at STREAM_ESTABLISHED/STREAM_RELEASED/
+    // SIGNALING_CONNECTION_RELEASED -- see D6's flush table.
+    uint32_t rtp_next;
+
+    // Bead pico-link-85v (D1): the tx ring. Replaces sbc_storage/
+    // sbc_storage_count/sbc_ready_to_send. tx_head is the slot currently
+    // being filled; tx_tail is the next slot to send; tx_count is the
+    // number of SEALED, unsent slots. send_requested mirrors whether we
+    // currently have an outstanding request_can_send_now with BTstack.
+    //
+    // CONCURRENCY: none. The media timer handler (producer, fills/seals)
+    // and the A2DP packet handler's CAN_SEND_MEDIA_PACKET_NOW case
+    // (consumer, sends) both run in the BTstack run loop on the same 0xFF
+    // background IRQ context, and BTstack does not re-enter its own run
+    // loop -- see this file's module doc for the IRQ-context contract.
+    // tx_head/tx_tail/tx_count are therefore PLAIN, NON-VOLATILE fields,
+    // not cross-context shared state like pcm_ring.h's ring (which IS
+    // genuinely producer/consumer across contexts and needs its
+    // discipline). Do NOT add atomics, memory barriers, or volatile here
+    // -- the visual similarity to pcm_ring invites "hardening" that would
+    // be pure cost with no correctness benefit, because there is no second
+    // context to race against.
+    pl_a2dp_slot_t tx[PL_A2DP_TX_QUEUE_SLOTS];
+    uint8_t tx_head;
+    uint8_t tx_tail;
+    uint8_t tx_count;
+    bool send_requested;
 
     uint32_t silent_ticks;
     bool pause_requested;
@@ -191,6 +257,13 @@ typedef struct {
     volatile uint64_t last_tick_us;
     volatile uint32_t worst_tick_interval_us;
     volatile uint32_t tick_count;
+    // Bead pico-link-85v (D4): this tick's own measured interval (the same
+    // elapsed_us computed for worst_tick_interval_us/credit accrual below),
+    // stashed for pl_a2dp_fill's duty-bound derivation -- same producer
+    // context, no new time_us_64() call. 0 means "not yet measured" (boot,
+    // or the very first tick ever) -- pl_a2dp_fill treats 0 as "duty bound
+    // not yet known" and skips it rather than spuriously binding at 0.
+    uint32_t last_tick_elapsed_us;
     // Cumulative frames actually encoded -- the RATE (delta between two
     // pl_a2dp_report samples, ~1s apart) is what the pbv acceptance
     // criterion calls "enc_frames": must read 375 +/- 2 per second in
@@ -199,12 +272,10 @@ typedef struct {
     // the design's own vocabulary now that it is a real pass/fail signal,
     // not just a diagnostic.
     volatile uint32_t enc_frames_total;
-    // Tests a specific hypothesis: does the fill loop stall waiting on
-    // BTstack's async A2DP_SUBEVENT_STREAMING_CAN_SEND_MEDIA_PACKET_NOW
-    // grant (the sbc_ready_to_send handoff below) for a meaningful
-    // fraction of ticks? Counter only. Measured 0 for the entire pbv
-    // investigation run -- kept as an ongoing regression check.
-    volatile uint32_t ticks_send_pending;
+    // Bead pico-link-85v (D1/D7): ticks_send_pending is RETIRED -- there is
+    // no sbc_ready_to_send left to pend on; the fill loop now seals and
+    // continues instead of stopping on a pending send. grants (below)
+    // replaces its regression-check role.
 
     // --- bead pico-link-pbv FIX (Ada's design, accepted 2026-08-29):
     // credit-pacing gives pl_a2dp_fill_sbc_buffer a real clock instead of
@@ -270,30 +341,58 @@ typedef struct {
     // itself, see PL_A2DP_MAX_ENCODE_DWELL_US and stop_dwell below).
     uint32_t frames_per_packet;
 
-    // --- bead pico-link-pbv round 2 (C2-2): stop-REASON instrumentation,
-    // replacing the single (and, round 2 found, arithmetically
-    // indistinguishable-from-healthy) ticks_cap_bound. Each counts the
-    // actual break site reached in pl_a2dp_fill_sbc_buffer's loop -- see
-    // that function's doc comment for what each one means and why
-    // stop_dwell, not stop_credit/stop_packet_full/stop_ring_empty, is the
-    // one true safety-trip signal that must read 0 in a healthy run.
+    // --- bead pico-link-pbv round 2 (C2-2), retuned by pico-link-85v
+    // (D1/D7): stop-REASON instrumentation. Each counts the actual break
+    // site reached in pl_a2dp_fill's loop -- see that function's doc
+    // comment for what each one means and why stop_dwell, not
+    // stop_credit/stop_queue_full/stop_ring_empty, is the one true
+    // safety-trip signal that must read 0 in a healthy run.
+    //
+    // stop_packet_full is RETIRED by pico-link-85v D1/D5/D7: a full head
+    // slot is no longer a loop *stop* -- it is a SEAL, and the loop
+    // continues into the next slot. payloads_sealed (below) counts the
+    // same event correctly, without conflating it with a real stop.
+    // stop_packet_full_hot is RETIRED with it -- its ceiling
+    // (one-packet-per-tick output) is exactly what this design removes;
+    // stop_queue_full is its replacement tripwire, for the NEW ceiling
+    // (no free slot).
     volatile uint32_t stop_credit;
-    volatile uint32_t stop_packet_full;
     volatile uint32_t stop_ring_empty;
     volatile uint32_t stop_dwell;
+    // Bead pico-link-85v (D7): the new ceiling tripwire, inheriting
+    // stop_packet_full_hot's job. Incremented when the fill loop cannot
+    // seal because every slot is full (tx_count == PL_A2DP_TX_QUEUE_SLOTS)
+    // -- the only remaining loop-stop condition besides dwell/credit/
+    // ring-empty. Predicted 0 for SBC (acceptance item 1); nonzero means
+    // the SEND side, not fill, is the limiter -- read grants/s.
+    volatile uint32_t stop_queue_full;
 
-    // Bead pico-link-pbv ROUND 3 (R3-3): tripwire for the one-packet-per-
-    // tick output ceiling (626 frames/s at today's MTU, 1.67x the 375
-    // frames/s requirement) that round 3's design deliberately does NOT
-    // build a multi-packet-per-tick queue for -- see the design's sec 8
-    // sustainability note. Incremented at the packet-full break in
-    // pl_a2dp_fill_sbc_buffer ONLY when a WHOLE packet's worth of credit
-    // was already owed and stranded by lack of room (samples_owed >=
-    // frames_per_packet * pcm_frames_per_encoded_frame at that break).
-    // Predicted 0 today. If this ever reads persistently nonzero, the
-    // ceiling is genuinely binding and the deferred multi-packet queue
-    // (bead pico-link-85v) becomes required work, not speculation.
-    volatile uint32_t stop_packet_full_hot;
+    // Bead pico-link-85v (D7): payloads_sealed's rate vs pkt_sent's rate is
+    // the single most important stop/send-side split -- divergence means
+    // the send side, not fill, is the limiter. Incremented once per SEAL
+    // (a full slot handed off to the tx ring), replacing stop_packet_full's
+    // old (and, post-D1, incorrect) role of standing in for this event.
+    volatile uint32_t payloads_sealed;
+    // High-water of tx_count, reset at STREAM_STARTED (pico-link-r44
+    // lesson: a high-water mark that never resets poisons later
+    // derivations). tx_depth_max == PL_A2DP_TX_QUEUE_SLOTS - 1 means D2's
+    // depth is marginal.
+    volatile uint32_t tx_depth_max;
+    // CAN_SEND_MEDIA_PACKET_NOW events. grants/s vs pkt_sent/s separates
+    // "grants are slow" (ACL-credit-bound, expected) from "we did not ask"
+    // (a re-arm bug). grants/s is also the number that answers whether
+    // LDAC HQ's 140 packets/s is reachable at all -- see the design's
+    // capture item (h).
+    volatile uint32_t grants;
+    // A CAN_SEND_MEDIA_PACKET_NOW grant that arrived with tx_count == 0
+    // (D6: a grant already pending inside BTstack when a flush emptied the
+    // queue). Nonzero only around SUSPEND/reconnect is healthy; nonzero
+    // mid-stream is a bug.
+    volatile uint32_t spurious_grants;
+    // High-water of fill dwell (dwell_us in pl_a2dp_fill), reset at
+    // STREAM_STARTED. Without this, "stop_dwell reads 0" says nothing
+    // about how close the loop came to the backstop.
+    volatile uint32_t dwell_max_us;
 
     // Bead pico-link-pbv round 2 (C2-6): cumulative whole frames dropped by
     // pl_pcm_reset() (a2dp.c's STREAM_ESTABLISHED/SUSPENDED/RELEASED
@@ -400,36 +499,62 @@ static inline uint32_t pl_a2dp_usable_payload(int max_media_payload_size) {
     return max_media_payload_size > 0 ? (uint32_t)(max_media_payload_size - 1) : 0u;
 }
 
-// Fills s_ctx.sbc_storage from the PCM ring under CREDIT PACING (bead
+// Bead pico-link-85v (D6): resets the tx ring to empty -- called at every
+// point that already calls pl_pcm_reset() (STREAM_ESTABLISHED/SUSPENDED/
+// RELEASED) plus SIGNALING_CONNECTION_RELEASED, which flushed nothing
+// before this bead. rtp_next is deliberately NOT touched here -- it is
+// preserved across SUSPEND (auto-resume continues one timeline) and reset
+// explicitly by the three call sites that want it reset. A grant can
+// arrive after this runs (send_requested may already be true inside
+// BTstack) -- pl_a2dp_send_media_packet's tx_count==0 guard handles it
+// (counted as spurious_grants).
+static void pl_a2dp_tx_flush(void) {
+    for (uint8_t i = 0; i < PL_A2DP_TX_QUEUE_SLOTS; i++) {
+        s_ctx.tx[i].len = 0;
+        s_ctx.tx[i].frames = 0;
+    }
+    s_ctx.tx_head = 0;
+    s_ctx.tx_tail = 0;
+    s_ctx.tx_count = 0;
+    s_ctx.send_requested = false;
+}
+
+// Fills the tx ring from the PCM ring under CREDIT PACING (bead
 // pico-link-pbv fix -- see the module doc's sec 11.2 rewrite and
 // s_ctx.samples_owed's doc comment for why this replaced a pure
 // data-driven drain). IRQ context (0xFF) -- see this file's module doc.
-// No allocation (s_pcm_scratch is static), no logging, no blocking;
-// codec->encode() carries the same contract (codec_table.h).
+// No allocation (s_pcm_scratch is static, and the tx ring is a fixed
+// array), no logging, no blocking; codec->encode() carries the same
+// contract (codec_table.h).
 //
-// Bead pico-link-pbv ROUND 2 (C2-2): the loop is no longer bounded by a
-// per-tick FRAME-COUNT cap (round 1's frames_per_tick_cap/ticks_cap_bound
-// are gone -- round 2 found ticks_cap_bound arithmetically indistinguishable
-// from a healthy steady state whenever the cap equals frames_per_packet).
-// Instead it is bounded by a real TIME budget: dwell_us accumulates the
-// already-measured per-encode dt below and the loop stops once it reaches
-// PL_A2DP_MAX_ENCODE_DWELL_US, same safety property (bounded worst-case IRQ
-// dwell), now correctly a wall-clock bound instead of a frame-count proxy
-// for one. stop_dwell is the true safety-trip counter this produces --
-// nonzero in steady state means the real dwell-safety bound (not the
-// credit clock or the packet size) is the actual limiter, which must never
-// happen with C2-1's clamp in place.
+// Bead pico-link-85v (D1/D4): renamed from pl_a2dp_fill_sbc_buffer. The
+// loop is bounded by a real TIME budget, freshly derived every call (D4):
+//   dwell_budget_us = min(PL_A2DP_MAX_ENCODE_DWELL_US backstop,
+//                          CATCHUP_K * owed_frames * worst_case_encode_us,
+//                          2/3 * this tick's own elapsed_us)
+//                     floored at worst_case_encode_us (never deadlock).
+// stop_dwell is the true safety-trip counter this produces -- nonzero in
+// steady state means the dwell-safety bound, not the credit clock, is the
+// actual limiter, which must never happen with the credit clamp in place.
 //
-// The four stop conditions are checked IN THIS ORDER -- dwell, credit,
-// packet-full, ring-empty -- because the order is what makes `starved`
-// (and therefore underrun_events/silent_ticks) mean anything. Under credit
-// pacing, frames_this_tick == 0 ROUTINELY means "the clock owed less than
-// one whole frame this tick" (normal -- most ticks fire faster than one
-// SBC frame's worth of real time, ~2.67ms at 48kHz/128), NOT "the ring is
-// empty". Only the ring-empty check, reached with the clock AND packet
-// room both still willing, is a real starvation signal -- conflating the
-// two would fire underrun_events on ordinary ticks, mid-music.
-static void pl_a2dp_fill_sbc_buffer(void) {
+// D1's core change: a full head slot is no longer a loop STOP. It is a
+// SEAL -- the slot is handed to the tx ring and the loop continues into
+// the next slot in the SAME tick. Only "no free slot" (stop_queue_full)
+// ends the loop early for lack-of-room reasons; the earlier
+// one-packet-per-tick ceiling (today a2dp.c's "tick with sbc_ready_to_send
+// still true does no filling at all") is gone.
+//
+// The stop conditions are checked IN THIS ORDER -- dwell, credit,
+// queue-full (inside the seal branch), ring-empty -- because the order is
+// what makes `starved` (and therefore underrun_events/silent_ticks) mean
+// anything. Under credit pacing, frames_this_tick == 0 ROUTINELY means
+// "the clock owed less than one whole frame this tick" (normal -- most
+// ticks fire faster than one SBC frame's worth of real time, ~2.67ms at
+// 48kHz/128), NOT "the ring is empty". Only the ring-empty check, reached
+// with the clock AND a slot both still willing, is a real starvation
+// signal -- conflating the two would fire underrun_events on ordinary
+// ticks, mid-music.
+static void pl_a2dp_fill(void) {
     uint16_t frame_bytes = s_ctx.frame.encoded_frame_bytes;
     uint16_t pcm_frame_count = s_ctx.frame.pcm_frames_per_encoded_frame;
     uint32_t pcm_bytes_needed = (uint32_t)pcm_frame_count * PL_PCM_FRAME_BYTES;
@@ -442,19 +567,39 @@ static void pl_a2dp_fill_sbc_buffer(void) {
         return;
     }
 
-    // Bead pico-link-pbv round 2 (C2-10), round 3 (R3-4): see
-    // pl_a2dp_usable_payload's doc comment for why this must be the one
-    // shared computation.
+    // Bead pico-link-pbv round 2 (C2-10), round 3 (R3-4), unchanged by
+    // pico-link-85v: see pl_a2dp_usable_payload's doc comment for why this
+    // must be the one shared computation -- the single correction point
+    // for the reserved header-byte offset (do not hardcode `1` anywhere
+    // else, D5/pico-link-cz0.5.6).
     uint32_t usable_payload = pl_a2dp_usable_payload(s_ctx.max_media_payload_size);
+
+    // Bead pico-link-85v (D4): the dwell budget, derived fresh every call.
+    uint32_t owed_frames = pcm_frame_count > 0 ? s_ctx.samples_owed / pcm_frame_count : 0;
+    uint32_t work_bound_us =
+        (uint32_t)((uint64_t)PL_A2DP_CATCHUP_K * owed_frames * s_ctx.frame.worst_case_encode_us);
+    uint32_t duty_bound_us = s_ctx.last_tick_elapsed_us != 0
+                                  ? (uint32_t)(((uint64_t)2 * s_ctx.last_tick_elapsed_us) / 3)
+                                  : PL_A2DP_MAX_ENCODE_DWELL_US; // not yet measured -- don't spuriously bind
+    uint32_t dwell_budget_us = PL_A2DP_MAX_ENCODE_DWELL_US;
+    if (work_bound_us < dwell_budget_us) {
+        dwell_budget_us = work_bound_us;
+    }
+    if (duty_bound_us < dwell_budget_us) {
+        dwell_budget_us = duty_bound_us;
+    }
+    if (dwell_budget_us < s_ctx.frame.worst_case_encode_us) {
+        dwell_budget_us = s_ctx.frame.worst_case_encode_us; // floored -- never deadlock
+    }
 
     uint8_t frames_this_tick = 0;
     bool starved = false;
     uint32_t dwell_us = 0;
     for (;;) {
-        // 0. Dwell safety: has this tick's fill loop already consumed the
-        // IRQ-dwell safety budget? The one true safety-trip stop reason --
-        // see this function's doc comment.
-        if (dwell_us >= PL_A2DP_MAX_ENCODE_DWELL_US) {
+        // 0. Dwell safety: has this tick's fill loop already consumed its
+        // (freshly derived) dwell budget? The one true safety-trip stop
+        // reason -- see this function's doc comment.
+        if (dwell_us >= dwell_budget_us) {
             s_ctx.stop_dwell++;
             break;
         }
@@ -465,21 +610,41 @@ static void pl_a2dp_fill_sbc_buffer(void) {
             s_ctx.stop_credit++;
             break;
         }
-        // 2. Packet-full: is there room for one more frame in the current
-        // AVDTP payload? Also not a fault -- just means it's time to send.
-        if ((uint32_t)(s_ctx.sbc_storage_count + frame_bytes) > usable_payload) {
-            s_ctx.stop_packet_full++;
-            // Bead pico-link-pbv ROUND 3 (R3-3): tripwire for the
-            // deliberately-not-built-for one-packet-per-tick ceiling --
-            // see stop_packet_full_hot's doc comment on pl_a2dp_ctx_t.
-            // Only "hot" when a WHOLE packet's worth of credit is already
-            // owed and stranded by lack of room, not merely a partial one.
-            if (s_ctx.frames_per_packet > 0 && pcm_frame_count > 0 &&
-                s_ctx.samples_owed >= s_ctx.frames_per_packet * (uint32_t)pcm_frame_count) {
-                s_ctx.stop_packet_full_hot++;
-            }
-            break;
+
+        pl_a2dp_slot_t *head = &s_ctx.tx[s_ctx.tx_head];
+        if (head->len == 0) {
+            // Fresh slot (never filled, or freed by a send/flush -- both
+            // reset len to 0). Reserve the header byte (data[0], written
+            // at send time -- see pl_a2dp_send_media_packet).
+            head->len = 1;
+            head->frames = 0;
         }
+        uint32_t data_bytes_so_far = (uint32_t)head->len - 1u;
+
+        // 2. Payload-full: is there room for one more frame in the head
+        // slot? Not a fault -- it means this slot is done. SEAL it (D1)
+        // and continue into the next slot in the SAME tick, unless there
+        // is no next slot (stop_queue_full -- the new ceiling tripwire).
+        if (data_bytes_so_far + frame_bytes > usable_payload) {
+            if (s_ctx.tx_count >= PL_A2DP_TX_QUEUE_SLOTS) {
+                s_ctx.stop_queue_full++;
+                break;
+            }
+            head->rtp_ts = s_ctx.rtp_next;
+            s_ctx.rtp_next += (uint32_t)head->frames * pcm_frame_count;
+            s_ctx.tx_head = (uint8_t)((s_ctx.tx_head + 1) % PL_A2DP_TX_QUEUE_SLOTS);
+            s_ctx.tx_count++;
+            if (s_ctx.tx_count > s_ctx.tx_depth_max) {
+                s_ctx.tx_depth_max = s_ctx.tx_count;
+            }
+            s_ctx.payloads_sealed++;
+            if (!s_ctx.send_requested) {
+                s_ctx.send_requested = true;
+                a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
+            }
+            continue; // re-evaluate dwell/credit/queue-full against the fresh head slot
+        }
+
         // 3. Ring-empty: the clock says we should encode and there is
         // room to, but the ring genuinely has nothing to give us. This is
         // the ONE true starvation signal.
@@ -496,20 +661,23 @@ static void pl_a2dp_fill_sbc_buffer(void) {
 
         uint64_t t0 = time_us_64();
         uint16_t written = s_ctx.codec->encode(
-            s_ctx.codec->state, s_pcm_scratch, &s_ctx.sbc_storage[1 + s_ctx.sbc_storage_count],
-            (uint16_t)(sizeof(s_ctx.sbc_storage) - 1 - s_ctx.sbc_storage_count)
+            s_ctx.codec->state, s_pcm_scratch, &head->data[head->len], (uint16_t)(sizeof(head->data) - head->len)
         );
         uint32_t dt = (uint32_t)(time_us_64() - t0);
         if (dt > s_ctx.enc_max_us) {
             s_ctx.enc_max_us = dt;
         }
         dwell_us += dt;
+        if (dwell_us > s_ctx.dwell_max_us) {
+            s_ctx.dwell_max_us = dwell_us;
+        }
         if (written == 0) {
             s_ctx.pkt_fail++;
             break;
         }
 
-        s_ctx.sbc_storage_count = (uint16_t)(s_ctx.sbc_storage_count + written);
+        head->len = (uint16_t)(head->len + written);
+        head->frames++;
         s_ctx.samples_owed -= pcm_frame_count;
         frames_this_tick++;
     }
@@ -526,19 +694,39 @@ static void pl_a2dp_fill_sbc_buffer(void) {
     }
 }
 
-// Sends whatever is currently queued in s_ctx.sbc_storage as one AVDTP
-// media packet -- mirrors a2dp_demo_send_media_packet exactly (SBC media
-// header byte = frame count, RTP timestamp advances by frames *
-// pcm_frames_per_encoded_frame). Called from
-// A2DP_SUBEVENT_STREAMING_CAN_SEND_MEDIA_PACKET_NOW, IRQ context.
+// Bead pico-link-85v (D1/D6): sends the slot at tx_tail as one AVDTP media
+// packet -- the tx-ring counterpart of the old single-buffer
+// pl_a2dp_send_media_packet (SBC media header byte = frame count, RTP
+// timestamp is the slot's own rtp_ts, stamped at SEAL not at send). Called
+// from A2DP_SUBEVENT_STREAMING_CAN_SEND_MEDIA_PACKET_NOW, IRQ context.
+//
+// The re-arm below (request_can_send_now while the queue is still
+// non-empty) is the whole fix this bead exists for, and it is legal:
+// btstack's avdtp.c clears stream_endpoint->request_can_send_now BEFORE
+// dispatching to us, then re-checks it AFTER we return and re-requests if
+// we set it -- verified against pico-sdk 2.1.1's vendored btstack,
+// avdtp.c:546-552. The next grant arrives as soon as L2CAP has an ACL
+// buffer, not at the next media tick -- the drain becomes ACL-credit-bound
+// rather than tick-bound.
+//
+// pico-link-j68 (D6): a grant can arrive after pl_a2dp_tx_flush() already
+// ran (SUSPEND/reconnect) -- send_requested may still be true inside
+// BTstack. The tx_count==0 guard below is the fix: previously this
+// function checked neither state nor storage count and sent an
+// unsolicited 1-byte payload with num_frames=0.
 static void pl_a2dp_send_media_packet(void) {
-    uint16_t frame_bytes = s_ctx.frame.encoded_frame_bytes;
-    uint16_t bytes_in_storage = s_ctx.sbc_storage_count;
-    uint8_t num_frames = frame_bytes > 0 ? (uint8_t)(bytes_in_storage / frame_bytes) : 0;
+    s_ctx.grants++;
 
-    s_ctx.sbc_storage[0] = num_frames; // (fragmentation<<7)|(start<<6)|(last<<5)|num_frames -- no fragmentation here
+    if (s_ctx.tx_count == 0) {
+        s_ctx.spurious_grants++;
+        s_ctx.send_requested = false;
+        return;
+    }
+
+    pl_a2dp_slot_t *slot = &s_ctx.tx[s_ctx.tx_tail];
+    slot->data[0] = (uint8_t)slot->frames; // (fragmentation<<7)|(start<<6)|(last<<5)|num_frames -- no fragmentation here
     uint8_t status = a2dp_source_stream_send_media_payload_rtp(
-        s_ctx.a2dp_cid, s_ctx.local_seid, 0, s_ctx.rtp_timestamp, s_ctx.sbc_storage, (uint16_t)(bytes_in_storage + 1)
+        s_ctx.a2dp_cid, s_ctx.local_seid, 0, slot->rtp_ts, slot->data, slot->len
     );
     if (status == ERROR_CODE_SUCCESS) {
         s_ctx.pkt_sent++;
@@ -546,9 +734,20 @@ static void pl_a2dp_send_media_packet(void) {
         s_ctx.pkt_fail++;
     }
 
-    s_ctx.rtp_timestamp += (uint32_t)num_frames * s_ctx.frame.pcm_frames_per_encoded_frame;
-    s_ctx.sbc_storage_count = 0;
-    s_ctx.sbc_ready_to_send = false;
+    // a2dp_source_stream_send_media_payload_rtp copies into an L2CAP
+    // buffer synchronously -- the slot is free the instant this call
+    // returns (no in-flight retention, no DMA-lifetime hazard). len == 0
+    // is this slot's "fresh" sentinel for pl_a2dp_fill's next use of it.
+    slot->len = 0;
+    slot->frames = 0;
+    s_ctx.tx_tail = (uint8_t)((s_ctx.tx_tail + 1) % PL_A2DP_TX_QUEUE_SLOTS);
+    s_ctx.tx_count--;
+
+    if (s_ctx.tx_count > 0) {
+        a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
+    } else {
+        s_ctx.send_requested = false;
+    }
 }
 
 static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
@@ -571,6 +770,9 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     uint64_t pbv_now_us = time_us_64();
     if (s_ctx.last_tick_us != 0) {
         uint32_t elapsed_us = (uint32_t)(pbv_now_us - s_ctx.last_tick_us);
+        // Bead pico-link-85v (D4): stash for pl_a2dp_fill's duty-bound
+        // derivation -- same elapsed_us, no new time_us_64() call.
+        s_ctx.last_tick_elapsed_us = elapsed_us;
         if (elapsed_us > s_ctx.worst_tick_interval_us) {
             s_ctx.worst_tick_interval_us = elapsed_us;
         }
@@ -677,19 +879,13 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
         return;
     }
 
-    if (!s_ctx.sbc_ready_to_send) {
-        pl_a2dp_fill_sbc_buffer();
-        // Bead pico-link-pbv round 2 (C2-10), round 3 (R3-4): see
-        // pl_a2dp_usable_payload's doc comment -- must match
-        // pl_a2dp_fill_sbc_buffer's own usable_payload exactly.
-        uint32_t usable_payload = pl_a2dp_usable_payload(s_ctx.max_media_payload_size);
-        if ((uint32_t)(s_ctx.sbc_storage_count + s_ctx.frame.encoded_frame_bytes) > usable_payload) {
-            s_ctx.sbc_ready_to_send = true;
-            a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
-        }
-    } else {
-        s_ctx.ticks_send_pending++;
-    }
+    // Bead pico-link-85v (D1): the old "only fill if not already waiting
+    // on a grant" gate is GONE -- that was the actual ceiling mechanism
+    // (a tick with sbc_ready_to_send still true did no filling at all).
+    // pl_a2dp_fill now self-manages sealing and re-arming
+    // request_can_send_now as slots fill, so it is simply called every
+    // tick regardless of any pending grant.
+    pl_a2dp_fill();
 
     // design sec 3.5 case 2: host silent -> not a fault. Auto-pause once,
     // wait for SUSPENDED, then re-prime (see the SUSPENDED case below).
@@ -848,10 +1044,14 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             }
             s_ctx.local_seid = a2dp_subevent_stream_established_get_local_seid(packet);
             int mtu = a2dp_max_media_payload_size(s_ctx.a2dp_cid, s_ctx.local_seid);
-            s_ctx.max_media_payload_size = btstack_min(mtu, (int)sizeof(s_ctx.sbc_storage) - 1);
-            s_ctx.sbc_storage_count = 0;
-            s_ctx.sbc_ready_to_send = false;
-            s_ctx.rtp_timestamp = 0;
+            s_ctx.max_media_payload_size = btstack_min(mtu, (int)PL_A2DP_PAYLOAD_SLOT_BYTES - 1);
+            // Bead pico-link-85v (D6): flush the tx ring here too -- a
+            // stale payload surviving into a new stream is an audible
+            // artefact (a burst of the previous track with a stale RTP
+            // timestamp). rtp_next resets to 0 (unlike SUSPEND, which
+            // preserves it for auto-resume).
+            pl_a2dp_tx_flush();
+            s_ctx.rtp_next = 0;
             s_ctx.silent_ticks = 0;
             s_ctx.pause_requested = false;
 
@@ -861,14 +1061,12 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // number. Round 2 (C2-1/C2-4) reuses this same value for the
             // credit clamp and the priming-cushion derivation below;
             // round 2 also RETIRES the dwell_cap/frames_per_tick_cap half
-            // of round 1's computation -- pl_a2dp_fill_sbc_buffer now
-            // bounds dwell with a real TIME check against
-            // PL_A2DP_MAX_ENCODE_DWELL_US directly, not a frame-count
-            // proxy for one. Round 3 (R3-4): divide by
-            // pl_a2dp_usable_payload's corrected capacity, not the raw
-            // negotiated size -- see that helper's doc comment for why
-            // using the uncorrected size here was a latent off-by-one that
-            // R3-1 would have turned active.
+            // of round 1's computation -- pl_a2dp_fill now bounds dwell
+            // with a real TIME check (D4), not a frame-count proxy for
+            // one. Round 3 (R3-4): divide by pl_a2dp_usable_payload's
+            // corrected capacity, not the raw negotiated size -- see that
+            // helper's doc comment for why using the uncorrected size here
+            // was a latent off-by-one that R3-1 would have turned active.
             s_ctx.frames_per_packet = s_ctx.frame.encoded_frame_bytes > 0
                                            ? btstack_max(
                                                  1u,
@@ -876,6 +1074,28 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                                                      s_ctx.frame.encoded_frame_bytes
                                              )
                                            : 1u;
+
+            // Bead pico-link-85v (D2): recompute the live tx-queue-depth
+            // requirement from what was ACTUALLY negotiated, and warn
+            // loudly (never silently clamp -- pico-link-r44 lesson) if it
+            // would exceed the compile-time PL_A2DP_TX_QUEUE_SLOTS.
+            // B_tick = ceil(PL_A2DP_MAX_ENCODE_DWELL_US /
+            //               (worst_case_encode_us * frames_per_packet)),
+            // required = 1 (head) + 2*B_tick (sealed this tick + unsent
+            // from last tick).
+            if (s_ctx.frame.worst_case_encode_us > 0 && s_ctx.frames_per_packet > 0) {
+                uint32_t denom = s_ctx.frame.worst_case_encode_us * s_ctx.frames_per_packet;
+                uint32_t b_tick = (PL_A2DP_MAX_ENCODE_DWELL_US + denom - 1) / denom; // ceil
+                uint32_t required_slots = 1u + 2u * b_tick;
+                if (required_slots > PL_A2DP_TX_QUEUE_SLOTS) {
+                    pl_log(
+                        "a2dp: WARNING tx queue depth %u required but only %u compiled in "
+                        "(b_tick=%lu frames_per_packet=%lu worst_case_encode_us=%lu)\r\n",
+                        (unsigned)required_slots, (unsigned)PL_A2DP_TX_QUEUE_SLOTS, (unsigned long)b_tick,
+                        (unsigned long)s_ctx.frames_per_packet, (unsigned long)s_ctx.frame.worst_case_encode_us
+                    );
+                }
+            }
 
             // Bead pico-link-pbv round 2 (C2-4): the priming cushion is
             // DERIVED, not hand-picked -- one media packet's worth of PCM
@@ -981,6 +1201,12 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // cited that as the reason NOT to use it in the credit clamp --
             // stale now that a reset exists here, see those comments).
             s_ctx.worst_tick_interval_us = 0;
+            // Bead pico-link-85v (D7): high-water marks reset at
+            // STREAM_STARTED, same reasoning as worst_tick_interval_us
+            // above (pico-link-r44 lesson: a high-water mark that never
+            // resets poisons later derivations).
+            s_ctx.tx_depth_max = 0;
+            s_ctx.dwell_max_us = 0;
             // Bead pico-link-pbv round 2 (C2-3): round 1's trim-to-target
             // here is DELETED -- it discarded exactly the cushion that
             // keeps one late tick from reaching zero (PRIMING now waits
@@ -1015,8 +1241,10 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
             pl_wdt_set_enabled(PL_WDT_MEDIA, false);
             pl_log("a2dp: stream suspended (auto_resume=%d)\r\n", s_ctx.auto_resume ? 1 : 0);
-            s_ctx.sbc_storage_count = 0;
-            s_ctx.sbc_ready_to_send = false;
+            // Bead pico-link-85v (D6): flush the tx ring -- rtp_next is
+            // deliberately PRESERVED here (not reset) so auto-resume
+            // continues one timeline, unlike ESTABLISHED/RELEASED below.
+            pl_a2dp_tx_flush();
             s_ctx.silent_ticks = 0;
             s_ctx.pause_requested = false;
             // Bead pico-link-pbv round 2 (C2-6): count the discard.
@@ -1034,6 +1262,10 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 btstack_run_loop_remove_timer(&s_ctx.media_timer);
                 s_ctx.timer_armed = false;
             }
+            // Bead pico-link-85v (D6): flush the tx ring; rtp_next resets
+            // (same as ESTABLISHED -- this timeline is over).
+            pl_a2dp_tx_flush();
+            s_ctx.rtp_next = 0;
             // Bead pico-link-pbv round 2 (C2-6): count the discard.
             s_ctx.flush_frames += pl_pcm_reset();
             break;
@@ -1044,6 +1276,12 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.a2dp_cid = 0;
             s_ctx.codec = NULL;
             s_ctx.state = PL_A2DP_MEDIA_IDLE;
+            // Bead pico-link-85v (D6): this handler flushed NOTHING before
+            // this bead -- not even the PCM ring. Flush both here, same as
+            // ESTABLISHED/RELEASED.
+            pl_a2dp_tx_flush();
+            s_ctx.rtp_next = 0;
+            s_ctx.flush_frames += pl_pcm_reset();
             if (s_ctx.timer_armed) {
                 btstack_run_loop_remove_timer(&s_ctx.media_timer);
                 s_ctx.timer_armed = false;
@@ -1187,9 +1425,8 @@ void pl_a2dp_report(void) {
     // this fix relies on (usb_pump.c:20-22, worker at 0xC0 preempts this
     // file's 0xFF encode loop) is wrong and the change should be reverted.
     pl_log(
-        "a2dp: tick_count=%lu worst_tick_interval_us=%lu enc_frames_total=%lu ticks_send_pending=%lu\r\n",
-        (unsigned long)s_ctx.tick_count, (unsigned long)s_ctx.worst_tick_interval_us,
-        (unsigned long)s_ctx.enc_frames_total, (unsigned long)s_ctx.ticks_send_pending
+        "a2dp: tick_count=%lu worst_tick_interval_us=%lu enc_frames_total=%lu\r\n", (unsigned long)s_ctx.tick_count,
+        (unsigned long)s_ctx.worst_tick_interval_us, (unsigned long)s_ctx.enc_frames_total
     );
     // Bead pico-link-pbv round 2 instrumentation. fill_ema/fill_min come
     // from usb_audio.c's feedback task (its own ~1ms sampling of
@@ -1211,17 +1448,34 @@ void pl_a2dp_report(void) {
         (unsigned long)s_ctx.credit_clamp_events, (unsigned long)s_ctx.flush_frames, (unsigned long)s_ctx.resync_drops,
         (long)pl_usb_audio_fb_fill_ema(), (unsigned long)pl_usb_audio_fill_min()
     );
-    // Bead pico-link-pbv round 2 (C2-2): stop-reason breakdown for
-    // pl_a2dp_fill_sbc_buffer's loop. stop_dwell must read 0 in a healthy
-    // run (falsifier: the real dwell-safety bound, not the credit clock,
-    // would be the actual limiter). stop_credit dominating is the expected
-    // healthy reading (most ticks fire faster than one SBC frame's worth
-    // of real time). Round 3 (R3-3): stop_packet_full_hot is the tripwire
-    // for the one-packet-per-tick output ceiling -- must read 0 in a
-    // healthy run; see that field's doc comment on pl_a2dp_ctx_t.
+    // Bead pico-link-pbv round 2 (C2-2), retuned by pico-link-85v: stop-
+    // reason breakdown for pl_a2dp_fill's loop. stop_dwell must read 0 in
+    // a healthy run (falsifier: the real dwell-safety bound, not the
+    // credit clock, would be the actual limiter). stop_credit dominating
+    // is the expected healthy reading (most ticks fire faster than one
+    // SBC frame's worth of real time). stop_queue_full is the new ceiling
+    // tripwire (replacing stop_packet_full_hot) -- must read 0 for SBC;
+    // see that field's doc comment on pl_a2dp_ctx_t.
     pl_log(
-        "a2dp: stop_credit=%lu stop_packet_full=%lu stop_packet_full_hot=%lu stop_ring_empty=%lu stop_dwell=%lu\r\n",
-        (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_packet_full,
-        (unsigned long)s_ctx.stop_packet_full_hot, (unsigned long)s_ctx.stop_ring_empty, (unsigned long)s_ctx.stop_dwell
+        "a2dp: stop_credit=%lu stop_queue_full=%lu stop_ring_empty=%lu stop_dwell=%lu\r\n",
+        (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_queue_full, (unsigned long)s_ctx.stop_ring_empty,
+        (unsigned long)s_ctx.stop_dwell
+    );
+    // Bead pico-link-85v (D7): the new drain-side counters. payloads_sealed
+    // vs pkt_sent (above) is the single most important split -- equal
+    // means fill-limited (healthy); sealed > sent means send-limited (read
+    // grants below for why). tx_depth_max == PL_A2DP_TX_QUEUE_SLOTS - 1
+    // means D2's depth is marginal. grants/s vs pkt_sent/s separates
+    // "grants are slow" (ACL-credit-bound) from "we did not ask" (a re-arm
+    // bug), and is the number that decides whether LDAC HQ's 140
+    // packets/s is reachable at all. spurious_grants > 0 only around
+    // SUSPEND/reconnect is healthy (D6); mid-stream is a bug.
+    // dwell_max_us is the high-water this tick's dwell reached -- a zero
+    // stop_dwell with no dwell_max_us reported is not evidence the
+    // backstop has margin.
+    pl_log(
+        "a2dp: payloads_sealed=%lu tx_depth_max=%lu grants=%lu spurious_grants=%lu dwell_max_us=%lu\r\n",
+        (unsigned long)s_ctx.payloads_sealed, (unsigned long)s_ctx.tx_depth_max, (unsigned long)s_ctx.grants,
+        (unsigned long)s_ctx.spurious_grants, (unsigned long)s_ctx.dwell_max_us
     );
 }
