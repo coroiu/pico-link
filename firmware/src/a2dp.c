@@ -611,6 +611,30 @@ static void pl_a2dp_fill(void) {
             break;
         }
 
+        // 1b. Queue-full, checked BEFORE touching the head slot.
+        //
+        // This looks redundant with the queue-full check inside the
+        // payload-full branch below, and today it IS: when tx_count ==
+        // SLOTS the head slot aliases tx_tail's sealed-unsent payload,
+        // but every seal happens BECAUSE the slot could not take another
+        // frame, so that stale head always re-trips payload-full and
+        // breaks there before anything is written into it.
+        //
+        // That safety is EMERGENT, not structural -- it rests on the
+        // invariant "every sealed slot is full". pico-link-cz0.5.6 breaks
+        // that invariant on purpose: LDAC self-packetises and seals when
+        // its encoder reports payload_complete, which can be well short
+        // of usable_payload. A short sealed slot WOULD have room, would
+        // fall through to the encode below, and would silently corrupt a
+        // sealed, unsent packet already queued for transmission.
+        //
+        // So make the invariant explicit here rather than leaving the
+        // next codec row to discover it as an audio-corruption bug.
+        if (s_ctx.tx_count >= PL_A2DP_TX_QUEUE_SLOTS) {
+            s_ctx.stop_queue_full++;
+            break;
+        }
+
         pl_a2dp_slot_t *head = &s_ctx.tx[s_ctx.tx_head];
         if (head->len == 0) {
             // Fresh slot (never filled, or freed by a send/flush -- both
