@@ -51,6 +51,7 @@
 
 pub mod chrome;
 pub mod confirm;
+pub mod ctx;
 pub mod framebuffer;
 pub mod hero;
 pub mod home;
@@ -66,7 +67,9 @@ pub mod wizard;
 
 pub use chrome::{compute_chrome, compute_chrome_for, ChromeLayout};
 pub use confirm::ConfirmView;
+pub use ctx::RenderCtx;
 pub use framebuffer::FrameBuffer565;
+pub use crate::platform::Instant;
 pub use hero::{BitrateStatus, CodecStatus, HeroStatusView};
 pub use home::{build_home_screen, HOME_TITLE};
 pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};
