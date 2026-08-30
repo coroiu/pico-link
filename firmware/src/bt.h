@@ -78,4 +78,21 @@ void pl_bt_push_connect_succeeded(bool degraded);
 // real FFI field of that numeric type).
 void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
 
+#ifdef PL_DEBUG_REMOTE
+// Bead pico-link-g48: debug-only direct connect to a host-supplied
+// BD_ADDR, bypassing GAP inquiry/discovery entirely -- lets an unattended
+// test reach a specific known headset without it being discoverable.
+// Mirrors bt.c's own PL_COMMAND_TAG_CONNECT handler body exactly (log the
+// target address, push PL_LINK_STATE_CONNECTING for UI feedback, call
+// pl_a2dp_connect) rather than duplicating that logic; the address itself
+// is never stored anywhere in this codebase -- it comes from
+// debug_remote.c's "CONNECT <addr>" line, which comes from a host-side
+// CLI argument (tools/usb-console/cdc_sender.py --connect), never a
+// constant. Thread-context only (called from the superloop via
+// pl_debug_remote_poll, same convention as the normal command path via
+// pl_bt_poll_commands). Compiled only when PL_DEBUG_REMOTE is set (see
+// firmware/CMakeLists.txt) -- entirely absent from a shipping build.
+void pl_bt_debug_connect(const uint8_t *addr);
+#endif
+
 #endif // PL_BT_H

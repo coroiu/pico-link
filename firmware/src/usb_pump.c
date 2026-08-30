@@ -67,11 +67,27 @@ static void pl_usb_pump_worker_irq(void) {
 
     // M4 S1 (bead pico-link-cz0.5.2), design sec 2.1: "in the 0xC0 worker
     // after the drain (we are already there; ring fill is two loads and a
-    // mask)". Must run every tick this worker runs, not just while a
-    // consumer is attached -- the feedback loop has to already be correct
-    // before a2dp.c's stream exists, or the ring overruns the instant one
-    // does (see usb_audio.c's doc comment on tud_audio_feedback_params_cb).
-    pl_usb_audio_feedback_task();
+    // mask)".
+    //
+    // Bead pico-link-pbv/pico-link-6vv (C2-7), guarded on
+    // pl_usb_audio_streaming(): Ada found that on this TinyUSB (pico-sdk
+    // 2.1.1), tud_audio_fb_set() does NOT merely store a value for the SOF
+    // ISR (design sec 2.1's original claim was wrong for this version, now
+    // corrected there too) -- tud_audio_n_fb_set only guards on p_desc !=
+    // NULL (true from SET_CONFIGURATION onward) and then unconditionally
+    // calls usbd_edpt_claim()/usbd_edpt_xfer() on audio->ep_fb. That field
+    // is 0 while alt 0 is selected (explicitly reset to 0 on alt 0,
+    // audio_device.c:1837), and neither usbd_edpt_claim nor usbd_edpt_xfer
+    // guards epnum != 0 -- so calling this unconditionally claims EP0-OUT
+    // and queues a 3-byte OUT transfer on the CONTROL endpoint about a
+    // thousand times a second whenever the streaming alt-setting isn't
+    // selected. That is a plausible mechanism for the "EP0 half-open, board
+    // goes deaf" wedge this project already spent a session chasing. Only
+    // call it once the streaming alt-setting (alt 1) is actually selected
+    // and ep_fb is a real endpoint.
+    if (pl_usb_audio_streaming()) {
+        pl_usb_audio_feedback_task();
+    }
 
     mutex_exit(&pl_usb_mutex);
 }
@@ -156,13 +172,17 @@ void pl_usb_pump_report(void) {
     // criterion (set_itf_alt1_calls) plus the finer clock breakdown and the
     // feedback-endpoint service count -- proves the fixed feedback endpoint
     // is actually carrying traffic, not just that the alt setting opened.
+    // Bead pico-link-pbv/pico-link-6vv (C2-8): fb_done replaces fb_sends --
+    // see pl_usb_audio_fb_done's doc comment. Also the pbv acceptance
+    // criterion A6 ("feedback alive"): fb_done climbing at ~1000/s while
+    // streaming.
     pl_log(
-        "usb-audio-fix: set_itf_alt1_calls=%lu clock_set_calls=%lu clk_get_freq_cur=%lu clk_get_freq_range=%lu clk_get_valid=%lu fb_sends=%lu\r\n",
+        "usb-audio-fix: set_itf_alt1_calls=%lu clock_set_calls=%lu clk_get_freq_cur=%lu clk_get_freq_range=%lu clk_get_valid=%lu fb_done=%lu\r\n",
         (unsigned long)pl_usb_audio_set_itf_alt1_calls(),
         (unsigned long)pl_usb_audio_clock_set_calls(),
         (unsigned long)pl_usb_audio_clk_get_freq_cur(),
         (unsigned long)pl_usb_audio_clk_get_freq_range(),
         (unsigned long)pl_usb_audio_clk_get_valid(),
-        (unsigned long)pl_usb_audio_fb_sends()
+        (unsigned long)pl_usb_audio_fb_done()
     );
 }

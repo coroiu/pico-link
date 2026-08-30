@@ -26,6 +26,9 @@
 
 #include "a2dp.h"
 #include "bt.h"
+#ifdef PL_DEBUG_REMOTE
+#include "debug_remote.h"
+#endif
 #include "input.h"
 #include "panic_recorder.h"
 #include "pico_link_ui.h"
@@ -337,6 +340,17 @@ int main(void) {
         if (n > 0) {
             pl_ui_input(ui, intents, n);
         }
+#ifdef PL_DEBUG_REMOTE
+        // Bead pico-link-cd3: debug-only NavIntent injection over the CDC
+        // console, feeding the SAME pl_ui_input call the GPIO scan above
+        // does. Main-loop/thread-context only, same as pl_link_input_poll
+        // -- see debug_remote.h's module doc for why that matters.
+        PlIntent debug_intents[4];
+        size_t debug_n = pl_debug_remote_poll(debug_intents, 4);
+        if (debug_n > 0) {
+            pl_ui_input(ui, debug_intents, debug_n);
+        }
+#endif
 #ifndef PL_DIAG_SKIP_BT
         // Drains events the BTstack packet handler queued from IRQ context
         // (pico-link-6o2) and makes the real pl_ui_push_event calls here, in

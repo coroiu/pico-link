@@ -108,10 +108,39 @@ uint32_t pl_usb_audio_clk_get_freq_range(void);
 // specifically.
 uint32_t pl_usb_audio_clk_get_valid(void);
 
-// Cumulative count of tud_audio_feedback_interval_isr firings -- proves the
-// feedback endpoint is actually being serviced once the streaming alt
-// setting opens, i.e. that the fix in this revision is the thing now
-// working rather than just "macOS opened the pipe".
-uint32_t pl_usb_audio_fb_sends(void);
+// Bead pico-link-pbv/pico-link-6vv (C2-8): cumulative count of
+// tud_audio_fb_done_cb firings -- one per completed feedback OUT transfer.
+// REPLACES pl_usb_audio_fb_sends()/tud_audio_feedback_interval_isr, which
+// Ada found structurally dead on this TinyUSB version with
+// AUDIO_FEEDBACK_METHOD_DISABLED (see usb_audio.c's doc comment). This is
+// the only counter that answers "is the host actually consuming our
+// feedback" -- pbv's falsifier F4 (reads 0 while streaming) depends on it.
+uint32_t pl_usb_audio_fb_done(void);
+
+// --- Instrumentation (bead pico-link-pbv, C6) ---
+// Both read the state pl_usb_audio_feedback_task() already maintains at
+// its own ~1ms cadence -- the finest-grained sampling of ring fill
+// anywhere in this firmware. Safe to call from thread context
+// (pl_a2dp_report); plain aligned reads, no locking needed.
+
+// The EMA fill level pl_usb_audio_feedback_task's P controller already
+// computes (design sec 2.1) -- the correct value to evaluate the
+// closed-loop pass criterion against, not the raw/instantaneous fill.
+int32_t pl_usb_audio_fb_fill_ema(void);
+
+// Bead pico-link-pbv round 2 (C2-9): WINDOWED minimum fill level -- reading
+// this resets the window, so it answers "what was the true minimum fill
+// since the last read" (~1s, pl_a2dp_report's cadence), not "since boot".
+// Round 1's lifetime-minimum version was guaranteed to latch at 0 forever
+// after the first pl_pcm_reset() and falsified nothing -- see usb_audio.c's
+// doc comment.
+uint32_t pl_usb_audio_fill_min(void);
+
+// Bead pico-link-pbv round 2 (C2-9): call from a2dp.c's STREAM_STARTED
+// handler. Seeds the fill EMA to the current ring fill (so the controller
+// starts streaming at its real operating point rather than coasting in
+// from priming) and resets the windowed fill_min so a stale reading can't
+// be attributed to the stream that's about to start.
+void pl_usb_audio_fb_reset(void);
 
 #endif // PICO_LINK_USB_AUDIO_H

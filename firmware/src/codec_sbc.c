@@ -46,6 +46,43 @@ typedef struct {
 
 static pl_sbc_encoder_t s_sbc_encoder;
 
+// Bead pico-link-19c: BOTH the encoded frame byte length and the nominal
+// bitrate depend on `sbc_buffer_length()`, which returns bluedroid's
+// `u16PacketLength` -- and that field has exactly one assignment site in
+// the whole vendored tree, inside the packing step of a SUCCESSFUL encode
+// (pico-sdk lib/btstack/3rd-party/bluedroid/encoder/srce/sbc_packing.c:237).
+// `SBC_Encoder_Init()`/`configure()` never touches it. So reading it right
+// after `configure()`, before any encode has ever run, is a chicken-and-egg
+// deadlock: the field is zero-initialized static state, and the ONLY way
+// to make it correct is to actually run one encode first.
+//
+// No BTstack/bluedroid API exposes the real encoded byte length before
+// that first encode -- confirmed by reading lib/btstack/3rd-party/
+// bluedroid/encoder/srce/sbc_encoder.c's SBC_Encoder_Init(), which has the
+// A2DP-spec frame-length formula only as COMMENTED-OUT, unexercised dead
+// code (and even that dead code has no branch at all for MONO/DUAL_CHANNEL
+// mode -- an incomplete reference, not a usable one). Reviving that by
+// hand would be a second, never-tested implementation of the same math,
+// exactly the kind of risk this fix exists to remove, not add.
+//
+// a2dp_source_demo.c's own fill loop (a2dp_source_demo.c:432-452) never
+// hits this: it doesn't query `sbc_buffer_length()` until AFTER its first
+// real `encode_signed_16()` call, which is the same real audio callers get
+// later -- it just never NEEDS the answer until then. This function does
+// need the answer immediately (a2dp.c logs frame_bytes/nominal_bitrate at
+// negotiation time, before any audio flows), so it primes the encoder with
+// one throwaway silent-PCM encode right here -- running the exact same
+// `encode_signed_16`/packing path every real encode will use, discarding
+// only the OUTPUT BYTES, not the mechanism. `s_priming_pcm` is sized for
+// the largest possible `num_audio_frames()` this project's capabilities
+// (codec_sbc.c's `s_sbc_capabilities`) can ever negotiate (8 subbands * 16
+// blocks = 128 PCM frames * 2 channels); `s_priming_out` is sized well
+// above the ~119-byte real-world frame size this same file's nominal-
+// bitrate comment already documented, comfortably inside bluedroid's own
+// 1000-byte internal packet buffer.
+#define PL_SBC_MAX_PRIMING_SAMPLES (8 * 16 * 2)
+#define PL_SBC_MAX_FRAME_BYTES 200
+
 static bool pl_codec_sbc_init(
     void *state, const uint8_t *configuration, uint8_t configuration_len, pl_codec_format_t *out_format,
     pl_codec_frame_info_t *out_frame
@@ -69,29 +106,59 @@ static bool pl_codec_sbc_init(
     out_format->bits_per_sample = 16;
 
     uint16_t pcm_frames = (uint16_t)enc->instance->num_audio_frames(&enc->state);
-    uint16_t frame_bytes = enc->instance->sbc_buffer_length(&enc->state);
     out_frame->pcm_frames_per_encoded_frame = pcm_frames;
+
+    // Priming encode -- see the doc comment above. Negotiation time only
+    // (not the IRQ-context audio hot path), so a static scratch buffer and
+    // a synchronous call here are fine.
+    static int16_t s_priming_pcm[PL_SBC_MAX_PRIMING_SAMPLES];
+    static uint8_t s_priming_out[PL_SBC_MAX_FRAME_BYTES];
+    uint16_t priming_samples = (uint16_t)(pcm_frames * 2u /* channels */);
+    if (priming_samples > 0 && priming_samples <= PL_SBC_MAX_PRIMING_SAMPLES) {
+        memset(s_priming_pcm, 0, (size_t)priming_samples * sizeof(int16_t));
+        enc->instance->encode_signed_16(&enc->state, s_priming_pcm, s_priming_out);
+    }
+
+    uint16_t frame_bytes = enc->instance->sbc_buffer_length(&enc->state);
     out_frame->encoded_frame_bytes = frame_bytes;
     // Nominal bitrate: frame_bytes*8 bits per pcm_frames samples, scaled to
     // the negotiated sample rate. E.g. ~119B/128 samples @ 48kHz -> ~357kbps.
     out_frame->nominal_bitrate_bps =
         pcm_frames > 0 ? (uint32_t)(((uint64_t)frame_bytes * 8u * (uint64_t)cfg.sampling_frequency) / pcm_frames) : 0;
+    // Bead pico-link-pbv: measured max real encode_signed_16 call on real
+    // hardware across several runs was 574-582us (a2dp.c's enc_max_us,
+    // pico-link-19c/asj/pbv sessions); 800 is that plus margin, not a
+    // theoretical derivation. See pl_codec_frame_info_t's doc comment.
+    out_frame->worst_case_encode_us = 800;
 
     return true;
 }
 
 static uint16_t pl_codec_sbc_encode(void *state, const int16_t *pcm, uint8_t *out, uint16_t out_cap) {
     pl_sbc_encoder_t *enc = (pl_sbc_encoder_t *)state;
-    uint16_t frame_bytes = enc->instance->sbc_buffer_length(&enc->state);
-    if (frame_bytes == 0 || frame_bytes > out_cap) {
+    // Bead pico-link-19c: this used to read `sbc_buffer_length()` BEFORE
+    // calling `encode_signed_16()` and bail out if it read zero -- which,
+    // per the doc comment on `pl_codec_sbc_init` above, it always did on
+    // this instance's very first call (and, because that early return
+    // meant `encode_signed_16` was never reached, forever after too:
+    // nothing ever primed the field). `pl_codec_sbc_init` now guarantees
+    // at least one real encode has already happened by the time this is
+    // ever called, so `sbc_buffer_length()` is only trustworthy AFTER an
+    // encode -- read it there instead, matching a2dp_source_demo.c's own
+    // fill loop (a2dp_source_demo.c:446-451), which encodes first and
+    // only re-queries the length afterward. `out_cap` is checked against a
+    // known-safe worst case up front (see PL_SBC_MAX_FRAME_BYTES above)
+    // since bluedroid's own `encode_signed_16` performs no bounds-checking
+    // of its own against the caller-supplied `out` buffer.
+    if (out_cap < PL_SBC_MAX_FRAME_BYTES) {
         return 0;
     }
     // encode_signed_16's return is a bluedroid status code, not a byte
     // count (matches a2dp_source_demo.c -- it discards the return value
-    // too and just trusts sbc_buffer_length()). No allocation, no
-    // logging, no blocking -- design sec 5's IRQ-context contract.
+    // too). No allocation, no logging, no blocking -- design sec 5's
+    // IRQ-context contract.
     enc->instance->encode_signed_16(&enc->state, pcm, out);
-    return frame_bytes;
+    return enc->instance->sbc_buffer_length(&enc->state);
 }
 
 static void pl_codec_sbc_deinit(void *state) {

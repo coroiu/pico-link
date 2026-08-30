@@ -67,7 +67,13 @@ uint32_t pl_pcm_fill_bytes(void);
 // current head. Consumer side only -- touches only `tail`, per the SPSC
 // ownership rule above. For stream open/close (design sec 3.5's "resume"
 // priming and "host silent" reset), not for routine drain.
-void pl_pcm_reset(void);
+//
+// Bead pico-link-pbv (C2-6): returns the number of whole frames dropped, so
+// callers can accumulate a counted flush_frames total -- without this the
+// drain-vs-supply conservation check (bead's acceptance A1) cannot be
+// balanced, since every silent discard is otherwise an uncounted exit from
+// the ring.
+uint32_t pl_pcm_reset(void);
 
 // Cumulative whole frames dropped on overflow since boot. Design sec 7:
 // once the feedback loop works this should be permanently 0 -- any nonzero
@@ -78,5 +84,17 @@ uint32_t pl_pcm_overrun_frames(void);
 // `len`. Should be permanently 0; nonzero means an ISO packet arrived with a
 // length TinyUSB's audio class driver should never produce.
 uint32_t pl_pcm_misaligned(void);
+
+// Bead pico-link-pbv (C5): trims the ring down to AT MOST target_bytes
+// fill by advancing tail forward, dropping the OLDEST excess whole frames
+// -- unlike pl_pcm_push()'s overrun policy (drop newest, producer side),
+// this is a deliberate consumer-side resync of already-buffered audio down
+// to a known-good latency, e.g. at the PRIMING to STREAMING transition
+// where a few extra USB packets can land between the fill>=target check
+// and the transition itself. target_bytes is rounded down to a frame
+// boundary. Returns the number of whole frames dropped (0 if fill was
+// already <= target_bytes -- the common case). Consumer side only, same
+// ownership rule as pl_pcm_reset().
+uint32_t pl_pcm_trim_to(uint32_t target_bytes);
 
 #endif // PICO_LINK_PCM_RING_H

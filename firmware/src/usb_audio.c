@@ -56,7 +56,17 @@ static volatile uint32_t s_clock_set_calls;    // clock_set_request calls -- doe
 static volatile uint32_t s_clk_get_freq_cur;   // clock_get_request, AUDIO_CS_CTRL_SAM_FREQ / AUDIO_CS_REQ_CUR
 static volatile uint32_t s_clk_get_freq_range; // clock_get_request, AUDIO_CS_CTRL_SAM_FREQ / AUDIO_CS_REQ_RANGE
 static volatile uint32_t s_clk_get_valid;      // clock_get_request, AUDIO_CS_CTRL_CLK_VALID
-static volatile uint32_t s_fb_sends;           // tud_audio_feedback_interval_isr firings -- feedback EP actually serviced
+// Bead pico-link-pbv/pico-link-6vv (C2-8): s_fb_sends/tud_audio_feedback_interval_isr
+// is REMOVED here -- Ada found it structurally dead on this TinyUSB version.
+// tud_audio_feedback_interval_isr is reached only from audiod_sof_isr, and
+// audiod_set_interface disables the SOF consumer unless the feedback method
+// is one of the FREQUENCY_* ones (audio_device.c:2013-2025); this build uses
+// AUDIO_FEEDBACK_METHOD_DISABLED (see tud_audio_feedback_params_cb below),
+// so that ISR can only ever read 0. tud_audio_fb_done_cb (weak,
+// audio_device.c:505, invoked per completed feedback transfer at
+// audio_device.c:2239) is the only counter that actually answers "is the
+// host consuming our feedback" -- see the override below.
+static volatile uint32_t s_fb_done;
 
 //--------------------------------------------------------------------+
 // Clock entity (UAC2_ENTITY_CLOCK)
@@ -234,18 +244,16 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedba
     feedback_param->sample_freq = current_sample_rate;
 }
 
-// Bead pico-link-icb revision 2: TinyUSB's weak default (audio_device.c:520)
-// does nothing. Overriding it with a plain counter proves the feedback
-// endpoint fixed in this revision is actually being serviced once alt 1
-// opens -- the difference between "macOS opened the pipe" and "macOS opened
-// it and we are feeding it". Fires from inside the 0xC0 worker IRQ
-// (TU_ATTR_FAST_FUNC, called from audio_device.c's SOF handling) -- plain
-// volatile increment only, no formatting here.
-TU_ATTR_FAST_FUNC void tud_audio_feedback_interval_isr(uint8_t func_id, uint32_t frame_number, uint8_t interval_shift) {
+// Bead pico-link-pbv/pico-link-6vv (C2-8): replaces the dead
+// tud_audio_feedback_interval_isr override (see s_fb_done's doc comment
+// above). tud_audio_fb_done_cb fires once per completed feedback OUT
+// transfer -- the only signal that answers "is the host actually consuming
+// our feedback", and pbv's falsifier F4 (fb_done reads 0 while streaming)
+// depends on it. Called from inside the 0xC0 worker IRQ (TinyUSB's device
+// task); plain volatile increment only, no formatting here.
+void tud_audio_fb_done_cb(uint8_t func_id) {
     (void)func_id;
-    (void)frame_number;
-    (void)interval_shift;
-    s_fb_sends++;
+    s_fb_done++;
 }
 
 // Fires once per received isochronous OUT packet, before this file's own
@@ -320,9 +328,20 @@ void pl_usb_audio_task(void) {
 #define PL_FB_MAX_PPM 500
 
 static int32_t s_fb_fill_ema;
+// Bead pico-link-pbv (C6): running minimum of the raw (non-EMA'd) fill
+// level, sampled at this function's own ~1ms cadence -- the finest-grained
+// sampling of pl_pcm_fill_bytes() anywhere in this firmware, so the true
+// sawtooth trough is far more likely to be caught here than at a2dp.c's
+// coarser ~11ms media-timer cadence. UINT32_MAX sentinel means "never
+// sampled yet" (link not up / no streaming started).
+static uint32_t s_fill_min = 0xFFFFFFFFu;
 
 void pl_usb_audio_feedback_task(void) {
-    s_fb_fill_ema += ((int32_t)pl_pcm_fill_bytes() - s_fb_fill_ema) >> 6;
+    uint32_t fill_now = pl_pcm_fill_bytes();
+    if (fill_now < s_fill_min) {
+        s_fill_min = fill_now;
+    }
+    s_fb_fill_ema += ((int32_t)fill_now - s_fb_fill_ema) >> 6;
     int32_t err_bytes = s_fb_fill_ema - (int32_t)PL_PCM_TARGET_FILL_BYTES;
     int32_t ppm = -(err_bytes * PL_FB_MAX_PPM) / (int32_t)PL_PCM_TARGET_FILL_BYTES;
     if (ppm > PL_FB_MAX_PPM) {
@@ -332,6 +351,43 @@ void pl_usb_audio_feedback_task(void) {
         ppm = -PL_FB_MAX_PPM;
     }
     tud_audio_fb_set((uint32_t)((int32_t)PL_FB_NOMINAL_Q16 + (int32_t)((int64_t)PL_FB_NOMINAL_Q16 * ppm / 1000000)));
+}
+
+// Bead pico-link-pbv (C6): exposes the EMA pl_usb_audio_feedback_task
+// already computes every ~1ms, for pl_a2dp_report (thread context) to
+// print -- see design sec 2.1's doc comment on why the EMA, not raw fill,
+// is the correct thing to evaluate the closed-loop pass criterion against
+// (raw fill sawtooths by roughly one tick's worth, comparable to the
+// target itself).
+int32_t pl_usb_audio_fb_fill_ema(void) {
+    return s_fb_fill_ema;
+}
+
+// Bead pico-link-pbv round 2 (C2-9): s_fill_min is now a WINDOWED minimum,
+// reset every time it is read -- round 1's lifetime minimum was guaranteed
+// to latch at 0 the first time pl_pcm_reset() ran (a2dp.c's STREAM_ESTABLISHED/
+// SUSPENDED/RELEASED handlers all call it) and stay there forever,
+// regardless of how the loop actually behaved afterward, which is why
+// "fill_min hit 0" falsified nothing in round 1. Each read (pl_a2dp_report,
+// ~1s cadence) now returns the true minimum fill seen only since the
+// previous read, then starts a fresh window. Same benign-race convention as
+// every other plain counter here -- see this file's module doc.
+uint32_t pl_usb_audio_fill_min(void) {
+    uint32_t result = s_fill_min;
+    s_fill_min = 0xFFFFFFFFu;
+    return result;
+}
+
+// Bead pico-link-pbv round 2 (C2-9): called from a2dp.c's STREAM_STARTED
+// handler. Seeds the EMA to the CURRENT ring fill (rather than letting it
+// coast in from whatever it read during priming/idle) so the P controller
+// starts streaming at its actual operating point instead of commanding a
+// large one-shot ppm correction through the priming transient, and resets
+// the windowed fill_min so a stale reading from a previous stream (or from
+// before this one started) never gets attributed to this run.
+void pl_usb_audio_fb_reset(void) {
+    s_fb_fill_ema = (int32_t)pl_pcm_fill_bytes();
+    s_fill_min = 0xFFFFFFFFu;
 }
 
 bool pl_usb_audio_streaming(void) {
@@ -390,6 +446,6 @@ uint32_t pl_usb_audio_clk_get_valid(void) {
     return s_clk_get_valid;
 }
 
-uint32_t pl_usb_audio_fb_sends(void) {
-    return s_fb_sends;
+uint32_t pl_usb_audio_fb_done(void) {
+    return s_fb_done;
 }

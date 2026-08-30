@@ -106,10 +106,32 @@ uint32_t pl_pcm_fill_bytes(void) {
     return (head - tail) & PL_PCM_RING_MASK;
 }
 
-void pl_pcm_reset(void) {
+uint32_t pl_pcm_reset(void) {
     // Consumer side only -- reads the producer's head, writes only its own
-    // tail. Drops everything currently buffered.
-    s_tail = s_head;
+    // tail. Drops everything currently buffered. Bead pico-link-pbv (C2-6):
+    // report how many whole frames that was, so the caller can count it.
+    uint32_t head = s_head;
+    uint32_t tail = s_tail;
+    uint32_t used = (head - tail) & PL_PCM_RING_MASK;
+    s_tail = head;
+    return used / PL_PCM_FRAME_BYTES;
+}
+
+uint32_t pl_pcm_trim_to(uint32_t target_bytes) {
+    // Consumer side only -- same read-head/write-tail discipline as
+    // pl_pcm_reset() above, just a partial drop instead of a full one.
+    target_bytes -= target_bytes % PL_PCM_FRAME_BYTES;
+
+    uint32_t head = s_head;
+    uint32_t tail = s_tail;
+    uint32_t used = (head - tail) & PL_PCM_RING_MASK;
+    if (used <= target_bytes) {
+        return 0; // already at or under target -- the common case
+    }
+
+    uint32_t drop_bytes = used - target_bytes;
+    s_tail = (tail + drop_bytes) & PL_PCM_RING_MASK;
+    return drop_bytes / PL_PCM_FRAME_BYTES;
 }
 
 uint32_t pl_pcm_overrun_frames(void) {
