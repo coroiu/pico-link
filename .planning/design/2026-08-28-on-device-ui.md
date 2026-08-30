@@ -24,8 +24,20 @@ never stand in front of it.
 - 240x240, read at 30-50cm. 5-way d-pad + A/B/X/Y along one edge.
 - **Press edges only. No key repeat, no long-press** (`firmware/src/input.c:120`).
 - **~18fps, full-frame redraw only.** No partial update.
-- **The core has no clock** (`ui-ffi/src/lib.rs:351` discards `now_us`). Every
-  time-varying element must be driven by an event from C.
+- ~~**The core has no clock** (`ui-ffi/src/lib.rs:351` discards `now_us`). Every
+  time-varying element must be driven by an event from C.~~ **Corrected
+  2026-08-31 (`pico-link-a67`, `pico-link-znb.10`):** both sentences are now
+  false. `pico-link-a67` landed the FFI half — `pl_ui_tick`
+  (`ui-ffi/src/lib.rs:492-499`) forwards `now_us` into `App::tick`
+  (`core/src/app.rs:858`); the old `:351` discard is gone (that line now sits
+  inside `pl_ui_destroy`). `pico-link-znb.10` (see
+  `.planning/decisions/2026-08-31-render-ctx-frame-scoped-clock.md`) designed
+  the widget-facing half: a frame-scoped `RenderCtx` threaded through
+  `measure`/`render`/`chrome_contribution`, plus `redraw_after` for
+  self-scheduled liveness. The rule inverts: **time-varying elements are
+  driven by core's own frame time**; C events still supply domain changes,
+  which core stamps with `now` on arrival (see the ADR's event-timestamp
+  note).
 - Scan 10.24s fixed. Connect-to-audio 2-8s. ACL page timeout up to 5.12s per
   attempt. Boot 1.5s + 1-2s radio.
 - Impossible, designed nowhere: now-playing metadata, battery, dual-sink,
@@ -599,13 +611,40 @@ in firmware; exposing it would be shipping a bug as a preference.
 
 ## 20. The clock, and two re-decisions
 
-**The clock is one FFI parameter discarded at `ui-ffi/src/lib.rs:351` and it
+~~**The clock is one FFI parameter discarded at `ui-ffi/src/lib.rs:351` and it
 unlocks eight things:** liveness during multi-second waits (a 5.12s page timeout
 with zero moving pixels is indistinguishable from a hang, which this project has
 already paid for once); a determinate 10.24s scan bar; wizard auto-dismiss
 without a C-side timer; "Last connected N days ago"; suppressing sub-500ms
 transition UI; dim/blank timing owned by core; the bitrate smoothing window; and
-peak-hold decay. Near-zero cost, eight payoffs - land it early.
+peak-hold decay. Near-zero cost, eight payoffs - land it early.~~
+
+**Corrected 2026-08-31 (`pico-link-a67`, `pico-link-znb.10`):** the FFI
+discard this paragraph describes was fixed by `pico-link-a67` and was near-zero
+cost, as claimed. But it is not "one parameter, eight payoffs" — the
+widget-facing seam Fern (fe-architect) designed for `pico-link-znb.10`
+(`.planning/decisions/2026-08-31-render-ctx-frame-scoped-clock.md`) is a
+trait-signature change across every widget plus a redraw-scheduling rule
+(`redraw_after`), not a free parameter. Scored honestly against the same eight
+payoffs: **3 delivered outright** (liveness during multi-second waits, wizard
+auto-dismiss without a C timer, suppressing sub-500ms transition UI), **1
+delivered conditional on event timestamps** (a determinate scan bar), **1 dead**
+(payoff 4, struck below), **1 out of scope** (dim/blank timing), **2 merely
+unblocked, not delivered** (bitrate smoothing window, peak-hold decay — both
+still blocked on E20/E17 respectively). "Eight payoffs for one parameter"
+oversells it; land it, but don't expect all eight for free.
+
+**Payoff 4, "Last connected N days ago," is struck as dead, not merely
+unblocked.** It contradicts section 21's E26 in this same document, which
+already cut it on merit: this board has no RTC. Section 20 and section 21
+disagreed with each other before this correction; section 21 was right.
+
+**Payoff 6, "dim/blank timing owned by core," is out of scope for
+`pico-link-znb.10`.** That policy already lives in `run::Runner`'s idle/deep-
+sleep tiers in the emulator, which already has a real `Clock` and already
+works. On firmware there is no `Runner` at all, so "core owns it" there would
+mean re-homing the whole policy behind the FFI — a separate, larger piece of
+work, not a side effect of the widget-facing clock seam.
 
 **Key repeat: the 12-item rule STAYS, and it was merit.** Re-checked
 independently of cost: a product where no list exceeds one screen-and-a-bit means
@@ -636,7 +675,7 @@ quality-of-feel item **after** the MVP ships (E22).
 | E5 | **Phase/wizard screen**, content replaced by events, no stack push | Fern | The whole pairing flow; keeps depth at 2. |
 | E6 | **Per-device codec availability + reason**, and **disabled-but-focusable `MenuItem`** | Ada + Fern | Fallback chain link 5. The reason text is the payload. |
 | E7 | **Home two-face toggle** (status <-> menu, no push) | Fern | Discoverability without the rail; keeps depth at 2. |
-| E8 | **Core clock** - plumb the discarded `now_us` | Ada | Eight payoffs for one parameter. |
+| E8 | **Core clock** - plumb `now_us` into the app (`pico-link-a67`, DONE) and expose it to widgets as `RenderCtx` (`pico-link-znb.10`, designed, not yet implemented) | Ada (FFI half, done) / Fern + Ruby (widget-facing half — see `.planning/decisions/2026-08-31-render-ctx-frame-scoped-clock.md`) | Corrected 2026-08-31: not "eight payoffs for one parameter" — see section 20's re-scoring. |
 | E9 | **Class-of-Device on inquiry results** | Ada | Keeps the scan list inside the 12-item rule in a crowded room. |
 | E10 | **Icon probes**: headphones, USB, warning triangle, check, plus | Ruby | Nothing renders without them. |
 | E11 | **Key/value field list** (check `MenuList` + `Trailing` first) | Fern | Device detail. Reuse over new. |
