@@ -274,15 +274,24 @@ pub enum WizardPhase {
     /// accumulated in `BtModel::devices` so far -- this phase covers both
     /// "still actively scanning" and "scan finished, results on screen,
     /// user is choosing one", since nothing about the rendered content
-    /// differs between them.
-    Scanning,
+    /// differs between them. `started` is when the scan began -- see the
+    /// frame-scoped clock ADR's "event timestamps" note: a timestamp is
+    /// domain state and belongs in the model, current time is not. Widget
+    /// code (`render::wizard`) has no clock of its own, so a freshly
+    /// entered `Scanning` phase carries [`PENDING_TIMESTAMP`] until
+    /// [`App`]'s own `now_us` backfills it -- see [`WizardPhase::
+    /// scanning_pending`].
+    Scanning { started: Instant },
     /// Phase 3: the scan ended (a C `LinkStateChanged(Idle)` event while
     /// this phase was `Scanning`) with zero devices found.
     NothingFound,
     /// Phase 4: connecting, at the named sub-`step` currently in
     /// progress. `addr` is carried so a subsequent retry (phase 5's "keep
     /// trying") knows which device to reissue [`Command::Connect`] for.
-    Connecting { addr: [u8; 6], step: ConnectStep },
+    /// `started` is when this connect attempt began -- same
+    /// pending-then-backfilled shape as `Scanning`'s own `started`, via
+    /// [`WizardPhase::connecting_pending`].
+    Connecting { addr: [u8; 6], step: ConnectStep, started: Instant },
     /// Phase 5: surfaced once a connect attempt has gone unanswered for
     /// ~6s (a C-timed threshold -- core never decides this itself, it
     /// only renders whatever [`Event::ConnectRetrying`] reports).
@@ -299,6 +308,38 @@ pub enum WizardPhase {
     Failed { addr: [u8; 6], reason: ConnectFailureReason },
 }
 
+/// Sentinel `started` value a widget-driven `WizardPhase` transition uses
+/// when it has no clock to stamp itself with. `render::wizard`'s
+/// `PairingWizardView` enters `Scanning`/`Connecting` directly from
+/// `on_focus`/`on_intent` (a d-pad press, not a Bluetooth [`Event`]), and
+/// neither of those gets a [`crate::render::RenderCtx`] -- deliberately:
+/// `Widget::render` is the only place time enters a widget, precisely so
+/// `render` stays a pure function of state/area/time (see the frame-scoped
+/// clock ADR) and mutating a timestamp from inside `render` would violate
+/// that. So the widget stamps `PENDING_TIMESTAMP` instead, and [`App`]
+/// (which does have `now_us`) backfills the real value immediately after
+/// dispatch -- see [`App::stamp_pending_wizard_timestamp`], called from
+/// both [`App::handle_input`] and [`App::handle_event`] since either path
+/// can produce a freshly entered phase.
+///
+/// `u64::MAX` rather than `0`: a genuinely-zero real timestamp (`now_us`
+/// before the very first tick, which every test in this module starts
+/// from) must never be confused with "not yet stamped".
+const PENDING_TIMESTAMP: Instant = Instant::from_micros(u64::MAX);
+
+impl WizardPhase {
+    /// Constructs a fresh `Scanning` phase with a not-yet-stamped
+    /// `started` -- see [`PENDING_TIMESTAMP`]'s doc comment.
+    pub(crate) fn scanning_pending() -> Self {
+        Self::Scanning { started: PENDING_TIMESTAMP }
+    }
+
+    /// Constructs a fresh `Connecting` phase with a not-yet-stamped
+    /// `started` -- see [`PENDING_TIMESTAMP`]'s doc comment.
+    pub(crate) fn connecting_pending(addr: [u8; 6], step: ConnectStep) -> Self {
+        Self::Connecting { addr, step, started: PENDING_TIMESTAMP }
+    }
+}
 
 /// Home's two faces (design section 4's Home exception, section 7 --
 /// bead `pico-link-znb.8`/E7). A **face**, not a pushed screen: Home is
@@ -685,6 +726,31 @@ impl App {
             Event::WizardAutoDismiss => self.on_wizard_auto_dismiss(),
             Event::CodecChanged(codec) => self.set_connected_codec(codec),
         }
+        self.stamp_pending_wizard_timestamp();
+    }
+
+    /// Backfills [`WizardPhase::Scanning`]/[`WizardPhase::Connecting`]'s
+    /// `started` field with the real current time (`self.now_us`) if it's
+    /// still [`PENDING_TIMESTAMP`] -- see that constant's doc comment for
+    /// why the widget itself can't do this. Called after every
+    /// [`App::handle_input`] and [`App::handle_event`], since either path
+    /// can produce a freshly entered phase (`handle_input` for a direct
+    /// d-pad-driven transition, `handle_event` for the `NotResponding` ->
+    /// `Connecting` retry-succeeding case in [`App::on_connect_step_
+    /// changed`]). A no-op whenever the current phase isn't pending (the
+    /// overwhelmingly common case), or isn't `Scanning`/`Connecting` at
+    /// all.
+    fn stamp_pending_wizard_timestamp(&mut self) {
+        let mut phase = self.wizard_phase.borrow_mut();
+        match &mut *phase {
+            WizardPhase::Scanning { started } if *started == PENDING_TIMESTAMP => {
+                *started = Instant::from_micros(self.now_us);
+            }
+            WizardPhase::Connecting { started, .. } if *started == PENDING_TIMESTAMP => {
+                *started = Instant::from_micros(self.now_us);
+            }
+            _ => {}
+        }
     }
 
     /// Phase 2 -> phase 3 transition (design section 9): when the scan
@@ -703,7 +769,7 @@ impl App {
             return;
         }
         let mut phase = self.wizard_phase.borrow_mut();
-        if *phase == WizardPhase::Scanning && self.wizard_devices.borrow().is_empty() {
+        if matches!(*phase, WizardPhase::Scanning { .. }) && self.wizard_devices.borrow().is_empty() {
             *phase = WizardPhase::NothingFound;
             drop(phase);
             self.dirty = true;
@@ -718,8 +784,18 @@ impl App {
     fn on_connect_step_changed(&mut self, step: ConnectStep) {
         let mut phase = self.wizard_phase.borrow_mut();
         match &*phase {
-            WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. } => {
-                *phase = WizardPhase::Connecting { addr: *addr, step };
+            // Already `Connecting`: this is the same connect attempt
+            // continuing, so its `started` carries forward unchanged.
+            WizardPhase::Connecting { addr, started, .. } => {
+                *phase = WizardPhase::Connecting { addr: *addr, step, started: *started };
+            }
+            // Coming back from `NotResponding` (which carries no
+            // `started` of its own): the original attempt's start time is
+            // gone, so this re-enters as pending, same as a brand-new
+            // connect -- `stamp_pending_wizard_timestamp` (called by
+            // `handle_event` right after this) backfills it.
+            WizardPhase::NotResponding { addr, .. } => {
+                *phase = WizardPhase::connecting_pending(*addr, step);
             }
             _ => {}
         }
@@ -959,6 +1035,7 @@ impl App {
         for intent in intents {
             self.navigator.dispatch(intent);
         }
+        self.stamp_pending_wizard_timestamp();
         self.dirty = true;
     }
 
