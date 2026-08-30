@@ -105,25 +105,61 @@ typedef struct {
     uint32_t loop_top_us;     // time_us_32() at the top of the current iteration
 } pl_loop_trace_t;
 
-static pl_loop_trace_t __attribute__((section(".uninitialized_data.pl_loop_trace")))
+// volatile: the fields are written by one function and read by another in
+// the same TU after a reset, with nothing in between the compiler can see.
+// Round 3's soak2 record (LAST=BT_POLL_CMDS PREV=BLIT_SPI_DRAIN) is
+// internally inconsistent -- BLIT_EXIT sits unconditionally between those
+// two marks and must have been stamped -- so the pair is not trustworthy on
+// its own. volatile removes reordering/elision as an explanation, and the
+// ring below removes the need to reason from two values at all.
+static volatile pl_loop_trace_t __attribute__((section(".uninitialized_data.pl_loop_trace")))
     s_loop_trace;
+
+// Last PL_WDT_RING_LEN marks with timestamps. At ~20 marks per frame and
+// ~30fps this covers roughly the last 25ms of superloop history, which is
+// enough to show the mark sequence LEADING INTO a stall plus the exact
+// microsecond gap -- strictly more information than LAST/PREV, and it makes
+// an inconsistent pair diagnosable instead of merely puzzling.
+#define PL_WDT_RING_LEN 16u
+typedef struct {
+    uint32_t magic;
+    uint32_t head;                        // next slot to write
+    uint8_t cp[PL_WDT_RING_LEN];
+    uint32_t us[PL_WDT_RING_LEN];
+} pl_loop_ring_t;
+
+static volatile pl_loop_ring_t __attribute__((section(".uninitialized_data.pl_loop_ring")))
+    s_loop_ring;
 
 static const char *const PL_WDT_CP_NAMES[PL_WDT_CP_COUNT] = {
     "NONE", "LOOP_TOP", "INPUT_POLL", "UI_INPUT", "DEBUG_REMOTE", "BT_DRAIN",
     "UI_TICK", "UI_RENDER", "BLIT_ENTER", "BLIT_DMA_WAIT", "BLIT_SPI_DRAIN",
     "BLIT_EXIT", "BT_POLL_CMDS", "BT_POLL_FFI", "BT_POLL_DISPATCH",
-    "REPORT", "WDT_SERVICE",
+    "CMD_NONE", "CMD_SCAN_CALL", "CMD_SCAN_RET", "CMD_CONNECT_ENTER",
+    "CMD_CONNECT_A2DP", "CMD_CONNECT_RET", "CMD_CANCEL_SCAN_CALL",
+    "CMD_CANCEL_SCAN_RET", "CMD_OTHER",
+    "REPORT", "REPORT_FRAME", "REPORT_SHARED", "LOG_DRAIN", "WDT_SERVICE",
 };
 
 void pl_wdt_mark(pl_wdt_checkpoint_t cp) {
+    uint32_t now = time_us_32();
     s_loop_trace.prev_checkpoint = s_loop_trace.checkpoint;
     s_loop_trace.checkpoint = (uint32_t)cp;
-    s_loop_trace.last_us = time_us_32();
+    s_loop_trace.last_us = now;
     if (cp == PL_WDT_CP_LOOP_TOP) {
         s_loop_trace.seq++;
-        s_loop_trace.loop_top_us = s_loop_trace.last_us;
+        s_loop_trace.loop_top_us = now;
     }
     s_loop_trace.magic = PL_LOOP_TRACE_MAGIC;
+
+    uint32_t h = s_loop_ring.head;
+    if (s_loop_ring.magic != PL_LOOP_TRACE_MAGIC || h >= PL_WDT_RING_LEN) {
+        h = 0;  // cold boot: garbage index would corrupt memory past the ring
+        s_loop_ring.magic = PL_LOOP_TRACE_MAGIC;
+    }
+    s_loop_ring.cp[h] = (uint8_t)cp;
+    s_loop_ring.us[h] = now;
+    s_loop_ring.head = (h + 1u) % PL_WDT_RING_LEN;
 }
 
 // Logs the surviving trace. Called from pl_wdt_report_boot_reason(). Reports
@@ -141,6 +177,23 @@ static void pl_wdt_report_loop_trace(void) {
     pl_log("wdt: loop-trace LAST=%s PREV=%s seq=%u in_iter_us=%u\r\n",
            cpn, prevn, (unsigned)s_loop_trace.seq,
            (unsigned)(s_loop_trace.last_us - s_loop_trace.loop_top_us));
+    // The ring: oldest first, each with the microseconds SINCE THE PREVIOUS
+    // mark. The stall is the one huge delta, and the mark printed BEFORE it
+    // is the region that hung.
+    if (s_loop_ring.magic == PL_LOOP_TRACE_MAGIC) {
+        uint32_t h = s_loop_ring.head % PL_WDT_RING_LEN;
+        uint32_t prev_us = 0;
+        for (uint32_t i = 0; i < PL_WDT_RING_LEN; i++) {
+            uint32_t idx = (h + i) % PL_WDT_RING_LEN;
+            uint32_t c = s_loop_ring.cp[idx];
+            uint32_t t = s_loop_ring.us[idx];
+            pl_log("wdt: ring[%u] %s dt_us=%u\r\n", (unsigned)i,
+                   (c < PL_WDT_CP_COUNT) ? PL_WDT_CP_NAMES[c] : "?",
+                   (unsigned)(i == 0 ? 0u : (t - prev_us)));
+            prev_us = t;
+        }
+        s_loop_ring.magic = 0;
+    }
     // Clear so the NEXT boot cannot re-report this one as fresh -- the
     // "reflashing destroys the evidence" trap in reverse.
     s_loop_trace.magic = 0;

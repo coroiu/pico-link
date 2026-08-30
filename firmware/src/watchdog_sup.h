@@ -139,7 +139,36 @@ typedef enum {
     PL_WDT_CP_BT_POLL_CMDS,
     PL_WDT_CP_BT_POLL_FFI,
     PL_WDT_CP_BT_POLL_DISPATCH,
-    PL_WDT_CP_REPORT,
+    // Bead pico-link-okx round 4: one mark per command.tag inside the C
+    // dispatch switch of pl_bt_poll_commands(), plus a "returned" mark after
+    // each handler. Round 3 named BT_POLL_DISPATCH as the last checkpoint
+    // before a >2s stall (n=1); these say WHICH tag's handler was entered and
+    // not returned from. CMD_NONE is stamped on the overwhelmingly common
+    // no-command path so that "reached the switch, dispatched nothing" is
+    // distinguishable from "stalled before the switch" -- without it, a stall
+    // with tag NONE is indistinguishable from the round-3 signature.
+    PL_WDT_CP_CMD_NONE,
+    PL_WDT_CP_CMD_SCAN_CALL,
+    PL_WDT_CP_CMD_SCAN_RET,
+    PL_WDT_CP_CMD_CONNECT_ENTER,   // case entered: pl_log + push_link_state ahead
+    PL_WDT_CP_CMD_CONNECT_A2DP,    // immediately before pl_a2dp_connect()
+    PL_WDT_CP_CMD_CONNECT_RET,
+    PL_WDT_CP_CMD_CANCEL_SCAN_CALL,
+    PL_WDT_CP_CMD_CANCEL_SCAN_RET,
+    PL_WDT_CP_CMD_OTHER,           // a tag with no case (e.g. CANCEL_CONNECT=4)
+    // Round 4, second finding: PL_WDT_CP_REPORT existed in this enum and in
+    // the name table but had NO call site, so the ~80 lines between
+    // pl_bt_poll_commands() returning and pl_wdt_mark(WDT_SERVICE) were
+    // entirely unmarked -- the once-a-second usb-audio/usb-pump/a2dp report
+    // (about 15 pl_log calls) and pl_log_ring_drain(), which pushes to the
+    // CDC console. A stall anywhere in there stamps BT_POLL_DISPATCH as
+    // LAST, which is exactly the round-3 soak3 signature. These four marks
+    // partition that region so the dispatch switch and the report block can
+    // be told apart.
+    PL_WDT_CP_REPORT,          // stamped the instant pl_bt_poll_commands returns
+    PL_WDT_CP_REPORT_FRAME,    // per-60-frame timing pl_log
+    PL_WDT_CP_REPORT_SHARED,   // pl_usb_pump_report + pl_a2dp_report
+    PL_WDT_CP_LOG_DRAIN,       // pl_log_ring_drain()
     PL_WDT_CP_WDT_SERVICE,
     PL_WDT_CP_COUNT
 } pl_wdt_checkpoint_t;

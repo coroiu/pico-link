@@ -432,6 +432,7 @@ int main(void) {
         pl_wdt_mark(PL_WDT_CP_BT_POLL_CMDS);
         pl_bt_poll_commands(ui);
 #endif
+        pl_wdt_mark(PL_WDT_CP_REPORT);
 
         // M3 acceptance evidence: a MEASURED byte rate, not just "it
         // enumerated". Report once a second while actually streaming --
@@ -466,6 +467,7 @@ int main(void) {
         // asks for "CDC prints per-frame render and blit timing", which
         // this satisfies by printing exactly that breakdown, just not on
         // literally every single frame.
+        pl_wdt_mark(PL_WDT_CP_REPORT_FRAME);
         if (frame_count % 60 == 1) {
             pl_log(
                 "frame %lu: render=%lluus blit=%lluus total=%lluus\r\n",
@@ -492,6 +494,7 @@ int main(void) {
 
             // Bead pico-link-tfj instrumentation, extended by pico-link-okx
             // -- see usb_pump.h's doc comment on pl_usb_pump_report.
+            pl_wdt_mark(PL_WDT_CP_REPORT_SHARED);
             pl_usb_pump_report(shared_report_dt_us);
 
             // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
@@ -505,6 +508,7 @@ int main(void) {
         // ONLY, never an IRQ or the 0xC0 worker (see pl_log_ring.h's module
         // doc). Called every iteration, not rate-limited, so the ring stays
         // close to empty between report bursts.
+        pl_wdt_mark(PL_WDT_CP_LOG_DRAIN);
         pl_log_ring_drain();
 
         // Bead pico-link-ufh: THE feed site -- exactly one call, from
