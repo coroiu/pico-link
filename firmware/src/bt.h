@@ -78,6 +78,19 @@ void pl_bt_push_connect_succeeded(bool degraded);
 // real FFI field of that numeric type).
 void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
 
+// Pushes Event::CodecChanged{addr, word, nominal_bitrate_bps} (bead
+// pico-link-1v5: the Home hero's live codec/bitrate). `name`/`name_len`
+// are the codec table row's `display_name` (codec_table.h) and its
+// length; truncated (never overrun) to PlCodecChangedPayload::name's fixed
+// capacity if longer, matching every codec name this table declares
+// today. Unlike pl_bt_push_device_discovered's borrowed pointer, this
+// payload's name field is a fixed-size buffer copied by value into the
+// PlEvent itself, so no separate ring name-buffer patching is needed at
+// drain time -- see PlCodecChangedPayload's doc comment in
+// pico_link_ui.h. Call only from the signaling codec-configuration
+// handler (a2dp.c), never from the media timer path.
+void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t name_len, uint32_t nominal_bitrate_bps);
+
 #ifdef PL_DEBUG_REMOTE
 // Bead pico-link-g48: debug-only direct connect to a host-supplied
 // BD_ADDR, bypassing GAP inquiry/discovery entirely -- lets an unattended

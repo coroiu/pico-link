@@ -14,6 +14,7 @@
 #include "pcm_ring.h"
 #include "pl_log_ring.h"
 #include "usb_audio.h"
+#include "watchdog_sup.h"
 
 // The USB address of the isochronous OUT audio endpoint (EP1 OUT, direction
 // bit clear) -- bead pico-link-okx. Matches the endpoint named in the
@@ -145,6 +146,12 @@ static void pl_usb_pump_worker_irq(void) {
     }
     s_last_worker_us = now_us;
 
+    // Bead pico-link-ufh: proves the 1ms timer -> 0xC0 IRQ path itself is
+    // still firing, independent of whether tud_task() below is reached --
+    // see watchdog_sup.h. Kept ABOVE the mutex_try_enter so a tick that
+    // skips tud_task() still proves the IRQ path alive.
+    pl_wdt_kick(PL_WDT_USB_TIMER);
+
     // D12: phase between the most recent SOF timestamp and THIS worker
     // invocation, computed before mutex_try_enter/tud_task() below ("worker
     // top", matching the design's placement) so a skipped tick still gets a
@@ -182,6 +189,10 @@ static void pl_usb_pump_worker_irq(void) {
     if (!busy_after) {
         s_ep_out_idle_ticks++;
     }
+
+    // Bead pico-link-ufh: proves tud_task() is actually being reached, not
+    // just that the timer/IRQ plumbing is alive.
+    pl_wdt_kick(PL_WDT_USB_TASK);
 
     // Peek (does not consume) before pl_usb_audio_task()'s drain loop, so
     // the high-water mark reflects the fill level tud_task() just left

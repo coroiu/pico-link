@@ -204,6 +204,13 @@ pub enum Event {
     /// phase 6), and this event arriving at any other time (a stray/late
     /// timer, the user having already backed out) is a defensive no-op.
     WizardAutoDismiss,
+    /// The live A2DP link's codec finished negotiating (or renegotiated),
+    /// as reported by C's signaling codec-configuration handler
+    /// (`firmware/src/a2dp.c`) -- never the media timer path. Folds into
+    /// [`BtModel::connected_codec`]; see [`ConnectedCodec`]'s doc comment
+    /// for why `core` never derives the name/bitrate itself. Added by
+    /// bead pico-link-1v5, closing the Home hero's hardcoded `NO LINK`.
+    CodecChanged(ConnectedCodec),
 }
 
 /// Phase 4's four named connect sub-steps (design section 9): naming the
@@ -333,11 +340,51 @@ pub struct BtModel {
     /// -- populated so the data exists and is representable ahead of the
     /// screen that will read it, per pico-link-a67's explicit ask.
     pub last_connect_failure: Option<(DeviceAddr, ConnectFailureReason)>,
+    /// The currently-negotiated codec on the live A2DP link, if any --
+    /// `None` whenever there is no connected codec to show (design section
+    /// 15: absent, never frozen or faked). Populated from
+    /// [`Event::CodecChanged`] (C's signaling codec-configuration handler,
+    /// `firmware/src/a2dp.c`) and cleared by [`App::set_link_state`]
+    /// whenever the link leaves [`LinkState::Connected`] -- see that
+    /// method's doc comment for why clearing keys off the *link state*
+    /// rather than a dedicated disconnect event (bead pico-link-1v5).
+    pub connected_codec: Option<ConnectedCodec>,
 }
 
 /// A Bluetooth device address, aliased for readability at call sites that
 /// pair it with a [`ConnectFailureReason`].
 pub type DeviceAddr = [u8; 6];
+
+/// The live A2DP link's negotiated codec, as reported by C over
+/// [`Event::CodecChanged`] (`pl_ui_push_event` in the FFI surface, fired
+/// from `firmware/src/a2dp.c`'s signaling codec-configuration handler --
+/// never from the media timer path, which must never call into `core`).
+///
+/// `word` and `nominal_bitrate_bps` are exactly the two fields
+/// `firmware/src/codec_table.h`'s `pl_codec_t`/`pl_codec_frame_info_t`
+/// already carry per row (`display_name`, `nominal_bitrate_bps`) -- `core`
+/// never derives a codec's display name or bitrate itself, it only
+/// displays whatever the one C-side codec table (Andreas's ruling: a
+/// table, never a per-call-site branch on codec identity) already decided.
+/// `nominal_bitrate_bps` is deliberately the table's *nominal* figure, not
+/// a live/adaptive one -- design section 13 confirms only the nominal
+/// number, and section 15's "absent, never faked" rule means a live figure
+/// this product cannot honestly measure yet must not be synthesized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedCodec {
+    /// Which device this codec applies to. Carried for forward
+    /// compatibility (a future per-device correlation); today's clearing
+    /// path (see [`App::set_link_state`]) does not key off it.
+    pub addr: DeviceAddr,
+    /// The codec's display name, exactly as the C-side codec table's
+    /// `display_name` reads (e.g. "SBC", "LDAC") -- this *is* the hero
+    /// word [`crate::render::CodecStatus::Connected::word`] renders.
+    pub word: String,
+    /// The codec table row's nominal bitrate, in bits per second (the FFI
+    /// payload's native unit -- converted to kbps only at render time, see
+    /// `render/home.rs`).
+    pub nominal_bitrate_bps: u32,
+}
 
 /// Builds the devices screen: a "Scan for headphones" row (its sublabel is
 /// the live [`LinkState`] label) followed by one row per discovered
@@ -625,6 +672,7 @@ impl App {
             Event::ConnectRetrying { attempt } => self.on_connect_retrying(attempt),
             Event::ConnectSucceeded { degraded } => self.on_connect_succeeded(degraded),
             Event::WizardAutoDismiss => self.on_wizard_auto_dismiss(),
+            Event::CodecChanged(codec) => self.set_connected_codec(codec),
         }
     }
 
@@ -713,8 +761,31 @@ impl App {
     /// the devices screen's scan-row sublabel to match. Also reachable
     /// directly (not just via [`App::handle_event`]) since it's a natural
     /// unit for tests and for [`App::record_connect_failure`] to reuse.
+    ///
+    /// Also clears [`BtModel::connected_codec`] whenever `state` isn't
+    /// [`LinkState::Connected`] -- a stale codec word surviving a
+    /// disconnect (or a scan/connect that reuses the link before a fresh
+    /// [`Event::CodecChanged`] arrives) is worse than `NO LINK` (design
+    /// section 15). Deliberately keyed off the link state itself rather
+    /// than a dedicated disconnect event: every path off `Connected`
+    /// already flows through this one method (bead pico-link-1v5), so
+    /// this can't race with a disconnect notification C forgot to send,
+    /// and it needs zero new firmware plumbing in `bt.c`.
     pub fn set_link_state(&mut self, state: LinkState) {
         self.model.link_state = state;
+        if state != LinkState::Connected {
+            self.model.connected_codec = None;
+        }
+        self.rebuild_root();
+    }
+
+    /// Records the live A2DP link's negotiated codec (or a renegotiation)
+    /// and refreshes the Home hero widget to match. See
+    /// [`ConnectedCodec`]'s doc comment for why `core` treats
+    /// `word`/`nominal_bitrate_bps` as opaque, already-decided display
+    /// data rather than deriving them from codec identity itself.
+    pub fn set_connected_codec(&mut self, codec: ConnectedCodec) {
+        self.model.connected_codec = Some(codec);
         self.rebuild_root();
     }
 

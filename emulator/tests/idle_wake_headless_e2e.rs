@@ -62,10 +62,35 @@ const CHECKPOINT_INITIAL: u32 = 2;
 /// several multiples of `TEST_IDLE_TIMEOUT` (40ms), so ordinary CI
 /// scheduling jitter can't flakily leave the loop short of the timeout.
 const CHECKPOINT_IDLE_AND_INJECT: u32 = 50;
-/// A handful of iterations past the injection point, so the wake iteration
-/// itself (and its render+flush) has definitely completed before the loop
-/// stops and the final screenshot is taken.
-const TOTAL_ITERATIONS: u32 = 55;
+/// Deliberately **equal to** `CHECKPOINT_IDLE_AND_INJECT`, not a handful of
+/// iterations past it (an earlier version of this test used
+/// `CHECKPOINT_IDLE_AND_INJECT + 5` here, reasoning that a few "filler"
+/// iterations were needed for the wake iteration's render+flush to
+/// "definitely" complete). That reasoning was wrong and caused a real,
+/// reproducible flake (`pico-link-wez`): `Runner::step` (see
+/// `core/src/run.rs`) handles the wake-triggering input and performs its
+/// render+flush *synchronously within the same step* that polls it -- the
+/// closure pushes the intent and `run`'s loop drives that very iteration's
+/// `step` immediately after, with no further iterations required. Trailing
+/// filler iterations don't just fail to help; they actively reintroduce a
+/// second idle-timeout race: each is a fresh chance for
+/// `frame_start.saturating_duration_since(last_input) >= idle_timeout` to
+/// go true again if the *real* wall-clock gap between iterations (normally
+/// ~`FRAME_BUDGET`, but unbounded under OS scheduling contention -- e.g.
+/// another `cargo test` invocation or emulator instance competing for CPU,
+/// which is exactly what this project's agents routinely do in sibling
+/// worktrees) happens to exceed `TEST_IDLE_TIMEOUT` before the loop stops.
+/// That re-blanks the display *after* the wake render but *before* this
+/// test reads the final screenshot, failing the "must restore the display"
+/// assertion below even though the wake logic itself is correct.
+/// Reproduced locally by running 8 copies of this test binary concurrently
+/// under synthetic CPU load: consistently reproduced with the old `+ 5`
+/// trailing window, zero failures in 200+ runs with this fixed value.
+/// Stopping the loop on the exact iteration that performs the wake removes
+/// the race entirely rather than papering over it with a bigger margin --
+/// there is no later iteration left in which a second idle timeout could
+/// ever fire.
+const TOTAL_ITERATIONS: u32 = CHECKPOINT_IDLE_AND_INJECT;
 
 fn is_all_black(image: &image::RgbImage) -> bool {
     image.pixels().all(|p| *p == image::Rgb([0, 0, 0]))

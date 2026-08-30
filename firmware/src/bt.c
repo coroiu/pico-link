@@ -28,14 +28,23 @@
 #include "bt.h"
 #include "pico_link_ui.h"
 #include "usb_pump.h"
+#include "watchdog_sup.h"
 
 // One inquiry scan runs for INQUIRY_DURATION_UNITS * 1.28s -- 8 units is
 // BTstack's own gap_inquiry.c example's INQUIRY_INTERVAL, long enough for
 // nearby headphones in pairing mode to be found in one pass.
 #define PL_INQUIRY_DURATION_UNITS 8
 
+// Bead pico-link-ufh: the BTstack heartbeat's period. A dedicated timer,
+// not a reuse of a2dp.c's media timer -- that one only exists while a
+// stream is established, so without this there would be no evidence of the
+// run loop at all in the idle/scanning state, which is most of the
+// device's life. See watchdog_sup.h's module doc.
+#define PL_WDT_BTSTACK_HEARTBEAT_MS 100
+
 static struct PlUi *g_ui;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
+static btstack_timer_source_t s_wdt_heartbeat_timer;
 
 // --- pico-link-6o2: a C-side ring decouples the event producers -- the
 // BTstack packet handler in IRQ context AND the command handler in thread
@@ -283,6 +292,26 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason) {
     pl_bt_ring_push(event, NULL, 0);
 }
 
+// Bead pico-link-1v5: pushes Event::CodecChanged. `name`'s bytes are
+// copied by value into the PlEvent's own fixed-size buffer right here
+// (never stored as a pointer), so -- unlike
+// pl_bt_push_device_discovered -- pl_bt_ring_push's separate deferred
+// name-buffer path is not needed; NULL/0 is passed for that parameter.
+void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t name_len, uint32_t nominal_bitrate_bps) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_CODEC_CHANGED,
+        .payload = {.codec_changed = {.name_len = name_len, .nominal_bitrate_bps = nominal_bitrate_bps}},
+    };
+    memcpy(event.payload.codec_changed.addr, addr, 6);
+    if (name_len > sizeof(event.payload.codec_changed.name)) {
+        name_len = (uint8_t)sizeof(event.payload.codec_changed.name);
+        event.payload.codec_changed.name_len = name_len;
+    }
+    memcpy(event.payload.codec_changed.name, name, name_len);
+    pl_bt_ring_push(event, NULL, 0);
+}
+
 // --- HCI Read Local Version Information: the acceptance-criterion probe ---
 //
 // Fires once, the first time BTSTACK_EVENT_STATE reports HCI_STATE_WORKING
@@ -409,6 +438,19 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
     }
 }
 
+// Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the
+// BTstack run loop is still servicing timers at all -- runs whether or not
+// a stream is established, unlike a2dp.c's media timer. Same self-rearm
+// idiom as pl_a2dp_media_timer_handler (a2dp.c): re-arm first, then do the
+// work. Runs in the cyw43/BTstack background IRQ, same context as every
+// other BTstack timer callback -- pl_wdt_kick() is a single volatile
+// increment, safe from there (see watchdog_sup.h's module doc).
+static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
+    btstack_run_loop_set_timer(ts, PL_WDT_BTSTACK_HEARTBEAT_MS);
+    btstack_run_loop_add_timer(ts);
+    pl_wdt_kick(PL_WDT_BTSTACK);
+}
+
 void pl_bt_init(struct PlUi *ui) {
     g_ui = ui;
 
@@ -425,6 +467,13 @@ void pl_bt_init(struct PlUi *ui) {
     // device registration MUST happen before hci_power_control(HCI_POWER_ON)
     // below -- see a2dp.h's doc comment on pl_a2dp_init.
     pl_a2dp_init(ui);
+
+    // Bead pico-link-ufh: start the watchdog heartbeat before HCI powers
+    // on, so the run loop is proven alive through the whole power-on
+    // sequence, not just once BT is fully up.
+    btstack_run_loop_set_timer_handler(&s_wdt_heartbeat_timer, pl_bt_wdt_heartbeat_handler);
+    btstack_run_loop_set_timer(&s_wdt_heartbeat_timer, PL_WDT_BTSTACK_HEARTBEAT_MS);
+    btstack_run_loop_add_timer(&s_wdt_heartbeat_timer);
 
     pl_log("BT: powering on HCI (async -- BTSTACK_EVENT_STATE/HCI_STATE_WORKING follows)\r\n");
     hci_power_control(HCI_POWER_ON);

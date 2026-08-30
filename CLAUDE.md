@@ -123,6 +123,25 @@ For trivial changes (<10 lines) on a **feature branch**, you can bypass the full
 
 **Always commit immediately after quick-fix** to avoid orphaned uncommitted changes.
 
+## Reporting to Andreas (terseness)
+
+**Andreas asked for this explicitly on 2026-08-29: report tersely.** He assumes
+the reasoning already happened in thinking tokens and does not need it narrated.
+Output tokens are a real cost on this project.
+
+- **Default: 1-5 lines.** What happened, what it means, what you did next.
+- **No teaching passages.** Do not re-explain a mechanism he has already been
+  told, or walk through the causal chain when the conclusion is the point.
+- **No poetry.** No "the thing hiding behind the thing", no dramatic framing, no
+  restating a finding for effect. Say it once, plainly.
+- **Drop the recap.** He has the previous messages. Do not summarise the session
+  state unless he asks or you are closing it.
+- **Bullets over prose** for multi-part status. One line per item.
+- **What still earns length:** a decision he has to make (state it + your
+  recommendation), a physical action only he can take, a correction to something
+  he believes, or full error/test output. Never compress those.
+- Numbers are fine and welcome; the prose around them is what to cut.
+
 ## Orchestrator Autonomy
 
 **Default to acting.** Andreas has said explicitly: be more independent, trust
@@ -280,6 +299,31 @@ This project keeps durable knowledge in version-controlled markdown, separate fr
 - Rule of thumb: **research** goes in `.research/`, **decisions** based on it go in `.planning/decisions/`, **status** in `progress.md`. Update the relevant `INDEX.md` whenever you add a file. Don't delete superseded entries — mark them Deprecated/Superseded.
 
 ## Project-Specific Operational Notes
+
+### Flashing: use the CDC BOOTSEL command, not picotool
+
+**As of 2026-08-29 (bead `pico-link-vu4`, branch `bd-pico-link-vu4`) the board can
+be put into BOOTSEL over the debug CDC channel — no physical button press.**
+Proven end to end on hardware: send it, `/Volumes/RP2350` appears, flash, board
+reboots.
+
+```bash
+python3 tools/usb-console/cdc_sender.py --bootsel
+```
+
+- **This is now the default flash path.** `picotool reboot -f -u` and the vendor
+  control transfer on interface 4 both STALL on this Mac even when the board is
+  perfectly healthy (`pico-link-d74`) — do not burn time on them.
+- Works because the debug channel is CDC **bulk** data, a different endpoint and
+  code path from the vendor **control** transfer that stalls. Same structural
+  reason `cdc_reader.py` works where the tty path does not.
+- **Requires `PL_DEBUG_REMOTE=ON`.** Release builds deliberately do not expose a
+  remote-reboot command and still need physical BOOTSEL.
+- **NOT a replacement for physical BOOTSEL.** It needs the main loop running. A
+  wedged, hung or panicking board still needs a human to hold the button — so it
+  is useless during exactly the hang hunts where you most want it. Ask Andreas.
+- **Never run `cdc_reader.py` and `cdc_sender.py` concurrently** — the second gets
+  `EACCES` claiming an already-claimed interface. One tool on the bus at a time.
 
 ### Firmware build (RP2350)
 

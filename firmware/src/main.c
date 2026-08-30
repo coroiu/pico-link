@@ -36,6 +36,7 @@
 #include "st7789.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
+#include "watchdog_sup.h"
 
 // The one call in the Rust -> C direction (see pico_link_ui.h's doc comment
 // on pl_ui_panic_hook): Rust hands us a panic message on the way to
@@ -118,11 +119,22 @@ int main(void) {
     pl_log("board: pimoroni_pico_plus2_w_rp2350\r\n");
     pl_log("pico-sdk owns main(); ui-ffi (Rust core) linked in over FFI.\r\n");
 
+    // Bead pico-link-ufh: classify *why* the board booted (power-on vs. an
+    // unattributed hardware watchdog expiry vs. a deliberate
+    // watchdog_reboot) from the raw watchdog_hw->reason/scratch[4]
+    // registers. MUST run before pl_wdt_arm() (below) -- arming stamps
+    // scratch[4] and destroys the value this reads -- and before
+    // pl_panic_report_and_clear() clears scratch[0..3], since it peeks
+    // scratch[0] to avoid double-reporting a supervised WDT trip that
+    // pl_panic_report_and_clear() is about to print in full.
+    pl_wdt_report_boot_reason();
+
     // bd pico-link-gap: report (and clear) a panic record left by the
     // reboot that just happened, if there is one. Placed here -- after the
     // CDC attach-grace sleep above, before anything else that could itself
     // panic -- so the report has the best chance of a listener actually
     // being attached, and so it isn't lost underneath later boot output.
+    // Also handles the pico-link-ufh watchdog-trip breadcrumb (PL_PANIC_MAGIC_WDT).
     pl_panic_report_and_clear();
 
     // Panel bring-up itself is proven on real hardware as of M1b (bd
@@ -295,6 +307,17 @@ int main(void) {
 #else
     pl_log("PL_DIAG_SKIP_BT set -- skipping cyw43_arch_init/pl_bt_init\r\n");
 #endif
+
+    // Bead pico-link-ufh: arm the hardware watchdog + software supervisor.
+    // Deliberately OUTSIDE the PL_DIAG_SKIP_BT guard above, so diag builds
+    // are also armed -- and deliberately AFTER pl_wdt_report_boot_reason()/
+    // pl_panic_report_and_clear() above, since arming stamps scratch[4] and
+    // would destroy the evidence those two functions read. Boot
+    // (tusb_init -> cyw43_arch_init -> pl_bt_init) stays deliberately
+    // unprotected -- arming late is what keeps main.c's halt-forever
+    // diagnostic paths above this line usable. See the design doc's
+    // "Consequences" section.
+    pl_wdt_arm();
 
     // Superloop on core0 only (M1b design, unchanged by M2). Every
     // iteration: poll debounced input edges, forward to Rust, tick,
@@ -476,6 +499,14 @@ int main(void) {
         // doc). Called every iteration, not rate-limited, so the ring stays
         // close to empty between report bursts.
         pl_log_ring_drain();
+
+        // Bead pico-link-ufh: THE feed site -- exactly one call, from
+        // thread context, in the superloop. Must never be fed from a timer
+        // or IRQ (see watchdog_sup.h's module doc for why). Placed after
+        // pl_a2dp_report() and before the pacing sleep below, per the
+        // design doc's "Where the feed lives" section.
+        pl_wdt_service();
+        pl_wdt_report();
 
         // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
         // re-renders unconditionally every call -- see its doc comment in
