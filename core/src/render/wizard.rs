@@ -72,27 +72,28 @@ pub fn build_wizard_screen(
 }
 
 /// Phase 2's 4-bar signal glyph (design section 9 rule 4: "signal as a
-/// 4-bar glyph here, dBm only in detail"). Rendered as a 4-character ASCII
-/// approximation (`#` filled, `.` empty) via the existing row-sublabel
-/// text path, not a drawn graphical glyph -- F10 (design section 14, "4-bar
-/// signal glyph", Fern's item) doesn't exist yet in this crate. This is a
-/// deliberate stand-in for the *behavior* the design rule actually cares
-/// about (a coarse, stable-enough-to-glance-at signal indicator that is
-/// **not** raw dBm) rather than its exact pixel form; swap for a real
-/// glyph if/when F10 lands.
-fn signal_bars(rssi: i8) -> String {
-    let bars: u8 = match rssi {
+/// 4-bar glyph here, dBm only in detail"; section 14 F10: "unconditional
+/// for the scan list"). Maps raw inquiry RSSI to a `0..=4` bar count,
+/// drawn as a real graphical glyph by [`super::theme::draw_signal_bars`]
+/// via [`ListItem::with_signal_bars`] -- pico-link-0r3 replaced the
+/// previous ASCII `#`/`.` stand-in (see that bead for why the stand-in
+/// existed and why four hash characters mattered enough to fix: this is
+/// the first screen a new user meets).
+///
+/// The thresholds themselves are an unchanged, unscientific coarse
+/// bucketing (not calibrated against real hardware RSSI distributions) --
+/// carried over from the stand-in this replaces. Good enough for "glance
+/// at four bars", not for anything quantitative; a real per-device dBm
+/// value stays available in phase-2's underlying `DeviceEntry`, this
+/// glyph never claims otherwise.
+fn signal_bar_level(rssi: i8) -> u8 {
+    match rssi {
         r if r >= -50 => 4,
         r if r >= -60 => 3,
         r if r >= -70 => 2,
         r if r >= -80 => 1,
         _ => 0,
-    };
-    let mut s = String::with_capacity(4);
-    for i in 0u8..4 {
-        s.push(if i < bars { '#' } else { '.' });
     }
-    s
 }
 
 /// The headline/subline pair for one of the five named failure causes
@@ -217,7 +218,7 @@ fn build_scan_list(
         .iter()
         .map(|d| {
             let label = if d.name.is_empty() { String::from("(unknown device)") } else { d.name.clone() };
-            ListItem::new(label).with_sublabel(signal_bars(d.rssi)).with_key(ListItemKey::from(d.addr))
+            ListItem::new(label).with_signal_bars(signal_bar_level(d.rssi)).with_key(ListItemKey::from(d.addr))
         })
         .collect();
 
@@ -454,6 +455,37 @@ mod tests {
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
         app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
         app.handle_input(vec![NavIntent::Select]); // "Scan for headphones" row -> pushes the wizard
+    }
+
+    // --- pico-link-0r3: F10, RSSI -> bar-count thresholds ---
+
+    #[test]
+    fn signal_bar_level_thresholds() {
+        assert_eq!(signal_bar_level(-30), 4, "well above the -50 cutoff");
+        assert_eq!(signal_bar_level(-50), 4, "exactly at the -50 cutoff is still 4 bars");
+        assert_eq!(signal_bar_level(-51), 3);
+        assert_eq!(signal_bar_level(-60), 3, "exactly at the -60 cutoff is still 3 bars");
+        assert_eq!(signal_bar_level(-61), 2);
+        assert_eq!(signal_bar_level(-70), 2, "exactly at the -70 cutoff is still 2 bars");
+        assert_eq!(signal_bar_level(-71), 1);
+        assert_eq!(signal_bar_level(-80), 1, "exactly at the -80 cutoff is still 1 bar");
+        assert_eq!(signal_bar_level(-81), 0);
+        assert_eq!(signal_bar_level(-128), 0, "the weakest representable RSSI is still 0 bars, not a panic");
+    }
+
+    #[test]
+    fn a_scan_row_built_the_way_build_scan_list_does_carries_signal_bars_not_sublabel_text() {
+        // Mirrors `build_scan_list`'s exact row-construction line for a
+        // -40 dBm device -- `ListItem`'s fields are `pub` (see its own
+        // doc comment), but `VerticalList` has no accessor to read a row
+        // back out once built, so this pins down the *construction* side
+        // directly rather than round-tripping through the widget.
+        // `list.rs`'s
+        // `a_row_with_signal_bars_draws_the_graphical_glyph_not_sublabel_text`
+        // covers the render-level pixel proof for the same field.
+        let item = ListItem::new("Cans").with_signal_bars(signal_bar_level(-40)).with_key(ListItemKey::from([1; 6]));
+        assert_eq!(item.signal_bars, Some(4));
+        assert_eq!(item.sublabel, None, "the scan list must not also carry a textual dBm sublabel");
     }
 
     #[test]

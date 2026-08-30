@@ -49,8 +49,22 @@ fn save_zoomed_png(app: &mut App, out_dir: &Path, name: &str) {
     println!("wrote {}", path.display());
 }
 
+/// Home(1) -> Devices(2) -> Wizard(3), all three `Select`s. Fixed
+/// (pico-link-0r3) to match the post-E7 navigator: `App::new` starts on
+/// Home's status face, not on Devices, so reaching the wizard now takes
+/// three `Select`s (Home status -> menu face with Bluetooth pre-selected;
+/// menu Bluetooth row -> pushes Devices; Devices' "Scan for headphones"
+/// row -> pushes the wizard), not the one this function used to send --
+/// see `wizard.rs`'s own `#[cfg(test)]` `open_wizard` for the up-to-date
+/// version this now mirrors. The stale one-`Select` version silently
+/// landed every fixture below on the wrong screen/phase instead of
+/// failing loudly, since a `Select` is always accepted by *something*
+/// (the Home status face, then the Devices list) -- it just wasn't the
+/// wizard.
 fn open_wizard(app: &mut App) {
-    app.handle_input(vec![NavIntent::Select]); // Devices row 0 -> wizard, Instructions
+    app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
+    app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+    app.handle_input(vec![NavIntent::Select]); // "Scan for headphones" row -> pushes the wizard
 }
 
 fn start_scan(app: &mut App) {
@@ -104,6 +118,21 @@ fn main() {
         rssi: -60,
     }));
     save_zoomed_png(&mut app, &out_dir, "02b_scanning_long_device_names");
+
+    // --- Phase 2c: F10, the real 4-bar signal glyph (pico-link-0r3) --
+    // five rows spanning every bar count the RSSI->level mapping
+    // (`signal_bar_level`) produces, including both ends (0 and 4 bars),
+    // so a zoomed screenshot shows the glyph at every distinct fill
+    // level side by side.
+    let mut app = App::new(240, 240);
+    open_wizard(&mut app);
+    start_scan(&mut app);
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x10; 6], name: String::from("4 bars"), rssi: -40 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x11; 6], name: String::from("3 bars"), rssi: -55 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x12; 6], name: String::from("2 bars"), rssi: -65 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x13; 6], name: String::from("1 bar"), rssi: -75 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x14; 6], name: String::from("0 bars"), rssi: -95 }));
+    save_zoomed_png(&mut app, &out_dir, "02c_scanning_signal_bar_levels");
 
     // --- Phase 3: nothing found ---
     let mut app = App::new(240, 240);
