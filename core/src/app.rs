@@ -1364,4 +1364,182 @@ mod tests {
             "a live Bluetooth event must not flip Home back to the status face"
         );
     }
+
+    // --- pico-link-dgx: does navigating back to Home disconnect the link? ---
+    //
+    // Orchestrator investigation (bead comment, 2026-08-30) already refuted
+    // both hypotheses in the bead's description by reading the code: there
+    // is no Disconnect command in the FFI at all, none of the five command
+    // push sites in `core/` is reachable from navigating to Home, and the
+    // one command a Back press CAN emit (`CancelConnect`, wizard.rs:309) is
+    // a no-op on the C side and only fires from `Connecting`/`NotResponding`,
+    // never from a connected state. These tests turn that reading into a
+    // regression: they drive a connected `BtModel` through every realistic
+    // Back route to Home and assert (a) the command queue stays *entirely*
+    // empty -- not just free of a Disconnect variant that cannot exist --
+    // and (b) the model and Home's own render both still say connected.
+
+    const DGX_ADDR: DeviceAddr = [9, 8, 7, 6, 5, 4];
+
+    /// Folds the two events that take a fresh `App` from Idle to a fully
+    /// connected, codec-reporting link -- exactly what `firmware/src/a2dp.c`
+    /// fires in sequence on a real successful pairing.
+    fn connect_link(app: &mut App) {
+        app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+        app.handle_event(Event::CodecChanged(ConnectedCodec {
+            addr: DGX_ADDR,
+            word: String::from("LDAC"),
+            nominal_bitrate_bps: 909_000,
+        }));
+    }
+
+    fn assert_link_still_connected(app: &App) {
+        assert_eq!(app.model().link_state, LinkState::Connected, "link_state must still read Connected");
+        assert_eq!(
+            app.model().connected_codec.as_ref().map(|c| c.word.as_str()),
+            Some("LDAC"),
+            "connected_codec must survive the navigation -- this is what pico-link-1v5 keys the hero word off"
+        );
+    }
+
+    /// Drains the command queue and asserts it was completely empty -- not
+    /// just absent of one variant. A test that only checks for a Disconnect
+    /// that cannot exist in the FFI (`pico_link_ui.h:51-76` has no such tag)
+    /// would prove nothing.
+    fn assert_no_commands_queued(app: &mut App) {
+        let mut drained = Vec::new();
+        while let Some(cmd) = app.poll_command() {
+            drained.push(cmd);
+        }
+        assert!(drained.is_empty(), "navigating to Home must not queue any command, got {drained:?}");
+    }
+
+    /// Route 1: Back from the wizard's success phase (Succeeded, degraded
+    /// or not -- both are reachable by a real Back press, only plain
+    /// success's *auto*-dismiss is gated to `degraded: false`) all the way
+    /// out to Home's status face, with a live connected link the whole
+    /// time.
+    fn back_from_wizard_success_to_home(degraded: bool) {
+        let mut app = App::new(240, 240);
+        connect_link(&mut app);
+        assert_no_commands_queued(&mut app); // sanity: the connect events themselves queue nothing
+
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+        app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+        app.handle_input(vec![NavIntent::Select]); // Scan row -> pushes the wizard (Instructions)
+        assert_eq!(app.navigator_depth(), 3);
+        assert_no_commands_queued(&mut app);
+
+        app.handle_event(Event::ConnectSucceeded { degraded });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded });
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+
+        // B: wizard Succeeded -> pop to Devices. wizard.rs's `on_intent`
+        // has no `(Back, Succeeded { .. })` arm, so this falls through to
+        // its `_ => Action::None` and `Navigator::dispatch` does a plain,
+        // side-effect-free pop.
+        app.handle_input(vec![NavIntent::Back]);
+        assert_eq!(app.navigator_depth(), 2, "first Back should land on Devices");
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+
+        // B: Devices -> pop to Home (root). Home's `home_face` is still
+        // `Menu` here (set by the first Select above and untouched by any
+        // pop), so this lands on Home's menu face, not the hero.
+        app.handle_input(vec![NavIntent::Back]);
+        assert_eq!(app.navigator_depth(), 1, "second Back should land on Home");
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+
+        // B: Home menu face -> status face (Home's own local toggle, no
+        // pop -- this is the step that actually makes the hero visible).
+        app.handle_input(vec![NavIntent::Back]);
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+
+        assert_home_hero_renders_connected(&mut app);
+    }
+
+    #[test]
+    fn back_from_wizard_plain_success_to_home_does_not_disconnect() {
+        back_from_wizard_success_to_home(false);
+    }
+
+    #[test]
+    fn back_from_wizard_degraded_success_to_home_does_not_disconnect() {
+        back_from_wizard_success_to_home(true);
+    }
+
+    /// Route 2: Back from an arbitrary pushed screen (standing in for a
+    /// future device-detail screen, per this bead's brief -- no such screen
+    /// exists in `core/` yet, so `push_screen_for_test` is the only way to
+    /// simulate "the user navigated one level deep and pressed Back") while
+    /// connected.
+    #[test]
+    fn back_from_a_pushed_screen_to_home_does_not_disconnect() {
+        let mut app = App::new(240, 240);
+        connect_link(&mut app);
+        app.push_screen_for_test(Screen::new("detail", vec![]));
+        assert_eq!(app.navigator_depth(), 2);
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+
+        app.handle_input(vec![NavIntent::Back]);
+        assert_eq!(app.navigator_depth(), 1, "Back should pop the detail screen back to Home");
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+
+        // Home starts on its status face by default in this route (no
+        // Select was ever pressed), so the hero is already showing.
+        assert_home_hero_renders_connected(&mut app);
+    }
+
+    /// Route 3: the `Navigator::replace_root` path `App::rebuild_root`
+    /// drives (app.rs:630) -- not a Back press at all, but the other way
+    /// Home's content changes while sitting at the root. Confirms a live
+    /// Bluetooth event folding into an already-connected model, with Home
+    /// as the current (root) screen the whole time, queues nothing and
+    /// keeps rendering connected.
+    #[test]
+    fn a_bluetooth_event_while_home_is_root_does_not_disconnect_or_queue_commands() {
+        let mut app = App::new(240, 240);
+        connect_link(&mut app);
+        assert_eq!(app.navigator_depth(), 1);
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+        assert_home_hero_renders_connected(&mut app);
+
+        // A second, unrelated event folds through `rebuild_root` again --
+        // must not disturb the connected model or queue anything either.
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 1, 1, 1, 1, 1], name: String::from("Other"), rssi: -55 }));
+        assert_no_commands_queued(&mut app);
+        assert_link_still_connected(&app);
+        assert_home_hero_renders_connected(&mut app);
+    }
+
+    /// Renders Home (must be at depth 1, status face) and checks the hero
+    /// paints the connected codec word in `TEXT_PRIMARY` (nominal, non-
+    /// fallback connection -- see `render::hero`'s own
+    /// `nominal_codec_renders_the_hero_word_in_text_primary` for the same
+    /// pixel-presence technique) and paints no `STATUS_ERROR` ink anywhere
+    /// -- `STATUS_ERROR` is exactly what `CodecStatus::NoLink` uses for the
+    /// "NO LINK" word (`render/hero.rs`'s `no_link_renders_the_hero_word_
+    /// in_status_error`), so its presence would mean Home rendered
+    /// disconnected even though the model says otherwise -- exactly the
+    /// failure mode this bead worried about.
+    fn assert_home_hero_renders_connected(app: &mut App) {
+        use crate::render::theme::palette;
+
+        assert_eq!(app.navigator_depth(), 1, "hero only renders on Home's status face at the root");
+        let fb = app.render();
+        assert!(
+            fb.pixels().any(|p| p.1 == palette::TEXT_PRIMARY),
+            "a nominal connected codec word should paint TEXT_PRIMARY ink somewhere"
+        );
+        assert!(
+            !fb.pixels().any(|p| p.1 == palette::STATUS_ERROR),
+            "STATUS_ERROR ink anywhere means Home rendered NO LINK despite a connected model"
+        );
+    }
 }
