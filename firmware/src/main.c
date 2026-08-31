@@ -556,6 +556,11 @@ int main(void) {
             // report line. Thread context only (pl_a2dp_report does no
             // BTstack calls, only pl_log + plain counter reads).
             pl_a2dp_report(shared_report_dt_us);
+
+            // Bead pico-link-auh, section 1: the non-starvable slot-0
+            // ("ctr") snapshot -- same 1Hz point, does not replace the
+            // verbose a2dp: lines above.
+            pl_a2dp_publish_counters();
         }
 
         // Bead pico-link-okx (F1): drains whatever pl_log()/pl_log_locked()

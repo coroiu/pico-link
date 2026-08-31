@@ -8,9 +8,23 @@
 #include "pico/time.h"
 #include "tusb.h"
 
+#include "pl_prio.h"
 #include "usb_pump.h"
 
-#define PL_LOG_RING_SIZE 4096u // power of two -- see the mask use below
+// Bead pico-link-auh: 4096 -> 8192. This is a BAND-AID, recorded as one --
+// see Ada's design comment (2026-08-31), section 3. The measured boot
+// burst is ~10.4KB (4073 held + 6309 dropped at the old 4096 size), so
+// 8192 still drops part of it; the actual fix for steady-state saturation
+// is the priority channel below (pl_prio.h) plus, out of scope here,
+// splitting st7789_blit_framebuffer so the drain ceiling isn't coupled to
+// frame rate (filed as a follow-up to pico-link-3uq). Do NOT read "grew
+// the ring" as "fixed auh" -- it isn't. Do NOT go to 16KB.
+#define PL_LOG_RING_SIZE 8192u // power of two -- see the mask use below
+
+// Bead pico-link-auh: a priority slot must always fit an otherwise-empty
+// CDC TX FIFO in one shot -- see pl_prio.h's module doc and the
+// reservation rule in pl_log_ring_drain() below.
+_Static_assert(PL_PRIO_SLOT_LEN < CFG_TUD_CDC_TX_BUFSIZE, "priority slot must fit an empty CDC TX FIFO");
 
 // Bead pico-link-okx (F3b): s_buf/s_write/s_read live in .uninitialized_data
 // (NOLOAD -- a watchdog reset does not clear SRAM, same mechanism
@@ -60,6 +74,49 @@ static volatile uint32_t s_backlog_hwm;
 static bool s_recovered;
 static uint32_t s_recovered_bytes;
 
+// Bead pico-link-auh, section 2a: producer attribution. Open-addressed,
+// 32 entries, updated ONLY inside pl_log_ring_push_attr()'s existing
+// save_and_disable_interrupts() critical section below -- no new critical
+// section, no lock elsewhere. `used` distinguishes an empty slot from a
+// genuine pc==0 attribution (pl_log_ring_push()'s "no attribution"
+// wrapper passes pc=0, which is itself a valid, trackable bucket).
+#define PL_LOG_ATTR_TABLE_SIZE 32u
+typedef struct {
+    bool used;
+    uint32_t pc;
+    uint32_t bytes;
+    uint32_t drops;
+} pl_log_attr_entry_t;
+static pl_log_attr_entry_t s_attr_table[PL_LOG_ATTR_TABLE_SIZE];
+
+// Bead pico-link-auh, section 2b: the drain-side saturation ledger --
+// deliberately separate from s_bytes_dropped/s_drain_skips/s_backlog_hwm
+// above (those predate this bead and are surfaced elsewhere); these three
+// are new and exist solely to answer "is the bottleneck production or
+// drain": room_zero counts pl_log_ring_drain() calls that got zero room to
+// give the log ring (either tud_cdc_write_available() returned 0, or the
+// priority reservation rule above consumed all of it -- both are "the log
+// ring got nothing this call"); bytes_drained_total is the cumulative sum
+// of w (bytes tud_cdc_write() actually accepted for the LOG ring, not
+// counting priority-slot bytes); bytes_pushed_total is the cumulative sum
+// of len for every successful (non-dropped) pl_log_ring_push_attr() call.
+// bytes_pushed_total + s_bytes_dropped vs bytes_drained_total is the
+// ledger Ada's design comment (section 2b) calls for.
+static volatile uint32_t s_room_zero;
+static volatile uint32_t s_bytes_drained_total;
+static volatile uint32_t s_bytes_pushed_total;
+// Cumulative count of pl_log_ring_drain() calls, incremented unconditionally
+// at entry (unlike s_drain_skips, which counts only the lock-contended
+// subset). This is drn's `c=` field -- the denominator for interpreting
+// every other drn counter as a rate.
+static volatile uint32_t s_drain_call_count;
+
+// Bead pico-link-auh: this file's own 1Hz clock for publishing slots 1
+// (atr) and 2 (drn) -- both are internal to this file, unlike slot 0
+// (ctr), which a2dp.c publishes at main.c's existing shared-report point.
+// Thread context only, same as everything else in pl_log_ring_drain().
+static uint64_t s_last_prio_report_us;
+
 void pl_log_ring_init(void) {
     // Bead pico-link-okx (F3b): THE persistence check -- this must NOT
     // unconditionally zero s_write/s_read (the pre-F3b body did exactly
@@ -85,9 +142,49 @@ void pl_log_ring_init(void) {
     s_push_hold_us_max = 0;
     s_drain_skips = 0;
     s_backlog_hwm = 0;
+
+    // Bead pico-link-auh.
+    memset(s_attr_table, 0, sizeof(s_attr_table));
+    s_room_zero = 0;
+    s_bytes_drained_total = 0;
+    s_bytes_pushed_total = 0;
+    s_drain_call_count = 0;
+    s_last_prio_report_us = 0;
 }
 
-void pl_log_ring_push(const char *data, uint32_t len) {
+// Forward declaration -- defined below pl_log_ring_drain(), which calls it
+// unconditionally at entry. See its definition for what it does.
+static void pl_log_ring_publish_diag_slots(void);
+
+// Bead pico-link-auh, section 2a: find-or-claim `pc`'s slot in the
+// attribution table. Called ONLY from inside pl_log_ring_push_attr()'s
+// save_and_disable_interrupts() critical section below -- see this file's
+// module doc and pl_log_ring.h's doc on pl_log_ring_push_attr() for why no
+// separate lock is added here. Linear probe; if the table is full and
+// `pc` isn't already in it, the attribution update is silently skipped --
+// this only loses ranking precision among the least frequent producers,
+// it never affects whether the underlying push itself succeeds or drops.
+static pl_log_attr_entry_t *pl_log_attr_find_or_claim(uint32_t pc) {
+    int32_t free_idx = -1;
+    for (uint32_t i = 0; i < PL_LOG_ATTR_TABLE_SIZE; i++) {
+        if (s_attr_table[i].used && s_attr_table[i].pc == pc) {
+            return &s_attr_table[i];
+        }
+        if (!s_attr_table[i].used && free_idx < 0) {
+            free_idx = (int32_t)i;
+        }
+    }
+    if (free_idx >= 0) {
+        s_attr_table[free_idx].used = true;
+        s_attr_table[free_idx].pc = pc;
+        s_attr_table[free_idx].bytes = 0;
+        s_attr_table[free_idx].drops = 0;
+        return &s_attr_table[free_idx];
+    }
+    return NULL; // table full and pc not already tracked -- see doc above
+}
+
+void pl_log_ring_push_attr(const char *data, uint32_t len, uint32_t pc) {
     if (len == 0) {
         return;
     }
@@ -104,6 +201,10 @@ void pl_log_ring_push(const char *data, uint32_t len) {
     uint32_t used = s_write - s_read; // wraparound-safe: unsigned modular arithmetic
     uint32_t free_space = PL_LOG_RING_SIZE - used;
     if (len > free_space) {
+        pl_log_attr_entry_t *e = pl_log_attr_find_or_claim(pc);
+        if (e != NULL) {
+            e->drops += len;
+        }
         restore_interrupts(save);
         s_bytes_dropped += len;
         return;
@@ -120,13 +221,24 @@ void pl_log_ring_push(const char *data, uint32_t len) {
     }
     s_write += len;
 
+    pl_log_attr_entry_t *e = pl_log_attr_find_or_claim(pc);
+    if (e != NULL) {
+        e->bytes += len;
+    }
+
     restore_interrupts(save);
+
+    s_bytes_pushed_total += len;
 
     uint32_t hold_us = (uint32_t)(time_us_64() - t0);
     s_push_hold_us_total += hold_us;
     if (hold_us > s_push_hold_us_max) {
         s_push_hold_us_max = hold_us;
     }
+}
+
+void pl_log_ring_push(const char *data, uint32_t len) {
+    pl_log_ring_push_attr(data, len, 0);
 }
 
 // Bead pico-link-okx (F2): rewritten to be bounded and non-blocking -- see
@@ -143,6 +255,13 @@ void pl_log_ring_push(const char *data, uint32_t len) {
 // New shape, no loop, no timeout, no tud_task() call from thread context,
 // no dependence on the host whatsoever:
 void pl_log_ring_drain(void) {
+    s_drain_call_count++; // bead pico-link-auh, section 2b -- drn's `c=` denominator
+
+    // Bead pico-link-auh, section 2a/2b: publish the atr/drn priority
+    // slots on this file's own 1Hz clock, independent of whether this
+    // particular call finds anything to drain.
+    pl_log_ring_publish_diag_slots();
+
     // Single reader, no lock needed to observe s_write or advance s_read --
     // see this file's header doc.
     uint32_t write_snapshot = s_write;
@@ -181,6 +300,41 @@ void pl_log_ring_drain(void) {
     // its own output.
     uint32_t room = tud_cdc_write_available();
     if (room == 0) {
+        s_room_zero++; // bead pico-link-auh, section 2b
+        pl_usb_unlock();
+        return;
+    }
+
+    // Bead pico-link-auh: the priority-slot reservation rule. A fresh
+    // priority snapshot (pl_prio.h) gets absolute priority over the
+    // verbose log ring, emitted through this same single tud_cdc_write()
+    // call site under the lock already held above -- see pl_prio.h's
+    // module doc for why this is the ONLY place that ever emits one.
+    //
+    // If a slot is fresh but there isn't room for a whole one, the log
+    // ring gets NOTHING this call (not a partial log write followed by a
+    // dropped slot) -- this bounds how long a pending slot can be delayed
+    // to at most one drain call: the FIFO drains host-side between calls,
+    // so `room` cannot stay below PL_PRIO_SLOT_LEN indefinitely. Combined
+    // with PL_PRIO_SLOT_LEN < CFG_TUD_CDC_TX_BUFSIZE (the _Static_assert
+    // above), a slot always fits an otherwise-empty FIFO, so this can
+    // never deadlock the priority channel against the log ring.
+    if (pl_prio_any_fresh()) {
+        if (room < PL_PRIO_SLOT_LEN) {
+            pl_usb_unlock();
+            return;
+        }
+        const char *slot_data = NULL;
+        uint32_t slot_len = pl_prio_emit_one(&slot_data);
+        if (slot_len > 0) {
+            uint32_t slot_w = tud_cdc_write(slot_data, slot_len);
+            tud_cdc_write_flush();
+            room -= slot_w;
+        }
+    }
+
+    if (room == 0) {
+        s_room_zero++; // bead pico-link-auh, section 2b -- the priority slot consumed all of it
         pl_usb_unlock();
         return;
     }
@@ -213,9 +367,65 @@ void pl_log_ring_drain(void) {
     // correct even if that ever changes.
     uint32_t w = tud_cdc_write(&s_buf[read_idx], take);
     s_read += w;
+    s_bytes_drained_total += w; // bead pico-link-auh, section 2b
     tud_cdc_write_flush();
 
     pl_usb_unlock();
+}
+
+// Bead pico-link-auh, section 2a/2b: once a second, publish the atr
+// (producer attribution, top-3 by bytes) and drn (drain-side ledger)
+// priority slots. THREAD CONTEXT ONLY, called from pl_log_ring_drain()
+// (itself thread-context-only) -- same contract as pl_prio_publish()
+// requires, see pl_prio.h's module doc. Runs unconditionally, independent
+// of whether this call actually found anything to drain, so the 1Hz
+// cadence holds even when the log ring is empty.
+static void pl_log_ring_publish_diag_slots(void) {
+    uint64_t now_us = time_us_64();
+    if (s_last_prio_report_us != 0 && now_us - s_last_prio_report_us < 1000000) {
+        return;
+    }
+    s_last_prio_report_us = now_us;
+
+    // Top-3 attribution entries by bytes. PL_LOG_ATTR_TABLE_SIZE is only
+    // 32, so a linear top-3 scan is cheap and simple.
+    const pl_log_attr_entry_t *top[3] = {NULL, NULL, NULL};
+    for (uint32_t i = 0; i < PL_LOG_ATTR_TABLE_SIZE; i++) {
+        if (!s_attr_table[i].used) {
+            continue;
+        }
+        const pl_log_attr_entry_t *cand = &s_attr_table[i];
+        for (uint32_t slot = 0; slot < 3; slot++) {
+            if (top[slot] == NULL || cand->bytes > top[slot]->bytes) {
+                for (uint32_t k = 2; k > slot; k--) {
+                    top[k] = top[k - 1];
+                }
+                top[slot] = cand;
+                break;
+            }
+        }
+    }
+    pl_prio_publish(
+        1,
+        "atr pc0=%08lx b0=%08lu pc1=%08lx b1=%08lu pc2=%08lx b2=%08lu",
+        (unsigned long)(top[0] != NULL ? top[0]->pc : 0),
+        (unsigned long)(top[0] != NULL ? top[0]->bytes : 0),
+        (unsigned long)(top[1] != NULL ? top[1]->pc : 0),
+        (unsigned long)(top[1] != NULL ? top[1]->bytes : 0),
+        (unsigned long)(top[2] != NULL ? top[2]->pc : 0),
+        (unsigned long)(top[2] != NULL ? top[2]->bytes : 0)
+    );
+
+    pl_prio_publish(
+        2,
+        "drn c=%08lu s=%08lu z=%08lu bd=%010lu bp=%010lu dr=%010lu",
+        (unsigned long)s_drain_call_count,
+        (unsigned long)s_drain_skips,
+        (unsigned long)s_room_zero,
+        (unsigned long)s_bytes_drained_total,
+        (unsigned long)s_bytes_pushed_total,
+        (unsigned long)s_bytes_dropped
+    );
 }
 
 uint32_t pl_log_ring_bytes_dropped(void) {

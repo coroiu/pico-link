@@ -174,6 +174,7 @@ add_executable(pico_link
     src/usb_audio.c
     src/usb_pump.c
     src/pl_log_ring.c
+    src/pl_prio.c
     src/pcm_ring.c
     src/usb_reset.c
     src/watchdog_sup.c

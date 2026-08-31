@@ -3,6 +3,7 @@
 #include "usb_pump.h"
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #include "device/usbd_pvt.h" // usbd_edpt_busy -- bead pico-link-okx D9/D13
@@ -339,7 +340,13 @@ void pl_usb_unlock(void) {
 // lines) covers every report line in this firmware today with headroom;
 // vsnprintf truncates safely if a future line is longer, it never
 // overflows.
-void pl_log(const char *fmt, ...) {
+// Bead pico-link-auh: __attribute__((noinline)) makes
+// __builtin_return_address(0) below stable -- without it, LTO/inlining at
+// call sites could fold this body into the caller and change what "the
+// caller's PC" even means. This settles the wbq-vs-Ada producer dispute by
+// measurement (pl_log_ring.c's attribution table) with ZERO edits to any
+// of the ~144 call sites -- the return address IS the call site.
+__attribute__((noinline)) void pl_log(const char *fmt, ...) {
     // Bead pico-link-okx (F4): raised from 256 to 384 to fit the collapsed
     // 8-entry-per-line wdt ring dump (watchdog_sup.c) without truncation.
     char scratch[384];
@@ -354,7 +361,8 @@ void pl_log(const char *fmt, ...) {
     if (len > sizeof(scratch) - 1) {
         len = sizeof(scratch) - 1; // vsnprintf's return value can exceed what it actually wrote
     }
-    pl_log_ring_push(scratch, len);
+    void *pc = __builtin_return_address(0);
+    pl_log_ring_push_attr(scratch, len, (uint32_t)(uintptr_t)pc);
 }
 
 // Bead pico-link-l60 introduced this for callers already holding
@@ -362,7 +370,9 @@ void pl_log(const char *fmt, ...) {
 // (F1): pl_log() no longer touches pl_usb_mutex at all, so there is no
 // hazard left to route around -- this is now a plain alias. See
 // usb_pump.h's doc comment on the declaration.
-void pl_log_locked(const char *fmt, ...) {
+// Bead pico-link-auh: see pl_log()'s comment just above on noinline +
+// __builtin_return_address -- identical rationale applies here.
+__attribute__((noinline)) void pl_log_locked(const char *fmt, ...) {
     // Bead pico-link-okx (F4): raised from 256 to 384 to fit the collapsed
     // 8-entry-per-line wdt ring dump (watchdog_sup.c) without truncation.
     char scratch[384];
@@ -377,7 +387,8 @@ void pl_log_locked(const char *fmt, ...) {
     if (len > sizeof(scratch) - 1) {
         len = sizeof(scratch) - 1;
     }
-    pl_log_ring_push(scratch, len);
+    void *pc = __builtin_return_address(0);
+    pl_log_ring_push_attr(scratch, len, (uint32_t)(uintptr_t)pc);
 }
 
 // Bead pico-link-wbq (E2, fix 2): the report set was cut from 11 pl_log()

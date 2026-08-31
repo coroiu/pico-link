@@ -59,6 +59,19 @@ void pl_a2dp_connect(const uint8_t *addr);
 // isn't cosmetic.
 void pl_a2dp_report(uint32_t report_dt_us);
 
+// Bead pico-link-auh, section 1: publishes slot 0 ("ctr") of the
+// non-starvable priority channel (pl_prio.h) from s_ctx's cumulative
+// counters -- tick_count, enc_frames_total, pkt_sent, stop_dwell,
+// stop_credit, ovr_frames -- plus a monotonically-incrementing seq and
+// uptime_ms. This is the LDAC PL_A2DP_MAX_ENCODE_DWELL_US (a2dp.c:149)
+// falsifier's data source: unlike the verbose "a2dp:" lines pl_a2dp_report
+// above emits (which pl_log_ring_drain() may shed under load), this slot
+// is overwrite-in-place and cannot be dropped -- see pl_prio.h's module
+// doc. Call once a second, at the same shared-report point as
+// pl_a2dp_report() (main.c). Does NOT replace pl_a2dp_report()'s verbose
+// lines -- both stay.
+void pl_a2dp_publish_counters(void);
+
 // Raw wire values of ui-ffi's PlConnectStep enum (Connecting=0, Pairing=1,
 // SettingUpAudio=2, NegotiatingCodec=3 -- see ui-ffi/src/lib.rs). Not
 // emitted by cbindgen into pico_link_ui.h because no FFI struct field is
