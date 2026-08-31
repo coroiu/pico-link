@@ -346,20 +346,38 @@ static void pl_bt_handle_read_local_version_complete(const uint8_t *params, uint
     );
 }
 
-static void pl_bt_start_scan(void) {
+// Does the actual radio work for a scan start -- BTstack API calls only, no
+// UI push. Safe to call from any context BTstack itself considers "the run
+// loop context" (see the pending-queue doc comment below): today that's
+// pl_bt_packet_handler's BTSTACK_EVENT_STATE case (IRQ context, unchanged)
+// and, as of pico-link-ouw, pl_bt_pending_service (also IRQ context, via the
+// heartbeat timer).
+static void pl_bt_start_scan_radio(void) {
     pl_log("BT: starting GAP inquiry (%d.%ds)\r\n", (PL_INQUIRY_DURATION_UNITS * 128) / 100, (PL_INQUIRY_DURATION_UNITS * 128) % 100);
-    pl_bt_push_devices_cleared();
-    pl_bt_push_link_state(PL_LINK_STATE_SCANNING);
     gap_inquiry_start(PL_INQUIRY_DURATION_UNITS);
 }
 
+// Used only from pl_bt_packet_handler (IRQ context) where pushing the UI
+// state and starting the radio in one atomic-looking call was always safe --
+// unlike the thread-context caller in pl_bt_poll_commands, which as of
+// pico-link-ouw pushes the UI state itself and defers only the radio half
+// (see the pending-queue section below).
+static void pl_bt_start_scan(void) {
+    pl_bt_push_devices_cleared();
+    pl_bt_push_link_state(PL_LINK_STATE_SCANNING);
+    pl_bt_start_scan_radio();
+}
+
+// Does the actual radio work for a scan cancel -- see pl_bt_start_scan_radio's
+// doc comment; same split for the same reason (pico-link-ouw).
+//
 // pico-link-znb.2 (E1, MVP-blocking): stops an in-flight GAP inquiry.
 // gap_inquiry_stop() itself triggers GAP_EVENT_INQUIRY_COMPLETE (same as a
 // natural timeout), so pl_bt_packet_handler's existing
 // GAP_EVENT_INQUIRY_COMPLETE case pushes PL_LINK_STATE_IDLE -- no separate
 // push needed here. Compiled but its runtime effect is UNVERIFIED (board is
 // wedged, see pico-link-icb; this bead may not block on hardware).
-static void pl_bt_cancel_scan(void) {
+static void pl_bt_cancel_scan_radio(void) {
     pl_log("BT: cancelling GAP inquiry\r\n");
     gap_inquiry_stop();
 }
@@ -438,6 +456,130 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
     }
 }
 
+// --- pico-link-ouw: defer thread-context BTstack calls onto the run loop ---
+//
+// pl_bt_start_scan_radio (gap_inquiry_start), pl_bt_cancel_scan_radio
+// (gap_inquiry_stop) and pl_a2dp_connect (a2dp_source_establish_stream) are
+// BTstack API calls. BTstack's own contract is that its API is called only
+// from "the run loop" -- in this build that is the cyw43/BTstack background
+// IRQ under pico_cyw43_arch_threadsafe_background (firmware/CMakeLists.txt),
+// which is exactly where pl_bt_packet_handler and pl_bt_wdt_heartbeat_handler
+// already run. Before this bead, pl_bt_poll_commands (thread context, the
+// main.c superloop) called these directly with no synchronization at all --
+// not even the async_context lock -- while the background IRQ could run
+// concurrently and touch the same BTstack run-loop state. Ada found this
+// while designing pico-link-2pq (see
+// .planning/design/2026-08-30-cancel-connect.md's "Why the teardown is
+// deferred to the heartbeat" section) and filed it separately as this bead.
+// It was investigated as a candidate cause of the pico-link-okx stall and
+// REFUTED for that role (okx's stall was LAST=LOG_DRAIN, unrelated) -- this
+// fix stands on its own as a correctness fix, not a stall fix.
+//
+// Fix shape, matching pico-link-2pq's D4: never call these from thread
+// context. pl_bt_poll_commands (and pl_bt_debug_connect, the PL_DEBUG_REMOTE
+// bypass path -- also thread context, see debug_remote.c) do only UI-event
+// pushes (already safe -- pl_bt_ring_push serializes both producer contexts)
+// and enqueue a small request here; pl_bt_wdt_heartbeat_handler, running in
+// the correct IRQ context on its existing 100ms period, drains the queue and
+// makes the real BTstack calls. Same MPSC-with-critical-section idiom as
+// pl_bt_ring_push above (pico-link-6o2), just carrying commands in the
+// opposite direction (thread -> run loop instead of run loop -> thread).
+// Capacity 8 is generous against the realistic case (at most one scan/cancel
+// and one connect in flight at a time; the UI can't issue more before the
+// prior one lands) while still being cheap.
+#define PL_BT_PENDING_CAPACITY 8
+
+typedef enum {
+    PL_BT_PENDING_START_SCAN,
+    PL_BT_PENDING_CANCEL_SCAN,
+    PL_BT_PENDING_CONNECT,
+} pl_bt_pending_tag_t;
+
+typedef struct {
+    pl_bt_pending_tag_t tag;
+    bd_addr_t addr; // meaningful only for PL_BT_PENDING_CONNECT
+} pl_bt_pending_entry_t;
+
+static pl_bt_pending_entry_t s_bt_pending[PL_BT_PENDING_CAPACITY];
+static volatile uint8_t s_bt_pending_head; // producer-owned (thread context, lock-protected)
+static volatile uint8_t s_bt_pending_tail; // consumer-owned (heartbeat/IRQ context only, no lock needed)
+// Diagnostics (pico-link-ouw verification): bumped so a hardware log proves
+// the deferral actually happens -- an enqueue log line from thread context
+// followed by a service log line from IRQ context, with these counters
+// distinguishing "queued but not yet serviced" from "dropped, queue full".
+static volatile uint32_t s_bt_pending_enqueued_count;
+static volatile uint32_t s_bt_pending_serviced_count;
+static volatile uint32_t s_bt_pending_drop_count;
+
+static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
+    switch (tag) {
+        case PL_BT_PENDING_START_SCAN:
+            return "START_SCAN";
+        case PL_BT_PENDING_CANCEL_SCAN:
+            return "CANCEL_SCAN";
+        case PL_BT_PENDING_CONNECT:
+            return "CONNECT";
+        default:
+            return "?";
+    }
+}
+
+// Enqueues one deferred BTstack call. Called only from thread context
+// (pl_bt_poll_commands, pl_bt_debug_connect) -- unlike pl_bt_ring_push this
+// queue has exactly one producer context, but it still needs the critical
+// section because the consumer (pl_bt_pending_service, IRQ context) can
+// preempt the producer mid read-modify-write of s_bt_pending_head.
+static void pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    uint8_t head = s_bt_pending_head;
+    uint8_t next_head = (uint8_t)((head + 1) % PL_BT_PENDING_CAPACITY);
+    if (next_head == s_bt_pending_tail) {
+        s_bt_pending_drop_count++;
+        restore_interrupts(irq_state);
+        pl_log("BT: pending-action queue full, dropped deferred %s\r\n", pl_bt_pending_tag_name(tag));
+        return;
+    }
+    s_bt_pending[head].tag = tag;
+    if (tag == PL_BT_PENDING_CONNECT) {
+        memcpy(s_bt_pending[head].addr, addr, sizeof(bd_addr_t));
+    }
+    s_bt_pending_head = next_head;
+    s_bt_pending_enqueued_count++;
+    restore_interrupts(irq_state);
+    pl_log(
+        "BT: queued deferred %s from thread context (enqueued=%lu)\r\n", pl_bt_pending_tag_name(tag),
+        (unsigned long)s_bt_pending_enqueued_count
+    );
+}
+
+// Drains every request currently queued and makes the real BTstack call for
+// each. Called only from pl_bt_wdt_heartbeat_handler (IRQ context) -- the
+// single consumer, so it only ever touches s_bt_pending_tail and needs no
+// lock of its own, same discipline as pl_bt_drain_events above.
+static void pl_bt_pending_service(void) {
+    while (s_bt_pending_tail != s_bt_pending_head) {
+        uint8_t tail = s_bt_pending_tail;
+        pl_bt_pending_entry_t entry = s_bt_pending[tail];
+        s_bt_pending_tail = (uint8_t)((tail + 1) % PL_BT_PENDING_CAPACITY);
+        s_bt_pending_serviced_count++;
+        pl_log(
+            "BT: servicing deferred %s on the run loop (serviced=%lu)\r\n", pl_bt_pending_tag_name(entry.tag),
+            (unsigned long)s_bt_pending_serviced_count
+        );
+        switch (entry.tag) {
+            case PL_BT_PENDING_START_SCAN:
+                pl_bt_start_scan_radio();
+                break;
+            case PL_BT_PENDING_CANCEL_SCAN:
+                pl_bt_cancel_scan_radio();
+                break;
+            case PL_BT_PENDING_CONNECT:
+                pl_a2dp_connect(entry.addr);
+                break;
+        }
+    }
+}
+
 // Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the
 // BTstack run loop is still servicing timers at all -- runs whether or not
 // a stream is established, unlike a2dp.c's media timer. Same self-rearm
@@ -445,10 +587,15 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 // work. Runs in the cyw43/BTstack background IRQ, same context as every
 // other BTstack timer callback -- pl_wdt_kick() is a single volatile
 // increment, safe from there (see watchdog_sup.h's module doc).
+//
+// pico-link-ouw: also the sole consumer of the deferred-action queue above --
+// this is "the run loop" that pl_bt_poll_commands's BTstack calls are
+// deferred onto, at up to PL_WDT_BTSTACK_HEARTBEAT_MS (100ms) latency.
 static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_set_timer(ts, PL_WDT_BTSTACK_HEARTBEAT_MS);
     btstack_run_loop_add_timer(ts);
     pl_wdt_kick(PL_WDT_BTSTACK);
+    pl_bt_pending_service();
 }
 
 void pl_bt_init(struct PlUi *ui) {
@@ -499,8 +646,16 @@ void pl_bt_poll_commands(struct PlUi *ui) {
 
     switch (command.tag) {
         case PL_COMMAND_TAG_START_SCAN:
+            // pico-link-ouw: this runs in thread context (the main.c
+            // superloop). gap_inquiry_start (inside pl_bt_start_scan_radio)
+            // is a BTstack API call and must not be made from here -- only
+            // the UI-event pushes are done inline (already safe, see
+            // pl_bt_ring_push); the radio call is deferred onto the
+            // heartbeat handler. See the pending-queue module doc above.
             pl_wdt_mark(PL_WDT_CP_CMD_SCAN_CALL);
-            pl_bt_start_scan();
+            pl_bt_push_devices_cleared();
+            pl_bt_push_link_state(PL_LINK_STATE_SCANNING);
+            pl_bt_pending_push(PL_BT_PENDING_START_SCAN, NULL);
             pl_wdt_mark(PL_WDT_CP_CMD_SCAN_RET);
             break;
 
@@ -511,6 +666,12 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             // observable over CDC). Now it actually opens an A2DP source
             // stream -- see a2dp.c's module doc and design sec 4.3's event
             // flow.
+            //
+            // pico-link-ouw: pl_a2dp_connect (a2dp_source_establish_stream)
+            // is a BTstack API call made from thread context here -- deferred
+            // onto the heartbeat handler for the same reason as START_SCAN
+            // above. The link-state push stays inline; only the radio call
+            // is deferred.
             const uint8_t *addr = command.payload.connect.addr;
             pl_log(
                 "BT: PL_CMD_CONNECT %02x:%02x:%02x:%02x:%02x:%02x\r\n",
@@ -518,14 +679,17 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             );
             pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
             pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_A2DP);
-            pl_a2dp_connect(addr);
+            pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
             pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_RET);
             break;
         }
 
         case PL_COMMAND_TAG_CANCEL_SCAN:
+            // pico-link-ouw: gap_inquiry_stop (inside
+            // pl_bt_cancel_scan_radio) is the same class of BTstack call,
+            // deferred for the same reason.
             pl_wdt_mark(PL_WDT_CP_CMD_CANCEL_SCAN_CALL);
-            pl_bt_cancel_scan();
+            pl_bt_pending_push(PL_BT_PENDING_CANCEL_SCAN, NULL);
             pl_wdt_mark(PL_WDT_CP_CMD_CANCEL_SCAN_RET);
             break;
 
@@ -545,13 +709,17 @@ void pl_bt_poll_commands(struct PlUi *ui) {
 // the PlCommand/pl_ui_poll_command indirection: there is no discovered
 // DeviceEntry to select here (that is the whole point -- this bypasses
 // inquiry), so this is called directly from debug_remote.c instead of
-// going through the Rust command queue.
+// going through the Rust command queue. debug_remote.c's poll function is
+// itself called from main.c's superloop (thread context, see
+// debug_remote.h's module doc), so this has the exact same pico-link-ouw
+// hazard as PL_COMMAND_TAG_CONNECT and gets the same fix: defer the actual
+// BTstack call to the heartbeat handler.
 void pl_bt_debug_connect(const uint8_t *addr) {
     pl_log(
         "BT: debug-remote CONNECT %02x:%02x:%02x:%02x:%02x:%02x (bypassing inquiry)\r\n",
         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
     );
     pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
-    pl_a2dp_connect(addr);
+    pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
 }
 #endif
