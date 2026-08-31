@@ -75,4 +75,40 @@ elif STOCK2 in src:
     print(f"APPLIED: 02-tinyusb-rp2040-inactive-xfer -> {f}")
 else:
     sys.exit("FAIL: hw_endpoint_xfer_continue matches neither stock nor patched form.")
+
+# --- 03: sample the ISO-OUT AVAIL bit in TRUE ISR context (bead pico-link-wbq) ---
+# usbd.c's DCD_EVENT_SOF case in dcd_event_handler() runs in real ISR context,
+# but only calls the app's tud_sof_cb() by RE-QUEUING an event that is later
+# drained by tud_task() -- on this firmware, from inside the 0xC0
+# pl_usb_pump_worker_irq. Sampling from there measures AVAIL up to ~1ms after
+# the real start of frame, at a phase set by our own 1ms timer, not the bus.
+# This patch calls pl_usb_sof_isr_sample() (firmware/src/usb_pump.c) directly
+# from inside the ISR case, before any re-queuing happens.
+f3 = sdk / "lib/tinyusb/src/device/usbd.c"
+if not f3.exists():
+    sys.exit(f"FAIL: not found: {f3}\nIs PICO_SDK_PATH correct? (got {sdk})")
+src3 = f3.read_text()
+
+STOCK3 = """    case DCD_EVENT_SOF:
+      // SOF driver handler in ISR context
+      for (uint8_t i = 0; i < TOTAL_DRIVER_COUNT; i++) {"""
+MARK3 = "pl_usb_sof_isr_sample"
+PATCHED3 = """    case DCD_EVENT_SOF:
+      // SOF driver handler in ISR context
+      // pico-link (bead pico-link-wbq): sample the raw ISO-OUT AVAIL bit
+      // HERE, in true ISR context, before this event is (maybe) re-queued
+      // for tud_task() below. Defined in firmware/src/usb_pump.c. See
+      // firmware/sdk-patches/README.md.
+      { extern void pl_usb_sof_isr_sample(uint32_t frame_count);
+        pl_usb_sof_isr_sample(event->sof.frame_count); }
+      for (uint8_t i = 0; i < TOTAL_DRIVER_COUNT; i++) {"""
+
+if MARK3 in src3:
+    print("ok: 03-tinyusb-usbd-sof-isr-sample already applied")
+elif STOCK3 in src3:
+    f3.write_text(src3.replace(STOCK3, PATCHED3, 1))
+    print(f"APPLIED: 03-tinyusb-usbd-sof-isr-sample -> {f3}")
+else:
+    sys.exit("FAIL: usbd.c's DCD_EVENT_SOF case matches neither stock nor patched form.\n"
+             "Unknown SDK version -- inspect it by hand before proceeding.")
 PY
