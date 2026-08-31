@@ -99,6 +99,7 @@
 #include "codec_sbc.h"
 #include "codec_table.h"
 #include "pcm_ring.h"
+#include "pl_prio.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
 #include "watchdog_sup.h"
@@ -1846,5 +1847,28 @@ void pl_a2dp_report(uint32_t report_dt_us) {
         "a2dp: payloads_sealed=%lu tx_depth_max=%lu grants=%lu spurious_grants=%lu dwell_max_us=%lu\r\n",
         (unsigned long)s_ctx.payloads_sealed, (unsigned long)s_ctx.tx_depth_max, (unsigned long)s_ctx.grants,
         (unsigned long)s_ctx.spurious_grants, (unsigned long)s_ctx.dwell_max_us
+    );
+}
+
+// Bead pico-link-auh, section 1: see a2dp.h's doc comment on this
+// function. seq is this function's own monotonic counter -- it exists
+// purely as the missed-publish detector (A2 in Ada's design comment's
+// acceptance criteria): a hardware capture with a gap in seq means a
+// publish cycle was skipped, not that the console dropped a line (this
+// slot cannot be dropped by pl_log_ring.c -- see pl_prio.h).
+void pl_a2dp_publish_counters(void) {
+    static uint32_t s_seq;
+    s_seq++;
+    pl_prio_publish(
+        0,
+        "ctr s=%010lu u=%010lu t=%010lu e=%010lu p=%010lu d=%010lu c=%010lu o=%010lu",
+        (unsigned long)s_seq,
+        (unsigned long)(time_us_64() / 1000),
+        (unsigned long)s_ctx.tick_count,
+        (unsigned long)s_ctx.enc_frames_total,
+        (unsigned long)s_ctx.pkt_sent,
+        (unsigned long)s_ctx.stop_dwell,
+        (unsigned long)s_ctx.stop_credit,
+        (unsigned long)pl_pcm_overrun_frames() // NOT a s_ctx field -- see pl_a2dp_report's ovr_frames= line above
     );
 }

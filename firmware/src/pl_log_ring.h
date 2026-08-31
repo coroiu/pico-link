@@ -69,7 +69,26 @@ void pl_log_ring_init(void);
 // that's safe. Drops the whole message (counted, see
 // pl_log_ring_bytes_dropped) if it would not fit rather than write a
 // partial line.
+//
+// Bead pico-link-auh: now a thin wrapper over pl_log_ring_push_attr()
+// passing pc=0 -- see that function's doc. Kept so the panic-recorder path
+// and any other direct caller that has no meaningful return address to
+// attribute stay untouched.
 void pl_log_ring_push(const char *data, uint32_t len);
+
+// Same as pl_log_ring_push(), plus attributes the push (or, on the two
+// drop paths, the drop) to `pc` in a 32-entry open-addressed table updated
+// inside the SAME save_and_disable_interrupts() critical section this
+// function already needs for the ring itself -- no new critical section
+// (bead pico-link-auh, section 2a). `pc` is expected to be a caller's
+// return address (uintptr_t truncated to 32 bits), as captured by
+// pl_log()/pl_log_locked() via __builtin_return_address(0); pass 0 for
+// "no attribution" (that's what pl_log_ring_push() does).
+//
+// Do NOT call this from anywhere new -- attribution exists to settle the
+// producer-identity question (this bead's section 2a), not as a general
+// logging API. pl_log()/pl_log_locked() are its only callers.
+void pl_log_ring_push_attr(const char *data, uint32_t len, uint32_t pc);
 
 // Drains whatever is currently queued directly to the CDC endpoint
 // (tud_cdc_write()/tud_cdc_write_flush()) -- NOT stdio/fwrite any more, see
