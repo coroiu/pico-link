@@ -357,7 +357,38 @@ void pl_usb_audio_task(void) {
 #define PL_FB_NOMINAL_Q16 (48u << 16)
 #define PL_FB_MAX_PPM 500
 
+// Bead pico-link-nxf: PROPORTIONAL GAIN, previously conflated with the
+// output clamp. It was PL_FB_MAX_PPM, which made the two impossible to
+// tune independently -- they are different quantities that happened to
+// share a number.
+#define PL_FB_KP_PPM 500
+
+// Integral scale: s_fb_i_accum sums -err_bytes once per ~1ms tick, and
+// this divides it down to ppm. At a steady 222ppm crystal offset the loop
+// converges in roughly 11s from a cold start, which is slow enough not to
+// fight the EMA (~64ms) or the ~11ms media-timer sawtooth, and fast
+// enough that a listener never reaches the dry-ring regime.
+#define PL_FB_KI_DIV 100000
+
+// Anti-windup bound on the integral term alone, in the accumulator's own
+// units, so the I contribution can never exceed the total output clamp.
+#define PL_FB_I_ACCUM_MAX ((int32_t)PL_FB_MAX_PPM * PL_FB_KI_DIV)
+
 static int32_t s_fb_fill_ema;
+// Bead pico-link-nxf: the integral term. WHY IT IS REQUIRED, not a
+// refinement: a pure P controller parks at whatever error produces the
+// correction it needs, so it CANNOT null a constant offset. The RP2350
+// and the host crystal differ by a fixed ~200-270ppm, and with
+// ppm = -(err * 500) / 4608 commanding +222ppm demands err = -2046, i.e.
+// the ring settles ~2050 bytes BELOW target and stays there by design.
+// Measured on hardware over 94s (.research/captures/2026-08-31-ldac-dwell-fix/
+// residual.log): fill_ema fell 5664 -> 1764 against a 4608 setpoint,
+// fill_min reached 740 bytes (3.9ms of audio, less than one tick's drain),
+// stop_ring_empty went 0 -> 7 and credit_clamp_events climbed by 113.
+// That dry-ring regime is the residual crackle Andreas reported after the
+// dwell-cap fix. The integral term drives the steady-state error to zero
+// so the ring sits AT target instead of parked below it.
+static int32_t s_fb_i_accum;
 // Bead pico-link-pbv (C6): running minimum of the raw (non-EMA'd) fill
 // level, sampled at this function's own ~1ms cadence -- the finest-grained
 // sampling of pl_pcm_fill_bytes() anywhere in this firmware, so the true
@@ -373,7 +404,20 @@ void pl_usb_audio_feedback_task(void) {
     }
     s_fb_fill_ema += ((int32_t)fill_now - s_fb_fill_ema) >> 6;
     int32_t err_bytes = s_fb_fill_ema - (int32_t)PL_PCM_TARGET_FILL_BYTES;
-    int32_t ppm = -(err_bytes * PL_FB_MAX_PPM) / (int32_t)PL_PCM_TARGET_FILL_BYTES;
+    int32_t p_ppm = -(err_bytes * PL_FB_KP_PPM) / (int32_t)PL_PCM_TARGET_FILL_BYTES;
+
+    // Integrate, then clamp the accumulator itself (not just the output) --
+    // clamping only the output is the classic windup bug: the accumulator
+    // keeps growing while saturated and then has to unwind before the loop
+    // responds at all.
+    s_fb_i_accum -= err_bytes;
+    if (s_fb_i_accum > PL_FB_I_ACCUM_MAX) {
+        s_fb_i_accum = PL_FB_I_ACCUM_MAX;
+    }
+    if (s_fb_i_accum < -PL_FB_I_ACCUM_MAX) {
+        s_fb_i_accum = -PL_FB_I_ACCUM_MAX;
+    }
+    int32_t ppm = p_ppm + (s_fb_i_accum / PL_FB_KI_DIV);
     if (ppm > PL_FB_MAX_PPM) {
         ppm = PL_FB_MAX_PPM;
     }
@@ -418,6 +462,11 @@ uint32_t pl_usb_audio_fill_min(void) {
 void pl_usb_audio_fb_reset(void) {
     s_fb_fill_ema = (int32_t)pl_pcm_fill_bytes();
     s_fill_min = 0xFFFFFFFFu;
+    // Bead pico-link-nxf: the integral term MUST be cleared here too.
+    // Carrying an old stream's accumulated correction into a fresh one
+    // starts the loop mid-windup against a ring that was just re-primed,
+    // which is exactly the transient this reset exists to prevent.
+    s_fb_i_accum = 0;
 }
 
 bool pl_usb_audio_streaming(void) {
