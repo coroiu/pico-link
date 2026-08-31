@@ -20,6 +20,9 @@ Wire protocol (one command per line, LF-terminated):
   NAV JUMP <signed-int>
   CONNECT <addr>   -- bead pico-link-g48: bypasses GAP inquiry and connects
                        straight to a known BD_ADDR. See --connect below.
+  DISCONNECT       -- bead pico-link-nb6: tears down the current A2DP
+                       connection, if any. No address (there is only ever
+                       one). See --disconnect below.
   BOOTSEL          -- bead pico-link-vu4: reboots the board straight into
                        the USB mass-storage bootloader (reset_usb_boot),
                        so a flash-verify loop no longer needs a human
@@ -199,6 +202,16 @@ def main():
         ),
     )
     ap.add_argument(
+        "--disconnect",
+        action="store_true",
+        help=(
+            "bead pico-link-nb6: tear down the current A2DP connection, if any -- "
+            "no address needed (there is only ever one). Lets unattended hardware "
+            "testing re-establish a fresh STREAM_ESTABLISHED without a human "
+            "power-cycling the headset. Sent after --connect, before --bootsel."
+        ),
+    )
+    ap.add_argument(
         "--bootsel",
         action="store_true",
         help=(
@@ -251,6 +264,8 @@ def main():
             lines.append(raw.strip())
         if args.connect is not None:
             lines.append(to_connect_line(args.connect))
+        if args.disconnect:
+            lines.append("DISCONNECT")
         if args.bootsel:
             # Sent last and unconditionally last of all -- reset_usb_boot()
             # on the firmware side is noreturn, so anything queued after it
@@ -263,7 +278,7 @@ def main():
     if not lines:
         print(
             "No commands given -- nothing to send. Pass e.g. UP DOWN SELECT, --raw 'NAV JUMP -3', "
-            "--connect AABBCCDDEEFF, or --bootsel.",
+            "--connect AABBCCDDEEFF, --disconnect, or --bootsel.",
             file=sys.stderr,
         )
         sys.exit(2)

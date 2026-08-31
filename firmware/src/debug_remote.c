@@ -188,6 +188,13 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                     // main-loop poll.
                     pl_log("debug-remote: CONNECT %s -> dispatched\r\n", s_line + 8);
                     pl_bt_debug_connect(connect_addr);
+                } else if (strcmp(s_line, "DISCONNECT") == 0) {
+                    // Bead pico-link-nb6: mirrors the CONNECT branch above --
+                    // no discovered DeviceEntry involved, so this bypasses
+                    // out/pl_ui_input and dispatches straight to bt.c.
+                    // No address needed (there is only ever one connection).
+                    pl_log("debug-remote: DISCONNECT -> dispatched\r\n");
+                    pl_bt_debug_disconnect();
                 } else if (emitted < max) {
                     PlIntent intent;
                     if (parse_line(s_line, &intent)) {

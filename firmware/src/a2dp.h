@@ -45,6 +45,19 @@ void pl_a2dp_init(struct PlUi *ui);
 // stdin_process command handler in thread context call it directly).
 void pl_a2dp_connect(const uint8_t *addr);
 
+// Tears down the current A2DP source connection, if any -- wraps
+// a2dp_source_disconnect(s_ctx.a2dp_cid). No-ops (logs only) when
+// a2dp_cid is 0, i.e. there is no active connection to tear down. Debug-only
+// entry point (bead pico-link-nb6): called from bt.c's
+// PL_BT_PENDING_DISCONNECT case in pl_bt_pending_service, IRQ context --
+// a2dp_source_disconnect() is safe to call there, matching every other
+// a2dp_source_* call already made from that same deferred-queue consumer's
+// context class (see pl_a2dp_connect's doc comment on thread-context calls;
+// this one runs on the IRQ side of the same queue instead). Not reachable
+// from the product-facing FFI yet -- that is pico-link-44w, deliberately out
+// of scope here.
+void pl_a2dp_disconnect(void);
+
 // Once-per-second instrumentation snapshot -- design sec 7's
 // "a2dp: codec=... bitrate=... fill=... ovr_frames=... und=... enc_max_us=...
 // pkt_sent=... pkt_fail=... misaligned=..." report line. Call from the
