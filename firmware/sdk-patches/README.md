@@ -73,6 +73,37 @@ interrupt storm.
 Verified in the linked binary: no `bl panic` remains in the function; the
 counter increment and `return false` are compiled in at `0x20001078`.
 
+## 03-tinyusb-usbd-sof-isr-sample.patch
+
+`usbd.c:1194`, `dcd_event_handler()`'s `DCD_EVENT_SOF` case. This case runs in
+**true ISR context** -- the comment right above it says so -- but the app-level
+hook TinyUSB offers there, `tud_sof_cb()`, is NOT actually reached from ISR
+context in this build. The case only calls it by re-queuing a `DCD_EVENT_SOF`
+event (gated on the `SOF_CONSUMER_USER` bit, set via `tud_sof_cb_enable(true)`
+in `usb_pump.c`'s `tud_mount_cb()`), and that queued event is drained later by
+`tud_task()` -- on this firmware, from inside `pl_usb_pump_worker_irq`'s 0xC0
+IRQ (`usb_pump.c`), up to ~1ms after the real start of frame, at a phase set
+by our own 1ms timer rather than by the bus.
+
+Bead pico-link-2ap's ISO-OUT AVAIL-bit discriminator (`usb-sof-2ap:` in the
+report) was originally sampled from that worker-dispatched `tud_sof_cb()` --
+which is why its `hw_unavail` reading collapsed from ~99.9% in health to
+near-zero in collapse: the *sample point* moved relative to packet arrival,
+not the endpoint's actual readiness. That made the `miss_avail` vs
+`miss_unavail` split a phase artifact, not a host-vs-us discriminator, until
+this patch (bead pico-link-wbq) fixed it.
+
+This patch calls `pl_usb_sof_isr_sample()` (`firmware/src/usb_pump.c`)
+directly from inside the `DCD_EVENT_SOF` case, before the re-queue -- i.e. at
+the exact instant the host is entitled to start a transaction for the new
+frame, not at whatever phase the worker's own timer happens to be at.
+`usb_pump.c`'s `tud_mount_cb()` (unchanged by this bead) is still what keeps
+`SOF_CONSUMER_USER` set and therefore the raw SOF hardware interrupt enabled
+at all -- without it `DCD_EVENT_SOF` never fires and this patch's call site
+is never reached, regardless of the patch itself being applied.
+
+Beads: pico-link-wbq (E2, fix 1), rides with pico-link-2ap.
+
 ## Deliberately NOT patched: dcd_rp2040.c:333 `panic("Unhandled IRQ")`
 
 Assessed 2026-08-30 and left FATAL on purpose. `if (status ^ handled) panic(...)`

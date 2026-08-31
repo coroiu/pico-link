@@ -37,6 +37,29 @@ if(_pl_patch_pos EQUAL -1)
 endif()
 endforeach()
 message(STATUS "pico-link: vendored SDK patches 01+02 (rp2040_usb.c) are applied")
+
+# Bead pico-link-wbq: patch 03 (usbd.c) -- samples the ISO-OUT AVAIL bit in
+# true ISR context instead of the worker-dispatched tud_sof_cb, which
+# measured AVAIL at the wrong phase (see firmware/sdk-patches/README.md).
+# Missing this patch does not crash the build or the board -- it silently
+# reverts pico-link-2ap's hw_unavail discriminator to the mis-phased
+# reading, which is exactly the ambiguity this bead exists to remove, so it
+# is still a FATAL_ERROR rather than a warning.
+set(_pl_usbd "${PICO_SDK_PATH}/lib/tinyusb/src/device/usbd.c")
+if(NOT EXISTS "${_pl_usbd}")
+    message(FATAL_ERROR "Cannot find ${_pl_usbd} -- is PICO_SDK_PATH right?")
+endif()
+file(READ "${_pl_usbd}" _pl_usbd_src)
+string(FIND "${_pl_usbd_src}" "pl_usb_sof_isr_sample" _pl_patch3_pos)
+if(_pl_patch3_pos EQUAL -1)
+    message(FATAL_ERROR
+        "pico-sdk is MISSING a vendored patch (marker pl_usb_sof_isr_sample).\n"
+        "  Run:  tools/apply-sdk-patches.sh\n"
+        "Without it, the pico-link-2ap ISO-OUT discriminator is sampled from\n"
+        "worker context (wrong phase), not true SOF ISR context.\n"
+        "See firmware/sdk-patches/README.md.")
+endif()
+message(STATUS "pico-link: vendored SDK patch 03 (usbd.c) is applied")
 # ---------------------------------------------------------------------------
 
 # Bead pico-link-cd3: debug-only NavIntent injection over the CDC console,

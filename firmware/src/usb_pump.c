@@ -5,7 +5,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-#include "device/usbd_pvt.h" // usbd_edpt_busy -- bead pico-link-okx D8/D9/D13
+#include "device/usbd_pvt.h" // usbd_edpt_busy -- bead pico-link-okx D9/D13
 #include "hardware/irq.h"
 #include "hardware/structs/usb.h" // bead pico-link-2ap: raw ISO-OUT buffer-control AVAIL bit at SOF
 #include "pico/mutex.h"
@@ -49,56 +49,35 @@ static uint64_t s_last_worker_us;
 // PL_USB_PUMP_IRQ_PRIORITY. ---
 static volatile uint32_t s_pump_ticks_run; // D1: mutex_try_enter succeeded, tud_task() ran
 static volatile uint32_t s_pump_ticks_skipped; // D2: mutex_try_enter failed, tick skipped entirely
-static volatile uint32_t s_ep_out_idle_ticks; // D8: usbd_edpt_busy(EP1 OUT) read false this tick -- endpoint was NOT armed
 static volatile uint32_t s_ep_out_state_flipped_in_task; // D13: usbd_edpt_busy(EP1 OUT) differed before vs after tud_task()
 
-// D12 (lead instrument, Ada's design addendum 2026-08-29): SOF-to-worker-
-// tick phase histogram. HOOK SUBSTITUTION FROM THE DESIGN AS WRITTEN, see
-// this file's tud_sof_cb override below for why: the design named
-// tud_audio_feedback_interval_isr (usb_audio.c) as "already ISR context,
-// already exists", but that function is UNREACHABLE in this build --
-// audiod_sof_isr only calls it for AUDIO_FEEDBACK_METHOD_FREQUENCY_* (see
-// pico-sdk 2.1.1 audio_device.c:2016-2025), this build uses
-// AUDIO_FEEDBACK_METHOD_DISABLED (usb_audio.c's
-// tud_audio_feedback_params_cb), and with no OTHER SOF consumer registered
-// either, usbd_sof_enable() ends up calling dcd_sof_enable(rhport, false),
-// which clears USB_INTS_DEV_SOF_BITS outright (dcd_rp2040.c:446-459) -- the
-// RP2350's SOF hardware interrupt is disabled entirely, so neither
-// audiod_sof_isr nor tud_audio_feedback_interval_isr would ever run.
-// Verified by reading pico-sdk 2.1.1's usbd.c/audio_device.c/dcd_rp2040.c
-// directly, not assumed. tud_sof_cb (also TU_ATTR_WEAK, also "already
-// exists", enabled via the public tud_sof_cb_enable(true) in main.c) is the
-// nearest equivalent that this build can actually reach: same phase
-// question (SOF arrival time vs worker tick time), same "no TinyUSB patch"
-// property, at the cost of turning the SOF hardware interrupt ON for the
-// duration of this measurement (it is normally off in this build) and one
-// extra queued-event hop (DCD_EVENT_SOF -> queue_event -> drained at the
-// top of the next tud_task() call, i.e. still inside this same worker,
-// typically within one tick).
-//
-// UNRESOLVED as of this bead's first hardware run (2026-08-29): sof_isr
-// read 0 for the entire ~19s capture (16000+ worker ticks, streaming never
-// started) despite this hook and tud_sof_cb_enable(true) both being
-// present and linked (confirmed via nm -- tud_sof_cb is a strong symbol,
-// not the weak default). The dispatch chain was re-verified by reading
-// dcd_rp2040.c/usbd.c directly (dcd_rp2040_irq's SOF handling, the raw ISR
-// dispatch loop, usbd_task()'s queue drain) and looks structurally sound;
-// no root cause identified yet. Do not assume this hook is proven working
-// -- check sof_isr on the NEXT hardware run before trusting sof_phase_hist
-// at all. A one-off register-level diagnostic (usb_hw->inte/ints/sie_ctrl)
-// was tried and pulled back out of this commit (see the bead's comments)
-// without a conclusive answer; the board went silent after that flash for
-// unrelated-looking reasons before the diagnostic read anything useful.
-static volatile uint64_t s_last_sof_us;
-static volatile uint32_t s_sof_isr_count; // D4: real SOF ISR count (fb_sends' original, dead-on-this-build intent)
-#define PL_SOF_PHASE_BUCKETS 8u
-static volatile uint32_t s_sof_phase_hist[PL_SOF_PHASE_BUCKETS];
+// Bead pico-link-wbq: D8 (s_ep_out_idle_ticks) and D12's sof_phase_hist/
+// hist2 (the SOF-to-worker-tick phase histograms) were DELETED here, not
+// merely trimmed from the report -- both were structurally dead
+// instruments, not just noisy ones:
+//   * D8 (usbd_edpt_busy(EP1 OUT) read false this tick) read 0 at every one
+//     of >700,000 SOFs in every state, in both health and collapse, because
+//     usbd's busy flag stays true from queue until tud_task() processes the
+//     completion -- it can never observe "idle" at the sampling point this
+//     worker used.
+//   * sof_phase_hist/hist2 measured the gap between s_last_sof_us and the
+//     worker's own invocation time, but s_last_sof_us was written from
+//     INSIDE this same worker (via tud_sof_cb, dispatched from the tud_task
+//     queue drain -- see pl_usb_sof_isr_sample's doc comment below for the
+//     dispatch chain this superseded). So the "phase" it measured was the
+//     1ms timer's own period, not anything about the USB bus. The 99% in
+//     bucket 7 the pre-wbq soak reported was that artifact, not a bus
+//     measurement -- do not cite either histogram again.
+// See pico-link-2ap's design-of-record comment (Ada, 2026-08-31, sections 4
+// and 7-E2) for the full reasoning.
+static volatile uint32_t s_sof_isr_count; // D4: real SOF ISR count, now sampled in true ISR context (see below)
 
 // --- Bead pico-link-2ap: THE discriminator between "the host is sending
 // fewer ISO-OUT packets" and "we are failing to ingest what it sends".
-// Sampled inside tud_sof_cb (the USB controller's own SOF interrupt), i.e.
-// at the exact instant the host is entitled to start a transaction for the
-// new frame. Plain volatile increments only, ISR-safe.
+// Sampled inside pl_usb_sof_isr_sample (see below), called from the
+// vendored usbd.c patch in TRUE ISR context -- bead pico-link-wbq moved
+// this off the worker-dispatched tud_sof_cb it originally used. Plain
+// volatile increments only, ISR-safe.
 //
 // The instrument is the RAW hardware buffer-control AVAIL bit for EP1 OUT,
 // NOT usbd_edpt_busy(): usbd's busy flag stays true from the moment a
@@ -116,25 +95,11 @@ static volatile uint32_t s_sof_phase_hist[PL_SOF_PHASE_BUCKETS];
 // Whichever of those two tracks (sof_streaming - packets) is the answer.
 static volatile uint32_t s_sof_streaming;      // denominator: SOF interrupts while alt 1 is selected
 static volatile uint32_t s_sof_hw_unavail;     // AVAIL bit clear at SOF (endpoint could not accept this frame)
-static volatile uint32_t s_sof_sw_idle;        // usbd_edpt_busy() false at SOF -- kept only to show how it diverges from the hardware bit
 static volatile uint32_t s_sof_got;            // packet_count advanced since the previous SOF
 static volatile uint32_t s_sof_miss_avail;     // no arrival AND AVAIL set   -> host sent nothing
 static volatile uint32_t s_sof_miss_unavail;   // no arrival AND AVAIL clear -> we were not ready
 static volatile uint32_t s_sof_last_pkt_count; // packet_count as of the previous SOF
 
-// Bead pico-link-2ap: the existing 8x128us sof_phase_hist DISCARDS every
-// sample with phase >= 1000us (see the worker below), and in the 2026-08-31
-// soak that was 11 percent of ticks even in healthy stretches -- so its
-// "100 percent in bucket 7" reading is not trustworthy. This one is 16
-// buckets of 128us spanning 0..2048us and drops nothing below 2048us.
-#define PL_SOF_PHASE2_BUCKETS 16
-static volatile uint32_t s_sof_phase2_hist[PL_SOF_PHASE2_BUCKETS];
-static volatile uint32_t s_sof_phase2_over; // phase >= 2048us
-
-// TU_ATTR_WEAK override -- fires once per SOF event, dispatched from inside
-// tud_task() (usbd.c's event-queue drain), i.e. from within this file's
-// worker. See s_last_sof_us's doc comment above for why this hook was
-// chosen over the one the design named.
 // Bead pico-link-06m: incremented from INSIDE the patched pico-sdk TinyUSB
 // (rp2040_usb.c, _hw_endpoint_buffer_control_update32) where stock TinyUSB
 // instead calls panic("ep %02X was already available") -- an endpoint buffer
@@ -156,20 +121,38 @@ volatile unsigned int pl_ep_double_arm_count[32];
 // pl_ep_double_arm_count so the two sites are distinguishable in one report.
 volatile unsigned int pl_ep_inactive_xfer_count[32];
 
-void tud_sof_cb(uint32_t frame_count) {
+// Bead pico-link-wbq (E2, fix 1): called from the vendored usbd.c patch
+// (firmware/sdk-patches/03-tinyusb-usbd-sof-isr-sample.patch), from INSIDE
+// dcd_event_handler's DCD_EVENT_SOF case, in TRUE ISR context, BEFORE that
+// function re-queues the event for tud_task() -- see
+// firmware/sdk-patches/README.md for exactly why that placement matters.
+//
+// This replaces the previous approach of sampling from a TU_ATTR_WEAK
+// tud_sof_cb() override: that hook is NOT an ISR hook in this build.
+// usbd.c's DCD_EVENT_SOF case runs in ISR context but only calls tud_sof_cb
+// after RE-QUEUING the event; usbd.c's tud_task() then dispatches it from
+// its event-queue drain, which on this firmware runs inside
+// pl_usb_pump_worker_irq (this file, below) -- i.e. up to ~1ms after the
+// real start of frame, at a phase set by OUR OWN 1ms timer rather than by
+// the bus. Reading usb_dpram->ep_buf_ctrl from there measured AVAIL at
+// worker time, not AVAIL at SOF -- which is why hw_unavail read ~99.9% of
+// samples in health and near-zero in collapse in the pre-wbq soak: the
+// sample point moved relative to packet arrival, not the endpoint's actual
+// readiness. Sampling directly in dcd_event_handler removes that phase
+// error entirely.
+//
+// See the counter block above for how to read sof_streaming/got/
+// miss_avail/miss_unavail/hw_unavail -- unchanged from before this bead;
+// only the point in time they are sampled at has moved.
+void pl_usb_sof_isr_sample(uint32_t frame_count) {
     (void)frame_count;
-    s_last_sof_us = time_us_64();
     s_sof_isr_count++;
 
-    // Bead pico-link-2ap -- see the counter block above for the reading.
     if (pl_usb_audio_streaming()) {
         s_sof_streaming++;
         bool hw_avail = (usb_dpram->ep_buf_ctrl[PL_EP_AUDIO_OUT & 0x0fu].out & USB_BUF_CTRL_AVAIL) != 0u;
         if (!hw_avail) {
             s_sof_hw_unavail++;
-        }
-        if (!usbd_edpt_busy(0, PL_EP_AUDIO_OUT)) {
-            s_sof_sw_idle++;
         }
         uint32_t pc = pl_usb_audio_packet_count();
         if (pc != s_sof_last_pkt_count) {
@@ -209,6 +192,13 @@ void tud_sof_cb(uint32_t frame_count) {
 // culminates in a fresh SET_CONFIGURATION and therefore a fresh
 // tud_mount_cb() call, which re-arms it. So mounting alone is sufficient;
 // no separate tud_umount_cb/tud_resume_cb override is needed.
+//
+// Bead pico-link-wbq: STILL REQUIRED after moving the actual sampling to
+// pl_usb_sof_isr_sample (called from the vendored usbd.c patch, not from a
+// tud_sof_cb override any more) -- this is what keeps SOF_CONSUMER_USER
+// set, which is what keeps the RP2350's raw SOF hardware interrupt enabled
+// at all (dcd_sof_enable). Without it, DCD_EVENT_SOF never fires and
+// pl_usb_sof_isr_sample never runs, regardless of the usbd.c patch.
 void tud_mount_cb(void) {
     tud_sof_cb_enable(true);
 }
@@ -232,25 +222,6 @@ static void pl_usb_pump_worker_irq(void) {
     // skips tud_task() still proves the IRQ path alive.
     pl_wdt_kick(PL_WDT_USB_TIMER);
 
-    // D12: phase between the most recent SOF timestamp and THIS worker
-    // invocation, computed before mutex_try_enter/tud_task() below ("worker
-    // top", matching the design's placement) so a skipped tick still gets a
-    // sample. s_last_sof_us == 0 means no SOF has ever been observed yet
-    // (tud_sof_cb never fired) -- skip rather than bucket a huge bogus
-    // phase.
-    if (s_last_sof_us != 0) {
-        uint32_t ph = (uint32_t)(now_us - s_last_sof_us);
-        if (ph < 1000) {
-            s_sof_phase_hist[ph >> 7]++;
-        }
-        // Bead pico-link-2ap: same sample, no >=1000us blind spot.
-        if (ph < 2048) {
-            s_sof_phase2_hist[ph >> 7]++;
-        } else {
-            s_sof_phase2_over++;
-        }
-    }
-
     // tud_task() is not reentrant -- this guard now exists purely for that
     // property in the abstract (bead pico-link-okx F1 removed pl_log's own
     // contention on pl_usb_mutex, so this is expected to never fail again
@@ -270,11 +241,13 @@ static void pl_usb_pump_worker_irq(void) {
     if (busy_before != busy_after) {
         s_ep_out_state_flipped_in_task++;
     }
-    // D8: was the ISO OUT endpoint NOT armed at all when the worker looked?
-    // In a healthy stream this should be true almost every tick.
-    if (!busy_after) {
-        s_ep_out_idle_ticks++;
-    }
+    // Bead pico-link-wbq: the D8 "was the endpoint idle" check that used to
+    // live here (s_ep_out_idle_ticks) was DELETED, not trimmed from the
+    // report -- usbd_edpt_busy() stays true from queue until tud_task()
+    // processes the completion, so it read 0 at every one of >700,000 SOFs
+    // in every state. See the doc comment above pl_usb_sof_isr_sample for
+    // the full reasoning (shared with the phase histograms it was deleted
+    // alongside).
 
     // Bead pico-link-ufh: proves tud_task() is actually being reached, not
     // just that the timer/IRQ plumbing is alive.
@@ -407,167 +380,80 @@ void pl_log_locked(const char *fmt, ...) {
     pl_log_ring_push(scratch, len);
 }
 
+// Bead pico-link-wbq (E2, fix 2): the report set was cut from 11 pl_log()
+// lines to 6. The pre-wbq 719s capture showed backlog_hwm=4095 (the ring's
+// full 4096-byte capacity) and log_drops=41355 -- the console was
+// saturated and competing with the 35ms display frames for the same bus,
+// i.e. the instrument was loading the thing it measures. Everything below
+// that isn't one of these six lines was DROPPED from the periodic report,
+// not deleted outright -- the underlying counters (avail high-water,
+// worst_interval_us, the double-arm/inactive-xfer totals, the
+// usb-audio-ctl/usb-audio-fix clock diagnostics, the logring push-hold
+// stats) still update; they answer questions from other beads (tfj, okx,
+// icb, 06m) and can be temporarily re-added to a report line if one of
+// those questions comes up again. What is gone for good (not just
+// unprinted) is covered above pl_usb_sof_isr_sample and at the
+// s_ep_out_state_flipped_in_task block: the two structurally dead
+// instruments, D8 and the phase histograms.
+//
+// See pico-link-2ap's design-of-record comment (Ada, 2026-08-31) sections
+// 7-E2 and 9.1 for the rationale.
 void pl_usb_pump_report(uint32_t report_dt_us) {
     pl_log(
-        "usb-pump: packets=%lu avail_hwm=%u/784 avail_ge_576=%lu worst_interval_us=%lu ring_drops=%lu "
-        "log_drops=%lu misaligned=%lu report_dt_us=%lu\r\n",
+        "usb-pump: packets=%lu log_drops=%lu report_dt_us=%lu\r\n",
         (unsigned long)pl_usb_audio_packet_count(),
-        (unsigned)s_avail_high_water,
-        (unsigned long)s_avail_ge_576,
-        (unsigned long)s_worst_interval_us,
-        (unsigned long)pl_pcm_overrun_frames(),
         (unsigned long)pl_log_ring_bytes_dropped(),
-        (unsigned long)pl_pcm_misaligned(),
         (unsigned long)report_dt_us
     );
-    // D6: avail_hwm/avail_ge_576 above are WINDOWED -- reset now that this
-    // report has read them, same convention as usb_audio.c's
-    // pl_usb_audio_fill_min windowed minimum.
+    // D6 (avail_hwm/avail_ge_576) was WINDOWED and is no longer printed, but
+    // is still reset here so it doesn't silently accumulate stale state if
+    // a future report line starts reading it again.
     s_avail_high_water = 0;
     s_avail_ge_576 = 0;
-    // Bead pico-link-okx D1/D2/D8/D13: the arm/complete-race discriminator
-    // counters. pump_ticks_run + pump_ticks_skipped should sum to
-    // ~report_dt_us/1000 (one tick/ms). ep_out_idle_ticks/s is D8, the
-    // instrument this bead's design calls out as the lead corroborator for
-    // sof_phase_hist below. ep_out_state_flipped_in_task is D13, a
-    // near-miss counter that does not require a crash to be informative.
+
+    // pump_ticks_run + pump_ticks_skipped (not printed) should sum to
+    // ~report_dt_us/1000 (one tick/ms). sof_isr is now sampled in true ISR
+    // context -- see pl_usb_sof_isr_sample's doc comment.
     pl_log(
-        "usb-pump-race: pump_ticks_run=%lu pump_ticks_skipped=%lu ep_out_idle_ticks=%lu "
-        "ep_out_state_flipped_in_task=%lu sof_isr=%lu\r\n",
+        "usb-pump-race: pump_ticks_run=%lu sof_isr=%lu\r\n",
         (unsigned long)s_pump_ticks_run,
-        (unsigned long)s_pump_ticks_skipped,
-        (unsigned long)s_ep_out_idle_ticks,
-        (unsigned long)s_ep_out_state_flipped_in_task,
         (unsigned long)s_sof_isr_count
     );
 
-    // Bead pico-link-06m: the arm/complete race made visible. Stock TinyUSB
-    // panics here and hard-locks the board from an IRQ path; the vendored SDK
-    // patch counts instead. A nonzero total means the race is REAL on this
-    // hardware; whether it is BENIGN is a separate question, answered by
-    // whether ingestion (usb-pump packets= / usb_audio measured=) degrades in
-    // step with it. Lifetime totals, not windowed -- the event is expected to
-    // be rare and clustered around alt-set/teardown, so a windowed counter
-    // would read 0 for most reports and hide the clustering.
-    {
-        unsigned long da_total = 0;
-        for (unsigned i = 0; i < 32; i++) {
-            da_total += (unsigned long)pl_ep_double_arm_count[i];
-        }
-        pl_log(
-            "usb-pump-dblarm: total=%lu ep0out=%lu ep0in=%lu audio_out=%lu\r\n",
-            da_total,
-            (unsigned long)pl_ep_double_arm_count[0],
-            (unsigned long)pl_ep_double_arm_count[1],
-            (unsigned long)pl_ep_double_arm_count[(PL_EP_AUDIO_OUT & 0x0fu) << 1]
-        );
-        unsigned long inact_total = 0;
-        for (unsigned i = 0; i < 32; i++) {
-            inact_total += (unsigned long)pl_ep_inactive_xfer_count[i];
-        }
-        pl_log(
-            "usb-pump-inactxfer: total=%lu ep0out=%lu ep0in=%lu audio_out=%lu\r\n",
-            inact_total,
-            (unsigned long)pl_ep_inactive_xfer_count[0],
-            (unsigned long)pl_ep_inactive_xfer_count[1],
-            (unsigned long)pl_ep_inactive_xfer_count[(PL_EP_AUDIO_OUT & 0x0fu) << 1]
-        );
-    }
-    // D12, the lead instrument (Ada's design addendum 2026-08-29): the SOF-
-    // to-worker-tick phase histogram, 8 buckets of 128us each spanning the
-    // full ~1ms SOF period. ROTATING bucket occupancy across successive
-    // report lines is the free-running-timer-vs-SOF beat this bead's
-    // leading hypothesis predicts; a STATIC bucket says the beat is not
-    // happening (or F4, not built this round, would already be needed).
-    // Cumulative, never reset -- deltas between report lines are what a
-    // reader should look at when checking for rotation.
+    // Bead pico-link-2ap: THE host-vs-ingest discriminator this bead exists
+    // to fix the sampling point of. sof_streaming is the denominator;
+    // got + miss_avail + miss_unavail == sof_streaming. hw_unavail is now
+    // sampled in true ISR context (fix 1) -- its distribution is expected
+    // to differ materially from the pre-wbq worker-context reading.
     pl_log(
-        "usb-pump-phase: sof_phase_hist=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
-        (unsigned long)s_sof_phase_hist[0], (unsigned long)s_sof_phase_hist[1], (unsigned long)s_sof_phase_hist[2],
-        (unsigned long)s_sof_phase_hist[3], (unsigned long)s_sof_phase_hist[4], (unsigned long)s_sof_phase_hist[5],
-        (unsigned long)s_sof_phase_hist[6], (unsigned long)s_sof_phase_hist[7]
-    );
-    // Bead pico-link-2ap: the host-vs-ingest discriminator. sof_streaming is
-    // the denominator; got + miss_avail + miss_unavail == sof_streaming.
-    pl_log(
-        "usb-sof-2ap: sof_streaming=%lu got=%lu miss_avail=%lu miss_unavail=%lu hw_unavail=%lu sw_idle=%lu\r\n",
+        "usb-sof-2ap: sof_streaming=%lu got=%lu miss_avail=%lu miss_unavail=%lu hw_unavail=%lu\r\n",
         (unsigned long)s_sof_streaming, (unsigned long)s_sof_got,
         (unsigned long)s_sof_miss_avail, (unsigned long)s_sof_miss_unavail,
-        (unsigned long)s_sof_hw_unavail, (unsigned long)s_sof_sw_idle
+        (unsigned long)s_sof_hw_unavail
     );
+
+    // Bead pico-link-pbv/pico-link-6vv (C2-8) acceptance criterion A6
+    // ("feedback alive"): fb_done climbing at ~1000/s while streaming.
     pl_log(
-        "usb-sof-2ap-phase: hist2=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu over=%lu\r\n",
-        (unsigned long)s_sof_phase2_hist[0], (unsigned long)s_sof_phase2_hist[1],
-        (unsigned long)s_sof_phase2_hist[2], (unsigned long)s_sof_phase2_hist[3],
-        (unsigned long)s_sof_phase2_hist[4], (unsigned long)s_sof_phase2_hist[5],
-        (unsigned long)s_sof_phase2_hist[6], (unsigned long)s_sof_phase2_hist[7],
-        (unsigned long)s_sof_phase2_hist[8], (unsigned long)s_sof_phase2_hist[9],
-        (unsigned long)s_sof_phase2_hist[10], (unsigned long)s_sof_phase2_hist[11],
-        (unsigned long)s_sof_phase2_hist[12], (unsigned long)s_sof_phase2_hist[13],
-        (unsigned long)s_sof_phase2_hist[14], (unsigned long)s_sof_phase2_hist[15],
-        (unsigned long)s_sof_phase2_over
-    );
-    // Bead pico-link-icb probe 2: is SET_INTERFACE or any audio
-    // control-entity request arriving at all? Answers the question
-    // before trusting packets=0 above as "never streamed".
-    pl_log(
-        "usb-audio-ctl: set_itf_calls=%lu last_itf=%u last_alt=%u fu_get=%lu fu_set=%lu streaming=%u\r\n",
-        (unsigned long)pl_usb_audio_set_itf_calls(),
-        (unsigned)pl_usb_audio_last_set_itf(),
-        (unsigned)pl_usb_audio_last_set_alt(),
-        (unsigned long)pl_usb_audio_fu_get_calls(),
-        (unsigned long)pl_usb_audio_fu_set_calls(),
-        (unsigned)pl_usb_audio_streaming()
-    );
-    // Bead pico-link-icb probe 3 (revision 2 of the fix): the primary pass
-    // criterion (set_itf_alt1_calls) plus the finer clock breakdown and the
-    // feedback-endpoint service count -- proves the fixed feedback endpoint
-    // is actually carrying traffic, not just that the alt setting opened.
-    // Bead pico-link-pbv/pico-link-6vv (C2-8): fb_done replaces fb_sends --
-    // see pl_usb_audio_fb_done's doc comment. Also the pbv acceptance
-    // criterion A6 ("feedback alive"): fb_done climbing at ~1000/s while
-    // streaming.
-    pl_log(
-        "usb-audio-fix: set_itf_alt1_calls=%lu clock_set_calls=%lu clk_get_freq_cur=%lu clk_get_freq_range=%lu clk_get_valid=%lu fb_done=%lu\r\n",
-        (unsigned long)pl_usb_audio_set_itf_alt1_calls(),
-        (unsigned long)pl_usb_audio_clock_set_calls(),
-        (unsigned long)pl_usb_audio_clk_get_freq_cur(),
-        (unsigned long)pl_usb_audio_clk_get_freq_range(),
-        (unsigned long)pl_usb_audio_clk_get_valid(),
+        "usb-audio-fix: fb_done=%lu\r\n",
         (unsigned long)pl_usb_audio_fb_done()
     );
-    // Bead pico-link-okx D7: rx_bytes_total/rx_short_packets, from
-    // usb_audio.c's tud_audio_rx_done_pre_read_cb -- rx_short_packets/s > 0
-    // with miss/s (sof_isr - packets, computed by the reader from the two
-    // lines above) ~ 0 is the decision table's "host genuinely sends less"
-    // branch; whole missing packets with rx_short_packets/s ~ 0 point the
-    // other way. D9: ep_out_busy_at_alt1_entry -- was the endpoint already
-    // marked busy the moment the streaming alt-setting was selected? Cheap
-    // corroborator for the alt-1-entry instance of the double-arm panic,
-    // never itself fatal.
+
+    // Bead pico-link-okx D7: rx_bytes_total/rx_short_packets -- distinguish
+    // "the host genuinely sends less" (rx_short_packets/s ~ 0, whole
+    // packets missing) from a partial-packet ingestion problem
+    // (rx_short_packets/s > 0).
     pl_log(
-        "usb-audio-okx: rx_bytes_total=%lu rx_short_packets=%lu ep_out_busy_at_alt1_entry=%lu\r\n",
-        (unsigned long)pl_usb_audio_rx_bytes_total(), (unsigned long)pl_usb_audio_rx_short_packets(),
-        (unsigned long)pl_usb_audio_ep_out_busy_at_alt1_entry()
+        "usb-audio-okx: rx_bytes_total=%lu rx_short_packets=%lu\r\n",
+        (unsigned long)pl_usb_audio_rx_bytes_total(), (unsigned long)pl_usb_audio_rx_short_packets()
     );
-    // D3, repointed (bead pico-link-okx): there is no pl_usb_mutex hold to
-    // measure any more (F1 removed it from the logging path entirely) --
-    // this is now the hold time of pl_log_ring's own interrupts-disabled
-    // push critical section, which replaced it. Expected to be a handful
-    // of microseconds always; if this ever climbs, the push itself (not
-    // I/O, which is now outside every producer's critical path) has become
-    // the hazard.
-    // Bead pico-link-okx (F2): drain_skips/backlog_hwm added -- "how much
-    // did the drain fall behind and how often did it get shut out of the
-    // lock" is now measured rather than inferred. drain_skips climbing in
-    // step with usb-pump-race's pump_ticks_skipped above would mean the
-    // console and the worker are contending on pl_usb_mutex more than
-    // expected (see this bead's risk note on pl_usb_lock_try's doc
-    // comment); backlog_hwm approaching PL_LOG_RING_SIZE (4096,
-    // pl_log_ring.c) means the drain cannot keep up with the push rate.
+
+    // Bead pico-link-okx (F2): backlog_hwm approaching PL_LOG_RING_SIZE
+    // (4096, pl_log_ring.c) means the drain cannot keep up with the push
+    // rate -- this is the OTHER half of fix 2's verification, alongside
+    // log_drops above.
     pl_log(
-        "usb-pump-logring: push_hold_us_total=%lu push_hold_us_max=%lu drain_skips=%lu backlog_hwm=%lu\r\n",
-        (unsigned long)pl_log_ring_push_hold_us_total(), (unsigned long)pl_log_ring_push_hold_us_max(),
-        (unsigned long)pl_log_ring_drain_skips(), (unsigned long)pl_log_ring_backlog_hwm()
+        "usb-pump-logring: backlog_hwm=%lu\r\n",
+        (unsigned long)pl_log_ring_backlog_hwm()
     );
 }

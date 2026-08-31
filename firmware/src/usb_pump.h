@@ -158,9 +158,22 @@ void pl_log_locked(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // didn't take" in one capture -- see bd pico-link-tfj's design comment.
 // Extended by bd pico-link-okx (D1-D13, see usb_pump.c) with the
 // arm/complete-race discriminator counters: pump_ticks_run/skipped,
-// ep_out_idle_ticks, ep_out_state_flipped_in_task, sof_isr, and the
-// sof_phase_hist[8] SOF-to-worker-tick phase histogram. Call from the
+// ep_out_state_flipped_in_task, sof_isr. Bead pico-link-wbq (E2) cut the
+// report to six lines and deleted the D8 idle-tick counter and the
+// SOF-to-worker-tick phase histograms -- both were structurally dead
+// instruments, not just noisy ones; see usb_pump.c for why. Call from the
 // superloop.
 void pl_usb_pump_report(uint32_t report_dt_us);
+
+// Bead pico-link-wbq (E2, fix 1): called from the vendored usbd.c SDK patch
+// (firmware/sdk-patches/03-tinyusb-usbd-sof-isr-sample.patch) from INSIDE
+// dcd_event_handler's DCD_EVENT_SOF case, in TRUE ISR context, before that
+// function re-queues the event for tud_task(). Samples the raw hardware
+// ISO-OUT AVAIL bit at the actual SOF instant rather than up to ~1ms later
+// at the worker's own phase -- see usb_pump.c's doc comment on the
+// implementation for the full reasoning. NOT part of this module's public
+// API in the normal sense -- it exists to be called from exactly one
+// non-Rust, non-firmware-src call site, the vendored SDK patch.
+void pl_usb_sof_isr_sample(uint32_t frame_count);
 
 #endif // PICO_LINK_USB_PUMP_H

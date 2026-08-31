@@ -1,0 +1,14 @@
+--- a/lib/tinyusb/src/device/usbd.c
++++ b/lib/tinyusb/src/device/usbd.c
+@@ -1194,6 +1194,12 @@
+     case DCD_EVENT_SOF:
+       // SOF driver handler in ISR context
++      // pico-link (bead pico-link-wbq): sample the raw ISO-OUT AVAIL bit
++      // HERE, in true ISR context, before this event is (maybe) re-queued
++      // for tud_task() below. Defined in firmware/src/usb_pump.c. See
++      // firmware/sdk-patches/README.md.
++      { extern void pl_usb_sof_isr_sample(uint32_t frame_count);
++        pl_usb_sof_isr_sample(event->sof.frame_count); }
+       for (uint8_t i = 0; i < TOTAL_DRIVER_COUNT; i++) {
+         usbd_class_driver_t const* driver = get_driver(i);
+         if (driver && driver->sof) {
