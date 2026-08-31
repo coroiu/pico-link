@@ -34,6 +34,7 @@
 #include "panic_recorder.h"
 #include "pico_link_ui.h"
 #include "pl_log_ring.h"
+#include "pl_loop_prof.h"
 #include "st7789.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
@@ -427,9 +428,21 @@ int main(void) {
     uint32_t xy_held_frames = 0;
     const uint32_t xy_held_frames_for_reset = 60; // ~2-3s at this loop's real (not budgeted) pace -- see comment above
 
+    // Bead pico-link-p1r: previous iteration's frame_start_us, used below
+    // to compute PL_LOOP_PHASE_TOTAL as the wall-clock gap between
+    // successive top-of-loop timestamps -- the true per-iteration period
+    // this bead's 6.14 Hz drain-rate measurement corresponds to. 0 means
+    // "no prior iteration yet", so the very first iteration records
+    // nothing.
+    uint64_t prev_frame_start_us = 0;
+
     while (true) {
         pl_wdt_mark(PL_WDT_CP_LOOP_TOP);
         uint64_t frame_start_us = time_us_64();
+        if (prev_frame_start_us != 0) {
+            pl_loop_prof_record(PL_LOOP_PHASE_TOTAL, frame_start_us - prev_frame_start_us);
+        }
+        prev_frame_start_us = frame_start_us;
 
         if (gpio_get(PL_INPUT_PIN_X) == 0 && gpio_get(PL_INPUT_PIN_Y) == 0) {
             xy_held_frames++;
@@ -442,21 +455,29 @@ int main(void) {
         }
 
         pl_wdt_mark(PL_WDT_CP_INPUT_POLL);
+        uint64_t input_start_us = time_us_64();
         size_t n = pl_link_input_poll(intents, 8);
         if (n > 0) {
             pl_ui_input(ui, intents, n);
         }
+        // Bead pico-link-p1r: attribute the input-poll phase. Does not
+        // include the X+Y BOOTSEL-hold GPIO reads above -- two gpio_get()
+        // calls, cheap enough to not need separate attribution.
+        pl_loop_prof_record(PL_LOOP_PHASE_INPUT, time_us_64() - input_start_us);
 #ifdef PL_DEBUG_REMOTE
         // Bead pico-link-cd3: debug-only NavIntent injection over the CDC
         // console, feeding the SAME pl_ui_input call the GPIO scan above
         // does. Main-loop/thread-context only, same as pl_link_input_poll
         // -- see debug_remote.h's module doc for why that matters.
         pl_wdt_mark(PL_WDT_CP_DEBUG_REMOTE);
+        uint64_t debug_remote_start_us = time_us_64();
         PlIntent debug_intents[4];
         size_t debug_n = pl_debug_remote_poll(debug_intents, 4);
         if (debug_n > 0) {
             pl_ui_input(ui, debug_intents, debug_n);
         }
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_DEBUG_REMOTE, time_us_64() - debug_remote_start_us);
 #endif
 #ifndef PL_DIAG_SKIP_BT
         // Drains events the BTstack packet handler queued from IRQ context
@@ -465,10 +486,16 @@ int main(void) {
         // discovered or a link-state change is visible in the same frame
         // it arrived, not one frame late.
         pl_wdt_mark(PL_WDT_CP_BT_DRAIN);
+        uint64_t bt_drain_start_us = time_us_64();
         pl_bt_drain_events(ui);
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_BT_DRAIN, time_us_64() - bt_drain_start_us);
 #endif
         pl_wdt_mark(PL_WDT_CP_UI_TICK);
+        uint64_t ui_tick_start_us = time_us_64();
         pl_ui_tick(ui, frame_start_us);
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_UI_TICK, time_us_64() - ui_tick_start_us);
 
         const uint16_t *px = NULL;
         uintptr_t px_len = 0;
@@ -476,6 +503,8 @@ int main(void) {
         pl_wdt_mark(PL_WDT_CP_UI_RENDER);
         pl_ui_render(ui, &px, &px_len);
         uint64_t render_end_us = time_us_64();
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_UI_RENDER, render_end_us - render_start_us);
 
         if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
             // ui_tick()/pl_ui_render() must not be called again until this
@@ -485,10 +514,23 @@ int main(void) {
             st7789_blit_framebuffer(spi1, px, (uint32_t)px_len);
         }
         uint64_t blit_end_us = time_us_64();
+        // Bead pico-link-p1r: the pico-link-3uq blit-split candidate --
+        // measured here as one blocking call, matching pico-link-14l's
+        // 38.6ms figure. Only recorded on the frame that actually blits
+        // (px non-NULL) -- a NULL-px frame does not call
+        // st7789_blit_framebuffer at all, so recording render_end..blit_end
+        // unconditionally would falsely attribute ~0us "blit" samples to
+        // frames that skipped it.
+        if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
+            pl_loop_prof_record(PL_LOOP_PHASE_BLIT, blit_end_us - render_end_us);
+        }
 
 #ifndef PL_DIAG_SKIP_BT
         pl_wdt_mark(PL_WDT_CP_BT_POLL_CMDS);
+        uint64_t bt_poll_cmds_start_us = time_us_64();
         pl_bt_poll_commands(ui);
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_BT_POLL_CMDS, time_us_64() - bt_poll_cmds_start_us);
 #endif
         pl_wdt_mark(PL_WDT_CP_REPORT);
 
@@ -498,6 +540,11 @@ int main(void) {
         // printing the measured one alongside lets a human (or the
         // verification loop) compare them directly.
         uint64_t now_us = time_us_64();
+        // Bead pico-link-p1r: attribute the ~1Hz audio-report block. Timed
+        // whether or not it actually fires this iteration -- the common
+        // case (no fire) should land in the smallest bucket and cost the
+        // histogram nothing but a bucket increment.
+        uint64_t audio_report_phase_start_us = now_us;
         if (now_us - audio_report_start_us >= 1000000) {
             uint32_t bytes_now = pl_usb_audio_pcm_bytes_total();
             uint32_t delta_bytes = bytes_now - audio_report_start_bytes;
@@ -516,6 +563,7 @@ int main(void) {
             audio_report_start_us = now_us;
             audio_report_start_bytes = bytes_now;
         }
+        pl_loop_prof_record(PL_LOOP_PHASE_AUDIO_REPORT, time_us_64() - audio_report_phase_start_us);
 
         static uint32_t frame_count = 0;
         frame_count++;
@@ -526,6 +574,7 @@ int main(void) {
         // this satisfies by printing exactly that breakdown, just not on
         // literally every single frame.
         pl_wdt_mark(PL_WDT_CP_REPORT_FRAME);
+        uint64_t frame_report_phase_start_us = time_us_64();
         if (frame_count % 60 == 1) {
             pl_log(
                 "frame %lu: render=%lluus blit=%lluus total=%lluus\r\n",
@@ -535,6 +584,8 @@ int main(void) {
                 (unsigned long long)(blit_end_us - frame_start_us)
             );
         }
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_FRAME_REPORT, time_us_64() - frame_report_phase_start_us);
 
         // Bead pico-link-okx (D11): ONE shared ~1s report clock for both
         // pl_usb_pump_report and pl_a2dp_report, replacing their two
@@ -545,6 +596,12 @@ int main(void) {
         // enc_frames_total/s).
         static uint64_t s_last_shared_report_us = 0;
         uint64_t shared_now_us = time_us_64();
+        // Bead pico-link-p1r: attribute the 1Hz shared-report block
+        // (pl_usb_pump_report + pl_a2dp_report + pl_a2dp_publish_counters).
+        // Deliberately excludes pl_loop_prof_publish_next() itself (called
+        // below, after this block) -- this module's own publish cost is
+        // not part of what it is measuring.
+        uint64_t shared_report_phase_start_us = shared_now_us;
         if (s_last_shared_report_us == 0 || shared_now_us - s_last_shared_report_us >= 1000000) {
             uint32_t shared_report_dt_us =
                 s_last_shared_report_us != 0 ? (uint32_t)(shared_now_us - s_last_shared_report_us) : 0;
@@ -564,7 +621,13 @@ int main(void) {
             // ("ctr") snapshot -- same 1Hz point, does not replace the
             // verbose a2dp: lines above.
             pl_a2dp_publish_counters();
+
+            // Bead pico-link-p1r: one phase's p50/p95/p99/max/count into
+            // pl_prio slot 3, round-robin -- same 1Hz cadence as the rest
+            // of this block. See pl_loop_prof.h's module doc.
+            pl_loop_prof_publish_next();
         }
+        pl_loop_prof_record(PL_LOOP_PHASE_SHARED_REPORT, time_us_64() - shared_report_phase_start_us);
 
         // Bead pico-link-okx (F1): drains whatever pl_log()/pl_log_locked()
         // queued this iteration to the actual console -- THREAD CONTEXT
@@ -572,7 +635,10 @@ int main(void) {
         // doc). Called every iteration, not rate-limited, so the ring stays
         // close to empty between report bursts.
         pl_wdt_mark(PL_WDT_CP_LOG_DRAIN);
+        uint64_t log_drain_start_us = time_us_64();
         pl_log_ring_drain();
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_LOG_DRAIN, time_us_64() - log_drain_start_us);
 
         // Bead pico-link-ufh: THE feed site -- exactly one call, from
         // thread context, in the superloop. Must never be fed from a timer
@@ -580,8 +646,11 @@ int main(void) {
         // pl_a2dp_report() and before the pacing sleep below, per the
         // design doc's "Where the feed lives" section.
         pl_wdt_mark(PL_WDT_CP_WDT_SERVICE);
+        uint64_t wdt_service_start_us = time_us_64();
         pl_wdt_service();
         pl_wdt_report();
+        // Bead pico-link-p1r.
+        pl_loop_prof_record(PL_LOOP_PHASE_WDT_SERVICE, time_us_64() - wdt_service_start_us);
 
         // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
         // re-renders unconditionally every call -- see its doc comment in
@@ -596,9 +665,16 @@ int main(void) {
         // budget most of the time, so this sleeps only the remainder (zero,
         // in practice) rather than always adding a further flat 16ms.
         uint64_t frame_elapsed_us = time_us_64() - frame_start_us;
+        // Bead pico-link-p1r: 0 whenever the body already exceeds
+        // frame_budget_us (the expected case under load, per the comment
+        // above), which is itself a useful data point -- a p50 of 0 here
+        // confirms the sleep is not where the missing time goes.
+        uint32_t sleep_phase_us = 0;
         if (frame_elapsed_us < frame_budget_us) {
-            sleep_us((uint32_t)(frame_budget_us - frame_elapsed_us));
+            sleep_phase_us = (uint32_t)(frame_budget_us - frame_elapsed_us);
+            sleep_us(sleep_phase_us);
         }
+        pl_loop_prof_record(PL_LOOP_PHASE_SLEEP, sleep_phase_us);
     }
 
     return 0;
