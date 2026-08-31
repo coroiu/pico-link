@@ -27,11 +27,24 @@ typedef struct {
 
 // What one call to encode() consumes/produces, so a2dp.c's media timer
 // never needs to know which codec is active to drive it correctly.
-// encoded_frame_bytes == 0 means variable-length output (not used by SBC,
-// which is fixed-size per configuration; reserved for a future codec).
+// encoded_frame_bytes == 0 means variable-length, self-packetising output
+// (SBC never sets this -- it is fixed-size per configuration; LDAC does,
+// bead pico-link-cz0.5.6 -- see pl_codec_encode_result_t's payload_complete
+// field, which is how a2dp.c's single fill loop tells the two shapes
+// apart without ever branching on codec identity).
 typedef struct {
     uint16_t pcm_frames_per_encoded_frame; // e.g. SBC 48k/8sb/16blk -> 128
     uint16_t encoded_frame_bytes;          // 0 == variable, query per-encode
+    // Bead pico-link-cz0.5.6: bytes of AVDTP media-payload HEADER this
+    // codec's packets carry (SBC and LDAC both use the classic 1-byte
+    // fragmentation/start/last/num_frames header -- see codec_sbc.c's row
+    // and the LDAC row for the shared value). Ownership of the "-1"
+    // reserved-header-byte correction moves here from a2dp.c's old
+    // hardcoded constant (pl_a2dp_usable_payload used to assume exactly 1
+    // unconditionally); every row must set this even though today both
+    // rows agree on 1, so a future codec with a different header shape is
+    // a table-row change, not a2dp.c surgery.
+    uint8_t header_bytes;
     uint32_t nominal_bitrate_bps;          // what the panel shows (S2)
     // Bead pico-link-pbv: worst-case wall-clock time one encode() call can
     // take, measured on real hardware plus margin -- NOT a live
@@ -50,6 +63,42 @@ typedef struct {
     // theoretical derivation -- see codec_sbc.c).
     uint32_t worst_case_encode_us;
 } pl_codec_frame_info_t;
+
+// Bead pico-link-cz0.5.6 (Andreas's decision 2026-08-31, design doc open
+// decision (a)): the uniformised encode() result. Every codec row is
+// self-packetising from a2dp.c's point of view -- one call may emit zero,
+// one, or (in principle) more complete encoded frames, and may or may not
+// finish a whole AVDTP payload. This is the ONE seam that lets SBC's
+// today-unchanged fixed-size accumulation and LDAC's libldac-driven
+// variable-size accumulation share a single drain path in a2dp.c with no
+// codec-identity branch anywhere (Andreas's 2026-08-29 ruling,
+// codec_table.h:4-11).
+typedef struct {
+    // False only on a genuine encode failure (e.g. SBC's out_cap-too-small
+    // guard, or a real libldac error return) -- NOT set false merely
+    // because this call produced no output yet (LDAC accumulating
+    // internally is a normal, successful call with bytes_written == 0).
+    // a2dp.c treats !ok exactly like today's "encode returned 0" failure
+    // path: count pkt_fail, stop the fill loop for this tick.
+    bool ok;
+    // Bytes appended to `out` THIS call (0 is normal for a self-packetising
+    // codec still accumulating). Never exceeds the `out_cap` passed in.
+    uint16_t bytes_written;
+    // Encoded audio frames represented by bytes_written, for the AVDTP
+    // media payload header's num_frames byte (pl_a2dp_slot_t.frames). SBC:
+    // always 1 when ok. LDAC: 0 while accumulating, ldacBT_encode's own
+    // frame_num when a payload completes.
+    uint16_t frames_emitted;
+    // True: the codec itself says this payload is complete and must be
+    // sealed/sent NOW, regardless of how much room is left in the AVDTP
+    // payload slot (LDAC -- libldac packetises to its own configured MTU).
+    // False: the codec has no opinion -- a2dp.c's own capacity-based
+    // sealing (comparing accumulated bytes against the negotiated MTU)
+    // continues to govern, EXACTLY as it does today (SBC -- fixed-size
+    // frames, a2dp.c decides how many fit per packet). This is the one
+    // field that lets both codec shapes drive the same fill loop.
+    bool payload_complete;
+} pl_codec_encode_result_t;
 
 // One codec table row. Statically allocated (one instance per codec,
 // defined in that codec's own .c file, e.g. codec_sbc.c's pl_codec_sbc) --
@@ -84,12 +133,14 @@ typedef struct pl_codec {
         void *state, const uint8_t *configuration, uint8_t configuration_len, pl_codec_format_t *out_format,
         pl_codec_frame_info_t *out_frame
     );
-    // Encodes exactly out_frame.pcm_frames_per_encoded_frame interleaved
-    // int16 stereo frames (from `init`'s out_frame) into `out`; returns
-    // bytes written, 0 on failure (including out_cap too small). CONTRACT
-    // (design sec 5): no allocation, no logging, no blocking, no Rust --
-    // this runs in the cyw43/BTstack background IRQ (0xFF).
-    uint16_t (*encode)(void *state, const int16_t *pcm, uint8_t *out, uint16_t out_cap);
+    // Consumes exactly out_frame.pcm_frames_per_encoded_frame interleaved
+    // int16 stereo PCM frames (from `init`'s out_frame) and MAY append 0 or
+    // more complete encoded bytes to `out` (capacity `out_cap`) -- see
+    // pl_codec_encode_result_t's doc comment for the full contract. CONTRACT
+    // (design sec 5), unchanged by pico-link-cz0.5.6: no allocation, no
+    // logging, no blocking, no Rust -- this runs in the cyw43/BTstack
+    // background IRQ (0xFF).
+    pl_codec_encode_result_t (*encode)(void *state, const int16_t *pcm, uint8_t *out, uint16_t out_cap);
     void (*deinit)(void *state);
     void *state; // statically allocated per codec, never malloc'd
 } pl_codec_t;
