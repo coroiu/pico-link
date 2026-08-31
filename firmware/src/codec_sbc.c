@@ -121,6 +121,11 @@ static bool pl_codec_sbc_init(
 
     uint16_t frame_bytes = enc->instance->sbc_buffer_length(&enc->state);
     out_frame->encoded_frame_bytes = frame_bytes;
+    // Bead pico-link-cz0.5.6: SBC's AVDTP media payload uses the classic
+    // 1-byte fragmentation/start/last/num_frames header (unchanged from
+    // what a2dp.c hardcoded before this bead -- see codec_table.h's
+    // header_bytes doc comment).
+    out_frame->header_bytes = 1;
     // Nominal bitrate: frame_bytes*8 bits per pcm_frames samples, scaled to
     // the negotiated sample rate. E.g. ~119B/128 samples @ 48kHz -> ~357kbps.
     out_frame->nominal_bitrate_bps =
@@ -134,7 +139,7 @@ static bool pl_codec_sbc_init(
     return true;
 }
 
-static uint16_t pl_codec_sbc_encode(void *state, const int16_t *pcm, uint8_t *out, uint16_t out_cap) {
+static pl_codec_encode_result_t pl_codec_sbc_encode(void *state, const int16_t *pcm, uint8_t *out, uint16_t out_cap) {
     pl_sbc_encoder_t *enc = (pl_sbc_encoder_t *)state;
     // Bead pico-link-19c: this used to read `sbc_buffer_length()` BEFORE
     // calling `encode_signed_16()` and bail out if it read zero -- which,
@@ -151,14 +156,33 @@ static uint16_t pl_codec_sbc_encode(void *state, const int16_t *pcm, uint8_t *ou
     // since bluedroid's own `encode_signed_16` performs no bounds-checking
     // of its own against the caller-supplied `out` buffer.
     if (out_cap < PL_SBC_MAX_FRAME_BYTES) {
-        return 0;
+        return (pl_codec_encode_result_t){.ok = false, .bytes_written = 0, .frames_emitted = 0, .payload_complete = false};
     }
     // encode_signed_16's return is a bluedroid status code, not a byte
     // count (matches a2dp_source_demo.c -- it discards the return value
     // too). No allocation, no logging, no blocking -- design sec 5's
     // IRQ-context contract.
     enc->instance->encode_signed_16(&enc->state, pcm, out);
-    return enc->instance->sbc_buffer_length(&enc->state);
+    uint16_t written = enc->instance->sbc_buffer_length(&enc->state);
+    // Bead pico-link-cz0.5.6 (uniformised vtable): PROVABLE equivalence
+    // with the pre-vtable code, not just assumed -- the old
+    // `pl_codec_sbc_encode` returned 0 (a2dp.c's fill loop then treated it
+    // as a hard failure, pkt_fail++, break) on EITHER the out_cap guard
+    // above OR sbc_buffer_length() itself reading 0 after a real encode.
+    // ok=false here reproduces BOTH paths bit-for-bit, not just the guard
+    // -- do not simplify this to an unconditional ok=true, that would be a
+    // real (if likely unreachable in practice, per pico-link-19c's priming
+    // fix) behaviour change on the proven-audible path.
+    if (written == 0) {
+        return (pl_codec_encode_result_t){.ok = false, .bytes_written = 0, .frames_emitted = 0, .payload_complete = false};
+    }
+    // payload_complete is always false -- SBC has no opinion on when a
+    // PAYLOAD (as opposed to one encoded frame) is complete, exactly
+    // reproducing the pre-vtable behaviour where a2dp.c alone decided how
+    // many fixed-size SBC frames fit in one AVDTP MTU
+    // (pl_a2dp_usable_payload's capacity check, still in a2dp.c,
+    // unchanged).
+    return (pl_codec_encode_result_t){.ok = true, .bytes_written = written, .frames_emitted = 1, .payload_complete = false};
 }
 
 static void pl_codec_sbc_deinit(void *state) {

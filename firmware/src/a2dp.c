@@ -92,7 +92,10 @@
 
 #include "btstack.h"
 
+#include "ldacBT.h" // LDACBT_SAMPLING_FREQ_048000/LDACBT_CHANNEL_MODE_STEREO -- the AVDTP_CODEC_NON_A2DP arm below
+
 #include "bt.h"
+#include "codec_ldac.h"
 #include "codec_sbc.h"
 #include "codec_table.h"
 #include "pcm_ring.h"
@@ -210,6 +213,21 @@ typedef struct {
         uint8_t sbc_allocation_method_bitmap;
         uint8_t sbc_min_bitpool_value;
         uint8_t sbc_max_bitpool_value;
+
+        // Bead pico-link-cz0.5.6 (LDAC L3): the vendor-codec counterpart
+        // of the sbc_* fields above, captured from
+        // A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CAPABILITY. "other"
+        // because the field names are generic (any AVDTP_CODEC_NON_A2DP
+        // row could populate them, matched by vendor_id/vendor_codec_id --
+        // see the capability handler below); LDAC is simply the only such
+        // row PL_CODECS has today. Same "first offering remote SEP wins"
+        // rule as SBC, independently -- a remote offering both an SBC SEP
+        // and a vendor SEP populates both halves of this struct in the
+        // same discovery pass, no collision.
+        bool other_offered;
+        uint8_t other_remote_seid;
+        uint8_t other_sampling_frequency_bitmap;
+        uint8_t other_channel_mode_bitmap;
     } discovered;
 
     pl_a2dp_media_state_t state;
@@ -523,8 +541,13 @@ static void pl_a2dp_avrcp_controller_packet_handler(uint8_t packet_type, uint16_
 // latent the moment R3-1 makes the credit clamp bound depend on
 // frames_per_packet. One function, used at all three sites, so the
 // correction can never drift out of sync again.
-static inline uint32_t pl_a2dp_usable_payload(int max_media_payload_size) {
-    return max_media_payload_size > 0 ? (uint32_t)(max_media_payload_size - 1) : 0u;
+//
+// Bead pico-link-cz0.5.6: the reserved header size is now the ACTIVE
+// codec row's own header_bytes (codec_table.h), not a hardcoded 1 --
+// SBC's row sets header_bytes=1, reproducing today's behaviour exactly;
+// a future codec with a different header shape changes only its own row.
+static inline uint32_t pl_a2dp_usable_payload(int max_media_payload_size, uint8_t header_bytes) {
+    return max_media_payload_size > (int)header_bytes ? (uint32_t)(max_media_payload_size - (int)header_bytes) : 0u;
 }
 
 // Bead pico-link-85v (D6): resets the tx ring to empty -- called at every
@@ -536,6 +559,28 @@ static inline uint32_t pl_a2dp_usable_payload(int max_media_payload_size) {
 // arrive after this runs (send_requested may already be true inside
 // BTstack) -- pl_a2dp_send_media_packet's tx_count==0 guard handles it
 // (counted as spurious_grants).
+// Bead pico-link-cz0.5.6: factored out of pl_a2dp_fill's two seal sites --
+// the fixed-size capacity-full seal (SBC, unchanged behaviour) and the
+// codec-reported payload_complete seal (LDAC, self-packetising). Both
+// mean the same thing operationally: hand the head slot to the tx ring and
+// arm a send. Caller is responsible for the tx_count < PL_A2DP_TX_QUEUE_SLOTS
+// guard (stop_queue_full) BEFORE calling -- this function does not check it.
+static void pl_a2dp_seal_head(void) {
+    pl_a2dp_slot_t *head = &s_ctx.tx[s_ctx.tx_head];
+    head->rtp_ts = s_ctx.rtp_next;
+    s_ctx.rtp_next += (uint32_t)head->frames * s_ctx.frame.pcm_frames_per_encoded_frame;
+    s_ctx.tx_head = (uint8_t)((s_ctx.tx_head + 1) % PL_A2DP_TX_QUEUE_SLOTS);
+    s_ctx.tx_count++;
+    if (s_ctx.tx_count > s_ctx.tx_depth_max) {
+        s_ctx.tx_depth_max = s_ctx.tx_count;
+    }
+    s_ctx.payloads_sealed++;
+    if (!s_ctx.send_requested) {
+        s_ctx.send_requested = true;
+        a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
+    }
+}
+
 static void pl_a2dp_tx_flush(void) {
     for (uint8_t i = 0; i < PL_A2DP_TX_QUEUE_SLOTS; i++) {
         s_ctx.tx[i].len = 0;
@@ -600,7 +645,7 @@ static void pl_a2dp_fill(void) {
     // must be the one shared computation -- the single correction point
     // for the reserved header-byte offset (do not hardcode `1` anywhere
     // else, D5/pico-link-cz0.5.6).
-    uint32_t usable_payload = pl_a2dp_usable_payload(s_ctx.max_media_payload_size);
+    uint32_t usable_payload = pl_a2dp_usable_payload(s_ctx.max_media_payload_size, s_ctx.frame.header_bytes);
 
     // Bead pico-link-85v (D4): the dwell budget, derived fresh every call.
     uint32_t owed_frames = pcm_frame_count > 0 ? s_ctx.samples_owed / pcm_frame_count : 0;
@@ -666,34 +711,36 @@ static void pl_a2dp_fill(void) {
         pl_a2dp_slot_t *head = &s_ctx.tx[s_ctx.tx_head];
         if (head->len == 0) {
             // Fresh slot (never filled, or freed by a send/flush -- both
-            // reset len to 0). Reserve the header byte (data[0], written
-            // at send time -- see pl_a2dp_send_media_packet).
-            head->len = 1;
+            // reset len to 0). Reserve the header byte(s) (data[0..],
+            // written at send time -- see pl_a2dp_send_media_packet).
+            // Bead pico-link-cz0.5.6: header_bytes is the active codec
+            // row's own declared header size (codec_table.h), not a
+            // hardcoded 1 -- SBC's row sets it to 1, reproducing today's
+            // behaviour exactly.
+            head->len = s_ctx.frame.header_bytes;
             head->frames = 0;
         }
-        uint32_t data_bytes_so_far = (uint32_t)head->len - 1u;
+        uint32_t data_bytes_so_far = (uint32_t)head->len - s_ctx.frame.header_bytes;
 
         // 2. Payload-full: is there room for one more frame in the head
         // slot? Not a fault -- it means this slot is done. SEAL it (D1)
         // and continue into the next slot in the SAME tick, unless there
         // is no next slot (stop_queue_full -- the new ceiling tripwire).
-        if (data_bytes_so_far + frame_bytes > usable_payload) {
+        //
+        // Bead pico-link-cz0.5.6: this capacity-based seal is a FIXED-SIZE
+        // codec concept -- it only applies when frame_bytes > 0 (SBC).
+        // Self-packetising codecs (frame_bytes == 0, e.g. LDAC) have no
+        // fixed per-frame size to check against usable_payload here; they
+        // seal via the payload_complete branch after encode() below
+        // instead. This is a branch on the row's DECLARED FRAME SHAPE
+        // (codec_table.h's own encoded_frame_bytes==0 convention, S1's
+        // design), not a codec-identity branch -- see codec_table.h:4-11.
+        if (frame_bytes > 0 && data_bytes_so_far + frame_bytes > usable_payload) {
             if (s_ctx.tx_count >= PL_A2DP_TX_QUEUE_SLOTS) {
                 s_ctx.stop_queue_full++;
                 break;
             }
-            head->rtp_ts = s_ctx.rtp_next;
-            s_ctx.rtp_next += (uint32_t)head->frames * pcm_frame_count;
-            s_ctx.tx_head = (uint8_t)((s_ctx.tx_head + 1) % PL_A2DP_TX_QUEUE_SLOTS);
-            s_ctx.tx_count++;
-            if (s_ctx.tx_count > s_ctx.tx_depth_max) {
-                s_ctx.tx_depth_max = s_ctx.tx_count;
-            }
-            s_ctx.payloads_sealed++;
-            if (!s_ctx.send_requested) {
-                s_ctx.send_requested = true;
-                a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
-            }
+            pl_a2dp_seal_head();
             continue; // re-evaluate dwell/credit/queue-full against the fresh head slot
         }
 
@@ -716,7 +763,7 @@ static void pl_a2dp_fill(void) {
         }
 
         uint64_t t0 = time_us_64();
-        uint16_t written = s_ctx.codec->encode(
+        pl_codec_encode_result_t result = s_ctx.codec->encode(
             s_ctx.codec->state, s_pcm_scratch, &head->data[head->len], (uint16_t)(sizeof(head->data) - head->len)
         );
         uint32_t dt = (uint32_t)(time_us_64() - t0);
@@ -727,15 +774,37 @@ static void pl_a2dp_fill(void) {
         if (dwell_us > s_ctx.dwell_max_us) {
             s_ctx.dwell_max_us = dwell_us;
         }
-        if (written == 0) {
+        if (!result.ok) {
             s_ctx.pkt_fail++;
             break;
         }
 
-        head->len = (uint16_t)(head->len + written);
-        head->frames++;
+        // Bead pico-link-cz0.5.6: bytes_written/frames_emitted may both be
+        // 0 -- a self-packetising codec (LDAC) accumulating internally
+        // with nothing to hand back yet. That is a SUCCESSFUL call (PCM
+        // was consumed), not a failure and not a stop condition -- the PCM
+        // unit's samples are spent below and the loop continues to the
+        // next unit exactly as if a fixed-size codec had produced a frame.
+        if (result.bytes_written > 0) {
+            head->len = (uint16_t)(head->len + result.bytes_written);
+            head->frames = (uint16_t)(head->frames + result.frames_emitted);
+        }
         s_ctx.samples_owed -= pcm_frame_count;
         frames_this_tick++;
+
+        // Bead pico-link-cz0.5.6: the codec-driven seal. Only self-
+        // packetising codecs ever set this (SBC's row always returns
+        // payload_complete=false, see codec_sbc.c -- this branch is
+        // therefore dead code on the proven-audible SBC path, not a
+        // behaviour change to it). The tx_count guard mirrors the
+        // fixed-size seal's own stop_queue_full check above.
+        if (result.payload_complete) {
+            if (s_ctx.tx_count >= PL_A2DP_TX_QUEUE_SLOTS) {
+                s_ctx.stop_queue_full++;
+                break;
+            }
+            pl_a2dp_seal_head();
+        }
     }
 
     // Cumulative -- see enc_frames_total's doc comment on pl_a2dp_ctx_t
@@ -780,6 +849,11 @@ static void pl_a2dp_send_media_packet(void) {
     }
 
     pl_a2dp_slot_t *slot = &s_ctx.tx[s_ctx.tx_tail];
+    // Bead pico-link-cz0.5.6: byte 0 is the num_frames header content for
+    // BOTH codec rows today (SBC and LDAC each declare header_bytes==1 --
+    // codec_table.h) -- header_bytes governs reservation/offset math
+    // elsewhere in this file, not this byte's content, which is specific
+    // to the shared 1-byte fragmentation/start/last/num_frames format.
     slot->data[0] = (uint8_t)slot->frames; // (fragmentation<<7)|(start<<6)|(last<<5)|num_frames -- no fragmentation here
     uint8_t status = a2dp_source_stream_send_media_payload_rtp(
         s_ctx.a2dp_cid, s_ctx.local_seid, 0, slot->rtp_ts, slot->data, slot->len
@@ -963,6 +1037,45 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     }
 }
 
+// Bead pico-link-cz0.5.6: factored out of the SBC_CONFIGURATION handler so
+// OTHER_CONFIGURATION (LDAC, and any future vendor row) can share it --
+// table lookup by local_seid, row->init(), and the settle/announce tail
+// (pl_bt_push_connect_step/_codec_changed). Callers own decoding their own
+// subevent's raw fields into the row-specific `cfg`/`cfg_len` shape first;
+// this function is generic across whatever that shape turns out to be.
+static void pl_a2dp_finish_codec_negotiation(uint8_t local_seid, const uint8_t *cfg, uint8_t cfg_len) {
+    // Table lookup by local_seid -- written generically (S1 had one row;
+    // S4/pico-link-cz0.5.6 adds a second). No call site here assumes SBC
+    // is the only possible row.
+    pl_codec_t *row = NULL;
+    for (size_t i = 0; i < PL_CODEC_COUNT; i++) {
+        if (PL_CODECS[i]->local_seid == local_seid) {
+            row = PL_CODECS[i];
+            break;
+        }
+    }
+    if (row == NULL || !row->init(row->state, cfg, cfg_len, &s_ctx.format, &s_ctx.frame)) {
+        pl_log("a2dp: codec init FAILED for local_seid %u\r\n", local_seid);
+        pl_bt_push_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_NO_A2DP_SINK);
+        return;
+    }
+    s_ctx.codec = row;
+    s_ctx.local_seid = local_seid;
+    pl_log(
+        "a2dp: codec=%s sample_rate=%lu pcm_frames_per_frame=%u frame_bytes=%u nominal_bitrate=%lu\r\n",
+        row->display_name, (unsigned long)s_ctx.format.sample_rate_hz, s_ctx.frame.pcm_frames_per_encoded_frame,
+        s_ctx.frame.encoded_frame_bytes, (unsigned long)s_ctx.frame.nominal_bitrate_bps
+    );
+    pl_bt_push_connect_step(PL_CONNECT_STEP_NEGOTIATING_CODEC);
+
+    // Bead pico-link-1v5: tells the Home hero which codec is now live and
+    // at what nominal bitrate, so it stops reading "NO LINK" once a
+    // device is actually connected. Never called from the media timer
+    // path (s_ctx.frame is already fully populated by row->init above, so
+    // this reads only settled state).
+    pl_bt_push_codec_changed(s_ctx.connect_addr, row->display_name, (uint8_t)strlen(row->display_name), s_ctx.frame.nominal_bitrate_bps);
+}
+
 static void pl_a2dp_media_timer_arm(void) {
     btstack_run_loop_remove_timer(&s_ctx.media_timer); // safe even if not currently added
     btstack_run_loop_set_timer_handler(&s_ctx.media_timer, pl_a2dp_media_timer_handler);
@@ -1024,6 +1137,50 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             break;
         }
 
+        case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CAPABILITY: {
+            // Bead pico-link-cz0.5.6 (LDAC L3): BTstack's generic
+            // catch-all for any AVDTP_CODEC_NON_A2DP SEP the remote
+            // offers -- raw bytes only (no BTstack-native decode exists
+            // for vendor codecs, unlike SBC above). Identify LDAC by
+            // matching the wire's own vendor_id/vendor_codec_id against a
+            // PL_CODECS row's declared identity -- a DATA-DRIVEN match
+            // against the table, not a codec-identity branch (same "wire
+            // fact, not business logic" reasoning a2dp.c's
+            // avdtp_codec_type dispatch already relies on elsewhere in
+            // this file); a remote offering some OTHER vendor codec we
+            // have no row for simply matches nothing and is ignored.
+            uint16_t cid = a2dp_subevent_signaling_media_codec_other_capability_get_a2dp_cid(packet);
+            if (cid != s_ctx.a2dp_cid) {
+                break;
+            }
+            uint16_t info_len = a2dp_subevent_signaling_media_codec_other_capability_get_media_codec_information_len(packet);
+            const uint8_t *info = a2dp_subevent_signaling_media_codec_other_capability_get_media_codec_information(packet);
+            if (info_len < 8 || info == NULL) {
+                break; // too short to carry any vendor codec identity we know
+            }
+            uint32_t vendor_id =
+                (uint32_t)info[0] | ((uint32_t)info[1] << 8) | ((uint32_t)info[2] << 16) | ((uint32_t)info[3] << 24);
+            uint16_t vendor_codec_id = (uint16_t)((uint32_t)info[4] | ((uint32_t)info[5] << 8));
+
+            if (!s_ctx.discovered.other_offered) {
+                for (size_t i = 0; i < PL_CODEC_COUNT; i++) {
+                    pl_codec_t *row = PL_CODECS[i];
+                    if (row->avdtp_codec_type != AVDTP_CODEC_NON_A2DP) {
+                        continue;
+                    }
+                    if (row->vendor_id != vendor_id || row->vendor_codec_id != vendor_codec_id) {
+                        continue;
+                    }
+                    s_ctx.discovered.other_offered = true;
+                    s_ctx.discovered.other_remote_seid = a2dp_subevent_signaling_media_codec_other_capability_get_remote_seid(packet);
+                    s_ctx.discovered.other_sampling_frequency_bitmap = info[6];
+                    s_ctx.discovered.other_channel_mode_bitmap = info[7];
+                    break;
+                }
+            }
+            break;
+        }
+
         case A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE: {
             uint16_t cid = a2dp_subevent_signaling_capabilities_complete_get_a2dp_cid(packet);
             if (cid != s_ctx.a2dp_cid) {
@@ -1070,9 +1227,45 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     }
                     matched = true;
                     break;
+                } else if (row->avdtp_codec_type == AVDTP_CODEC_NON_A2DP) {
+                    // Bead pico-link-cz0.5.6 (LDAC L3): no BTstack
+                    // avdtp_choose_* helper exists for vendor codecs (SBC
+                    // above gets one; LDAC does not), so this project
+                    // implements its own -- trivially, because it only
+                    // ever offers/accepts ONE LDAC configuration
+                    // (48kHz/stereo, codec_ldac.c's doc comment). "Choose"
+                    // therefore degenerates to "does the remote's
+                    // discovered bitmap include our one supported bit",
+                    // not a real intersection-and-pick algorithm. This
+                    // LDAC-shaped glue living behind the AVDTP_CODEC_
+                    // NON_A2DP wire-level-fact arm is the same accepted
+                    // pattern as the SBC arm above (a2dp.c's own doc
+                    // comment on the SBC_CONFIGURATION handler already
+                    // makes this argument for that arm; design sec 4.2's
+                    // rule is about the DISPATCH across PL_CODECS, not
+                    // about a row's own negotiation-shape code living in
+                    // its own arm here).
+                    if (!s_ctx.discovered.other_offered) {
+                        continue;
+                    }
+                    if ((s_ctx.discovered.other_sampling_frequency_bitmap & LDACBT_SAMPLING_FREQ_048000) == 0 ||
+                        (s_ctx.discovered.other_channel_mode_bitmap & LDACBT_CHANNEL_MODE_STEREO) == 0) {
+                        pl_log("a2dp: remote OTHER codec does not support 48kHz/stereo, skipping\r\n");
+                        continue;
+                    }
+                    uint8_t status = a2dp_source_set_config_other(
+                        cid, row->local_seid, s_ctx.discovered.other_remote_seid, pl_codec_ldac_negotiated_info,
+                        sizeof(pl_codec_ldac_negotiated_info)
+                    );
+                    if (status != ERROR_CODE_SUCCESS) {
+                        pl_log("a2dp: set_config_other FAILED status=0x%02x\r\n", status);
+                        continue;
+                    }
+                    matched = true;
+                    break;
                 }
-                // Future rows (e.g. AVDTP_CODEC_NON_A2DP for LDAC, L3) fall
-                // through here until their own set_config_* arm exists.
+                // Future rows fall through here until their own
+                // set_config_* arm exists.
             }
 
             if (!matched) {
@@ -1135,41 +1328,46 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     break;
             }
 
-            // Table lookup by local_seid -- written generically (S1 has
-            // one row; S4 adds a second). No call site here assumes SBC is
-            // the only possible row.
-            pl_codec_t *row = NULL;
-            for (size_t i = 0; i < PL_CODEC_COUNT; i++) {
-                if (PL_CODECS[i]->local_seid == local_seid) {
-                    row = PL_CODECS[i];
-                    break;
-                }
+            pl_a2dp_finish_codec_negotiation(local_seid, (const uint8_t *)&cfg, sizeof(cfg));
+            break;
+        }
+
+        case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION: {
+            // Bead pico-link-cz0.5.6 (LDAC L3): the vendor-codec
+            // counterpart of SBC_CONFIGURATION above -- forwarded by
+            // BTstack's own a2dp.c:754-759, raw bytes only (no
+            // BTstack-native decode for vendor codecs). Field offsets
+            // mirror the capability bytes' own layout (codec_ldac.c's doc
+            // comment): 6/7 are the negotiated single-bit sampling-
+            // frequency/channel-mode selections.
+            uint16_t cid = a2dp_subevent_signaling_media_codec_other_configuration_get_a2dp_cid(packet);
+            if (cid != s_ctx.a2dp_cid) {
+                break;
             }
-            if (row == NULL || !row->init(row->state, (const uint8_t *)&cfg, sizeof(cfg), &s_ctx.format, &s_ctx.frame)) {
-                pl_log("a2dp: codec init FAILED for local_seid %u\r\n", local_seid);
+            uint8_t local_seid = a2dp_subevent_signaling_media_codec_other_configuration_get_local_seid(packet);
+            s_ctx.remote_seid = a2dp_subevent_signaling_media_codec_other_configuration_get_remote_seid(packet);
+
+            uint16_t info_len = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information_len(packet);
+            const uint8_t *info = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information(packet);
+            if (info_len < 8 || info == NULL) {
+                pl_log("a2dp: OTHER_CONFIGURATION too short (%u bytes)\r\n", (unsigned)info_len);
                 pl_bt_push_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_NO_A2DP_SINK);
                 break;
             }
-            s_ctx.codec = row;
-            s_ctx.local_seid = local_seid;
-            pl_log(
-                "a2dp: codec=%s sample_rate=%lu pcm_frames_per_frame=%u frame_bytes=%u nominal_bitrate=%lu\r\n",
-                row->display_name, (unsigned long)s_ctx.format.sample_rate_hz, s_ctx.frame.pcm_frames_per_encoded_frame,
-                s_ctx.frame.encoded_frame_bytes, (unsigned long)s_ctx.frame.nominal_bitrate_bps
-            );
-            pl_bt_push_connect_step(PL_CONNECT_STEP_NEGOTIATING_CODEC);
+            // Decoded straight into codec_ldac.h's private shape -- safe
+            // because PL_CODECS has exactly one AVDTP_CODEC_NON_A2DP row
+            // today (LDAC) and the bytes here are what WE sent via
+            // a2dp_source_set_config_other (pl_codec_ldac_negotiated_info,
+            // the CAPABILITIES_COMPLETE handler above), so they cannot be
+            // any other vendor codec's shape. A second vendor row would
+            // need this decode to dispatch on info[0..5]
+            // (vendor_id/vendor_codec_id) first, same as the
+            // OTHER_CAPABILITY handler above already does.
+            pl_codec_ldac_negotiated_t cfg;
+            cfg.sampling_frequency = info[6];
+            cfg.channel_mode = info[7];
 
-            // Bead pico-link-1v5: tells the Home hero which codec is now
-            // live and at what nominal bitrate, so it stops reading
-            // "NO LINK" once a device is actually connected. Narrow
-            // addition at the one place codec negotiation completes --
-            // never called from the media timer path (s_ctx.frame is
-            // already fully populated by row->init above, so this reads
-            // only settled state).
-            pl_bt_push_codec_changed(
-                s_ctx.connect_addr, row->display_name, (uint8_t)strlen(row->display_name),
-                s_ctx.frame.nominal_bitrate_bps
-            );
+            pl_a2dp_finish_codec_negotiation(local_seid, (const uint8_t *)&cfg, sizeof(cfg));
             break;
         }
 
@@ -1217,7 +1415,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.frames_per_packet = s_ctx.frame.encoded_frame_bytes > 0
                                            ? btstack_max(
                                                  1u,
-                                                 pl_a2dp_usable_payload(s_ctx.max_media_payload_size) /
+                                                 pl_a2dp_usable_payload(s_ctx.max_media_payload_size, s_ctx.frame.header_bytes) /
                                                      s_ctx.frame.encoded_frame_bytes
                                              )
                                            : 1u;
@@ -1378,11 +1576,16 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             pl_usb_audio_fb_reset();
             pl_log("a2dp: stream started\r\n");
             pl_bt_push_link_state_connected();
-            // S1's table has exactly one row -- SBC is never "not the
-            // first row we'd have accepted", so degraded is always false
-            // here (design sec 4.3). S4 computes this for real once a
-            // second row exists.
-            pl_bt_push_connect_succeeded(false);
+            // Bead pico-link-cz0.5.6: computed for real now that a second
+            // row exists (design sec 4.3) -- degraded means the negotiated
+            // codec (s_ctx.codec) was NOT PL_CODECS' own most-preferred
+            // row, i.e. some higher-preference row (LDAC) was tried first
+            // and refused/fell through, so the connection settled for a
+            // lower one (SBC). PL_CODECS[0] is that most-preferred row by
+            // construction (codec_table.c's own array-order-is-preference
+            // rule); s_ctx.codec is always non-NULL here (STREAM_STARTED
+            // cannot be reached without a prior successful codec init).
+            pl_bt_push_connect_succeeded(PL_CODEC_COUNT > 0 && s_ctx.codec != PL_CODECS[0]);
             break;
 
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
