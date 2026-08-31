@@ -269,7 +269,20 @@ void pl_log_ring_drain(void) {
     if (available > s_backlog_hwm) {
         s_backlog_hwm = available;
     }
-    if (available == 0) {
+    // Bead pico-link-zmg, A2: this early return USED to be unconditional,
+    // which silently dropped a fresh priority slot whenever the plain log
+    // ring happened to be empty -- the priority check further down was
+    // never reached. Nothing counted it, so it did not even show up as a
+    // drop. It self-masks under sustained logging (the ring is rarely
+    // empty then), which is why it cost only the first ~16s of the
+    // verification capture: ctr sequences 147-161 vanished, then 633
+    // consecutive publishes survived without a single gap.
+    //
+    // The priority channel's whole promise is that telemetry outlives
+    // narration, so it must NOT be gated on narration having something to
+    // say. With available == 0 the log-drain tail below computes take == 0
+    // and writes nothing, which is correct and harmless.
+    if (available == 0 && !pl_prio_any_fresh()) {
         return;
     }
 
