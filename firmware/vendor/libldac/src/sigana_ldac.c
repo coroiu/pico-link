@@ -41,7 +41,7 @@ int n)
         y2 = p_spec[1];
         tmp = y1 * y1 + y2 * y2;
         low_energy = tmp;
-        p_psd[0] = sqrt(tmp);
+        p_psd[0] = sqrtf(tmp);
     }
 
     for (isp = 1; isp < LDAC_NSP_LOWENERGY; isp++) {
@@ -50,7 +50,7 @@ int n)
         y2 = p_spec[isp+1];
         tmp = y1 * y1 + (y0-y2) * (y0-y2);
         low_energy += tmp;
-        p_psd[isp] = sqrt(tmp);
+        p_psd[isp] = sqrtf(tmp);
     }
 
     for (isp = LDAC_NSP_LOWENERGY; isp < n-1; isp++) {
@@ -58,12 +58,12 @@ int n)
         y1 = y2;
         y2 = p_spec[isp+1];
         tmp = y1 * y1 + (y0-y2) * (y0-y2);
-        p_psd[isp] = sqrt(tmp);
+        p_psd[isp] = sqrtf(tmp);
     }
 
     {
         tmp = y1 * y1 + y2 * y2;
-        p_psd[n-1] = sqrt(tmp);
+        p_psd[n-1] = sqrtf(tmp);
     }
 
     return low_energy;
