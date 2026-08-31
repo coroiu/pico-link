@@ -7,6 +7,7 @@
 
 #include "device/usbd_pvt.h" // usbd_edpt_busy -- bead pico-link-okx D8/D9/D13
 #include "hardware/irq.h"
+#include "hardware/structs/usb.h" // bead pico-link-2ap: raw ISO-OUT buffer-control AVAIL bit at SOF
 #include "pico/mutex.h"
 #include "pico/time.h"
 #include "tusb.h"
@@ -93,6 +94,43 @@ static volatile uint32_t s_sof_isr_count; // D4: real SOF ISR count (fb_sends' o
 #define PL_SOF_PHASE_BUCKETS 8u
 static volatile uint32_t s_sof_phase_hist[PL_SOF_PHASE_BUCKETS];
 
+// --- Bead pico-link-2ap: THE discriminator between "the host is sending
+// fewer ISO-OUT packets" and "we are failing to ingest what it sends".
+// Sampled inside tud_sof_cb (the USB controller's own SOF interrupt), i.e.
+// at the exact instant the host is entitled to start a transaction for the
+// new frame. Plain volatile increments only, ISR-safe.
+//
+// The instrument is the RAW hardware buffer-control AVAIL bit for EP1 OUT,
+// NOT usbd_edpt_busy(): usbd's busy flag stays true from the moment a
+// transfer is queued until tud_task() processes the completion event, so it
+// reads "armed" during exactly the window where the hardware buffer is
+// already full and the controller can NOT accept another packet. AVAIL set
+// == the controller will accept this frame's packet; AVAIL clear == this
+// frame's packet is dropped by hardware no matter what the host does.
+//
+// Reading of the counters:
+//   sof_miss_avail  -- frame passed with the endpoint READY and no packet
+//                      turned up  => the HOST sent nothing.
+//   sof_miss_unavail-- frame passed with the endpoint NOT ready => WE lost
+//                      it (re-arm too late).
+// Whichever of those two tracks (sof_streaming - packets) is the answer.
+static volatile uint32_t s_sof_streaming;      // denominator: SOF interrupts while alt 1 is selected
+static volatile uint32_t s_sof_hw_unavail;     // AVAIL bit clear at SOF (endpoint could not accept this frame)
+static volatile uint32_t s_sof_sw_idle;        // usbd_edpt_busy() false at SOF -- kept only to show how it diverges from the hardware bit
+static volatile uint32_t s_sof_got;            // packet_count advanced since the previous SOF
+static volatile uint32_t s_sof_miss_avail;     // no arrival AND AVAIL set   -> host sent nothing
+static volatile uint32_t s_sof_miss_unavail;   // no arrival AND AVAIL clear -> we were not ready
+static volatile uint32_t s_sof_last_pkt_count; // packet_count as of the previous SOF
+
+// Bead pico-link-2ap: the existing 8x128us sof_phase_hist DISCARDS every
+// sample with phase >= 1000us (see the worker below), and in the 2026-08-31
+// soak that was 11 percent of ticks even in healthy stretches -- so its
+// "100 percent in bucket 7" reading is not trustworthy. This one is 16
+// buckets of 128us spanning 0..2048us and drops nothing below 2048us.
+#define PL_SOF_PHASE2_BUCKETS 16
+static volatile uint32_t s_sof_phase2_hist[PL_SOF_PHASE2_BUCKETS];
+static volatile uint32_t s_sof_phase2_over; // phase >= 2048us
+
 // TU_ATTR_WEAK override -- fires once per SOF event, dispatched from inside
 // tud_task() (usbd.c's event-queue drain), i.e. from within this file's
 // worker. See s_last_sof_us's doc comment above for why this hook was
@@ -122,6 +160,27 @@ void tud_sof_cb(uint32_t frame_count) {
     (void)frame_count;
     s_last_sof_us = time_us_64();
     s_sof_isr_count++;
+
+    // Bead pico-link-2ap -- see the counter block above for the reading.
+    if (pl_usb_audio_streaming()) {
+        s_sof_streaming++;
+        bool hw_avail = (usb_dpram->ep_buf_ctrl[PL_EP_AUDIO_OUT & 0x0fu].out & USB_BUF_CTRL_AVAIL) != 0u;
+        if (!hw_avail) {
+            s_sof_hw_unavail++;
+        }
+        if (!usbd_edpt_busy(0, PL_EP_AUDIO_OUT)) {
+            s_sof_sw_idle++;
+        }
+        uint32_t pc = pl_usb_audio_packet_count();
+        if (pc != s_sof_last_pkt_count) {
+            s_sof_got++;
+        } else if (hw_avail) {
+            s_sof_miss_avail++;
+        } else {
+            s_sof_miss_unavail++;
+        }
+        s_sof_last_pkt_count = pc;
+    }
 }
 
 // TU_ATTR_WEAK override -- fires from inside tud_task() right after
@@ -183,6 +242,12 @@ static void pl_usb_pump_worker_irq(void) {
         uint32_t ph = (uint32_t)(now_us - s_last_sof_us);
         if (ph < 1000) {
             s_sof_phase_hist[ph >> 7]++;
+        }
+        // Bead pico-link-2ap: same sample, no >=1000us blind spot.
+        if (ph < 2048) {
+            s_sof_phase2_hist[ph >> 7]++;
+        } else {
+            s_sof_phase2_over++;
         }
     }
 
@@ -421,6 +486,26 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
         (unsigned long)s_sof_phase_hist[0], (unsigned long)s_sof_phase_hist[1], (unsigned long)s_sof_phase_hist[2],
         (unsigned long)s_sof_phase_hist[3], (unsigned long)s_sof_phase_hist[4], (unsigned long)s_sof_phase_hist[5],
         (unsigned long)s_sof_phase_hist[6], (unsigned long)s_sof_phase_hist[7]
+    );
+    // Bead pico-link-2ap: the host-vs-ingest discriminator. sof_streaming is
+    // the denominator; got + miss_avail + miss_unavail == sof_streaming.
+    pl_log(
+        "usb-sof-2ap: sof_streaming=%lu got=%lu miss_avail=%lu miss_unavail=%lu hw_unavail=%lu sw_idle=%lu\r\n",
+        (unsigned long)s_sof_streaming, (unsigned long)s_sof_got,
+        (unsigned long)s_sof_miss_avail, (unsigned long)s_sof_miss_unavail,
+        (unsigned long)s_sof_hw_unavail, (unsigned long)s_sof_sw_idle
+    );
+    pl_log(
+        "usb-sof-2ap-phase: hist2=%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu over=%lu\r\n",
+        (unsigned long)s_sof_phase2_hist[0], (unsigned long)s_sof_phase2_hist[1],
+        (unsigned long)s_sof_phase2_hist[2], (unsigned long)s_sof_phase2_hist[3],
+        (unsigned long)s_sof_phase2_hist[4], (unsigned long)s_sof_phase2_hist[5],
+        (unsigned long)s_sof_phase2_hist[6], (unsigned long)s_sof_phase2_hist[7],
+        (unsigned long)s_sof_phase2_hist[8], (unsigned long)s_sof_phase2_hist[9],
+        (unsigned long)s_sof_phase2_hist[10], (unsigned long)s_sof_phase2_hist[11],
+        (unsigned long)s_sof_phase2_hist[12], (unsigned long)s_sof_phase2_hist[13],
+        (unsigned long)s_sof_phase2_hist[14], (unsigned long)s_sof_phase2_hist[15],
+        (unsigned long)s_sof_phase2_over
     );
     // Bead pico-link-icb probe 2: is SET_INTERFACE or any audio
     // control-entity request arriving at all? Answers the question
