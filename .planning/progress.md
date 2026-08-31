@@ -1,5 +1,48 @@
 # Progress
 
+## 2026-08-31 (night) — LDAC is listenable
+
+`main` @ `1e4734c`, pushed to origin. Board flashed with that exact commit.
+
+**The headline: LDAC went from unlistenable to listenable.** `PL_A2DP_MAX_ENCODE_DWELL_US`
+6000 -> 10000us. Andreas, listening: "muuuuuch better, I can actually listen to music like this."
+Counters agree — `enc_frames/s` 338.27 -> 374.76 against 375.0 needed, `stop_dwell` trips
+18.5% -> 0.78% of ticks. The 6000 was an SBC-era bound from when a frame cost ~800us; an LDAC
+frame costs ~1159us.
+
+This was only diagnosable because the priority counter channel (`pico-link-auh`) shipped first —
+the a2dp counters used to vanish from the console the moment streaming started, and the
+falsifier had never once run.
+
+### Waiting on Andreas
+The board carries `pico-link-nxf`, the PI feedback fix, **unproven by ear**. He listens in the
+morning. Rollback is `git revert 1e4734c`.
+
+### The residual crackle has a root cause
+`pl_usb_audio_feedback_task` was a pure P controller, which cannot null a constant offset — it
+parks at whatever error produces the needed correction. A fixed ~220ppm crystal difference meant
+the ring settled ~2050 bytes below its 4608 setpoint by design and eventually ran dry. Measured:
+`fill_ema` 5664 -> 1764, `fill_min` 740 bytes, `stop_ring_empty` 0 -> 7. Now PI with anti-windup.
+
+### Next: `pico-link-p1r`, instrument built, measurement not taken
+The superloop runs at ~6Hz under streaming load against ~28fps idle. That refuted the 7.7 KB/s
+drain-ceiling the `auh` design assumed (real ceiling ~1.57 KB/s) and is why logs saturate. A
+14-phase profiler is merged and flashed. The measurement distinguishes two different fixes:
+one phase dominating -> `pico-link-3uq` (split the blocking blit); thread-context work inflated
+across the board -> `pico-link-yz6` (display/UI to core1).
+
+### Merged today
+`auh` (priority counter channel) · `idy` (its ordering bug, caught on hardware) · `nb6`
+(DISCONNECT over CDC) · `qx8` (LDAC bitrate from the library, not a literal 990000) · `8er`
+(closed as obsolete) · the dwell fix · `nxf` · `p1r` instrumentation.
+
+### Evidence
+`.research/captures/2026-08-31-ldac-dwell-fix/` — three captures with a README recording what
+each proves and the two traps that already produced wrong readings from them.
+
+
+---
+
 **Last updated:** 2026-08-28
 
 ## Where things stand
