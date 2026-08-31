@@ -147,7 +147,15 @@
 // clock (samples_owed credit-pacing below, now windup-clamped -- C2-1) --
 // see the module doc's sec 11.2 rewrite for why both are required
 // together.
-#define PL_A2DP_MAX_ENCODE_DWELL_US 6000u
+// LISTENING TEST 2026-08-31 (bead pico-link-p1r / the LDAC crackle):
+// 6000u was an SBC-era value from when a frame cost ~800us. An LDAC frame
+// costs ~1159us, so 6000 caps the fill loop at 5 frames/tick while credit
+// needs 6.26 -- measured on hardware as 18.5% of ticks tripping this
+// backstop (pico-link-zmg, delta stop_dwell/delta tick_count = 0.1851)
+// alongside a 9.8% encode shortfall. 10000u allows 8 frames/tick.
+// The loop-hogging this bound protects against is already moot at 6Hz
+// (pico-link-p1r): 4ms more dwell against a 164ms iteration is noise.
+#define PL_A2DP_MAX_ENCODE_DWELL_US 10000u
 
 // Bead pico-link-85v (D4): work-bound multiplier -- the fill loop never
 // needs more than CATCHUP_K times the work real time has owed it; beyond
