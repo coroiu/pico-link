@@ -22,9 +22,17 @@ void pl_prio_publish(uint8_t slot_id, const char *fmt, ...) {
     int n = vsnprintf(slot, PL_PRIO_SLOT_LEN - 2, fmt, args);
     va_end(args);
 
+    // vsnprintf(buf, size, ...) writes at most size-1 characters plus a NUL,
+    // and RETURNS the length it WOULD have written -- which can exceed that.
+    // With size = PL_PRIO_SLOT_LEN - 2 the most real content bytes it can
+    // leave behind is PL_PRIO_SLOT_LEN - 3; index PL_PRIO_SLOT_LEN - 3 itself
+    // holds the NUL on truncation. Clamping to -2 would treat that NUL as
+    // content and skip padding over it, corrupting the last byte of an
+    // overlong line. Inert today (the longest live line, ctr, is 109 chars)
+    // but it is a silent corruption waiting for a wider slot.
     uint32_t len = (n > 0) ? (uint32_t)n : 0;
-    if (len > PL_PRIO_SLOT_LEN - 2) {
-        len = PL_PRIO_SLOT_LEN - 2; // vsnprintf's return value can exceed what it actually wrote
+    if (len > PL_PRIO_SLOT_LEN - 3) {
+        len = PL_PRIO_SLOT_LEN - 3;
     }
 
     // Right-pad with spaces to PL_PRIO_SLOT_LEN - 2, then terminate CRLF --
