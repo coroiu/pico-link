@@ -16,6 +16,7 @@
 #include "classic/avdtp.h"
 
 #include "ldacBT.h"
+#include "usb_pump.h" // pl_log
 
 // AVDTP media codec capability bytes we advertise for LDAC -- the classic
 // vendor-specific layout every open LDAC A2DP implementation uses
@@ -179,12 +180,29 @@ static bool pl_codec_ldac_init(
     // until that queue depth is revisited. Flagged for the pico-link-371
     // hardware session, not resolved here.
     out_frame->worst_case_encode_us = 2000;
-    // Bead pico-link-371: encode cost (and therefore the bitrate actually
-    // configured, LDACBT_EQMID_HQ above) is essentially EQMID-independent
-    // (1034-1069us avg across HQ/SQ/MQ) -- there is no cheaper quality
-    // tier to retreat to on CPU grounds, so HQ is used throughout L3. L4
-    // (pico-link-cz0.5.7, UI-side quality selection) is a separate bead.
-    out_frame->nominal_bitrate_bps = 990000; // HQ @ 48kHz, ldacBT.h's own documented bitrate table
+    // Bead pico-link-qx8: ASK THE LIBRARY, never restate its table. libldac
+    // computes the real bitrate inside ldacBT_init_handle_encode
+    // (ldacBT_api.c:281-282, via ldacBT_frmlen_to_bitrate) from the frame
+    // length the EQMID actually produced, so it is already correct by the
+    // time we get here -- no need to wait for a first encoded frame despite
+    // what ldacBT.h's "previously processed frame" wording suggests.
+    // ldacBT_frmlen_to_bitrate returns KILObits/s (ldacBT_internal.c:429
+    // divides by 1000/8), hence the x1000.
+    //
+    // This used to be a literal 990000 restating ldacBT.h's HQ-at-48kHz row,
+    // which meant the panel and console reported 990k for every stream
+    // whatever quality the encoder ran -- the MVP's headline readout was a
+    // constant, and it actively misled a listening test.
+    int kbps = ldacBT_get_bitrate(enc->handle);
+    if (kbps <= 0) {
+        // LDACBT_E_FAIL. Report 0 rather than inventing a number: a wrong
+        // bitrate on the panel is worse than an obviously absent one.
+        pl_log("ldac: ldacBT_get_bitrate failed (%d), reporting 0\r\n", kbps);
+        out_frame->nominal_bitrate_bps = 0;
+    } else {
+        out_frame->nominal_bitrate_bps = (uint32_t)kbps * 1000u;
+        pl_log("ldac: nominal bitrate %d kbps from ldacBT_get_bitrate\r\n", kbps);
+    }
 
     return true;
 }
