@@ -57,6 +57,17 @@ elsewhere is hardware-accelerated on this board's FPU
 (`thumb/v8-m.main+fp/softfp`, see `firmware/CMakeLists.txt:42-51`); this
 `sqrt()` site is the one place that isn't.
 
+**Fixed 2026-08-31 (bead pico-link-cz0.5.8):** all four call sites in
+`src/sigana_ldac.c` (lines 44, 53, 61, 66) now call `sqrtf()` instead of
+`sqrt()`. This is a local patch to vendored source — the file's Apache-2.0
+header and upstream attribution are unchanged, only the four call sites
+differ from upstream. With this fix, the compiled encoder path (default
+float build, `_32BIT_FIXED_POINT` undefined) has **no remaining
+double-precision arithmetic**: `arm-none-eabi-nm -u` on the rebuilt
+`ldaclib.c.o` should no longer reference `__aeabi_f2d`/`__aeabi_d2f`/`sqrt`
+for this reason (re-verify if this file changes again). See
+`pico-link-cz0.5.8`'s L0 bench re-run for the measured saving.
+
 A `_32BIT_FIXED_POINT` build macro does exist (gates `mdct_fixp_ldac.c`,
 `sigana_fixp_ldac.c`, `quant_fixp_ldac.c`, etc. in `src/ldaclib.c`'s
 `#include` block) — upstream's own `Android.bp` documents it as "for devices
