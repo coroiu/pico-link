@@ -214,16 +214,6 @@ pub mod icon {
     /// A shield brand mark, for chrome (e.g. the title bar).
     /// Probed in the design-review spike's `core/examples/icon_probe.rs`.
     pub const SHIELD: char = '\u{FC}';
-    /// A closed padlock — e.g. a masked secret field.
-    /// Probed in the design-review spike's `core/examples/icon_probe.rs`.
-    pub const LOCK_LOCKED: char = '\u{CA}';
-    /// An open padlock — e.g. a revealed secret field.
-    /// Probed in the design-review spike's `core/examples/icon_probe.rs`.
-    pub const LOCK_UNLOCKED: char = '\u{CB}';
-    /// An eye — an alternative "reveal" affordance to [`LOCK_UNLOCKED`],
-    /// for a future field that prefers that convention.
-    /// Probed in the design-review spike's `core/examples/icon_probe.rs`.
-    pub const EYE: char = '\u{A5}';
     /// A right-pointing solid caret/triangle — a row/field's "this is
     /// selected, activate to go further" disclosure indicator.
     ///
@@ -233,12 +223,15 @@ pub mod icon {
     /// is the 48th file alphabetically (1-indexed) -> 0-based index 47
     /// -> codepoint `64 + 47 = 111 = 0x6F`. Cross-checked two ways before
     /// trusting it: (1) the same formula applied to `eye.svg` (102nd
-    /// file -> codepoint `0xA5`) reproduces the spike's independently
-    /// probed value for [`EYE`] exactly; (2) a throwaway
-    /// `core/examples/caret_probe.rs` rendered `0x6D..=0x71` to a PNG and
-    /// visually confirmed `0x6D`/`0x6E`/`0x6F`/`0x70` are down/left/
-    /// right/up-pointing carets respectively, with `0x6C`
-    /// (camera-slr) and `0x71` (cart) as sane neighbors either side.
+    /// file -> codepoint `0xA5`) reproduced the design-review spike's
+    /// independently probed codepoint for that glyph exactly (the `eye`
+    /// constant that validated this has since been removed as a
+    /// Bitwarden-hardware-key leftover with no consumer — see
+    /// `pico-link-znb.12`); (2) a throwaway `core/examples/caret_probe.rs`
+    /// rendered `0x6D..=0x71` to a PNG and visually confirmed
+    /// `0x6D`/`0x6E`/`0x6F`/`0x70` are down/left/right/up-pointing carets
+    /// respectively, with `0x6C` (camera-slr) and `0x71` (cart) as sane
+    /// neighbors either side.
     pub const CARET_RIGHT: char = '\u{6F}';
     /// A Bluetooth glyph — e.g. a Home menu's "Pair device" row icon.
     /// Probed via a throwaway grid probe
@@ -250,6 +243,72 @@ pub mod icon {
     /// A cog/gear glyph — e.g. a Home menu's "Settings" row icon. Probed
     /// alongside [`BLUETOOTH`]; see its doc comment.
     pub const COG: char = '\u{81}';
+
+    // -- pico-link-znb.12: E10 icon probe (2026-08-31) --
+    //
+    // Fetched the live alphabetical listing of
+    // `github.com/iconic/open-iconic/tree/master/svg` (223 files,
+    // `account-login.svg`..`zoom-out.svg`) and applied this module's
+    // `codepoint = 0x40 + alphabetical index` formula. Cross-checked
+    // against every codepoint already in this module before trusting the
+    // formula for new ones: SHIELD (index 188), CARET_RIGHT (47),
+    // BLUETOOTH (30) and COG (65) all reproduced their existing,
+    // independently-probed values exactly. All five glyphs below were
+    // then rendered in a labelled grid at `icon_2x`/`icon_4x`
+    // (`core/examples/icon_probe_znb12.rs`, run via `cargo run -p
+    // pico-link-core --example icon_probe_znb12`, output
+    // `icon_probe_znb12.png`) and confirmed by eye at 3x nearest-neighbor
+    // zoom — each one names the glyph it actually rendered, not just the
+    // formula's prediction.
+
+    /// A headphones glyph — e.g. the Devices/scan list's per-row device
+    /// icon. `headphones.svg` is alphabetical index 118 -> codepoint
+    /// `0x40 + 118 = 0xB6`. Confirmed by eye: a clean over-ear headphones
+    /// silhouette at both `icon_2x` and `icon_4x` in
+    /// `icon_probe_znb12.png`.
+    pub const HEADPHONES: char = '\u{B6}';
+
+    /// A checkmark glyph — e.g. the pairing wizard's success outcome.
+    /// `check.svg` is alphabetical index 51 -> codepoint
+    /// `0x40 + 51 = 0x73`. Confirmed by eye: a clean single checkmark
+    /// (not a circled check — that's the separate `circle-check.svg`,
+    /// index 56) at both `icon_2x` and `icon_4x` in
+    /// `icon_probe_znb12.png`.
+    pub const CHECK: char = '\u{73}';
+
+    /// A plus glyph — e.g. the Devices list's "Pair new headphones" row.
+    /// `plus.svg` is alphabetical index 170 -> codepoint
+    /// `0x40 + 170 = 0xEA`. Confirmed by eye: a clean plus/cross shape at
+    /// both `icon_2x` and `icon_4x` in `icon_probe_znb12.png`.
+    pub const PLUS: char = '\u{EA}';
+
+    /// A warning-triangle glyph (a triangle containing "!") — e.g. the
+    /// FALLBACK/MUTED status banners. `warning.svg` is alphabetical index
+    /// 216 -> codepoint `0x40 + 216 = 0x118`. Confirmed by eye: a clean
+    /// filled triangle with an exclamation mark at both `icon_2x` and
+    /// `icon_4x` in `icon_probe_znb12.png`. Codepoint exceeds `0xFF`
+    /// (unlike every other constant in this module) because index 216
+    /// pushes past the single-byte range this alphabet happens to fit
+    /// for earlier glyphs — still a single valid `char`, just not a
+    /// single UTF-8 byte when encoded.
+    pub const WARNING: char = '\u{118}';
+
+    /// A "USB" title-bar glyph, paired with [`BLUETOOTH`] to indicate the
+    /// wired audio-in link (design section 3's title-bar layout).
+    ///
+    /// **There is no dedicated USB icon in `open-iconic`** — verified
+    /// against the full, current 223-file `svg/` directory listing: no
+    /// `usb.svg` or equivalent exists at all. This constant is therefore
+    /// a stand-in, not a literal USB glyph: `data-transfer-download.svg`
+    /// (alphabetical index 78 -> codepoint `0x40 + 78 = 0x8E`), a
+    /// downward arrow into a tray, chosen over the other candidates
+    /// rendered side-by-side in `icon_probe_znb12.png`
+    /// (`hard-drive`/`data-transfer-upload`/`cloud-download`/`signal`)
+    /// because it reads as "data coming in" without visually resembling
+    /// [`BLUETOOTH`]'s glyph. **Flagged for design confirmation** (Uma or
+    /// Andreas) before it ships on-screen — swap this codepoint rather
+    /// than treating the name as settled.
+    pub const USB: char = '\u{8E}';
 }
 
 /// Corner radius, in pixels, [`draw_chip`] draws its background with.
