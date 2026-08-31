@@ -1810,6 +1810,26 @@ void pl_a2dp_report(uint32_t report_dt_us) {
         (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_queue_full, (unsigned long)s_ctx.stop_ring_empty,
         (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read
     );
+    // Bead pico-link-cz0.5.8 (Ada's step 4): stop_dwell is documented two
+    // comments up as "must read 0 in a healthy run" -- it was, all session,
+    // and nobody diffed it against a healthy baseline. stop_dwell is
+    // cumulative and never reset (see the comment on the tick_count log
+    // above), so a real, sustained dwell-cap trip shows as a nonzero DELTA
+    // between consecutive report windows, not a one-off blip -- track the
+    // last reported value here and warn loudly, same shape as the D2
+    // tx-queue-depth check above (never let a real safety-trip go silent).
+    static uint32_t s_last_stop_dwell;
+    uint32_t stop_dwell_now = s_ctx.stop_dwell;
+    if (stop_dwell_now != s_last_stop_dwell) {
+        pl_log(
+            "a2dp: WARNING stop_dwell rose by %lu this report window (total=%lu) -- the "
+            "dwell-safety backstop tripped; encode is NOT finishing inside its credit "
+            "budget and pl_a2dp_fill is being force-stopped by PL_A2DP_MAX_ENCODE_DWELL_US, "
+            "not by the credit clock. See a2dp.c:609's doc comment.\r\n",
+            (unsigned long)(stop_dwell_now - s_last_stop_dwell), (unsigned long)stop_dwell_now
+        );
+    }
+    s_last_stop_dwell = stop_dwell_now;
     // Bead pico-link-85v (D7): the new drain-side counters. payloads_sealed
     // vs pkt_sent (above) is the single most important split -- equal
     // means fill-limited (healthy); sealed > sent means send-limited (read
