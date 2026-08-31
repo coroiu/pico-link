@@ -72,6 +72,7 @@
 
 // For pl_wdt_subsys_name() only (the WDT breadcrumb case below) -- no
 // circular dependency: watchdog_sup.h does not include this file.
+#include "usb_pump.h"
 #include "watchdog_sup.h"
 
 // --- Tier 1: the contract -- watchdog scratch[0..3]. ---
@@ -361,37 +362,45 @@ void pl_panic_report_and_clear(void) {
     uint32_t address = watchdog_hw->scratch[1];
     uint32_t diag = watchdog_hw->scratch[2];
 
-    printf("\r\n=== pico_link PANIC RECORD (previous boot) ===\r\n");
+    // Bead pico-link-okx (F2b): converted from raw printf() to pl_log() --
+    // printf() went straight to stdio, blocking on a host that hadn't
+    // attached yet (exactly the case right after boot). pl_log() pushes
+    // into the byte ring instead and returns immediately; the superloop's
+    // pl_log_ring_drain() (now bounded and non-blocking itself, F2) writes
+    // it out whenever a host is actually listening. This is also why the
+    // #define printf poison macro below usb_pump.h's include doesn't fire
+    // here any more.
+    pl_log("\r\n=== pico_link PANIC RECORD (previous boot) ===\r\n");
     switch (magic) {
         case PL_PANIC_MAGIC_RUST:
-            printf("kind: Rust panic (ui-ffi)\r\n");
-            printf("message: %s\r\n", s_panic_msg);
+            pl_log("kind: Rust panic (ui-ffi)\r\n");
+            pl_log("message: %s\r\n", s_panic_msg);
             break;
         case PL_PANIC_MAGIC_C:
-            printf("kind: C panic()\r\n");
-            printf("caller return address: 0x%08lx\r\n", (unsigned long)address);
-            printf("message: %s\r\n", s_panic_msg);
+            pl_log("kind: C panic()\r\n");
+            pl_log("caller return address: 0x%08lx\r\n", (unsigned long)address);
+            pl_log("message: %s\r\n", s_panic_msg);
             break;
         case PL_PANIC_MAGIC_ASSERT:
-            printf("kind: assert()\r\n");
-            printf("caller return address: 0x%08lx\r\n", (unsigned long)address);
-            printf("line: %lu\r\n", (unsigned long)diag);
-            printf("message: %s\r\n", s_panic_msg);
+            pl_log("kind: assert()\r\n");
+            pl_log("caller return address: 0x%08lx\r\n", (unsigned long)address);
+            pl_log("line: %lu\r\n", (unsigned long)diag);
+            pl_log("message: %s\r\n", s_panic_msg);
             break;
         case PL_PANIC_MAGIC_HARDFAULT:
-            printf("kind: HardFault\r\n");
-            printf("faulting PC: 0x%08lx\r\n", (unsigned long)address);
-            printf("CFSR: 0x%08lx\r\n", (unsigned long)diag);
+            pl_log("kind: HardFault\r\n");
+            pl_log("faulting PC: 0x%08lx\r\n", (unsigned long)address);
+            pl_log("CFSR: 0x%08lx\r\n", (unsigned long)diag);
             break;
         case PL_PANIC_MAGIC_WDT:
-            printf("kind: watchdog supervisor -- stale subsystem\r\n");
-            printf("subsystem: %s (id %lu)\r\n", pl_wdt_subsys_name((pl_wdt_subsys_t)address), (unsigned long)address);
-            printf("observed staleness: %lums\r\n", (unsigned long)diag);
+            pl_log("kind: watchdog supervisor -- stale subsystem\r\n");
+            pl_log("subsystem: %s (id %lu)\r\n", pl_wdt_subsys_name((pl_wdt_subsys_t)address), (unsigned long)address);
+            pl_log("observed staleness: %lums\r\n", (unsigned long)diag);
             break;
         default:
             break;
     }
-    printf("=== end panic record ===\r\n\r\n");
+    pl_log("=== end panic record ===\r\n\r\n");
 
     // Clear the record -- both tiers -- so a genuinely new, unrelated panic
     // later is treated as a fresh one (retry counter back to 0) rather than

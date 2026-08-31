@@ -58,6 +58,15 @@
 
 #define PL_WDT_TIMEOUT_MS 2000u
 
+// Mirrors hardware_watchdog/watchdog.c's private WATCHDOG_NON_REBOOT_MAGIC
+// -- not exposed via any pico-sdk header, so redefined here with a comment
+// pointing at the source of truth. watchdog_enable() stamps this into
+// scratch[4]; watchdog_reboot() overwrites scratch[4] with 0 (pc == 0,
+// "regular flash boot") or 0xb007c0d3 (pc != 0). See
+// hardware_watchdog/watchdog.c:77-124. Moved up from this file's bottom
+// (bead pico-link-okx F4) so pl_wdt_capture_boot_reason() below can use it.
+#define PL_WDT_NON_REBOOT_MAGIC 0x6ab73121u
+
 static const uint32_t PL_WDT_DEADLINE_US[PL_WDT_COUNT] = {
     [PL_WDT_USB_TIMER] = 100000u,
     [PL_WDT_USB_TASK] = 250000u,
@@ -89,6 +98,130 @@ const char *pl_wdt_subsys_name(pl_wdt_subsys_t s) {
         default:
             return "UNKNOWN";
     }
+}
+
+// Survives a watchdog reset: .uninitialized_data is NOLOAD, and a watchdog
+// reset does not clear SRAM. The magic distinguishes a real record from
+// cold-boot garbage.
+#define PL_LOOP_TRACE_MAGIC 0x4C4F4F50u  // "LOOP"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t checkpoint;      // last checkpoint reached
+    uint32_t prev_checkpoint; // the one before it -- shows direction of travel
+    uint32_t seq;             // superloop iteration count
+    uint32_t last_us;         // time_us_32() when the last mark was stamped
+    uint32_t loop_top_us;     // time_us_32() at the top of the current iteration
+} pl_loop_trace_t;
+
+// volatile: the fields are written by one function and read by another in
+// the same TU after a reset, with nothing in between the compiler can see.
+// Round 3's soak2 record (LAST=BT_POLL_CMDS PREV=BLIT_SPI_DRAIN) is
+// internally inconsistent -- BLIT_EXIT sits unconditionally between those
+// two marks and must have been stamped -- so the pair is not trustworthy on
+// its own. volatile removes reordering/elision as an explanation, and the
+// ring below removes the need to reason from two values at all.
+static volatile pl_loop_trace_t __attribute__((section(".uninitialized_data.pl_loop_trace")))
+    s_loop_trace;
+
+// Last PL_WDT_RING_LEN marks with timestamps. At ~20 marks per frame and
+// ~30fps this covers roughly the last 25ms of superloop history, which is
+// enough to show the mark sequence LEADING INTO a stall plus the exact
+// microsecond gap -- strictly more information than LAST/PREV, and it makes
+// an inconsistent pair diagnosable instead of merely puzzling.
+#define PL_WDT_RING_LEN 16u
+typedef struct {
+    uint32_t magic;
+    uint32_t head;                        // next slot to write
+    uint8_t cp[PL_WDT_RING_LEN];
+    uint32_t us[PL_WDT_RING_LEN];
+} pl_loop_ring_t;
+
+static volatile pl_loop_ring_t __attribute__((section(".uninitialized_data.pl_loop_ring")))
+    s_loop_ring;
+
+static const char *const PL_WDT_CP_NAMES[PL_WDT_CP_COUNT] = {
+    "NONE", "LOOP_TOP", "INPUT_POLL", "UI_INPUT", "DEBUG_REMOTE", "BT_DRAIN",
+    "UI_TICK", "UI_RENDER", "BLIT_ENTER", "BLIT_DMA_WAIT", "BLIT_SPI_DRAIN",
+    "BLIT_EXIT", "BT_POLL_CMDS", "BT_POLL_FFI", "BT_POLL_DISPATCH",
+    "CMD_NONE", "CMD_SCAN_CALL", "CMD_SCAN_RET", "CMD_CONNECT_ENTER",
+    "CMD_CONNECT_A2DP", "CMD_CONNECT_RET", "CMD_CANCEL_SCAN_CALL",
+    "CMD_CANCEL_SCAN_RET", "CMD_OTHER",
+    "REPORT", "REPORT_FRAME", "REPORT_SHARED", "LOG_DRAIN", "WDT_SERVICE",
+};
+
+void pl_wdt_mark(pl_wdt_checkpoint_t cp) {
+    uint32_t now = time_us_32();
+    s_loop_trace.prev_checkpoint = s_loop_trace.checkpoint;
+    s_loop_trace.checkpoint = (uint32_t)cp;
+    s_loop_trace.last_us = now;
+    if (cp == PL_WDT_CP_LOOP_TOP) {
+        s_loop_trace.seq++;
+        s_loop_trace.loop_top_us = now;
+    }
+    s_loop_trace.magic = PL_LOOP_TRACE_MAGIC;
+
+    uint32_t h = s_loop_ring.head;
+    if (s_loop_ring.magic != PL_LOOP_TRACE_MAGIC || h >= PL_WDT_RING_LEN) {
+        h = 0;  // cold boot: garbage index would corrupt memory past the ring
+        s_loop_ring.magic = PL_LOOP_TRACE_MAGIC;
+    }
+    s_loop_ring.cp[h] = (uint8_t)cp;
+    s_loop_ring.us[h] = now;
+    s_loop_ring.head = (h + 1u) % PL_WDT_RING_LEN;
+}
+
+// Logs the surviving trace. Called from pl_wdt_report_boot_reason(). Reports
+// the STALL DURATION as (last_us - loop_top_us): how far into the iteration
+// the loop got before time stopped.
+static void pl_wdt_report_loop_trace(void) {
+    if (s_loop_trace.magic != PL_LOOP_TRACE_MAGIC) {
+        pl_log("wdt: loop-trace = none (cold boot or SRAM not preserved)\r\n");
+        return;
+    }
+    uint32_t cp = s_loop_trace.checkpoint;
+    uint32_t prev = s_loop_trace.prev_checkpoint;
+    const char *cpn = (cp < PL_WDT_CP_COUNT) ? PL_WDT_CP_NAMES[cp] : "?";
+    const char *prevn = (prev < PL_WDT_CP_COUNT) ? PL_WDT_CP_NAMES[prev] : "?";
+    pl_log("wdt: loop-trace LAST=%s PREV=%s seq=%u in_iter_us=%u\r\n",
+           cpn, prevn, (unsigned)s_loop_trace.seq,
+           (unsigned)(s_loop_trace.last_us - s_loop_trace.loop_top_us));
+    // The ring: oldest first, each with the microseconds SINCE THE PREVIOUS
+    // mark. The stall is the one huge delta, and the mark printed BEFORE it
+    // is the region that hung.
+    //
+    // Bead pico-link-okx F4: collapsed from 16 individual pl_log() calls (17
+    // lines total with the summary above) to two 8-entry lines. Each
+    // individual-entry call was its own chance to be silently byte-
+    // truncated by the pre-F2 console path AND its own ring push -- one
+    // truncated entry mid-dump was indistinguishable from a short ring. Two
+    // fixed-width lines make a truncation obviously a truncation (the line
+    // just stops short) rather than silently short.
+    if (s_loop_ring.magic == PL_LOOP_TRACE_MAGIC) {
+        uint32_t h = s_loop_ring.head % PL_WDT_RING_LEN;
+        uint32_t prev_us = 0;
+        uint32_t dt[PL_WDT_RING_LEN];
+        const char *names[PL_WDT_RING_LEN];
+        for (uint32_t i = 0; i < PL_WDT_RING_LEN; i++) {
+            uint32_t idx = (h + i) % PL_WDT_RING_LEN;
+            uint32_t c = s_loop_ring.cp[idx];
+            uint32_t t = s_loop_ring.us[idx];
+            names[i] = (c < PL_WDT_CP_COUNT) ? PL_WDT_CP_NAMES[c] : "?";
+            dt[i] = (i == 0) ? 0u : (t - prev_us);
+            prev_us = t;
+        }
+        pl_log("wdt: ring[0-7] %s:%u,%s:%u,%s:%u,%s:%u,%s:%u,%s:%u,%s:%u,%s:%u\r\n", names[0], (unsigned)dt[0],
+               names[1], (unsigned)dt[1], names[2], (unsigned)dt[2], names[3], (unsigned)dt[3], names[4],
+               (unsigned)dt[4], names[5], (unsigned)dt[5], names[6], (unsigned)dt[6], names[7], (unsigned)dt[7]);
+        pl_log("wdt: ring[8-15] %s:%u,%s:%u,%s:%u,%s:%u,%s:%u,%s:%u,%s:%u,%s:%u\r\n", names[8], (unsigned)dt[8],
+               names[9], (unsigned)dt[9], names[10], (unsigned)dt[10], names[11], (unsigned)dt[11], names[12],
+               (unsigned)dt[12], names[13], (unsigned)dt[13], names[14], (unsigned)dt[14], names[15],
+               (unsigned)dt[15]);
+        s_loop_ring.magic = 0;
+    }
+    // Clear so the NEXT boot cannot re-report this one as fresh -- the
+    // "reflashing destroys the evidence" trap in reverse.
+    s_loop_trace.magic = 0;
 }
 
 void pl_wdt_kick(pl_wdt_subsys_t s) {
@@ -241,41 +374,85 @@ void pl_wdt_report(void) {
 #endif
 }
 
-// Mirrors hardware_watchdog/watchdog.c's private WATCHDOG_NON_REBOOT_MAGIC
-// -- not exposed via any pico-sdk header, so redefined here with a comment
-// pointing at the source of truth. watchdog_enable() stamps this into
-// scratch[4]; watchdog_reboot() overwrites scratch[4] with 0 (pc == 0,
-// "regular flash boot") or 0xb007c0d3 (pc != 0). See
-// hardware_watchdog/watchdog.c:77-124.
-#define PL_WDT_NON_REBOOT_MAGIC 0x6ab73121u
+// --- Boot-reason snapshot (bead pico-link-okx, F4: "make the reset cause
+// measurable") -----------------------------------------------------------
+//
+// WHY THIS SPLIT EXISTS. Before this bead, pl_wdt_report_boot_reason() read
+// watchdog_hw->reason/scratch[] LIVE, and correctness depended entirely on
+// call-site ordering documented only in a comment ("MUST run before
+// pl_wdt_arm()") -- a landmine, per this bead's design (Ada, 2026-08-30).
+// pl_wdt_capture_boot_reason() now does the one-shot register read, called
+// as the LITERAL FIRST STATEMENT of main() (before even pl_log_ring_init())
+// so nothing in this firmware can execute first and disturb the registers.
+// pl_wdt_report_boot_reason() below only ever formats the snapshot -- it no
+// longer touches watchdog_hw at all, so its own position in main() stops
+// being load-bearing for correctness (still called early for good boot-log
+// ordering, just not for safety).
+typedef struct {
+    bool captured;
+    uint32_t reason;
+    uint32_t scratch0;
+    uint32_t scratch4;
+} pl_wdt_boot_snapshot_t;
+
+static pl_wdt_boot_snapshot_t s_boot_snapshot;
+
+// Survives a watchdog reset (NOLOAD, same mechanism as s_loop_trace/
+// s_loop_ring above, proven to survive by watchdog_sup.c's own reset path).
+// boot_seq is the load-bearing field: it climbs by exactly one every boot,
+// so a soak's final report line proves HOW MANY resets happened even if no
+// capture was running for the intermediate ones -- "boot_seq stays at its
+// post-flash value" becomes a literal, checkable pass criterion instead of
+// an inference from silence. last_reason mirrors this boot's own raw
+// watchdog_hw->reason value into the persisted record for symmetry with a
+// future F3(b) persisted-ring read.
+#define PL_BOOT_SEQ_MAGIC 0x424f4f54u // "BOOT"
+typedef struct {
+    uint32_t magic;
+    uint32_t boot_seq;
+    uint32_t last_reason;
+} pl_boot_seq_t;
+
+static volatile pl_boot_seq_t __attribute__((section(".uninitialized_data.pl_boot_seq")))
+    s_boot_seq;
+
+void pl_wdt_capture_boot_reason(void) {
+#ifdef PL_WATCHDOG
+    // Always-on-domain hardware registers, read once, before anything else
+    // in this firmware can run -- see this function's doc comment above.
+    s_boot_snapshot.reason = watchdog_hw->reason;
+    s_boot_snapshot.scratch0 = watchdog_hw->scratch[0];
+    s_boot_snapshot.scratch4 = watchdog_hw->scratch[4];
+    s_boot_snapshot.captured = true;
+
+    if (s_boot_seq.magic != PL_BOOT_SEQ_MAGIC) {
+        s_boot_seq.boot_seq = 0; // cold boot or SRAM not preserved
+    }
+    s_boot_seq.boot_seq++;
+    s_boot_seq.last_reason = s_boot_snapshot.reason;
+    s_boot_seq.magic = PL_BOOT_SEQ_MAGIC;
+#endif
+}
 
 void pl_wdt_report_boot_reason(void) {
 #ifdef PL_WATCHDOG
-    // MUST run before pl_wdt_arm() -- arming overwrites scratch[4] with
-    // PL_WDT_NON_REBOOT_MAGIC via watchdog_enable(), destroying the value
-    // this function reads. Also must not run after panic_recorder.c's
-    // pl_panic_report_and_clear() has cleared scratch[0..3] for a WDT-magic
-    // record, or the check below can't tell a supervised trip apart from
-    // "no record at all" -- call this one first (see main.c).
-    uint32_t reason = watchdog_hw->reason;
-    if (reason == 0) {
+    pl_log("wdt: boot_seq=%lu\r\n", (unsigned long)s_boot_seq.boot_seq);
+
+    if (!s_boot_snapshot.captured) {
+        // pl_wdt_capture_boot_reason() was not called before this -- a
+        // build/wiring bug, not a hardware state. Say so plainly rather
+        // than silently printing nothing.
+        pl_log("wdt: boot reason = UNKNOWN (pl_wdt_capture_boot_reason() never ran)\r\n");
+    } else if (s_boot_snapshot.reason == 0) {
         // Scratch is not retained across a true power cycle -- see
         // panic_recorder.c:315-329's banked reasoning, same silicon fact.
         pl_log("wdt: boot reason = power-on / brown-out reset\r\n");
-        return;
-    }
-
-    uint32_t magic0 = watchdog_hw->scratch[0];
-    if (magic0 == PL_PANIC_MAGIC_WDT) {
+    } else if (s_boot_snapshot.scratch0 == PL_PANIC_MAGIC_WDT) {
         // A supervised stale-subsystem trip -- pl_panic_report_and_clear()
         // (called separately, after this function) prints the subsystem
         // name and staleness from scratch[1..2] and clears the record.
         // Nothing to add here.
-        return;
-    }
-
-    uint32_t scratch4 = watchdog_hw->scratch[4];
-    if (scratch4 == PL_WDT_NON_REBOOT_MAGIC) {
+    } else if (s_boot_snapshot.scratch4 == PL_WDT_NON_REBOOT_MAGIC) {
         // watchdog_enable() was called (by us, or by panic_recorder.c's
         // arm-first step) but nothing ever reached a deliberate
         // watchdog_reboot() before the timer itself expired -- i.e. the
@@ -293,4 +470,9 @@ void pl_wdt_report_boot_reason(void) {
                "recorder or a flash/BOOTSEL request)\r\n");
     }
 #endif
+    // Bead pico-link-okx F4: moved from the TOP of this function to the
+    // END -- the boot-reason line above is the higher-priority read (it's
+    // one line, cheap, and now register-independent), so it survives even
+    // if the ring dump below gets truncated by a still-degraded console.
+    pl_wdt_report_loop_trace();
 }

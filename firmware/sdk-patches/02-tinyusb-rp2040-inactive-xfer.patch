@@ -1,0 +1,19 @@
+--- a/lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c
++++ b/lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c
+@@ -311,7 +311,17 @@ bool __tusb_irq_path_func(hw_endpoint_xfer_continue)(struct hw_endpoint* ep) {
+   // Part way through a transfer
+   if (!ep->active) {
+-    panic("Can't continue xfer on inactive ep %02X", ep->ep_addr);
++    // pico-link (bead pico-link-06m): a stale buffer-status completion for an
++    // endpoint torn down mid-transfer -- what an abrupt alt0 teardown makes.
++    // Count and RETURN FALSE: falling through would _hw_endpoint_xfer_sync()
++    // against torn-down state, and returning true would hand the stack a bogus
++    // dcd_event_xfer_complete() with a stale xferred_len. Returning false makes
++    // hw_handle_buff_status() neither complete nor reset the transfer, which is
++    // the correct handling of "there is no transfer here". The buf_status bit
++    // is already cleared by the caller (dcd_rp2040.c:157) so this cannot storm.
++    { extern volatile unsigned int pl_ep_inactive_xfer_count[32];
++      pl_ep_inactive_xfer_count[((ep->ep_addr & 0x0fu) << 1) | ((ep->ep_addr & 0x80u) ? 1u : 0u)]++; }
++    hw_endpoint_lock_update(ep, -1);
++    return false;
+   }

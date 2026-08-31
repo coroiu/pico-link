@@ -45,13 +45,19 @@ void pl_a2dp_init(struct PlUi *ui);
 // stdin_process command handler in thread context call it directly).
 void pl_a2dp_connect(const uint8_t *addr);
 
-// Once-per-second instrumentation snapshot (rate-limits itself internally,
-// cheap to call every superloop iteration) -- design sec 7's
+// Once-per-second instrumentation snapshot -- design sec 7's
 // "a2dp: codec=... bitrate=... fill=... ovr_frames=... und=... enc_max_us=...
 // pkt_sent=... pkt_fail=... misaligned=..." report line. Call from the
 // superloop, thread context (this function itself does no BTstack calls,
 // only pl_log and plain counter reads).
-void pl_a2dp_report(void);
+//
+// Bead pico-link-okx (D11): report_dt_us is the real elapsed microseconds
+// since the previous call, computed ONCE in main.c's superloop and shared
+// with pl_usb_pump_report -- this function no longer rate-limits itself;
+// the caller decides when a second has elapsed. Pass 0 on the very first
+// call. See pl_usb_pump_report's doc comment (usb_pump.h) for why this
+// isn't cosmetic.
+void pl_a2dp_report(uint32_t report_dt_us);
 
 // Raw wire values of ui-ffi's PlConnectStep enum (Connecting=0, Pairing=1,
 // SettingUpAudio=2, NegotiatingCodec=3 -- see ui-ffi/src/lib.rs). Not

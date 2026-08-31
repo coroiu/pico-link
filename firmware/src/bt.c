@@ -480,7 +480,13 @@ void pl_bt_init(struct PlUi *ui) {
 }
 
 void pl_bt_poll_commands(struct PlUi *ui) {
+    // Bead pico-link-okx round 3: the loop-trace named BT_POLL_CMDS as the
+    // last checkpoint before a >2s stall and a hardware watchdog expiry
+    // (n=1). These two marks split this function into the Rust FFI call and
+    // the C dispatch that follows, so the next expiry says which side.
+    pl_wdt_mark(PL_WDT_CP_BT_POLL_FFI);
     PlCommand command = pl_ui_poll_command(ui);
+    pl_wdt_mark(PL_WDT_CP_BT_POLL_DISPATCH);
 
     // Defensive ABI version check (pico-link-a67) -- Rust is the sole
     // producer of PlCommand and always sets this correctly today, but a
@@ -493,10 +499,13 @@ void pl_bt_poll_commands(struct PlUi *ui) {
 
     switch (command.tag) {
         case PL_COMMAND_TAG_START_SCAN:
+            pl_wdt_mark(PL_WDT_CP_CMD_SCAN_CALL);
             pl_bt_start_scan();
+            pl_wdt_mark(PL_WDT_CP_CMD_SCAN_RET);
             break;
 
         case PL_COMMAND_TAG_CONNECT: {
+            pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_ENTER);
             // M4 S1 (bead pico-link-cz0.5.2): this used to be log-only
             // (M2's acceptance criterion was just that the intent was
             // observable over CDC). Now it actually opens an A2DP source
@@ -508,16 +517,24 @@ void pl_bt_poll_commands(struct PlUi *ui) {
                 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
             );
             pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
+            pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_A2DP);
             pl_a2dp_connect(addr);
+            pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_RET);
             break;
         }
 
         case PL_COMMAND_TAG_CANCEL_SCAN:
+            pl_wdt_mark(PL_WDT_CP_CMD_CANCEL_SCAN_CALL);
             pl_bt_cancel_scan();
+            pl_wdt_mark(PL_WDT_CP_CMD_CANCEL_SCAN_RET);
             break;
 
         case PL_COMMAND_TAG_NONE:
+            pl_wdt_mark(PL_WDT_CP_CMD_NONE);
+            break;
+
         default:
+            pl_wdt_mark(PL_WDT_CP_CMD_OTHER);
             break;
     }
 }

@@ -117,6 +117,21 @@ uint32_t pl_usb_audio_clk_get_valid(void);
 // feedback" -- pbv's falsifier F4 (reads 0 while streaming) depends on it.
 uint32_t pl_usb_audio_fb_done(void);
 
+// --- Instrumentation (bead pico-link-okx D7/D9) ---
+// rx_bytes_total: cumulative n_bytes_received summed over every completed
+// ISO-OUT packet (tud_audio_rx_done_pre_read_cb), including short ones.
+// rx_short_packets: count of those packets where n_bytes_received != 192
+// (one full 1ms 48kHz/16-bit/stereo UAC2 packet) -- a genuinely
+// host-reduced send, as opposed to a whole packet going missing.
+uint32_t pl_usb_audio_rx_bytes_total(void);
+uint32_t pl_usb_audio_rx_short_packets(void);
+// Cumulative count of SET_INTERFACE(streaming, alt=1) calls that found
+// usbd_edpt_busy(EP1 OUT) already true -- the precondition for the
+// EP1-OUT double-arm panic (rp2040_usb.c:108), captured non-fatally at the
+// one transition point besides the steady-state worker tick where an arm
+// is attempted.
+uint32_t pl_usb_audio_ep_out_busy_at_alt1_entry(void);
+
 // --- Instrumentation (bead pico-link-pbv, C6) ---
 // Both read the state pl_usb_audio_feedback_task() already maintains at
 // its own ~1ms cadence -- the finest-grained sampling of ring fill

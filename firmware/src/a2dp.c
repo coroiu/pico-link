@@ -415,6 +415,12 @@ typedef struct {
     // STREAM_STARTED. Without this, "stop_dwell reads 0" says nothing
     // about how close the loop came to the backstop.
     volatile uint32_t dwell_max_us;
+    // Bead pico-link-okx D10: the uncounted break below (pl_a2dp_fill_sbc_buffer,
+    // "got != pcm_bytes_needed") -- the ring's fill_bytes() promised at
+    // least pcm_bytes_needed but pl_pcm_read() returned less. Shouldn't
+    // happen; counted so a conservation check can tell "never happens"
+    // from "silently happens sometimes" instead of assuming the former.
+    volatile uint32_t fill_short_read;
 
     // Bead pico-link-pbv round 2 (C2-6): cumulative whole frames dropped by
     // pl_pcm_reset() (a2dp.c's STREAM_ESTABLISHED/SUSPENDED/RELEASED
@@ -702,7 +708,11 @@ static void pl_a2dp_fill(void) {
 
         uint32_t got = pl_pcm_read((uint8_t *)s_pcm_scratch, pcm_bytes_needed);
         if (got != pcm_bytes_needed) {
-            break; // ring gave less than its own fill_bytes() promised -- shouldn't happen, defend anyway
+            // Bead pico-link-okx D10: was an uncounted break. Ring gave
+            // less than its own fill_bytes() promised -- shouldn't happen,
+            // defend anyway, but now visible if it does.
+            s_ctx.fill_short_read++;
+            break;
         }
 
         uint64_t t0 = time_us_64();
@@ -1523,21 +1533,20 @@ void pl_a2dp_connect(const uint8_t *addr) {
     pl_bt_push_connect_step(PL_CONNECT_STEP_SETTING_UP_AUDIO);
 }
 
-void pl_a2dp_report(void) {
-    static uint64_t s_last_report_us = 0;
-    uint64_t now_us = time_us_64();
-    if (s_last_report_us != 0 && now_us - s_last_report_us < 1000000) {
-        return;
-    }
-    // Bead pico-link-pbv round 2 (C2-11): the real interval since the last
-    // report line, in microseconds -- every rate the reader computes from
-    // two report lines (enc_frames/s, tick rate, etc) MUST divide by this,
-    // not by an assumed 1s. round 1's "354/s" and "375 +/- 2" were compared
-    // across an interval nobody had actually measured. 0 on the very first
-    // line (no prior sample to diff against).
-    uint32_t report_dt_us = s_last_report_us != 0 ? (uint32_t)(now_us - s_last_report_us) : 0;
-    s_last_report_us = now_us;
-
+void pl_a2dp_report(uint32_t report_dt_us) {
+    // Bead pico-link-pbv round 2 (C2-11): every rate the reader computes
+    // from two report lines (enc_frames/s, tick rate, etc) MUST divide by
+    // the real interval since the last report, not an assumed 1s -- round
+    // 1's "354/s" and "375 +/- 2" were compared across an interval nobody
+    // had actually measured.
+    //
+    // Bead pico-link-okx (D11): report_dt_us is now a PARAMETER, computed
+    // ONCE in main.c's superloop and shared with pl_usb_pump_report --
+    // this function used to run its own independent ~1s rate-limit clock,
+    // so every sof_isr/s-vs-packets/s-vs-enc_frames_total/s comparison this
+    // bead's discriminator needs divided two different unsynchronized
+    // ~1.02s windows. NOT cosmetic -- worth ~1 percent by construction. 0
+    // on the very first call (no prior sample to diff against).
     const char *codec_name = s_ctx.codec != NULL ? s_ctx.codec->display_name : "none";
     pl_log(
         "a2dp: codec=%s bitrate=%lu fill=%lu/%lu ovr_frames=%lu und=%lu report_dt_us=%lu\r\n", codec_name,
@@ -1594,9 +1603,9 @@ void pl_a2dp_report(void) {
     // tripwire (replacing stop_packet_full_hot) -- must read 0 for SBC;
     // see that field's doc comment on pl_a2dp_ctx_t.
     pl_log(
-        "a2dp: stop_credit=%lu stop_queue_full=%lu stop_ring_empty=%lu stop_dwell=%lu\r\n",
+        "a2dp: stop_credit=%lu stop_queue_full=%lu stop_ring_empty=%lu stop_dwell=%lu fill_short_read=%lu\r\n",
         (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_queue_full, (unsigned long)s_ctx.stop_ring_empty,
-        (unsigned long)s_ctx.stop_dwell
+        (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read
     );
     // Bead pico-link-85v (D7): the new drain-side counters. payloads_sealed
     // vs pkt_sent (above) is the single most important split -- equal

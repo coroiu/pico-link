@@ -33,6 +33,7 @@
 #include "ldac_bench.h"
 #include "panic_recorder.h"
 #include "pico_link_ui.h"
+#include "pl_log_ring.h"
 #include "st7789.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
@@ -55,23 +56,6 @@ void pl_ui_panic_hook(const uint8_t *msg, uintptr_t len) {
     pl_panic_record_rust(msg, len);
 }
 
-// Bead pico-link-cz0.5.4 (LDAC L0) BUILD-ENVIRONMENT WORKAROUND -- NOT part
-// of this bead's scope. This machine's shared pico-sdk install
-// (~/.pico-sdk/sdk/2.1.1) has instrumentation patches applied globally from
-// the unmerged bd-pico-link-okx branch (bead pico-link-06m,
-// firmware/sdk-patches/, not present on main): rp2040_usb.c now has two
-// `extern volatile unsigned int` counter arrays,
-// pl_ep_double_arm_count[32] and pl_ep_inactive_xfer_count[32], normally
-// DEFINED by that branch's firmware/src/usb_pump.c. This worktree branched
-// from main, which has neither the patch files nor that definition, so a
-// build here fails to link against the (globally, machine-wide) already-
-// patched SDK. Defined here with dummy storage ONLY so this bead's on-target
-// benchmark can build and run. This is not this bead's fix for that
-// instrumentation -- merging pico-link-06m/okx (or reverting the SDK patch)
-// obsoletes this block; do not extend or rely on it elsewhere.
-volatile unsigned int pl_ep_double_arm_count[32];
-volatile unsigned int pl_ep_inactive_xfer_count[32];
-
 #define PANEL_WIDTH ST7789_WIDTH
 #define PANEL_HEIGHT ST7789_HEIGHT
 
@@ -82,6 +66,33 @@ volatile unsigned int pl_ep_inactive_xfer_count[32];
 #define COLOR_BLUE 0x001F
 
 int main(void) {
+    // Bead pico-link-okx (F4): THE literal first statement of main() --
+    // snapshots watchdog_hw->reason/scratch[] before anything else in this
+    // firmware (including pl_log_ring_init() right below) can run and
+    // possibly disturb them. See watchdog_sup.h's doc comment on this call.
+    pl_wdt_capture_boot_reason();
+
+    // Bead pico-link-okx (F1): zero the console byte ring before ANYTHING
+    // else -- pl_log()/pl_log_locked() push into it unconditionally, and
+    // nothing downstream of this line may call either before it has run.
+    // Bead pico-link-okx (F3b): "zero" is no longer quite right -- see this
+    // function's own doc comment in pl_log_ring.h. A warm reset now KEEPS
+    // whatever backlog didn't get drained before the reset happened.
+    pl_log_ring_init();
+
+    // Bead pico-link-okx (F3b): note the recovery explicitly, as the VERY
+    // FIRST thing pushed into the ring this boot -- pl_log() is safe to call
+    // this early (it only pushes bytes into the ring, see its own doc
+    // comment; no USB/stdio init required). Because the ring is strictly
+    // FIFO, this line (and therefore every byte still queued from the
+    // previous boot) is guaranteed to drain BEFORE the "=== pico_link
+    // firmware boot ===" banner a few lines down, giving a reader a clear
+    // marker for where the surviving backlog ends and this boot begins.
+    if (pl_log_ring_recovered_backlog()) {
+        pl_log("log-ring: recovered %lu unread byte(s) from the previous session (warm reset)\r\n",
+               (unsigned long)pl_log_ring_recovered_backlog_bytes());
+    }
+
     // M3: this project now owns TinyUSB's init/task loop (see
     // CMakeLists.txt linking `tinyusb_device`, and tusb_config.h/
     // usb_descriptors.c/.h's module docs). stdio_init_all() below still
@@ -97,11 +108,28 @@ int main(void) {
     };
     tusb_init(BOARD_TUD_RHPORT, &dev_init);
 
+    // Bead pico-link-okx (D12): turns on the RP2350's SOF hardware
+    // interrupt via TinyUSB's public SOF_CONSUMER_USER path (this build's
+    // AUDIO_FEEDBACK_METHOD_DISABLED means nothing else requests it -- see
+    // usb_pump.c's tud_sof_cb doc comment for the full chain, verified by
+    // reading pico-sdk 2.1.1's usbd.c/audio_device.c/dcd_rp2040.c). Needed
+    // for the sof_phase_hist instrument; not needed by anything else in
+    // this firmware. Must run after tusb_init() (usbd_sof_enable asserts
+    // the stack is initialized).
+    //
+    // Bead pico-link-1av: this call ALONE does not survive enumeration --
+    // usbd.c's configuration_reset() (called on the first real
+    // SET_CONFIGURATION, and on every subsequent bus reset) tu_varclr()s
+    // the whole _usbd_dev struct, wiping the sof_consumer bit this sets.
+    // Kept here anyway so sof_isr/sof_phase_hist have data even before the
+    // first enumeration; usb_pump.c's tud_mount_cb() override is the call
+    // that actually keeps it armed post-enumeration -- see that function's
+    // doc comment for the full chain.
+    tud_sof_cb_enable(true);
+
     // Bead pico-link-tfj: brings up pl_usb_mutex and the 1ms-timer/0xC0-IRQ
-    // worker that services tud_task() from here on. Must run before
-    // stdio_init_all()/any pl_log() call -- pl_log()'s mutex has to exist
-    // first, and this firmware no longer calls tud_task() from the
-    // superloop at all (see below).
+    // worker that services tud_task() from here on. This firmware no
+    // longer calls tud_task() from the superloop at all (see below).
     pl_usb_pump_init();
 
     stdio_init_all();
@@ -116,12 +144,14 @@ int main(void) {
 
     // Bead pico-link-ufh: classify *why* the board booted (power-on vs. an
     // unattributed hardware watchdog expiry vs. a deliberate
-    // watchdog_reboot) from the raw watchdog_hw->reason/scratch[4]
-    // registers. MUST run before pl_wdt_arm() (below) -- arming stamps
-    // scratch[4] and destroys the value this reads -- and before
-    // pl_panic_report_and_clear() clears scratch[0..3], since it peeks
-    // scratch[0] to avoid double-reporting a supervised WDT trip that
-    // pl_panic_report_and_clear() is about to print in full.
+    // watchdog_reboot). Bead pico-link-okx (F4): the register read this
+    // used to do live now happened at the top of this function via
+    // pl_wdt_capture_boot_reason() -- this call only formats that snapshot,
+    // so it is no longer racing pl_wdt_arm()'s scratch[4] stamp. Kept here
+    // (before pl_panic_report_and_clear(), below) purely for boot-log
+    // ordering: it peeks the ALREADY-CAPTURED scratch[0] value to avoid
+    // double-reporting a supervised WDT trip that pl_panic_report_and_clear()
+    // is about to print in full.
     pl_wdt_report_boot_reason();
 
     // bd pico-link-gap: report (and clear) a panic record left by the
@@ -219,7 +249,11 @@ int main(void) {
     // and WHITE do not (or vice versa) -- which is the tell.
     static const uint8_t s_madctl_candidates[4] = {0x00, 0x60, 0xA0, 0xC0};
     static uint16_t s_madctl_test_buf[PANEL_WIDTH * PANEL_HEIGHT];
-    printf("PL_DIAG_MADCTL_TEST: cycling MADCTL 0x00/0x60/0xA0/0xC0, ~5s each, corner pattern\r\n");
+    // Bead pico-link-okx (F2b): converted from printf to pl_log for
+    // consistency with the rest of this firmware's console output --
+    // low-priority (this is a diagnostic-only build path), done to keep
+    // this the last raw printf() call site.
+    pl_log("PL_DIAG_MADCTL_TEST: cycling MADCTL 0x00/0x60/0xA0/0xC0, ~5s each, corner pattern\r\n");
     while (true) {
         for (int idx = 0; idx < 4; idx++) {
             uint8_t madctl = s_madctl_candidates[idx];
@@ -261,7 +295,7 @@ int main(void) {
             }
 
             st7789_blit_framebuffer(spi1, s_madctl_test_buf, PANEL_WIDTH * PANEL_HEIGHT);
-            printf("PL_DIAG_MADCTL_TEST: candidate %d/4 -- MADCTL=0x%02X, %d dot(s) in RED corner\r\n",
+            pl_log("PL_DIAG_MADCTL_TEST: candidate %d/4 -- MADCTL=0x%02X, %d dot(s) in RED corner\r\n",
                    idx + 1, madctl, idx + 1);
 
             sleep_ms(5000);
@@ -391,6 +425,7 @@ int main(void) {
     const uint32_t xy_held_frames_for_reset = 60; // ~2-3s at this loop's real (not budgeted) pace -- see comment above
 
     while (true) {
+        pl_wdt_mark(PL_WDT_CP_LOOP_TOP);
         uint64_t frame_start_us = time_us_64();
 
         if (gpio_get(PL_INPUT_PIN_X) == 0 && gpio_get(PL_INPUT_PIN_Y) == 0) {
@@ -403,6 +438,7 @@ int main(void) {
             xy_held_frames = 0;
         }
 
+        pl_wdt_mark(PL_WDT_CP_INPUT_POLL);
         size_t n = pl_link_input_poll(intents, 8);
         if (n > 0) {
             pl_ui_input(ui, intents, n);
@@ -412,6 +448,7 @@ int main(void) {
         // console, feeding the SAME pl_ui_input call the GPIO scan above
         // does. Main-loop/thread-context only, same as pl_link_input_poll
         // -- see debug_remote.h's module doc for why that matters.
+        pl_wdt_mark(PL_WDT_CP_DEBUG_REMOTE);
         PlIntent debug_intents[4];
         size_t debug_n = pl_debug_remote_poll(debug_intents, 4);
         if (debug_n > 0) {
@@ -424,13 +461,16 @@ int main(void) {
         // thread context, before this frame ticks/renders -- so a device
         // discovered or a link-state change is visible in the same frame
         // it arrived, not one frame late.
+        pl_wdt_mark(PL_WDT_CP_BT_DRAIN);
         pl_bt_drain_events(ui);
 #endif
+        pl_wdt_mark(PL_WDT_CP_UI_TICK);
         pl_ui_tick(ui, frame_start_us);
 
         const uint16_t *px = NULL;
         uintptr_t px_len = 0;
         uint64_t render_start_us = time_us_64();
+        pl_wdt_mark(PL_WDT_CP_UI_RENDER);
         pl_ui_render(ui, &px, &px_len);
         uint64_t render_end_us = time_us_64();
 
@@ -444,8 +484,10 @@ int main(void) {
         uint64_t blit_end_us = time_us_64();
 
 #ifndef PL_DIAG_SKIP_BT
+        pl_wdt_mark(PL_WDT_CP_BT_POLL_CMDS);
         pl_bt_poll_commands(ui);
 #endif
+        pl_wdt_mark(PL_WDT_CP_REPORT);
 
         // M3 acceptance evidence: a MEASURED byte rate, not just "it
         // enumerated". Report once a second while actually streaming --
@@ -480,6 +522,7 @@ int main(void) {
         // asks for "CDC prints per-frame render and blit timing", which
         // this satisfies by printing exactly that breakdown, just not on
         // literally every single frame.
+        pl_wdt_mark(PL_WDT_CP_REPORT_FRAME);
         if (frame_count % 60 == 1) {
             pl_log(
                 "frame %lu: render=%lluus blit=%lluus total=%lluus\r\n",
@@ -490,21 +533,45 @@ int main(void) {
             );
         }
 
-        // Bead pico-link-tfj instrumentation -- see usb_pump.h's doc
-        // comment on pl_usb_pump_report for what the three counters mean.
-        pl_usb_pump_report();
+        // Bead pico-link-okx (D11): ONE shared ~1s report clock for both
+        // pl_usb_pump_report and pl_a2dp_report, replacing their two
+        // previously-independent rate-limit clocks -- see
+        // pl_usb_pump_report's doc comment (usb_pump.h) for why an
+        // unsynchronized pair of ~1.02s windows isn't good enough for this
+        // bead's cross-report rate comparisons (sof_isr/s vs packets/s vs
+        // enc_frames_total/s).
+        static uint64_t s_last_shared_report_us = 0;
+        uint64_t shared_now_us = time_us_64();
+        if (s_last_shared_report_us == 0 || shared_now_us - s_last_shared_report_us >= 1000000) {
+            uint32_t shared_report_dt_us =
+                s_last_shared_report_us != 0 ? (uint32_t)(shared_now_us - s_last_shared_report_us) : 0;
+            s_last_shared_report_us = shared_now_us;
 
-        // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
-        // report line. Thread context only (pl_a2dp_report does no
-        // BTstack calls, only pl_log + plain counter reads); rate-limits
-        // itself internally.
-        pl_a2dp_report();
+            // Bead pico-link-tfj instrumentation, extended by pico-link-okx
+            // -- see usb_pump.h's doc comment on pl_usb_pump_report.
+            pl_wdt_mark(PL_WDT_CP_REPORT_SHARED);
+            pl_usb_pump_report(shared_report_dt_us);
+
+            // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
+            // report line. Thread context only (pl_a2dp_report does no
+            // BTstack calls, only pl_log + plain counter reads).
+            pl_a2dp_report(shared_report_dt_us);
+        }
+
+        // Bead pico-link-okx (F1): drains whatever pl_log()/pl_log_locked()
+        // queued this iteration to the actual console -- THREAD CONTEXT
+        // ONLY, never an IRQ or the 0xC0 worker (see pl_log_ring.h's module
+        // doc). Called every iteration, not rate-limited, so the ring stays
+        // close to empty between report bursts.
+        pl_wdt_mark(PL_WDT_CP_LOG_DRAIN);
+        pl_log_ring_drain();
 
         // Bead pico-link-ufh: THE feed site -- exactly one call, from
         // thread context, in the superloop. Must never be fed from a timer
         // or IRQ (see watchdog_sup.h's module doc for why). Placed after
         // pl_a2dp_report() and before the pacing sleep below, per the
         // design doc's "Where the feed lives" section.
+        pl_wdt_mark(PL_WDT_CP_WDT_SERVICE);
         pl_wdt_service();
         pl_wdt_report();
 
