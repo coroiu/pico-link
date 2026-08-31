@@ -113,15 +113,18 @@ int main(void) {
     // AUDIO_FEEDBACK_METHOD_DISABLED means nothing else requests it -- see
     // usb_pump.c's tud_sof_cb doc comment for the full chain, verified by
     // reading pico-sdk 2.1.1's usbd.c/audio_device.c/dcd_rp2040.c). Needed
-    // for the sof_phase_hist instrument; not needed by anything else in
-    // this firmware. Must run after tusb_init() (usbd_sof_enable asserts
+    // for the s_sof_isr_count instrument; not needed by anything else in
+    // this firmware. (This used to say sof_phase_hist -- bead pico-link-wbq
+    // deleted that histogram as a structurally dead instrument, but the SOF
+    // callback is still needed, now for pico-link-2ap's ISO-OUT
+    // discriminator. Corrected under pico-link-8er.) Must run after tusb_init() (usbd_sof_enable asserts
     // the stack is initialized).
     //
     // Bead pico-link-1av: this call ALONE does not survive enumeration --
     // usbd.c's configuration_reset() (called on the first real
     // SET_CONFIGURATION, and on every subsequent bus reset) tu_varclr()s
     // the whole _usbd_dev struct, wiping the sof_consumer bit this sets.
-    // Kept here anyway so sof_isr/sof_phase_hist have data even before the
+    // Kept here anyway so s_sof_isr_count has data even before the
     // first enumeration; usb_pump.c's tud_mount_cb() override is the call
     // that actually keeps it armed post-enumeration -- see that function's
     // doc comment for the full chain.
