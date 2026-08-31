@@ -1,0 +1,1106 @@
+# direct-USB CDC reader -- claimed iface 3 on 0x2e8a:0x000c 'Pico Link' / 'Pico Link Audio Dongle' (serial 7E869DB737264356)
+# no /dev/cu.* node opened; exclusive libusb claim
+ng=11824 got=11743 miss_avail=68 miss_unavail=13 hw_unavail=13
+usb-audio-fix: fb_done=11767
+usb-audio-okx: rx_bytes_total=2253992 rx_short_packets=168
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=5732/4608 ovr_frames=97170 unatr pc0=10002981 b0=00004450 pc1=10002913 b1=00002824 pc2=100029a1 b2=00002777                                                
+d=0 report_dt_us=1041031
+a2dp: enc_max_us=1737 pkt_sent=1781 pkt_fail=0 misaligned=0
+a2dp: tick_count=2301 worst_tick_intervaldrn c=00005293 s=00000000 z=00000000 bd=0000030464 bp=0000038508 dr=0000321988                                                
+_us=14852 enc_frames_total=3568
+a2dp: frames_per_packet=1 credit_clamped_samples=780240 credit_clamp_events=1454 flush_frames=8ctr s=0000000293 u=0000318086 t=0000014598 e=0000055476 p=0000027738 d=0000000135 c=0000012723 o=0000097170                   
+191 resync_drops=0 fill_ema=5664 fill_min=4352
+a2dp: stop_credit=790 stop_queue_full=43 stop_ring_empty=0 stop_dwell=11 fill_shatr pc0=10002981 b0=00004450 pc1=10002913 b1=00002824 pc2=100029a1 b2=00002777                                                
+ort_read=0
+a2dp: WARNING stop_dwell rose by 6 this report window (total=11) -- the dwell-safety backstop tripped; encode is NOTctr s=0000000294 u=0000319320 t=0000014708 e=0000055939 p=0000027969 d=0000000136 c=0000012832 o=0000097170                   
+ finishing inside its credit budget and pl_a2dp_fill is being force-stopped by PL_A2DP_MAX_ENCODE_DWELL_US, not by the credit clatr pc0=10002981 b0=00004450 pc1=10002913 b1=00002824 pc2=100029a1 b2=00002777                                                
+ock. See a2dp.c:609's doc comment.
+a2dp: payloads_sealed=1784 tx_depth_max=5 grants=1781 spurious_grants=0 dwell_max_us=9601
+wdrn c=00005297 s=00000000 z=00000000 bd=0000030976 bp=0000039031 dr=0000322961                                                
+dt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191919 B/s (216532 bytes / 1128ms)
+usb-pump: packets=12811 log_drops=172186 report_dt_us=1067679
+usb-pumpctr s=0000000295 u=0000320558 t=0000014818 e=0000056403 p=0000028201 d=0000000136 c=0000012942 o=0000097170                   
+-race: pump_ticks_run=180484 sof_isr=180419
+usb-sof-2ap: sof_streaming=12891 got=12810 miss_avail=68 miss_unavail=13 hw_unavailatr pc0=10002981 b0=00004450 pc1=100036f3 b1=00002855 pc2=10002913 b2=00002824                                                
+=13
+usb-audio-fix: fb_done=12835
+usb-audio-okx: rx_bytes_total=2459024 rx_short_packets=174
+usb-pump-logring: backlog_hwm=819drn c=00005301 s=00000000 z=00000000 bd=0000031616 bp=0000039647 dr=0000323560                                                
+2
+a2dp: codec=LDAC bitrate=990000 fill=5452/4608 ovr_frames=97170 und=0 report_dt_us=1067679
+a2dp: enc_max_us=1737 pkt_sent=1984 pkt_fail=0 misaligned=0
+a2dp: tick_count=2396 worst_tick_interval_us=14852 enc_frames_total=3969
+a2dp: frames_per_packet=1 credit_clamped_samples=780240 credit_clamp_events=1454 flush_frames=8191 resync_drops=0 fill_ema=5320 fill_min=4252
+a2dp: stop_credit=869 stop_queue_full=56 stop_ring_empty=0 stop_dwell=14 fill_short_read=0
+a2dp: WARNING stop_dwell rose by 3 this report window (total=14) -- the dwell-safety backstop tripped; encode is NOT finishing inside its credit budget and pl_a2dp_fill is beictr s=0000000296 u=0000321628 t=0000014913 e=0000056804 p=0000028397 d=0000000137 c=0000013031 o=0000097170                   
+ng force-stopped by PL_A2DP_MAX_ENCODE_DWELL_US, not by the credit clock. See a2dp.c:609's doc comment.
+a2dp: payloads_sealed=1984 tx_depth_max=5 grants=1984 spurious_grants=0 dwell_max_us=9601
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stalatr pc0=10002981 b0=00004450 pc1=100036f3 b1=00002947 pc2=10002913 b2=00002916                                                
+e_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192057 B/s (196976 bytes / 1025ms)
+usdrn c=00005307 s=00000000 z=00000000 bd=0000032768 bp=0000040529 dr=0000324174                                                
+b-pump: packets=13819 log_drops=172186 report_dt_us=1008710
+usb-pump-race: pump_ticks_run=181493 sof_isr=181428
+usb-sof-2ap: sof_streaming=13900 got=13819 miss_avail=68 miss_unavail=13 hw_unavail=13
+usb-audio-fix: fb_done=13844
+usb-audio-okx: rx_bytes_total=2652736 rx_short_packets=178
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=5628/4608 ovr_frames=97170 und=0 report_dt_us=1008710
+a2dp: enc_max_us=1737 pkt_sent=2173 pkt_fail=0 misaligned=0
+a2dp: tick_count=2486 worst_tick_interval_us=14852 enc_frames_total=4347
+a2dp: frames_per_packet=1 credit_clamped_samples=780240 credit_clamp_events=1454 flush_frames=8191 resync_drops=0 fill_ema=5437 fill_min=4736
+a2dp: stop_credit=959 stop_queue_full=56 stop_ring_empty=0 stop_dwell=14 fill_short_read=0
+a2dp: payloads_sealed=2173 tx_depth_max=5 grants=2173 spurious_grants=0 dwell_max_us=9601
+wdt: USB_TIMER ctr s=0000000297 u=0000322653 t=0000015001 e=0000057184 p=0000028589 d=0000000158 c=0000013047 o=0000097170                   
+max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191645 B/s (192368 bytes / 1003ms)
+usb-pump: packets=14825 log_drops=172186 report_dt_us=1006769
+usb-pump-race: pump_tiatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003039 pc2=10002913 b2=00003008                                                
+cks_run=182498 sof_isr=182435
+usb-sof-2ap: sof_streaming=14907 got=14825 miss_avail=68 miss_unavail=14 hw_unavail=14
+usb-audiodrn c=00005314 s=00000000 z=00000000 bd=0000034176 bp=0000041932 dr=0000324268                                                
+-fix: fb_done=14849
+usb-audio-okx: rx_bytes_total=2845680 rx_short_packets=182
+usb-pump-logring: backlog_hwm=8192
+a2dp: codecctr s=0000000298 u=0000323801 t=0000015103 e=0000057619 p=0000028809 d=0000000163 c=0000013143 o=0000097170                   
+=LDAC bitrate=990000 fill=5228/4608 ovr_frames=97170 und=0 report_dt_us=1006769
+a2dp: enc_max_us=1737 pkt_sent=2362 pkt_fail=0 misaligned=0
+a2dp: tick_count=2575 worst_tick_interval_us=14852 enc_frames_total=4725
+a2dp: frames_per_packet=1 credit_clamped_samples=780240 credit_clamp_events=1454 flush_frames=8191 resync_drops=0 fill_ema=5259 fill_min=4472
+a2dp: stop_credit=1048 statr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003131 pc2=10002913 b2=00003008                                                
+op_queue_full=56 stop_ring_empty=0 stop_dwell=14 fill_short_read=0
+a2dp: payloads_sealed=2362 tx_depth_max=5 grants=2362 spuriodrn c=00005318 s=00000000 z=00000000 bd=0000034816 bp=0000042585 dr=0000325112                                                
+us_grants=0 dwell_max_us=9601
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_msctr s=0000000299 u=0000325028 t=0000015212 e=0000058079 p=0000029039 d=0000000163 c=0000013252 o=0000097170                   
+=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usbatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003223 pc2=10002913 b2=00003008                                                
+-audio: streaming rate=48000Hz ch=2 bits=16 measured=192069 B/s (197168 bytes / 1026ms)
+usb-pump: packets=15928 log_drops=17218drn c=00005321 s=00000000 z=00000000 bd=0000035200 bp=0000043237 dr=0000325675                                                
+6 report_dt_us=1102713
+usb-pump-race: pump_ticks_run=183601 sof_isr=183537
+usb-sof-2ap: sof_streaming=16009 got=15927 miss_avail=68 miss_unavail=14 hw_unavail=14
+usb-audio-fix: fb_done=15952
+usb-audio-okx: rx_bytes_total=3057444 rx_short_packets=185
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=5344/4608 ovr_frames=97170 und=0 report_dt_us=1102713
+actr s=0000000300 u=0000326188 t=0000015315 e=0000058514 p=0000029257 d=0000000163 c=0000013355 o=0000097170                   
+2dp: enc_max_us=1751 pkt_sent=2569 pkt_fail=0 misaligned=0
+a2dp: tick_count=2673 worst_tick_interval_us=14852 enc_frames_total=atr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003315 pc2=10002913 b2=00003008                                                
+5138
+a2dp: frames_per_packet=1 credit_clamped_samples=780240 credit_clamp_events=1454 flush_frames=8191 resync_drops=0 fill_emadrn c=00005325 s=00000000 z=00000000 bd=0000035840 bp=0000043889 dr=0000326238                                                
+=5210 fill_min=4516
+a2dp: stop_credit=1146 stop_queue_full=56 stop_ring_empty=0 stop_dwell=14 fill_short_read=0
+a2dp: payloads_sealed=2569 tx_depth_max=5 grants=2569 spurious_grants=0 dwell_max_us=9601
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=190494 B/s (219264 bytes / 1151ms)
+usb-pump: packets=17069 log_drops=172186 report_dt_us=1150420
+usb-pump-race: pump_ticks_run=184743 sof_isr=184688
+usb-sctr s=0000000301 u=0000327303 t=0000015414 e=0000058933 p=0000029466 d=0000000163 c=0000013451 o=0000097170                   
+of-2ap: sof_streaming=17160 got=17069 miss_avail=68 miss_unavail=23 hw_unavail=23
+usb-audio-fix: fb_done=17094
+usb-audio-okx: atr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003407 pc2=10002913 b2=00003100                                                
+rx_bytes_total=3276728 rx_short_packets=192
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=3444/4608 drn c=00005330 s=00000000 z=00000000 bd=0000036736 bp=0000044771 dr=0000326570                                                
+ovr_frames=97170 und=0 report_dt_us=1150420
+a2dp: enc_max_us=1761 pkt_sent=2785 pkt_fail=0 misaligned=0
+a2dp: tick_count=2776 worst_tick_interval_us=14852 enc_frames_total=5570
+a2dp: frames_per_packet=1 credit_clamped_samples=780240 credit_clamp_events=1454 flush_frames=8191 resync_drops=0 fill_ema=3473 fill_min=2848
+a2dp: stop_credit=1249 stop_queue_full=56 stop_ring_empty=0 sctr s=0000000302 u=0000328419 t=0000015513 e=0000059351 p=0000029675 d=0000000163 c=0000013550 o=0000097170                   
+top_dwell=14 fill_short_read=0
+a2dp: payloads_sealed=2785 tx_depth_max=5 grants=2785 spurious_grants=0 dwell_max_us=9601
+wdt: atr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003499 pc2=10002913 b2=00003100                                                
+USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stadrn c=00005334 s=00000000 z=00000000 bd=0000037376 bp=0000045423 dr=0000327133                                                
+le_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192031 B/s (228508 bytes / 1189ms)
+usb-pump: packets=18313 log_drops=172186 report_dt_us=1244093
+usb-pump-race: pump_ticks_run=185987 sof_isr=185932
+usb-sof-2ap: sof_streaming=18404 got=18313 miss_avail=68 miss_unavail=23 hw_unavail=23ctr s=0000000303 u=0000329607 t=0000015619 e=0000059796 p=0000029898 d=0000000163 c=0000013656 o=0000097170                   
+
+usb-audio-fix: fb_done=18338
+usb-audio-okx: rx_bytes_total=3515604 rx_short_packets=199
+usb-pump-logring: backlog_hwm=8192
+aatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003591 pc2=10002913 b2=00003100                                                
+2dp: codec=LDAC bitrate=990000 fill=3728/4608 ovr_frames=97170 und=0 report_dt_us=1244093
+a2dp: enc_max_us=1783 pkt_sent=3018 pdrn c=00005338 s=00000000 z=00000000 bd=0000038016 bp=0000046075 dr=0000327696                                                
+kt_fail=0 misaligned=0
+a2dp: tick_count=2887 worst_tick_interval_us=14852 enc_frames_total=6036
+a2dp: frames_per_packet=1 credit_clamped_samples=780240 credit_clamp_events=1454 flush_frames=8191 resync_drops=0 fill_ema=3583 fill_min=2764
+a2dp: stop_credit=1359 stop_queue_full=56 stop_ring_empty=0 stop_dwell=15 fill_short_read=0
+usb-audio-fix: fb_done=19545
+wdt: USB_TIMER max_sctr s=0000000304 u=0000330763 t=0000015722 e=0000060229 p=0000030114 d=0000000163 c=0000013759 o=0000097170                   
+tale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadlinatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003683 pc2=10002913 b2=00003100                                                
+e_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measuredrn c=00005342 s=00000000 z=00000000 bd=0000038656 bp=0000046686 dr=0000328357                                                
+d=192077 B/s (238912 bytes / 1243ms)
+usb-pump: packets=151345 log_drops=321988 report_dt_us=1243738
+usb-pump-race: pump_ticks_run=319018 sof_isr=319082
+usb-sof-2ap: sof_streaming=151554 got=151345 miss_avail=68 miss_unavail=141 hw_unavail=141
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_mctr s=0000000305 u=0000331914 t=0000015824 e=0000060661 p=0000030330 d=0000000166 c=0000013858 o=0000097170                   
+s=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bitsatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003775 pc2=10002913 b2=00003100                                                
+=16 measured=192040 B/s (237756 bytes / 1238ms)
+usb-pump: packets=152583 log_drops=322961 report_dt_us=1238052
+usb-pump-race: drn c=00005346 s=00000000 z=00000000 bd=0000039296 bp=0000047338 dr=0000329201                                                
+pump_ticks_run=320257 sof_isr=320320
+usb-sof-2ap: sof_streaming=152792 got=152583 miss_avail=68 miss_unavail=141 hw_unavail=141
+usb-audio-fix: fb_done=152608
+usb-audio-okx: rx_bytes_total=29302024 rx_short_packets=1906
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enactr s=0000000306 u=0000332916 t=0000015913 e=0000061037 p=0000030518 d=0000000166 c=0000013947 o=0000097170                   
+bled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192018 B/s atr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003867 pc2=10002913 b2=00003100                                                
+(205496 bytes / 1070ms)
+usb-pump: packets=153654 log_drops=323560 report_dt_us=1070215
+usb-pump-race: pump_ticks_run=321327 sodrn c=00005350 s=00000000 z=00000000 bd=0000039936 bp=0000047990 dr=0000329764                                                
+f_isr=321390
+usb-sof-2ap: sof_streaming=153862 got=153653 miss_avail=68 miss_unavail=141 hw_unavail=141
+usb-audio-fix: fb_done=153678
+usb-audio-okx: rx_bytes_total=29507520 rx_short_packets=1920
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=2428/4608 ovr_frames=97170 und=3 report_dt_us=1070215
+a2dp: enc_max_us=1803 pkt_sent=28397 pkt_fail=0 misaligned=0
+a2dp: tick_count=14913 worst_tick_interval_us=15932 enc_frames_total=56804
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: Mctr s=0000000307 u=0000334136 t=0000016022 e=0000061494 p=0000030747 d=0000000166 c=0000014056 o=0000097170                   
+EDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191973 B/s (196236 bytes atr pc0=10002981 b0=00004593 pc1=100036f3 b1=00003959 pc2=10002913 b2=00003192                                                
+/ 1022ms)
+usb-pump: packets=154675 log_drops=324174 report_dt_us=1022163
+usb-pump-race: pump_ticks_run=322351 sof_isr=322416
+drn c=00005355 s=00000000 z=00000000 bd=0000040832 bp=0000048872 dr=0000330096                                                
+usb-sof-2ap: sof_streaming=154888 got=154678 miss_avail=68 miss_unavail=142 hw_unavail=142
+usb-audio-fix: fb_done=154702
+usb-audio-okx: rx_bytes_total=29704140 rx_short_packets=1925
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=4488/4608 ovr_frames=97170 und=3 report_dt_us=1022163
+a2dp: enc_max_us=1803 pkt_sent=28589 pkt_fail=0 misaligned=0
+a2dp: ticctr s=0000000308 u=0000335361 t=0000016131 e=0000061954 p=0000030977 d=0000000166 c=0000014165 o=0000097170                   
+k_count=15001 worst_tick_interval_us=15932 enc_frames_total=57184
+a2dp: frames_per_packet=1 credit_clamped_samples=783943 crediatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00004051 pc2=10002913 b2=00003192                                                
+t_clamp_events=1507 flush_frames=8191 resync_drops=0 fill_ema=2869 fill_min=1028
+a2dp: stop_credit=13047 stop_queue_full=336 stdrn c=00005359 s=00000000 z=00000000 bd=0000041472 bp=0000049524 dr=0000330659                                                
+op_ring_empty=3 stop_dwell=158 fill_short_read=0
+a2dp: WARNING stop_dwell rose by 21 this report window (total=158) -- the dwell-safety backstop tripped; encode is NOT finishing inside its credit budget and pl_a2dp_fill is being force-stopped by PL_A2DP_MAX_ENCODE_DWELL_US, not by the credit clock. See a2dp.c:609's doc comment.
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enablectr s=0000000309 u=0000336525 t=0000016234 e=0000062390 p=0000031195 d=0000000166 c=0000014268 o=0000097170                   
+d=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=81 deadline_ms=1000 enabled=1
+wdt: MEDIAatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00004143 pc2=10002913 b2=00003192                                                
+ max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191590 B/s (220476 bytes / 11drn c=00005363 s=00000000 z=00000000 bd=0000042112 bp=0000050176 dr=0000331221                                                
+50ms)
+usb-pump: packets=155824 log_drops=324268 report_dt_us=1150886
+usb-pump-race: pump_ticks_run=323497 sof_isr=323563
+usb-sof-2ap: sof_streaming=156035 got=155823 miss_avail=68 miss_unavail=144 hw_unavail=144
+usb-audio-fix: fb_done=155848
+usb-audio-okx: rx_bytes_total=29924232 rx_short_packets=1940
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ctr s=0000000310 u=0000337675 t=0000016336 e=0000062821 p=0000031410 d=0000000166 c=0000014370 o=0000097170                   
+ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1atr pc0=10002981 b0=00004593 pc1=100036f3 b1=00004235 pc2=10002913 b2=00003192                                                
+
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192113 B/s (23565drn c=00005367 s=00000000 z=00000000 bd=0000042752 bp=0000050792 dr=0000331820                                                
+6 bytes / 1226ms)
+usb-pump: packets=157050 log_drops=325112 report_dt_us=1226538
+usb-pump-race: pump_ticks_run=324723 sof_isr=324790
+usb-sof-2ap: sof_streaming=157262 got=157050 miss_avail=68 miss_unavail=144 hw_unavail=144
+usb-audio-fix: fb_done=157074
+usb-audio-okx: rx_bytes_total=30159696 rx_short_packets=1958
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_msctr s=0000000311 u=0000338678 t=0000016425 e=0000063197 p=0000031598 d=0000000166 c=0000014459 o=0000097170                   
+=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=10atr pc0=10002981 b0=00004593 pc1=100036f3 b1=00004327 pc2=10002913 b2=00003192                                                
+00 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=19213drn c=00005371 s=00000000 z=00000000 bd=0000043392 bp=0000051444 dr=0000332383                                                
+2 B/s (222976 bytes / 1160ms)
+usb-pump: packets=158211 log_drops=325675 report_dt_us=1160530
+usb-pump-race: pump_ticks_run=325884 sof_isr=325950
+usb-sof-2ap: sof_streaming=158423 got=158211 miss_avail=68 miss_unavail=144 hw_unavail=144
+usb-audio-fix: fb_done=158235
+usb-audio-okx: rx_bytes_total=30382672 rx_short_packets=1974
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER ctr s=0000000312 u=0000339688 t=0000016515 e=0000063576 p=0000031788 d=0000000166 c=0000014549 o=0000097170                   
+max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00004419 pc2=10002913 b2=00003192                                                
+adline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 medrn c=00005375 s=00000000 z=00000000 bd=0000044032 bp=0000052096 dr=0000332945                                                
+asured=191999 B/s (210112 bytes / 1094ms)
+usb-pump: packets=159305 log_drops=326238 report_dt_us=1094350
+usb-pump-race: pump_ticks_run=326978 sof_isr=327045
+usb-sof-2ap: sof_streaming=159517 got=159305 miss_avail=68 miss_unavail=144 hw_unavail=144
+usb-audio-fix: fb_done=159329
+usb-audio-okx: rx_bytes_total=30592784 rx_short_packets=1990
+usb-pump-logring: backlog_hwm=8192
+a2dctr s=0000000313 u=0000340887 t=0000016622 e=0000064025 p=0000032012 d=0000000166 c=0000014656 o=0000097170                   
+p: codec=LDAC bitrate=990000 fill=2252/4608 ovr_frames=97170 und=3 report_dt_us=1094350
+a2dp: enc_max_us=1803 pkt_sent=29462 pkatr pc0=10002981 b0=00004593 pc1=100036f3 b1=00004511 pc2=100036bd b2=00003210                                                
+t_fail=0 misaligned=0
+a2dp: tick_count=15412 worst_tick_interval_us=15932 enc_frames_total=58924
+wdt: USB_TIMER max_stale_ms=0drn c=00005379 s=00000000 z=00000000 bd=0000044672 bp=0000052712 dr=0000333543                                                
+ deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192041 B/s (218172 bytes / 1136ms)
+usb-pump: packets=160441 log_drops=326570 report_dt_us=1136058
+usb-pump-race: pump_ticks_run=32811ctr s=0000000314 u=0000341962 t=0000016718 e=0000064425 p=0000032212 d=0000000166 c=0000014751 o=0000097170                   
+4 sof_isr=328181
+usb-sof-2ap: sof_streaming=160653 got=160441 miss_avail=68 miss_unavail=144 hw_unavail=144
+usb-audio-fix: fb_atr pc0=100036f3 b0=00004603 pc1=10002981 b1=00004593 pc2=100036bd b2=00003274                                                
+done=160465
+usb-audio-okx: rx_bytes_total=30810956 rx_short_packets=2005
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER madrn c=00005383 s=00000000 z=00000000 bd=0000045312 bp=0000053364 dr=0000334105                                                
+x_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192114 B/s (228352 bytes / 1188ms)
+usb-pump: packets=161630 log_drops=327133 report_dt_us=1188624
+usb-pump-race: pump_ticctr s=0000000315 u=0000343142 t=0000016823 e=0000064868 p=0000032434 d=0000000167 c=0000014855 o=0000097170                   
+ks_run=329303 sof_isr=329370
+usb-sof-2ap: sof_streaming=161842 got=161630 miss_avail=68 miss_unavail=144 hw_unavail=144
+usb-auatr pc0=100036f3 b0=00004695 pc1=10002981 b1=00004593 pc2=100036bd b2=00003338                                                
+dio-fix: fb_done=161654
+usb-audio-okx: rx_bytes_total=31039308 rx_short_packets=2021
+usb-pump-logring: backlog_hwm=8192
+wdt: drn c=00005387 s=00000000 z=00000000 bd=0000045952 bp=0000054016 dr=0000334949                                                
+USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191973 B/s (221816 bytes / 1155ms)
+frame 5341: render=302542us blit=21122us total=323716us
+usb-pump: packets=ctr s=0000000316 u=0000344165 t=0000016914 e=0000065252 p=0000032626 d=0000000167 c=0000014946 o=0000097170                   
+162785 log_drops=327696 report_dt_us=1155516
+usb-pump-race: pump_ticks_run=330458 sof_isr=330525
+usb-sof-2ap: sof_streaming=162997 got=162785 miss_avail=68 miss_unavail=144 hw_unavail=144
+usb-audio-fix: fb_done=162809
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabatr pc0=100036f3 b0=00004787 pc1=10002981 b1=00004593 pc2=100036bd b2=00003402                                                
+led=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191936 B/s (drn c=00005392 s=00000000 z=00000000 bd=0000046848 bp=0000054632 dr=0000335548                                                
+221052 bytes / 1151ms)
+usb-pump: packets=163936 log_drops=328357 report_dt_us=1151621
+usb-pump-race: pump_ticks_run=331609 sofctr s=0000000317 u=0000345162 t=0000017003 e=0000065625 p=0000032812 d=0000000167 c=0000015035 o=0000097170                   
+_isr=331677
+usb-sof-2ap: sof_streaming=164149 got=163936 miss_avail=68 miss_unavail=145 hw_unavail=145
+usb-audio-fix: fb_done=163960
+usb-audio-okx: rx_bytes_total=31482176 rx_short_packets=2050
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_atr pc0=100036f3 b0=00004879 pc1=10002981 b1=00004593 pc2=100036bd b2=00003466                                                
+ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=drn c=00005396 s=00000000 z=00000000 bd=0000047488 bp=0000055284 dr=0000336111                                                
+191824 B/s (192248 bytes / 1002ms)
+usb-pump: packets=164937 log_drops=329201 report_dt_us=1002199
+usb-pump-race: pump_ticks_ructr s=0000000318 u=0000346355 t=0000017109 e=0000066073 p=0000033036 d=0000000167 c=0000015141 o=0000097170                   
+n=332610 sof_isr=332679
+usb-sof-2ap: sof_streaming=165151 got=164937 miss_avail=68 miss_unavail=146 hw_unavail=146
+usb-audio-fix: fb_done=164961
+usb-audio-okx: rx_bytes_total=31674424 rx_short_packets=2064
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_msatr pc0=100036f3 b0=00004971 pc1=10002981 b1=00004593 pc2=100036bd b2=00003530                                                
+=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=drn c=00005400 s=00000000 z=00000000 bd=0000048128 bp=0000055936 dr=0000336674                                                
+16 measured=191714 B/s (233736 bytes / 1219ms)
+usb-pump: packets=166154 log_drops=329764 report_dt_us=1219186
+usb-pump-race: pctr s=0000000319 u=0000347479 t=0000017209 e=0000066494 p=0000033247 d=0000000167 c=0000015241 o=0000097170                   
+ump_ticks_run=333827 sof_isr=333898
+usb-sof-2ap: sof_streaming=166370 got=166154 miss_avail=68 miss_unavail=148 hw_unavail=148
+usb-audio-fix: fb_done=166178
+usb-audio-okx: rx_bytes_total=31908160 rx_short_packets=2082
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1980/4608 ovr_frames=97170 und=3 report_dt_us=1219186
+a2dp: enc_max_us=1803 pkt_sent=307atr pc0=100036f3 b0=00005063 pc1=10002981 b1=00004593 pc2=100036bd b2=00003594                                                
+47 pkt_fail=0 misaligned=0
+a2dp: tick_count=16022 worst_tick_interval_us=15932 enc_frames_total=61494
+wdt: USB_TIMER max_staledrn c=00005404 s=00000000 z=00000000 bd=0000048768 bp=0000056547 dr=0000337335                                                
+_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=19ctr s=0000000320 u=0000348678 t=0000017316 e=0000066941 p=0000033470 d=0000000167 c=0000015348 o=0000097170                   
+2139 B/s (235468 bytes / 1225ms)
+usb-pump: packets=167380 log_drops=330096 report_dt_us=1225531
+usb-pump-race: pump_ticks_run=atr pc0=100036f3 b0=00005155 pc1=10002981 b1=00004593 pc2=100036bd b2=00003658                                                
+335053 sof_isr=335124
+usb-sof-2ap: sof_streaming=167596 got=167380 miss_avail=68 miss_unavail=148 hw_unavail=148
+usb-audio-fixdrn c=00005408 s=00000000 z=00000000 bd=0000049280 bp=0000057291 dr=0000337805                                                
+: fb_done=167404
+usb-audio-okx: rx_bytes_total=32143628 rx_short_packets=2101
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16ctr s=0000000321 u=0000349727 t=0000017409 e=0000067335 p=0000033667 d=0000000167 c=0000015441 o=0000097170                   
+ measured=191722 B/s (223172 bytes / 1164ms)
+usb-pump: packets=168542 log_drops=330659 report_dt_us=1164035
+usb-pump-race: pumatr pc0=100036f3 b0=00005247 pc1=10002981 b1=00004593 pc2=100036bd b2=00003722                                                
+p_ticks_run=336215 sof_isr=336288
+usb-sof-2ap: sof_streaming=168760 got=168542 miss_avail=68 miss_unavail=150 hw_unavail=150
+udrn c=00005412 s=00000000 z=00000000 bd=0000049920 bp=0000057943 dr=0000338368                                                
+sb-audio-fix: fb_done=168566
+usb-audio-okx: rx_bytes_total=32366800 rx_short_packets=2118
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ctr s=0000000322 u=0000350738 t=0000017499 e=0000067714 p=0000033857 d=0000000167 c=0000015531 o=0000097170                   
+ch=2 bits=16 measured=192048 B/s (220872 bytes / 1150ms)
+usb-pump: packets=169692 log_drops=331221 report_dt_us=1150093
+usb-puatr pc0=100036f3 b0=00005339 pc1=10002981 b1=00004593 pc2=100036bd b2=00003786                                                
+mp-race: pump_ticks_run=337365 sof_isr=337438
+usb-sof-2ap: sof_streaming=169910 got=169692 miss_avail=68 miss_unavail=150 hw_undrn c=00005416 s=00000000 z=00000000 bd=0000050560 bp=0000058595 dr=0000338930                                                
+avail=150
+usb-audio-fix: fb_done=169716
+usb-audio-okx: rx_bytes_total=32587672 rx_short_packets=2136
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=19ctr s=0000000323 u=0000351772 t=0000017591 e=0000068101 p=0000034050 d=0000000167 c=0000015623 o=0000097170                   
+1753 B/s (192248 bytes / 1002ms)
+usb-pump: packets=170694 log_drops=331820 report_dt_us=1002691
+usb-pump-race: pump_ticks_run=atr pc0=100036f3 b0=00005431 pc1=10002981 b1=00004593 pc2=100036bd b2=00003850                                                
+338367 sof_isr=338440
+usb-sof-2ap: sof_streaming=170912 got=170693 miss_avail=68 miss_unavail=151 hw_unavail=151
+usb-audio-fixdrn c=00005420 s=00000000 z=00000000 bd=0000051200 bp=0000059247 dr=0000339492                                                
+: fb_done=170718
+usb-audio-okx: rx_bytes_total=32780112 rx_short_packets=2150
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16ctr s=0000000324 u=0000352989 t=0000017699 e=0000068555 p=0000034277 d=0000000168 c=0000015729 o=0000097170                   
+ measured=192173 B/s (194176 bytes / 1010ms)
+usb-pump: packets=171704 log_drops=332383 report_dt_us=1010305
+usb-pump-race: pumatr pc0=100036f3 b0=00005523 pc1=10002981 b1=00004593 pc2=100036bd b2=00003914                                                
+p_ticks_run=339377 sof_isr=339451
+usb-sof-2ap: sof_streaming=171923 got=171704 miss_avail=68 miss_unavail=151 hw_unavail=151
+udrn c=00005424 s=00000000 z=00000000 bd=0000051840 bp=0000059899 dr=0000340335                                                
+sb-audio-fix: fb_done=171728
+usb-audio-okx: rx_bytes_total=32974096 rx_short_packets=2166
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ctr s=0000000325 u=0000354109 t=0000017798 e=0000068975 p=0000034487 d=0000000168 c=0000015828 o=0000097170                   
+ch=2 bits=16 measured=191708 B/s (229704 bytes / 1198ms)
+usb-pump: packets=172900 log_drops=332945 report_dt_us=1198174
+usb-puatr pc0=100036f3 b0=00005615 pc1=10002981 b1=00004593 pc2=100036bd b2=00003978                                                
+mp-race: pump_ticks_run=340573 sof_isr=340649
+usb-sof-2ap: sof_streaming=173121 got=172900 miss_avail=68 miss_unavail=153 hw_undrn c=00005428 s=00000000 z=00000000 bd=0000052480 bp=0000060515 dr=0000340934                                                
+avail=153
+usb-audio-fix: fb_done=172924
+usb-audio-okx: rx_bytes_total=33203800 rx_short_packets=2184
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=19ctr s=0000000326 u=0000355428 t=0000017916 e=0000069469 p=0000034734 d=0000000170 c=0000015944 o=0000097170                   
+0757 B/s (205120 bytes / 1075ms)
+usb-pump: packets=173968 log_drops=333543 report_dt_us=1075302
+usb-pump-race: pump_ticks_run=atr pc0=100036f3 b0=00005707 pc1=10002981 b1=00004593 pc2=100036bd b2=00004042                                                
+341642 sof_isr=341724
+usb-sof-2ap: sof_streaming=174196 got=173968 miss_avail=68 miss_unavail=160 hw_unavail=160
+usb-audio-fixdrn c=00005432 s=00000000 z=00000000 bd=0000053120 bp=0000061167 dr=0000341778                                                
+: fb_done=173993
+usb-audio-okx: rx_bytes_total=33409112 rx_short_packets=2200
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16ctr s=0000000327 u=0000356659 t=0000018025 e=0000069931 p=0000034965 d=0000000170 c=0000016053 o=0000097170                   
+ measured=192149 B/s (226824 bytes / 1180ms)
+usb-pump: packets=175149 log_drops=334105 report_dt_us=1180459
+usb-pump-race: pumatr pc0=100036f3 b0=00005799 pc1=10002981 b1=00004593 pc2=100036bd b2=00004106                                                
+p_ticks_run=342822 sof_isr=342905
+usb-sof-2ap: sof_streaming=175377 got=175149 miss_avail=68 miss_unavail=160 hw_unavail=160
+udrn c=00005436 s=00000000 z=00000000 bd=0000053760 bp=0000061819 dr=0000342340                                                
+sb-audio-fix: fb_done=175173
+usb-audio-okx: rx_bytes_total=33635744 rx_short_packets=2218
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191889 B/s (194364 bytes / 1012ms)
+usb-pump: packets=176161 log_drops=334949 report_dt_us=1012896
+usb-pump-race: pump_ticks_run=343834 sof_isr=343918
+usb-sof-2ap: sof_streaming=176390 got=176161 miss_avail=68 miss_unavail=161 hw_unctr s=0000000328 u=0000357953 t=0000018140 e=0000070413 p=0000035206 d=0000000170 c=0000016167 o=0000097170                   
+avail=161
+usb-audio-fix: fb_done=176185
+usb-audio-okx: rx_bytes_total=33830108 rx_short_packets=2233
+wdt: USB_TIMER max_staleatr pc0=100036f3 b0=00005891 pc1=10002981 b1=00004593 pc2=100036bd b2=00004170                                                
+_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_msdrn c=00005440 s=00000000 z=00000000 bd=0000054528 bp=0000062701 dr=0000342672                                                
+=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191984 B/s (193212 bytes / 1006ms)
+usb-pump: packets=177167 log_drops=335548 report_dt_us=1006389
+usb-pump-race: pump_ticks_run=344840 sof_isr=344924
+usb-sof-2ap: sof_streaming=177396 got=177167 miss_avail=68 miss_unavail=161 hw_unavail=161
+usb-audio-fixctr s=0000000329 u=0000359044 t=0000018237 e=0000070822 p=0000035411 d=0000000170 c=0000016264 o=0000097170                   
+: fb_done=177191
+usb-audio-okx: rx_bytes_total=34023320 rx_short_packets=2248
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMatr pc0=100036f3 b0=00005983 pc1=10002981 b1=00004593 pc2=100036bd b2=00004234                                                
+ER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0drn c=00005444 s=00000000 z=00000000 bd=0000055168 bp=0000063336 dr=0000343251                                                
+ deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192100 B/s (225284 bytes / 1172ms)
+usb-pump: packets=178340 log_drops=336111 report_dt_us=1172746
+usb-pump-race: pump_ticks_run=346013 sof_isr=346097
+usb-sof-2ap: sof_streaming=178569 got=178340 miss_avail=68 miss_unavail=161 hw_unavail=161
+usb-audio-fix: fb_done=178364
+usb-audio-okx: rx_bytes_total=34248604 rx_short_packets=2265
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK mactr s=0000000330 u=0000360234 t=0000018342 e=0000071269 p=0000035634 d=0000000178 c=0000016344 o=0000097170                   
+x_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+frame 5401: render=290550us blit=2atr pc0=100036f3 b0=00006075 pc1=10002981 b1=00004735 pc2=100036bd b2=00004298                                                
+2483us total=313081us
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191900 B/s (219716 bytes / 1144ms)
+usb-pump: pacdrn c=00005449 s=00000000 z=00000000 bd=0000056064 bp=0000064251 dr=0000343831                                                
+kets=179484 log_drops=336674 report_dt_us=1144946
+usb-pump-race: pump_ticks_run=347157 sof_isr=347242
+usb-sof-2ap: sof_streaming=179714 got=179484 miss_avail=68 miss_unavail=162 hw_unavail=162
+usb-audio-fix: fb_done=179508
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000ctr s=0000000331 u=0000361510 t=0000018455 e=0000071747 p=0000035873 d=0000000178 c=0000016457 o=0000097170                   
+ enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=190772 atr pc0=100036f3 b0=00006167 pc1=10002981 b1=00004735 pc2=100036bd b2=00004362                                                
+B/s (228744 bytes / 1199ms)
+usb-pump: packets=180675 log_drops=337335 report_dt_us=1199052
+usb-pump-race: pump_ticks_run=34834drn c=00005453 s=00000000 z=00000000 bd=0000056704 bp=0000064886 dr=0000344411                                                
+8 sof_isr=348441
+usb-sof-2ap: sof_streaming=180913 got=180675 miss_avail=68 miss_unavail=170 hw_unavail=170
+usb-audio-fix: fb_done=180699
+usb-audio-okx: rx_bytes_total=34697064 rx_short_packets=2300
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1828/4608 ovr_frames=97170 und=4 report_dt_us=1199052
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabledctr s=0000000332 u=0000362798 t=0000018569 e=0000072230 p=0000036115 d=0000000180 c=0000016569 o=0000097170                   
+=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA matr pc0=100036f3 b0=00006259 pc1=10002981 b1=00004735 pc2=100036bd b2=00004426                                                
+ax_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192043 B/s (201468 bytes / 1049drn c=00005457 s=00000000 z=00000000 bd=0000057344 bp=0000065521 dr=0000345271                                                
+ms)
+usb-pump: packets=181724 log_drops=337805 report_dt_us=1049066
+usb-pump-race: pump_ticks_run=349397 sof_isr=349490
+usb-sof-2ap: sof_streaming=181962 got=181724 miss_avail=68 miss_unavail=170 hw_unavail=170
+usb-audio-fix: fb_done=181748
+usb-audio-okx: rx_bytes_total=34898532 rx_short_packets=2315
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_msctr s=0000000333 u=0000363911 t=0000018668 e=0000072647 p=0000036323 d=0000000180 c=0000016668 o=0000097170                   
+=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+atr pc0=100036f3 b0=00006351 pc1=10002981 b1=00004735 pc2=100036bd b2=00004490                                                
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191758 B/s (193792 drn c=00005461 s=00000000 z=00000000 bd=0000057984 bp=0000066121 dr=0000345942                                                
+bytes / 1010ms)
+usb-pump: packets=182734 log_drops=338368 report_dt_us=1010725
+usb-pump-race: pump_ticks_run=350407 sof_isr=350501
+usb-sof-2ap: sof_streaming=182973 got=182734 miss_avail=68 miss_unavail=171 hw_unavail=171
+usb-audio-fix: fb_done=182758
+usb-audio-okx: rx_bytes_total=35092516 rx_short_packets=2331
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0ctr s=0000000334 u=0000365095 t=0000018773 e=0000073091 p=0000036545 d=0000000180 c=0000016773 o=0000097170                   
+ deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000atr pc0=100036f3 b0=00006443 pc1=10002981 b1=00004735 pc2=100036bd b2=00004554                                                
+ enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191967 drn c=00005465 s=00000000 z=00000000 bd=0000058624 bp=0000066812 dr=0000346466                                                
+B/s (198584 bytes / 1034ms)
+usb-pump: packets=183767 log_drops=338930 report_dt_us=1034347
+usb-pump-race: pump_ticks_run=351440 sof_isr=351535
+usb-sof-2ap: sof_streaming=184007 got=183767 miss_avail=68 miss_unavail=172 hw_unavail=172
+usb-audio-fix: fb_done=183791
+usb-audio-okx: rx_bytes_total=35290908 rx_short_packets=2345
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER mactr s=0000000335 u=0000366190 t=0000018870 e=0000073502 p=0000036751 d=0000000180 c=0000016870 o=0000097170                   
+x_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadatr pc0=100036f3 b0=00006535 pc1=10002981 b1=00004735 pc2=100036bd b2=00004618                                                
+line_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measdrn c=00005469 s=00000000 z=00000000 bd=0000059264 bp=0000067447 dr=0000347045                                                
+ured=190870 B/s (232200 bytes / 1216ms)
+usb-pump: packets=184977 log_drops=339492 report_dt_us=1216657
+usb-pump-race: pump_ticks_run=352650 sof_isr=352752
+usb-sof-2ap: sof_streaming=185224 got=184977 miss_avail=68 miss_unavail=179 hw_unavail=179
+usb-audio-fix: fb_done=185001
+usb-audio-okx: rx_bytes_total=35523300 rx_short_packets=2363
+usb-pump-logring: backlog_hwm=8192
+wdt: ctr s=0000000336 u=0000367323 t=0000018971 e=0000073923 p=0000036961 d=0000000180 c=0000016970 o=0000097170                   
+USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_staatr pc0=100036f3 b0=00006627 pc1=10002981 b1=00004735 pc2=100036bd b2=00004682                                                
+le_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 drn c=00005473 s=00000000 z=00000000 bd=0000059904 bp=0000068082 dr=0000347624                                                
+bits=16 measured=192050 B/s (215104 bytes / 1120ms)
+usb-pump: packets=186097 log_drops=340335 report_dt_us=1120035
+usb-pump-race: pump_ticks_run=353770 sof_isr=353872
+usb-sof-2ap: sof_streaming=186344 got=186097 miss_avail=68 miss_unavail=179 hw_unavail=179
+usb-audio-fix: fb_done=186121
+usb-audio-okx: rx_bytes_total=35738404 rx_short_packets=2379
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192068 ctr s=0000000337 u=0000368594 t=0000019084 e=0000074400 p=0000037200 d=0000000180 c=0000017083 o=0000097170                   
+B/s (253324 bytes / 1318ms)
+usb-pump: packets=187416 log_drops=340934 report_dt_us=1318942
+usb-pump-race: pump_ticks_run=35508atr pc0=100036f3 b0=00006719 pc1=100036bd b1=00004746 pc2=10002981 b2=00004735                                                
+9 sof_isr=355191
+usb-sof-2ap: sof_streaming=187663 got=187416 miss_avail=68 miss_unavail=179 hw_unavail=179
+usb-audio-fix: fb_drn c=00005478 s=00000000 z=00000000 bd=0000060800 bp=0000068951 dr=0000347969                                                
+done=187440
+usb-audio-okx: rx_bytes_total=35991728 rx_short_packets=2398
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measctr s=0000000338 u=0000369817 t=0000019193 e=0000074859 p=0000037429 d=0000000182 c=0000017190 o=0000097170                   
+ured=191946 B/s (236232 bytes / 1230ms)
+usb-pump: packets=188645 log_drops=341778 report_dt_us=1230573
+usb-pump-race: pump_ticatr pc0=100036f3 b0=00006811 pc1=100036bd b1=00004810 pc2=10002981 b2=00004735                                                
+ks_run=356318 sof_isr=356421
+usb-sof-2ap: sof_streaming=188893 got=188645 miss_avail=68 miss_unavail=180 hw_unavail=180
+usb-audrn c=00005482 s=00000000 z=00000000 bd=0000061440 bp=0000069612 dr=0000348804                                                
+dio-fix: fb_done=188669
+usb-audio-okx: rx_bytes_total=36227768 rx_short_packets=2416
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 ctr s=0000000339 u=0000371028 t=0000019301 e=0000075313 p=0000037656 d=0000000182 c=0000017298 o=0000097170                   
+bits=16 measured=190683 B/s (246800 bytes / 1294ms)
+usb-pump: packets=189931 log_drops=342340 report_dt_us=1294418
+usb-pump-raatr pc0=100036f3 b0=00006903 pc1=100036bd b1=00004874 pc2=10002981 b2=00004735                                                
+ce: pump_ticks_run=357604 sof_isr=357716
+usb-sof-2ap: sof_streaming=190188 got=189931 miss_avail=68 miss_unavail=189 hw_unavaildrn c=00005486 s=00000000 z=00000000 bd=0000062080 bp=0000070247 dr=0000349384                                                
+=189
+usb-audio-fix: fb_done=189955
+usb-audio-okx: rx_bytes_total=36474760 rx_short_packets=2436
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1860/4608 ovr_frames=97170 und=6 report_dt_us=1294418
+a2dp: enc_max_us=1816 pkt_sent=35206 pkt_fail=0 misaligned=0
+a2dp: tick_count=18140 worst_tick_interval_us=15932 enc_frames_total=70413
+wdt: USB_TIMER max_ctr s=0000000340 u=0000372196 t=0000019405 e=0000075750 p=0000037875 d=0000000182 c=0000017402 o=0000097170                   
+stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz atr pc0=100036f3 b0=00006995 pc1=100036bd b1=00004938 pc2=10002981 b2=00004735                                                
+ch=2 bits=16 measured=192169 B/s (209732 bytes / 1091ms)
+usb-pump: packets=191022 log_drops=342781 report_dt_us=1091263
+usb-pudrn c=00005490 s=00000000 z=00000000 bd=0000062720 bp=0000070882 dr=0000349964                                                
+mp-race: pump_ticks_run=358695 sof_isr=358807
+usb-sof-2ap: sof_streaming=191279 got=191022 miss_avail=68 miss_unavail=189 hw_unavail=189
+usb-audio-fix: fb_done=191046
+usb-audio-okx: rx_bytes_total=36684300 rx_short_packets=2453
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1992/4608 ovr_frames=97170 und=6 report_dt_us=1091263
+wdt: USB_TIMER max_stalectr s=0000000341 u=0000373284 t=0000019502 e=0000076158 p=0000038079 d=0000000182 c=0000017499 o=0000097170                   
+_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 atr pc0=100036f3 b0=00007087 pc1=100036bd b1=00005002 pc2=10002981 b2=00004735                                                
+bits=16 measured=192058 B/s (228536 bytes / 1189ms)
+usb-pump: packets=192212 log_drops=343360 report_dt_us=1189946
+usb-pump-radrn c=00005494 s=00000000 z=00000000 bd=0000063360 bp=0000071517 dr=0000350543                                                
+ce: pump_ticks_run=359885 sof_isr=359997
+usb-sof-2ap: sof_streaming=192469 got=192212 miss_avail=68 miss_unavail=189 hw_unavail=189
+usb-audio-fix: fb_done=192236
+usb-audio-okx: rx_bytes_total=36912836 rx_short_packets=2467
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1664/4608 ovr_frames=97170 und=6 report_dt_us=1189946
+a2dp: enc_max_us=1816 pkt_senctr s=0000000342 u=0000374332 t=0000019595 e=0000076549 p=0000038274 d=0000000182 c=0000017591 o=0000097170                   
+t=35634 pkt_fail=0 misaligned=0
+a2dp: tick_count=18342 worst_tick_interval_us=15932 enc_frames_total=71269
+a2dp: frames_per_paatr pc0=100036f3 b0=00007179 pc1=100036bd b1=00005066 pc2=10002981 b2=00004735                                                
+cket=1 credit_clamped_samples=785583 credit_clamp_events=1537 flush_frames=8191 resync_drops=0 fill_ema=1794 fill_min=740
+wdt: drn c=00005498 s=00000000 z=00000000 bd=0000064000 bp=0000072152 dr=0000351122                                                
+USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192022 B/s (245064 bytes / 1276ms)
+usb-pump: packets=193488 log_drops=343940 report_dt_us=1276183
+usb-pump-race: pump_ticks_run=361161 sof_isr=361273
+usb-sof-2ap: sof_streaming=193745 got=193488 miss_avail=68 miss_unactr s=0000000343 u=0000375477 t=0000019697 e=0000076978 p=0000038489 d=0000000182 c=0000017693 o=0000097170                   
+vail=189 hw_unavail=189
+usb-audio-fix: fb_done=193512
+usb-audio-okx: rx_bytes_total=37157900 rx_short_packets=2485
+usb-pump-latr pc0=100036f3 b0=00007271 pc1=100036bd b1=00005130 pc2=10003713 b2=00004752                                                
+ogring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1992/4608 ovr_frames=97170 und=6 report_dt_us=1276183
+wdt: USB_Tdrn c=00005502 s=00000000 z=00000000 bd=0000064640 bp=0000072810 dr=0000351679                                                
+IMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191972 B/s (247172 bytes / 1287ms)
+usb-pump: packets=194776 log_drops=344520 report_dt_us=1287681
+usb-pump-race: pump_ticks_run=362449 sof_isr=362561
+usb-sof-2ap: sof_streaming=195033 got=194776 miss_avail=68 miss_unavail=189 hw_unavail=189
+usb-audio-fix: fb_done=194800
+usb-audio-okx: rx_bytes_total=37405268 rx_short_packets=2503
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=2064/4608 ovr_frames=97170 und=6 report_dt_us=1287681
+wdt: USB_TIMER ctr s=0000000344 u=0000376737 t=0000019809 e=0000077450 p=0000038725 d=0000000182 c=0000017805 o=0000097170                   
+max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=4800atr pc0=100036f3 b0=00007363 pc1=100036bd b1=00005194 pc2=10002981 b2=00004877                                                
+0Hz ch=2 bits=16 measured=191818 B/s (213572 bytes / 1113ms)
+frame 5461: render=283605us blit=21505us total=305163us
+usb-pump:drn c=00005507 s=00000000 z=00000000 bd=0000065536 bp=0000073725 dr=0000351978                                                
+ packets=195887 log_drops=345380 report_dt_us=1113353
+usb-pump-race: pump_ticks_run=363560 sof_isr=363674
+usb-sof-2ap: sof_streaming=196146 got=195887 miss_avail=68 miss_unavail=191 hw_unavail=191
+usb-audio-fix: fb_done=195911
+usb-audio-okx: rx_bytes_total=37618644 rx_short_packets=2519
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1ctr s=0000000345 u=0000378008 t=0000019922 e=0000077927 p=0000038963 d=0000000184 c=0000017916 o=0000097170                   
+
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+usb-audio: stratr pc0=100036f3 b0=00007455 pc1=100036bd b1=00005258 pc2=10002981 b2=00004877                                                
+eaming rate=48000Hz ch=2 bits=16 measured=192012 B/s (227208 bytes / 1183ms)
+usb-pump: packets=197070 log_drops=345995 report_ddrn c=00005511 s=00000000 z=00000000 bd=0000066176 bp=0000074360 dr=0000352839                                                
+t_us=1183221
+usb-pump-race: pump_ticks_run=364743 sof_isr=364857
+usb-sof-2ap: sof_streaming=197329 got=197070 miss_avail=68 miss_unavail=191 hw_unavail=191
+usb-audio-fix: fb_done=197094
+usb-audio-okx: rx_bytes_total=37846044 rx_short_packets=2537
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=2008/4608 ovr_frames=97170 und=6 report_dt_us=1183221
+wdt:ctr s=0000000346 u=0000379240 t=0000020032 e=0000078389 p=0000039194 d=0000000185 c=0000018025 o=0000097170                   
+ USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaminatr pc0=100036f3 b0=00007547 pc1=100036bd b1=00005322 pc2=10003713 b2=00004938                                                
+g rate=48000Hz ch=2 bits=16 measured=191910 B/s (205888 bytes / 1072ms)
+usb-pump: packets=198142 log_drops=346575 report_dt_us=drn c=00005515 s=00000000 z=00000000 bd=0000066816 bp=0000074995 dr=0000353700                                                
+1072834
+usb-pump-race: pump_ticks_run=365815 sof_isr=365930
+usb-sof-2ap: sof_streaming=198402 got=198142 miss_avail=68 miss_unavail=192 hw_unavail=192
+usb-audio-fix: fb_done=198166
+usb-audio-okx: rx_bytes_total=38051740 rx_short_packets=2553
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1880/4608 ovr_frames=97170 und=6 report_dt_us=1072834
+wdt: USB_ctr s=0000000347 u=0000380428 t=0000020138 e=0000078834 p=0000039417 d=0000000186 c=0000018130 o=0000097170                   
+TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming ratatr pc0=100036f3 b0=00007639 pc1=100036bd b1=00005386 pc2=10003713 b2=00005000                                                
+e=48000Hz ch=2 bits=16 measured=190512 B/s (220104 bytes / 1155ms)
+usb-pump: packets=199289 log_drops=347154 report_dt_us=11554drn c=00005519 s=00000000 z=00000000 bd=0000067456 bp=0000075630 dr=0000354561                                                
+38
+usb-pump-race: pump_ticks_run=366962 sof_isr=367085
+usb-sof-2ap: sof_streaming=199557 got=199288 miss_avail=68 miss_unavail=201 hw_unavail=201
+usb-audio-fix: fb_done=199313
+usb-audio-okx: rx_bytes_total=38272036 rx_short_packets=2571
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=2016/4608 ovr_frames=97170 und=7 report_dt_us=1155438
+wdt: USB_TIMERctr s=0000000348 u=0000381585 t=0000020241 e=0000079268 p=0000039634 d=0000000186 c=0000018233 o=0000097170                   
+ max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=480atr pc0=100036f3 b0=00007731 pc1=100036bd b1=00005450 pc2=10003713 b2=00005062                                                
+00Hz ch=2 bits=16 measured=192177 B/s (240076 bytes / 1249ms)
+usb-pump: packets=200559 log_drops=347733 report_dt_us=1270006
+udrn c=00005523 s=00000000 z=00000000 bd=0000068096 bp=0000076230 dr=0000355233                                                
+sb-pump-race: pump_ticks_run=368232 sof_isr=368356
+usb-sof-2ap: sof_streaming=200828 got=200559 miss_avail=68 miss_unavail=201 hw_unavail=201
+usb-audio-fix: fb_done=200583
+usb-audio-okx: rx_bytes_total=38515952 rx_short_packets=2590
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1708/4608 ovr_frames=97170 und=7 report_dt_us=1270006
+a2dp: enc_max_us=18ctr s=0000000349 u=0000382842 t=0000020353 e=0000079740 p=0000039870 d=0000000186 c=0000018345 o=0000097170                   
+16 pkt_sent=37200 pkt_fail=0 misaligned=0
+a2dp: tick_count=19084 worst_tick_interval_us=15932 enc_frames_total=74400
+a2dp: stoatr pc0=100036f3 b0=00007823 pc1=100036bd b1=00005514 pc2=10003713 b2=00005124                                                
+p_credit=17083 stop_queue_full=357 stop_ring_empty=7 stop_dwell=180 fill_short_read=0
+wdt: USB_TIMER max_stale_ms=0 deadline_msdrn c=00005527 s=00000000 z=00000000 bd=0000068736 bp=0000076921 dr=0000355757                                                
+=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191941 B/s (238920 bytes / 1244ms)
+usb-pump: packets=201783 log_drops=348022 report_dt_us=1223987
+usb-pump-race: pump_ticks_run=369456 sof_isr=369579
+usb-sof-2ap: sof_streaming=202051 got=201782 mictr s=0000000350 u=0000383875 t=0000020445 e=0000080127 p=0000040063 d=0000000186 c=0000018437 o=0000097170                   
+ss_avail=68 miss_unavail=201 hw_unavail=201
+usb-audio-fix: fb_done=201807
+usb-audio-okx: rx_bytes_total=38751032 rx_short_packatr pc0=100036f3 b0=00007915 pc1=100036bd b1=00005578 pc2=10003713 b2=00005186                                                
+ets=2608
+usb-pump-logring: backlog_hwm=8192
+a2dp: enc_max_us=1816 pkt_sent=37429 pkt_fail=0 misaligned=0
+wdt: USB_TIMER max_sdrn c=00005531 s=00000000 z=00000000 bd=0000069376 bp=0000077556 dr=0000356337                                                
+tale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191846 B/s (232392 bytes / 1211ms)
+usb-pump: packets=202992 log_drops=348913 report_dt_us=1211253
+usb-pump-race: pump_ticks_run=370665 sof_isr=370791
+usb-sof-2ap: sof_streaming=203263 got=202992 miss_avail=68 miss_unavail=203 hw_unactr s=0000000351 u=0000385093 t=0000020554 e=0000080583 p=0000040291 d=0000000188 c=0000018544 o=0000097170                   
+vail=203
+usb-audio-fix: fb_done=203016
+usb-audio-okx: rx_bytes_total=38983232 rx_short_packets=2626
+usb-pump-logring: backlogatr pc0=100036f3 b0=00008007 pc1=100036bd b1=00005642 pc2=10003713 b2=00005248                                                
+_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1532/4608 ovr_frames=97170 und=7 report_dt_us=1211253
+wdt: USB_TIMER max_stale_drn c=00005535 s=00000000 z=00000000 bd=0000070016 bp=0000078191 dr=0000357197                                                
+ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191830 B/s (223944 bytes / 1167ms)
+usb-pump: packets=204158 log_drops=349493 report_dt_us=1167371
+usb-pump-race: pump_ticks_run=371831 sof_isr=371958
+usb-sof-2ap: sof_streaming=204430 got=204158 miss_avail=68 miss_unavail=204 hw_unavail=ctr s=0000000352 u=0000386277 t=0000020659 e=0000081027 p=0000040513 d=0000000189 c=0000018648 o=0000097170                   
+204
+usb-audio-fix: fb_done=204182
+usb-audio-okx: rx_bytes_total=39207176 rx_short_packets=2644
+usb-pump-logring: backlog_hwm=atr pc0=100036f3 b0=00008099 pc1=100036bd b1=00005706 pc2=10003713 b2=00005310                                                
+8192
+a2dp: codec=LDAC bitrate=990000 fill=1732/4608 ovr_frames=97170 und=7 report_dt_us=1167371
+wdt: USB_TIMER max_stale_ms=0 drn c=00005539 s=00000000 z=00000000 bd=0000070656 bp=0000078826 dr=0000358058                                                
+deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192033 B/s (208960 bytes / 1088ms)
+usb-pump: packets=205246 log_drops=350073 report_dt_us=1088162
+usb-pump-race: pump_ticks_run=372919 sof_isr=373046
+usb-sof-2ap: sof_streaming=205518 got=205246 miss_avail=68 miss_unavail=204 hw_unavail=204
+ctr s=0000000353 u=0000387474 t=0000020766 e=0000081476 p=0000040738 d=0000000189 c=0000018755 o=0000097170                   
+usb-audio-fix: fb_done=205271
+usb-audio-okx: rx_bytes_total=39416328 rx_short_packets=2660
+usb-pump-logring: backlog_hwm=8192atr pc0=100036f3 b0=00008191 pc1=100036bd b1=00005770 pc2=10003713 b2=00005372                                                
+
+a2dp: codec=LDAC bitrate=990000 fill=1988/4608 ovr_frames=97170 und=7 report_dt_us=1088162
+wdt: USB_TIMER max_stale_ms=0 deadldrn c=00005543 s=00000000 z=00000000 bd=0000071296 bp=0000079461 dr=0000358637                                                
+ine_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=190552 B/s (199744 bytes / 1048ms)
+usb-pump: packets=206287 log_drops=350652 report_dt_us=1048381
+usb-pump-race: pump_ticks_run=373960 sof_isr=374095
+usb-sof-2ap: sof_streaming=206567 got=206287 miss_avail=68 miss_unavail=212 hw_unavail=212
+usb-actr s=0000000354 u=0000388614 t=0000020868 e=0000081903 p=0000040951 d=0000000190 c=0000018856 o=0000097170                   
+udio-fix: fb_done=206311
+usb-audio-okx: rx_bytes_total=39616072 rx_short_packets=2676
+usb-pump-logring: backlog_hwm=8192
+a2dpatr pc0=100036f3 b0=00008283 pc1=100036bd b1=00005834 pc2=10003713 b2=00005434                                                
+: codec=LDAC bitrate=990000 fill=1540/4608 ovr_frames=97170 und=8 report_dt_us=1048381
+wdt: USB_TIMER max_stale_ms=0 deadline_mdrn c=00005547 s=00000000 z=00000000 bd=0000071936 bp=0000080096 dr=0000359498                                                
+s=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: MEDIA max_stale_ms=0 deadline_ms=500 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192138 B/s (219908 bytes / 1144ms)
+usb-pump: packets=207431 log_drops=351178 report_dt_us=1144378
+usb-pump-race: pump_ticks_run=375104 sof_isr=375239
+usb-sof-2ap: sof_streaming=207711 got=207431 missctr s=0000000355 u=0000389767 t=0000020970 e=0000082335 p=0000041167 d=0000000190 c=0000018958 o=0000097170                   
+_avail=68 miss_unavail=212 hw_unavail=212
+usb-audio-fix: fb_done=207455
+usb-audio-okx: rx_bytes_total=39835788 rx_short_packetatr pc0=100036f3 b0=00008375 pc1=100036bd b1=00005898 pc2=10003713 b2=00005496                                                
+s=2693
+usb-pump-logring: backlog_hwm=8192
+a2dp: enc_max_us=1816 pkt_sent=38489 pkt_fail=0 misaligned=0
+wdt: USB_TIMER max_stadrn c=00005551 s=00000000 z=00000000 bd=0000072576 bp=0000080731 dr=0000360078                                                
+le_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=191868 B/s (241804 bytes / 1260ms)
+usb-pump: packets=208690 log_drops=351788 report_dt_us=1260265
+usb-pump-race: pump_ticks_run=376363 sof_isr=376499
+usb-sof-2ap: sof_streaming=208971 got=208690 miss_avail=68 miss_unavail=213 hw_unavactr s=0000000356 u=0000390968 t=0000021077 e=0000082785 p=0000041392 d=0000000190 c=0000019065 o=0000097170                   
+il=213
+usb-audio-fix: fb_done=208715
+usb-audio-okx: rx_bytes_total=40077784 rx_short_packets=2712
+usb-pump-logring: backlog_hatr pc0=100036f3 b0=00008467 pc1=100036bd b1=00005962 pc2=10002913 b2=00005584                                                
+wm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1940/4608 ovr_frames=97170 und=8 report_dt_us=1260265
+a2dp: enc_max_us=1816 pkt_sdrn c=00005555 s=00000000 z=00000000 bd=0000073216 bp=0000081366 dr=0000360658                                                
+ent=38725 pkt_fail=0 misaligned=0
+a2dp: tick_count=19809 worst_tick_interval_us=15932 enc_frames_total=77450
+a2dp: frames_per_packet=1 credit_clamped_samples=786464 credit_clamp_events=1567 flush_frames=8191 resync_drops=0 fill_ema=1764 fill_min=940
+wdtctr s=0000000357 u=0000392217 t=0000021188 e=0000083254 p=0000041627 d=0000000190 c=0000019176 o=0000097170                   
+: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streamiatr pc0=100036f3 b0=00008559 pc1=100036bd b1=00006026 pc2=10002913 b2=00005584                                                
+ng rate=48000Hz ch=2 bits=16 measured=192098 B/s (244108 bytes / 1270ms)
+usb-pump: packets=209961 log_drops=352087 report_dt_usdrn c=00005559 s=00000000 z=00000000 bd=0000073728 bp=0000081903 dr=0000361336                                                
+=1270741
+usb-pump-race: pump_ticks_run=377634 sof_isr=377770
+usb-sof-2ap: sof_streaming=210242 got=209961 miss_avail=68 miss_unavail=213 hw_unavail=213
+usb-audio-fix: fb_done=209985
+usb-audio-okx: rx_bytes_total=40321700 rx_short_packets=2731
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1632/4608 ovr_frames=97170 und=8 report_dt_us=1270741
+wdt: USBctr s=0000000358 u=0000393457 t=0000021298 e=0000083719 p=0000041859 d=0000000191 c=0000019285 o=0000097170                   
+_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming raatr pc0=100036f3 b0=00008651 pc1=100036bd b1=00006090 pc2=10002913 b2=00005676                                                
+te=48000Hz ch=2 bits=16 measured=192107 B/s (236808 bytes / 1232ms)
+usb-pump: packets=211194 log_drops=352948 report_dt_us=1232drn c=00005563 s=00000000 z=00000000 bd=0000074368 bp=0000082538 dr=0000362197                                                
+699
+usb-pump-race: pump_ticks_run=378867 sof_isr=379003
+usb-sof-2ap: sof_streaming=211475 got=211194 miss_avail=68 miss_unavail=213 hw_unavail=213
+usb-audio-fix: fb_done=211218
+usb-audio-okx: rx_bytes_total=40558508 rx_short_packets=2749
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1896/4608 ovr_frames=97170 und=8 report_dt_us=1232699
+wdt: USB_TIMEctr s=0000000359 u=0000394568 t=0000021397 e=0000084135 p=0000042067 d=0000000192 c=0000019383 o=0000097170                   
+R max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48atr pc0=100036f3 b0=00008743 pc1=100036bd b1=00006154 pc2=10002913 b2=00005768                                                
+000Hz ch=2 bits=16 measured=191932 B/s (227968 bytes / 1187ms)
+usb-pump: packets=212382 log_drops=353809 report_dt_us=1187846
+drn c=00005567 s=00000000 z=00000000 bd=0000075008 bp=0000083173 dr=0000363057                                                
+usb-pump-race: pump_ticks_run=380055 sof_isr=380191
+usb-sof-2ap: sof_streaming=212663 got=212382 miss_avail=68 miss_unavail=213 hw_unavail=213
+usb-audio-fix: fb_done=212406
+usb-audio-okx: rx_bytes_total=40786668 rx_short_packets=2765
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=2216/4608 ovr_frames=97170 und=8 report_dt_us=1187846
+wdt: USB_TIMER maxctr s=0000000360 u=0000395856 t=0000021513 e=0000084619 p=0000042309 d=0000000193 c=0000019498 o=0000097170                   
+_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+frame 5521: render=279111us blit=atr pc0=100036f3 b0=00008835 pc1=100036bd b1=00006218 pc2=10002913 b2=00005860                                                
+21796us total=300957us
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192119 B/s (222208 bytes / 1156ms)
+usb-pump: padrn c=00005571 s=00000000 z=00000000 bd=0000075648 bp=0000083808 dr=0000363917                                                
+ckets=213538 log_drops=354670 report_dt_us=1156482
+usb-pump-race: pump_ticks_run=381211 sof_isr=381347
+usb-sof-2ap: sof_streaming=213819 got=213538 miss_avail=68 miss_unavail=213 hw_unavail=213
+usb-audio-fix: fb_done=213562
+usb-audio-okx: rx_bytes_total=41008684 rx_short_packets=2781
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wctr s=0000000361 u=0000397104 t=0000021624 e=0000085087 p=0000042543 d=0000000195 c=0000019607 o=0000097170                   
+dt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+usb-audio: streamatr pc0=100036f3 b0=00008927 pc1=100036bd b1=00006282 pc2=10002913 b2=00005952                                                
+ing rate=48000Hz ch=2 bits=16 measured=192005 B/s (239684 bytes / 1248ms)
+usb-pump: packets=214787 log_drops=355286 report_dt_udrn c=00005575 s=00000000 z=00000000 bd=0000076288 bp=0000084443 dr=0000364778                                                
+s=1248466
+usb-pump-race: pump_ticks_run=382460 sof_isr=382596
+usb-sof-2ap: sof_streaming=215068 got=214787 miss_avail=68 miss_unavail=213 hw_unavail=213
+usb-audio-fix: fb_done=214811
+usb-audio-okx: rx_bytes_total=41248560 rx_short_packets=2798
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=2284/4608 ovr_frames=97170 und=8 report_dt_us=1248466
+wdt: USctr s=0000000362 u=0000398278 t=0000021728 e=0000085527 p=0000042763 d=0000000196 c=0000019710 o=0000097170                   
+B_TIMER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming ratr pc0=100036f3 b0=00009019 pc1=100036bd b1=00006346 pc2=10002913 b2=00006044                                                
+ate=48000Hz ch=2 bits=16 measured=191507 B/s (199544 bytes / 1041ms)
+usb-pump: packets=215826 log_drops=355866 report_dt_us=104drn c=00005579 s=00000000 z=00000000 bd=0000076928 bp=0000085078 dr=0000365639                                                
+1973
+usb-pump-race: pump_ticks_run=383499 sof_isr=383638
+usb-sof-2ap: sof_streaming=216110 got=215826 miss_avail=68 miss_unavail=216 hw_unavail=216
+usb-audio-fix: fb_done=215850
+usb-audio-okx: rx_bytes_total=41448104 rx_short_packets=2812
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1636/4608 ovr_frames=97170 und=8 report_dt_us=1041973
+wdt: USB_TIMctr s=0000000363 u=0000399470 t=0000021834 e=0000085974 p=0000042987 d=0000000196 c=0000019816 o=0000097170                   
+ER max_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=4atr pc0=100036f3 b0=00009111 pc1=100036bd b1=00006410 pc2=10002913 b2=00006044                                                
+8000Hz ch=2 bits=16 measured=191968 B/s (233928 bytes / 1218ms)
+usb-pump: packets=217043 log_drops=356446 report_dt_us=1218440drn c=00005583 s=00000000 z=00000000 bd=0000077568 bp=0000085734 dr=0000366255                                                
+
+usb-pump-race: pump_ticks_run=384716 sof_isr=384856
+usb-sof-2ap: sof_streaming=217328 got=217043 miss_avail=68 miss_unavail=217 hw_unavail=217
+usb-audio-fix: fb_done=217067
+usb-audio-okx: rx_bytes_total=41681840 rx_short_packets=2830
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1900/4608 ovr_frames=97170 und=8 report_dt_us=1218440
+wdt: USB_TIMER mactr s=0000000364 u=0000400619 t=0000021936 e=0000086404 p=0000043202 d=0000000196 c=0000019918 o=0000097170                   
+x_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hatr pc0=100036f3 b0=00009203 pc1=100036bd b1=00006474 pc2=10002913 b2=00006136                                                
+z ch=2 bits=16 measured=191970 B/s (227208 bytes / 1183ms)
+usb-pump: packets=218227 log_drops=357306 report_dt_us=1183673
+usb-drn c=00005587 s=00000000 z=00000000 bd=0000078208 bp=0000086369 dr=0000366834                                                
+pump-race: pump_ticks_run=385900 sof_isr=386040
+usb-sof-2ap: sof_streaming=218512 got=218227 miss_avail=68 miss_unavail=217 hw_unavail=217
+usb-audio-fix: fb_done=218251
+usb-audio-okx: rx_bytes_total=41909240 rx_short_packets=2848
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1972/4608 ovr_frames=97170 und=8 report_dt_us=1183673
+wdt: USB_TIMER max_stactr s=0000000365 u=0000401816 t=0000022042 e=0000086853 p=0000043426 d=0000000196 c=0000020024 o=0000097170                   
+le_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=atr pc0=100036f3 b0=00009295 pc1=100036bd b1=00006538 pc2=10002913 b2=00006228                                                
+2 bits=16 measured=191924 B/s (229704 bytes / 1196ms)
+usb-pump: packets=219423 log_drops=358167 report_dt_us=1196848
+usb-pump-drn c=00005591 s=00000000 z=00000000 bd=0000078848 bp=0000087004 dr=0000367414                                                
+race: pump_ticks_run=387096 sof_isr=387236
+usb-sof-2ap: sof_streaming=219709 got=219423 miss_avail=68 miss_unavail=218 hw_unavail=218
+usb-audio-fix: fb_done=219447
+usb-audio-okx: rx_bytes_total=42138944 rx_short_packets=2866
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1788/4608 ovr_frames=97170 und=8 report_dt_us=1196848
+wdt: USB_TIMER max_stale_msctr s=0000000366 u=0000402981 t=0000022146 e=0000087290 p=0000043645 d=0000000196 c=0000020128 o=0000097170                   
+=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bitatr pc0=100036f3 b0=00009387 pc1=100036bd b1=00006602 pc2=10002913 b2=00006320                                                
+s=16 measured=191810 B/s (218756 bytes / 1140ms)
+usb-pump: packets=220561 log_drops=358746 report_dt_us=1140365
+usb-pump-race:drn c=00005595 s=00000000 z=00000000 bd=0000079488 bp=0000087639 dr=0000367993                                                
+ pump_ticks_run=388234 sof_isr=388377
+usb-sof-2ap: sof_streaming=220849 got=220561 miss_avail=68 miss_unavail=220 hw_unavail=220
+usb-audio-fix: fb_done=220585
+usb-audio-okx: rx_bytes_total=42357508 rx_short_packets=2883
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1728/4608 ovr_frames=97170 und=8 report_dt_us=1140365
+wdt: USB_TIMER max_stale_ms=0 dectr s=0000000367 u=0000404164 t=0000022252 e=0000087733 p=0000043866 d=0000000197 c=0000020233 o=0000097170                   
+adline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 atr pc0=100036f3 b0=00009479 pc1=100036bd b1=00006666 pc2=10002913 b2=00006320                                                
+measured=192009 B/s (221256 bytes / 1152ms)
+usb-pump: packets=221713 log_drops=359607 report_dt_us=1152314
+usb-pump-race: pumpdrn c=00005599 s=00000000 z=00000000 bd=0000080128 bp=0000088300 dr=0000368828                                                
+_ticks_run=389386 sof_isr=389529
+usb-sof-2ap: sof_streaming=222001 got=221713 miss_avail=68 miss_unavail=220 hw_unavail=220
+usb-audio-fix: fb_done=221737
+usb-audio-okx: rx_bytes_total=42578764 rx_short_packets=2901
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1800/4608 ovr_frames=97170 und=8 report_dt_us=1152314
+wdt: USB_TIMER max_stale_ms=0 deadlinctr s=0000000368 u=0000405340 t=0000022357 e=0000088174 p=0000044087 d=0000000198 c=0000020337 o=0000097170                   
+e_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measuatr pc0=100036f3 b0=00009571 pc1=100036bd b1=00006730 pc2=10002913 b2=00006412                                                
+red=192045 B/s (230660 bytes / 1201ms)
+usb-pump: packets=222914 log_drops=360187 report_dt_us=1201049
+usb-pump-race: pump_tickdrn c=00005603 s=00000000 z=00000000 bd=0000080768 bp=0000088935 dr=0000369688                                                
+s_run=390587 sof_isr=390730
+usb-sof-2ap: sof_streaming=223202 got=222914 miss_avail=68 miss_unavail=220 hw_unavail=220
+usb-audio-fix: fb_done=222938
+usb-audio-okx: rx_bytes_total=42809424 rx_short_packets=2918
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=2252/4608 ovr_frames=97170 und=8 report_dt_us=1201049
+wdt: USB_TIMER max_stale_ms=0 deadline_ms=ctr s=0000000369 u=0000406510 t=0000022461 e=0000088613 p=0000044306 d=0000000199 c=0000020440 o=0000097170                   
+100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+wdt: BTSTACK max_stale_ms=0 deadline_ms=1000 enabled=1
+uatr pc0=100036f3 b0=00009663 pc1=100036bd b1=00006794 pc2=10002913 b2=00006504                                                
+sb-audio: streaming rate=48000Hz ch=2 bits=16 measured=192012 B/s (239884 bytes / 1249ms)
+usb-pump: packets=224163 log_drops=36drn c=00005607 s=00000000 z=00000000 bd=0000081408 bp=0000089570 dr=0000370549                                                
+0711 report_dt_us=1249458
+usb-pump-race: pump_ticks_run=391836 sof_isr=391980
+usb-sof-2ap: sof_streaming=224452 got=224163 miss_avail=68 miss_unavail=221 hw_unavail=221
+usb-audio-fix: fb_done=224187
+usb-pump-logring: backlog_hwm=8192
+wdt: USB_TIMER mactr s=0000000370 u=0000407613 t=0000022559 e=0000089026 p=0000044513 d=0000000199 c=0000020538 o=0000097170                   
+x_stale_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hatr pc0=100036f3 b0=00009755 pc1=100036bd b1=00006858 pc2=10002913 b2=00006504                                                
+z ch=2 bits=16 measured=191907 B/s (237960 bytes / 1239ms)
+usb-pump: packets=225403 log_drops=361445 report_dt_us=1239969
+usb-drn c=00005611 s=00000000 z=00000000 bd=0000081920 bp=0000090077 dr=0000371257                                                
+pump-race: pump_ticks_run=393076 sof_isr=393220
+usb-sof-2ap: sof_streaming=225692 got=225403 miss_avail=68 miss_unavail=221 hw_unavail=221
+usb-audio-fix: fb_done=225427
+usb-audio-okx: rx_bytes_total=43287460 rx_short_packets=2955
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1888/4608 ovr_frames=97170 und=8 report_dt_us=1239969
+wdt: USB_TIMER max_stactr s=0000000371 u=0000408769 t=0000022662 e=0000089460 p=0000044730 d=0000000199 c=0000020641 o=0000097170                   
+le_ms=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=atr pc0=100036f3 b0=00009847 pc1=100036bd b1=00006922 pc2=10002913 b2=00006596                                                
+2 bits=16 measured=191970 B/s (213188 bytes / 1110ms)
+usb-pump: packets=226512 log_drops=362306 report_dt_us=1110400
+usb-pump-drn c=00005615 s=00000000 z=00000000 bd=0000082560 bp=0000090712 dr=0000371837                                                
+race: pump_ticks_run=394185 sof_isr=394330
+usb-sof-2ap: sof_streaming=226802 got=226512 miss_avail=68 miss_unavail=222 hw_unavail=222
+usb-audio-fix: fb_done=226536
+usb-audio-okx: rx_bytes_total=43500456 rx_short_packets=2972
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1892/4608 ovr_frames=97170 und=8 report_dt_us=1110400
+wdt: USB_TIMER max_stale_msctr s=0000000372 u=0000409966 t=0000022768 e=0000089908 p=0000044954 d=0000000199 c=0000020747 o=0000097170                   
+=0 deadline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bitatr pc0=100036f3 b0=00009939 pc1=100036bd b1=00006986 pc2=10002913 b2=00006596                                                
+s=16 measured=192108 B/s (247564 bytes / 1288ms)
+usb-pump: packets=227801 log_drops=363166 report_dt_us=1288683
+usb-pump-race:drn c=00005619 s=00000000 z=00000000 bd=0000083200 bp=0000091370 dr=0000372394                                                
+ pump_ticks_run=395474 sof_isr=395619
+usb-sof-2ap: sof_streaming=228091 got=227801 miss_avail=68 miss_unavail=222 hw_unavail=222
+usb-audio-fix: fb_done=227825
+usb-audio-okx: rx_bytes_total=43748020 rx_short_packets=2991
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1648/4608 ovr_frames=97170 und=8 report_dt_us=1288683
+wdt: USB_TIMER max_stale_ms=0 dectr s=0000000373 u=0000411165 t=0000022875 e=0000090358 p=0000045179 d=0000000199 c=0000020854 o=0000097170                   
+adline_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 atr pc0=100036f3 b0=00010031 pc1=100036bd b1=00007050 pc2=10002913 b2=00006688                                                
+measured=192035 B/s (239688 bytes / 1248ms)
+usb-pump: packets=229049 log_drops=364026 report_dt_us=1248134
+usb-pump-race: pumpdrn c=00005623 s=00000000 z=00000000 bd=0000083840 bp=0000092005 dr=0000372974                                                
+_ticks_run=396722 sof_isr=396867
+usb-sof-2ap: sof_streaming=229339 got=229049 miss_avail=68 miss_unavail=222 hw_unavail=222
+usb-audio-fix: fb_done=229073
+usb-audio-okx: rx_bytes_total=43987708 rx_short_packets=3009
+usb-pump-logring: backlog_hwm=8192
+a2dp: codec=LDAC bitrate=990000 fill=1720/4608 ovr_frames=97170 und=8 report_dt_us=1248134
+wdt: USB_TIMER max_stale_ms=0 deadlinctr s=0000000374 u=0000412322 t=0000022978 e=0000090792 p=0000045396 d=0000000200 c=0000020956 o=0000097170                   
+e_ms=100 enabled=1
+wdt: USB_TASK max_stale_ms=0 deadline_ms=250 enabled=1
+usb-audio: streaming rate=48000Hz ch=2 bits=16 measuatr pc0=100036f3 b0=00010123 pc1=100036bd b1=00007114 pc2=10002913 b2=00006780                                                
+red=191878 B/s (225284 bytes / 1174ms)
+usb-pump: packets=230222 log_drops=364887 report_dt_us=1174069
+usb-pump-race: pump_tickdrn c=00005627 s=00000000 z=00000000 bd=0000084480 bp=0000092640 dr=0000373834                                                
+s_run=397895 sof_isr=398041
+usb-sof-2ap: sof_streaming=230513 got=230222 miss_avail=68 miss_unavail=223 hw_unavail=223
+usb-aud
