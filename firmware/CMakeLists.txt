@@ -145,6 +145,7 @@ add_executable(pico_link
     src/a2dp.c
     src/codec_table.c
     src/codec_sbc.c
+    src/codec_ldac.c
     src/panic_recorder.c
     src/usb_descriptors.c
     src/usb_audio.c
@@ -295,8 +296,10 @@ target_link_libraries(pico_link
     # -- no new fetch, no new submodule (design sec 11.6).
     pico_btstack_sbc_encoder
     # Bead pico-link-cz0.5.4 (LDAC L0): the vendored Sony/libldac encoder
-    # (firmware/vendor/libldac). Linked in for the offline on-target
-    # benchmark (PL_DIAG_LDAC_BENCH in main.c) only -- no A2DP wiring yet.
+    # (firmware/vendor/libldac). Originally linked for the offline
+    # on-target benchmark only (PL_DIAG_LDAC_BENCH in main.c); bead
+    # pico-link-cz0.5.6 (LDAC L3) adds the real A2DP codec row
+    # (src/codec_ldac.c) on top of the same library.
     pl_ldac_enc
     pico_cyw43_arch_threadsafe_background
     # M3: link the MARKED tinyusb_device target (not just the

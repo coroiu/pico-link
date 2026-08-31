@@ -92,7 +92,10 @@
 
 #include "btstack.h"
 
+#include "ldacBT.h" // LDACBT_SAMPLING_FREQ_048000/LDACBT_CHANNEL_MODE_STEREO -- the AVDTP_CODEC_NON_A2DP arm below
+
 #include "bt.h"
+#include "codec_ldac.h"
 #include "codec_sbc.h"
 #include "codec_table.h"
 #include "pcm_ring.h"
@@ -210,6 +213,21 @@ typedef struct {
         uint8_t sbc_allocation_method_bitmap;
         uint8_t sbc_min_bitpool_value;
         uint8_t sbc_max_bitpool_value;
+
+        // Bead pico-link-cz0.5.6 (LDAC L3): the vendor-codec counterpart
+        // of the sbc_* fields above, captured from
+        // A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CAPABILITY. "other"
+        // because the field names are generic (any AVDTP_CODEC_NON_A2DP
+        // row could populate them, matched by vendor_id/vendor_codec_id --
+        // see the capability handler below); LDAC is simply the only such
+        // row PL_CODECS has today. Same "first offering remote SEP wins"
+        // rule as SBC, independently -- a remote offering both an SBC SEP
+        // and a vendor SEP populates both halves of this struct in the
+        // same discovery pass, no collision.
+        bool other_offered;
+        uint8_t other_remote_seid;
+        uint8_t other_sampling_frequency_bitmap;
+        uint8_t other_channel_mode_bitmap;
     } discovered;
 
     pl_a2dp_media_state_t state;
@@ -1119,6 +1137,50 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             break;
         }
 
+        case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CAPABILITY: {
+            // Bead pico-link-cz0.5.6 (LDAC L3): BTstack's generic
+            // catch-all for any AVDTP_CODEC_NON_A2DP SEP the remote
+            // offers -- raw bytes only (no BTstack-native decode exists
+            // for vendor codecs, unlike SBC above). Identify LDAC by
+            // matching the wire's own vendor_id/vendor_codec_id against a
+            // PL_CODECS row's declared identity -- a DATA-DRIVEN match
+            // against the table, not a codec-identity branch (same "wire
+            // fact, not business logic" reasoning a2dp.c's
+            // avdtp_codec_type dispatch already relies on elsewhere in
+            // this file); a remote offering some OTHER vendor codec we
+            // have no row for simply matches nothing and is ignored.
+            uint16_t cid = a2dp_subevent_signaling_media_codec_other_capability_get_a2dp_cid(packet);
+            if (cid != s_ctx.a2dp_cid) {
+                break;
+            }
+            uint16_t info_len = a2dp_subevent_signaling_media_codec_other_capability_get_media_codec_information_len(packet);
+            const uint8_t *info = a2dp_subevent_signaling_media_codec_other_capability_get_media_codec_information(packet);
+            if (info_len < 8 || info == NULL) {
+                break; // too short to carry any vendor codec identity we know
+            }
+            uint32_t vendor_id =
+                (uint32_t)info[0] | ((uint32_t)info[1] << 8) | ((uint32_t)info[2] << 16) | ((uint32_t)info[3] << 24);
+            uint16_t vendor_codec_id = (uint16_t)((uint32_t)info[4] | ((uint32_t)info[5] << 8));
+
+            if (!s_ctx.discovered.other_offered) {
+                for (size_t i = 0; i < PL_CODEC_COUNT; i++) {
+                    pl_codec_t *row = PL_CODECS[i];
+                    if (row->avdtp_codec_type != AVDTP_CODEC_NON_A2DP) {
+                        continue;
+                    }
+                    if (row->vendor_id != vendor_id || row->vendor_codec_id != vendor_codec_id) {
+                        continue;
+                    }
+                    s_ctx.discovered.other_offered = true;
+                    s_ctx.discovered.other_remote_seid = a2dp_subevent_signaling_media_codec_other_capability_get_remote_seid(packet);
+                    s_ctx.discovered.other_sampling_frequency_bitmap = info[6];
+                    s_ctx.discovered.other_channel_mode_bitmap = info[7];
+                    break;
+                }
+            }
+            break;
+        }
+
         case A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE: {
             uint16_t cid = a2dp_subevent_signaling_capabilities_complete_get_a2dp_cid(packet);
             if (cid != s_ctx.a2dp_cid) {
@@ -1165,9 +1227,45 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     }
                     matched = true;
                     break;
+                } else if (row->avdtp_codec_type == AVDTP_CODEC_NON_A2DP) {
+                    // Bead pico-link-cz0.5.6 (LDAC L3): no BTstack
+                    // avdtp_choose_* helper exists for vendor codecs (SBC
+                    // above gets one; LDAC does not), so this project
+                    // implements its own -- trivially, because it only
+                    // ever offers/accepts ONE LDAC configuration
+                    // (48kHz/stereo, codec_ldac.c's doc comment). "Choose"
+                    // therefore degenerates to "does the remote's
+                    // discovered bitmap include our one supported bit",
+                    // not a real intersection-and-pick algorithm. This
+                    // LDAC-shaped glue living behind the AVDTP_CODEC_
+                    // NON_A2DP wire-level-fact arm is the same accepted
+                    // pattern as the SBC arm above (a2dp.c's own doc
+                    // comment on the SBC_CONFIGURATION handler already
+                    // makes this argument for that arm; design sec 4.2's
+                    // rule is about the DISPATCH across PL_CODECS, not
+                    // about a row's own negotiation-shape code living in
+                    // its own arm here).
+                    if (!s_ctx.discovered.other_offered) {
+                        continue;
+                    }
+                    if ((s_ctx.discovered.other_sampling_frequency_bitmap & LDACBT_SAMPLING_FREQ_048000) == 0 ||
+                        (s_ctx.discovered.other_channel_mode_bitmap & LDACBT_CHANNEL_MODE_STEREO) == 0) {
+                        pl_log("a2dp: remote OTHER codec does not support 48kHz/stereo, skipping\r\n");
+                        continue;
+                    }
+                    uint8_t status = a2dp_source_set_config_other(
+                        cid, row->local_seid, s_ctx.discovered.other_remote_seid, pl_codec_ldac_negotiated_info,
+                        sizeof(pl_codec_ldac_negotiated_info)
+                    );
+                    if (status != ERROR_CODE_SUCCESS) {
+                        pl_log("a2dp: set_config_other FAILED status=0x%02x\r\n", status);
+                        continue;
+                    }
+                    matched = true;
+                    break;
                 }
-                // Future rows (e.g. AVDTP_CODEC_NON_A2DP for LDAC, L3) fall
-                // through here until their own set_config_* arm exists.
+                // Future rows fall through here until their own
+                // set_config_* arm exists.
             }
 
             if (!matched) {
@@ -1229,6 +1327,45 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     cfg.channel_mode = SBC_CHANNEL_MODE_STEREO;
                     break;
             }
+
+            pl_a2dp_finish_codec_negotiation(local_seid, (const uint8_t *)&cfg, sizeof(cfg));
+            break;
+        }
+
+        case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION: {
+            // Bead pico-link-cz0.5.6 (LDAC L3): the vendor-codec
+            // counterpart of SBC_CONFIGURATION above -- forwarded by
+            // BTstack's own a2dp.c:754-759, raw bytes only (no
+            // BTstack-native decode for vendor codecs). Field offsets
+            // mirror the capability bytes' own layout (codec_ldac.c's doc
+            // comment): 6/7 are the negotiated single-bit sampling-
+            // frequency/channel-mode selections.
+            uint16_t cid = a2dp_subevent_signaling_media_codec_other_configuration_get_a2dp_cid(packet);
+            if (cid != s_ctx.a2dp_cid) {
+                break;
+            }
+            uint8_t local_seid = a2dp_subevent_signaling_media_codec_other_configuration_get_local_seid(packet);
+            s_ctx.remote_seid = a2dp_subevent_signaling_media_codec_other_configuration_get_remote_seid(packet);
+
+            uint16_t info_len = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information_len(packet);
+            const uint8_t *info = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information(packet);
+            if (info_len < 8 || info == NULL) {
+                pl_log("a2dp: OTHER_CONFIGURATION too short (%u bytes)\r\n", (unsigned)info_len);
+                pl_bt_push_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_NO_A2DP_SINK);
+                break;
+            }
+            // Decoded straight into codec_ldac.h's private shape -- safe
+            // because PL_CODECS has exactly one AVDTP_CODEC_NON_A2DP row
+            // today (LDAC) and the bytes here are what WE sent via
+            // a2dp_source_set_config_other (pl_codec_ldac_negotiated_info,
+            // the CAPABILITIES_COMPLETE handler above), so they cannot be
+            // any other vendor codec's shape. A second vendor row would
+            // need this decode to dispatch on info[0..5]
+            // (vendor_id/vendor_codec_id) first, same as the
+            // OTHER_CAPABILITY handler above already does.
+            pl_codec_ldac_negotiated_t cfg;
+            cfg.sampling_frequency = info[6];
+            cfg.channel_mode = info[7];
 
             pl_a2dp_finish_codec_negotiation(local_seid, (const uint8_t *)&cfg, sizeof(cfg));
             break;
