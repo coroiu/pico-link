@@ -106,6 +106,14 @@ void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t nam
 // pl_bt_poll_commands). Compiled only when PL_DEBUG_REMOTE is set (see
 // firmware/CMakeLists.txt) -- entirely absent from a shipping build.
 void pl_bt_debug_connect(const uint8_t *addr);
+
+// Bead pico-link-nb6: debug-only direct disconnect of the current A2DP
+// connection, no address needed (there is only ever one). Same context
+// discipline as pl_bt_debug_connect -- thread-context caller, defers the
+// real BTstack call to the heartbeat handler via the pending-action queue.
+// Compiled only when PL_DEBUG_REMOTE is set; entirely absent from a
+// shipping build.
+void pl_bt_debug_disconnect(void);
 #endif
 
 #endif // PL_BT_H

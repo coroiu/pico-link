@@ -1736,6 +1736,15 @@ void pl_a2dp_connect(const uint8_t *addr) {
     pl_bt_push_connect_step(PL_CONNECT_STEP_SETTING_UP_AUDIO);
 }
 
+void pl_a2dp_disconnect(void) {
+    if (s_ctx.a2dp_cid == 0) {
+        pl_log("a2dp: disconnect requested, no active a2dp_cid, no-op\r\n");
+        return;
+    }
+    uint8_t status = a2dp_source_disconnect(s_ctx.a2dp_cid);
+    pl_log("a2dp: disconnect requested, a2dp_cid=0x%04x status=0x%02x\r\n", s_ctx.a2dp_cid, status);
+}
+
 void pl_a2dp_report(uint32_t report_dt_us) {
     // Bead pico-link-pbv round 2 (C2-11): every rate the reader computes
     // from two report lines (enc_frames/s, tick rate, etc) MUST divide by

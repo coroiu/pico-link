@@ -493,6 +493,7 @@ typedef enum {
     PL_BT_PENDING_START_SCAN,
     PL_BT_PENDING_CANCEL_SCAN,
     PL_BT_PENDING_CONNECT,
+    PL_BT_PENDING_DISCONNECT,
 } pl_bt_pending_tag_t;
 
 typedef struct {
@@ -519,6 +520,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "CANCEL_SCAN";
         case PL_BT_PENDING_CONNECT:
             return "CONNECT";
+        case PL_BT_PENDING_DISCONNECT:
+            return "DISCONNECT";
         default:
             return "?";
     }
@@ -575,6 +578,9 @@ static void pl_bt_pending_service(void) {
                 break;
             case PL_BT_PENDING_CONNECT:
                 pl_a2dp_connect(entry.addr);
+                break;
+            case PL_BT_PENDING_DISCONNECT:
+                pl_a2dp_disconnect();
                 break;
         }
     }
@@ -721,5 +727,18 @@ void pl_bt_debug_connect(const uint8_t *addr) {
     );
     pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
     pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
+}
+
+// Bead pico-link-nb6: debug-only disconnect, letting an unattended hardware
+// test tear down the current A2DP connection without a human power-cycling
+// the headset. No address payload -- there is only ever one active
+// connection, tracked entirely inside a2dp.c's s_ctx.a2dp_cid. Same
+// pico-link-ouw hazard and same fix as pl_bt_debug_connect above: this runs
+// in thread context (via debug_remote.c's superloop poll), so it only
+// enqueues; pl_bt_pending_service (IRQ context, the heartbeat handler)
+// makes the real a2dp_source_disconnect() call.
+void pl_bt_debug_disconnect(void) {
+    pl_log("BT: debug-remote DISCONNECT\r\n");
+    pl_bt_pending_push(PL_BT_PENDING_DISCONNECT, NULL);
 }
 #endif
