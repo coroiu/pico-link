@@ -4,3 +4,5 @@ build/
 include/pico_link_ui.h
 build-on/
 build-off/
+build_debugremote/
+build_*/
