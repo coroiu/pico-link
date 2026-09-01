@@ -81,11 +81,13 @@ Work is done by a small team of specialized agents plus one main-thread persona.
 | **UX designer** | Uma | `ux-designer` agent | Interaction & visual design for the 240x240 display + d-pad/buttons; new-feature UX ideas. |
 | **Implementer** | Ruby | `rust-embedded-supervisor` agent | Writes the actual Rust (firmware + emulator + shared libs) in a worktree. Restartable. |
 | **Tester** | Tess | `tester` agent | The three run modes (headless/windowed/real-target); proves changes work via builds, tests, headless screenshots. |
+| **Hardware debugger** | Tex | `hardware-debugger` agent | The 10x closer for bugs that resisted a normal round: wedged buses, intermittent/timing-dependent faults, and cases where the instrument itself may be lying. |
 | Support | scout / detective / scribe / code-reviewer / merge-supervisor | agents | Search / bug investigation / docs / code review / merge conflicts. |
 
-**Model tiers** (`model:` in each agent's frontmatter): Opus for Ada, Fern and Uma —
-architecture, the render/layout framework and UX are judgment calls that are
-expensive to get subtly wrong. Sonnet for Ruby, Tess, Tao, code-reviewer,
+**Model tiers** (`model:` in each agent's frontmatter): Opus for Ada, Fern, Uma
+and Tex — architecture, the render/layout framework and UX are judgment calls
+that are expensive to get subtly wrong, and Tex is only ever dispatched at bugs
+that already defeated a cheaper round. Sonnet for Ruby, Tess, Tao, code-reviewer,
 scribe, detective, merge-supervisor. Haiku only for scout (pure file discovery).
 **code-reviewer must never be cheaper than Sonnet** — it is the quality gate
 before the orchestrator merges, and a reviewer that misses defects is worse than
