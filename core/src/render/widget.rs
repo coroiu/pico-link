@@ -278,6 +278,16 @@ pub trait Widget {
     /// See [`Screen::redraw_after`] for how a screen combines its widgets'
     /// answers, and `.planning/decisions/2026-08-31-render-ctx-frame-
     /// scoped-clock.md` for the full design.
+    ///
+    /// A returned `Some(Duration::ZERO)` (or any other sub-frame duration)
+    /// is not an error, but it is not honoured literally either: the
+    /// caller (`crate::app::App::render`) floors it at a small minimum
+    /// before adding it to `ctx.now()`, so it cannot come due on the very
+    /// next tick with no time elapsed — which would otherwise re-dirty the
+    /// app forever and reinstate the always-dirty behaviour the ADR above
+    /// forbids. See `pico_link_core::app::MIN_REDRAW_DELAY`'s doc comment
+    /// (pico-link-6wz). No production widget relies on this today; treat
+    /// it as a guard, not a feature to depend on for a near-instant redraw.
     fn redraw_after(&self, _ctx: &RenderCtx) -> Option<core::time::Duration> {
         None
     }
