@@ -39,17 +39,21 @@ use super::framebuffer::FrameBuffer565;
 use super::theme::{font, palette};
 use super::widget::{ChromeContribution, Widget};
 
-/// Left margin (px) for the device-name line and the bottom stat strip —
-/// the only two left-aligned elements this widget draws (the hero word
-/// and bitrate are centered).
-const LEFT_MARGIN: i32 = 8;
-/// Right margin (px) reserved past the device-name line before it must
-/// truncate — keeps the ellipsis off the very edge of the panel.
-const NAME_RIGHT_MARGIN: i32 = 8;
-/// Top padding (px) before the device-name line's first pixel.
-const TOP_PADDING: i32 = 8;
+/// Left rule `L` (px, area-relative) — shared by the device-name line, the
+/// hero codec word, the banner text and the stat strip. Design
+/// `.planning/design/2026-09-01-home-alignment-grid.md` section 3: the
+/// single left rule every left-aligned element on Home now shares with
+/// the title bar's `TITLE_SIDE_MARGIN` (`screen.rs`).
+const LEFT_MARGIN: i32 = 12;
+/// Right rule `R` (px, area-relative) — the device-name truncation budget
+/// and the bitrate slot's right edge both end here. Same design doc,
+/// section 3: symmetric with `LEFT_MARGIN` on the 206px content measure.
+const RIGHT_MARGIN: i32 = 12;
+/// Top padding (px) before the device-name line's first pixel — part of
+/// the uniform 12px frame (design doc section 4).
+const TOP_PADDING: i32 = 12;
 /// Gap (px) between the device-name line and the hero codec word.
-const GAP_NAME_TO_HERO: i32 = 8;
+const GAP_NAME_TO_HERO: i32 = 12;
 /// Fixed vertical slot every hero codec word gets, regardless of its own
 /// ink height. Measured off `core/examples/hero_font_probe.rs` against
 /// the real `font::hero()` face (`cargo run -p pico-link-core --example
@@ -60,25 +64,34 @@ const GAP_NAME_TO_HERO: i32 = 8;
 /// bitrate line drawn right below it — see the orchestrator note on bead
 /// `pico-link-znb.6`. Every hero word, of any case mix, gets this same
 /// fixed 32px slot so the bitrate line's position never depends on which
-/// codec is showing.
+/// codec is showing. Unchanged by the alignment-grid rework — this
+/// rationale still holds.
 const HERO_SLOT_HEIGHT: i32 = 32;
-/// Gap (px) between the hero slot's bottom and the bitrate line.
+/// Gap (px) between the hero slot's bottom and the bitrate line —
+/// deliberately tight: hero + bitrate read as one unit (design doc
+/// section 4).
 const GAP_HERO_TO_BITRATE: i32 = 4;
 /// Width (px) of the bitrate's fixed, `BACKGROUND`-cleared slot — see the
 /// design's numeric rule ("every number is right-aligned into a fixed
 /// slot cleared to `BACKGROUND` first"), which exists so a digit-count
 /// change (e.g. "660 kbps" -> "90 kbps") never shifts other digits'
-/// positions or leaves stale ink behind.
+/// positions or leaves stale ink behind. Unchanged; only the slot's x
+/// moves (now ends at `RIGHT_MARGIN` instead of a centered invisible
+/// slot).
 const BITRATE_SLOT_WIDTH: u32 = 120;
-/// Gap (px) between the bitrate line and the banner (if shown) or the
-/// stat strip (if not).
-const GAP_TO_NEXT: i32 = 10;
 /// Height (px) of the persistent banner bar, when shown.
 const BANNER_HEIGHT: i32 = 20;
-/// Left/right inset (px) for the banner's own text within its bar.
-const BANNER_TEXT_INSET: i32 = 8;
-/// Gap (px) between the banner and the stat strip, when both are shown.
-const GAP_BANNER_TO_STAT: i32 = 8;
+/// Left/right inset (px) for the banner's own text within its bar — now
+/// on the same left rule as everything else.
+const BANNER_TEXT_INSET: i32 = 12;
+/// Banner slot's fixed top y (px, relative to `area.top_left.y`) — design
+/// doc section 4/7: absolute panel y 116. Fixed, not cursor-derived, so
+/// the banner's presence never moves the stat strip below it.
+const BANNER_TOP: i32 = 100;
+/// Stat strip's fixed top y (px, relative to `area.top_left.y`) — design
+/// doc section 4/7: absolute panel y 144. Fixed for the same reason as
+/// `BANNER_TOP`.
+const STAT_TOP: i32 = 128;
 
 /// The hero codec word's colour is a reassurance mechanic (design section
 /// 6): steady green means "you got what you asked for", amber means "you
@@ -288,12 +301,11 @@ impl Widget for HeroStatusView {
     #[allow(clippy::too_many_lines)]
     fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
-        let center_x = area.top_left.x + area.size.width as i32 / 2;
 
         // --- Device name: truncates with an ellipsis, never a marquee. ---
         let name_font = font::name();
         let name_line_h = line_height(&name_font);
-        let name_max_width = (area.size.width as i32 - LEFT_MARGIN - NAME_RIGHT_MARGIN).max(0) as u32;
+        let name_max_width = (area.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
         let name_text = truncate_to_width(&name_font, &self.device_name, name_max_width);
         let name_y = area.top_left.y + TOP_PADDING;
         let name_rect = Rectangle::new(
@@ -310,7 +322,10 @@ impl Widget for HeroStatusView {
             &mut name_target,
         );
 
-        // --- Hero codec word: the fixed 32px slot, regardless of word. ---
+        // --- Hero codec word: the fixed 32px slot, regardless of word.
+        // Left-aligned on `LEFT_MARGIN`, not centered — design doc section
+        // 3.1: a centred hero moves both its edges the moment the codec
+        // changes, exactly when the change most needs to be noticed. ---
         let hero_font = font::hero();
         let hero_y = name_y + name_line_h + GAP_NAME_TO_HERO;
         let (hero_text, hero_color) = match &self.status {
@@ -322,59 +337,60 @@ impl Widget for HeroStatusView {
         };
         let _ = hero_font.render_aligned(
             hero_text.as_str(),
-            Point::new(center_x, hero_y),
+            Point::new(area.top_left.x + LEFT_MARGIN, hero_y),
             VerticalPosition::Top,
-            HorizontalAlignment::Center,
+            HorizontalAlignment::Left,
             FontColor::Transparent(hero_color),
             &mut clipped,
         );
 
         // --- Bitrate line: fixed slot, cleared to BACKGROUND, right-
-        // aligned within it (design's numeric rule) — absent entirely for
-        // NoLink, never a faked/frozen number. ---
+        // aligned to `RIGHT_MARGIN` (design's numeric rule) — absent
+        // entirely for NoLink, never a faked/frozen number. ---
         let value_font = font::value();
         let value_line_h = line_height(&value_font);
-        let mut cursor_y = hero_y + HERO_SLOT_HEIGHT + GAP_HERO_TO_BITRATE;
+        let bitrate_y = hero_y + HERO_SLOT_HEIGHT + GAP_HERO_TO_BITRATE;
         if let CodecStatus::Connected { bitrate, .. } = &self.status {
             let bitrate_text = match bitrate {
                 BitrateStatus::Idle => String::from("idle"),
                 BitrateStatus::Kbps(kbps) => format!("{kbps} kbps"),
             };
+            let slot_right_x = area.top_left.x + area.size.width as i32 - RIGHT_MARGIN;
             let slot_rect = Rectangle::new(
-                Point::new(center_x - BITRATE_SLOT_WIDTH as i32 / 2, cursor_y),
+                Point::new(slot_right_x - BITRATE_SLOT_WIDTH as i32, bitrate_y),
                 Size::new(BITRATE_SLOT_WIDTH, value_line_h as u32),
             );
             slot_rect.into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND)).draw(&mut clipped)?;
             let _ = value_font.render_aligned(
                 bitrate_text.as_str(),
-                Point::new(slot_rect.top_left.x + slot_rect.size.width as i32, cursor_y),
+                Point::new(slot_rect.top_left.x + slot_rect.size.width as i32, bitrate_y),
                 VerticalPosition::Top,
                 HorizontalAlignment::Right,
                 FontColor::Transparent(palette::TEXT_PRIMARY),
                 &mut clipped,
             );
-            cursor_y += value_line_h;
         }
 
         // --- Persistent banner slot: at most one, MUTED outranks
         // FALLBACK (design section 6.2/6.3). Not a toast: no timer, no
         // auto-dismiss, drawn every render exactly like everything else
-        // on this widget. ---
+        // on this widget. Fixed y (`BANNER_TOP`), not cursor-derived, so
+        // showing/hiding it never moves the stat strip below it. ---
         if let Some(banner) = self.active_banner() {
-            cursor_y += GAP_TO_NEXT;
+            let banner_y = area.top_left.y + BANNER_TOP;
             let (text, color) = match banner {
                 ActiveBanner::Muted => (String::from("MUTED  Press Up to raise"), palette::STATUS_WARNING),
                 ActiveBanner::Fallback(reason) => (String::from(reason), palette::STATUS_WARNING),
             };
             let banner_rect = Rectangle::new(
-                Point::new(area.top_left.x, cursor_y),
+                Point::new(area.top_left.x, banner_y),
                 Size::new(area.size.width, BANNER_HEIGHT as u32),
             );
             banner_rect.into_styled(PrimitiveStyle::with_fill(palette::SURFACE_ELEVATED)).draw(&mut clipped)?;
             let banner_text_max_width = (area.size.width as i32 - 2 * BANNER_TEXT_INSET).max(0) as u32;
             let label_font = font::label();
             let banner_text = truncate_to_width(&label_font, &text, banner_text_max_width);
-            let banner_mid_y = cursor_y + BANNER_HEIGHT / 2;
+            let banner_mid_y = banner_y + BANNER_HEIGHT / 2;
             let _ = label_font.render_aligned(
                 banner_text.as_str(),
                 Point::new(area.top_left.x + BANNER_TEXT_INSET, banner_mid_y),
@@ -383,23 +399,23 @@ impl Widget for HeroStatusView {
                 FontColor::Transparent(color),
                 &mut clipped,
             );
-            cursor_y += BANNER_HEIGHT + GAP_BANNER_TO_STAT;
-        } else {
-            cursor_y += GAP_TO_NEXT;
         }
 
         // --- Bottom stat strip. Whatever fields the design's data-
         // dependency table (section 13) says survive Tier 1 — the OUT
         // meter and LINK/SIGNAL bars are CUT entirely, not dashed, so
-        // they are simply not part of `stat_line` at all. ---
+        // they are simply not part of `stat_line` at all. Fixed y
+        // (`STAT_TOP`) — occupies the same rows whether or not a banner
+        // is showing; this is the whole point of the fixed grid. ---
         if let Some(stat_line) = &self.stat_line {
+            let stat_y = area.top_left.y + STAT_TOP;
             let label_font = font::label();
-            let stat_max_width = (area.size.width as i32 - LEFT_MARGIN - NAME_RIGHT_MARGIN).max(0) as u32;
+            let stat_max_width = (area.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
             let upper = stat_line.to_uppercase();
             let stat_text = truncate_to_width(&label_font, &upper, stat_max_width);
             let _ = label_font.render_aligned(
                 stat_text.as_str(),
-                Point::new(area.top_left.x + LEFT_MARGIN, cursor_y),
+                Point::new(area.top_left.x + LEFT_MARGIN, stat_y),
                 VerticalPosition::Top,
                 HorizontalAlignment::Left,
                 FontColor::Transparent(palette::TEXT_SECONDARY),
@@ -680,5 +696,67 @@ mod tests {
         // check is the zoomed PNG capture named in the bead's DONE
         // criteria.
         assert!(fb.pixels().any(|p| p.1 == palette::TEXT_PRIMARY), "the hero word + bitrate line should both paint TEXT_PRIMARY ink");
+    }
+
+    // --- Fixed vertical grid: the regression this refactor exists to
+    // prevent (design `.planning/design/2026-09-01-home-alignment-grid.md`
+    // section 4/7) -- the stat strip's y position must never depend on
+    // whether the banner is showing. Before this bead, `hero.rs` walked
+    // an accumulating `cursor_y`, so showing the banner moved the stat
+    // strip down 28px. ---
+
+    /// The set of framebuffer rows (y coordinates) that carry
+    /// `palette::TEXT_SECONDARY` ink -- the stat strip's exclusive color
+    /// in this widget (device name/hero/bitrate use `TEXT_PRIMARY`; the
+    /// banner and a fallen-back hero use `STATUS_WARNING`), so this
+    /// isolates exactly the stat strip's occupied rows.
+    fn stat_strip_ink_rows(fb: &FrameBuffer565) -> alloc::vec::Vec<i32> {
+        let mut rows: alloc::vec::Vec<i32> = fb
+            .pixels()
+            .filter(|p| p.1 == palette::TEXT_SECONDARY)
+            .map(|p| p.0.y)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    #[test]
+    fn stat_strip_occupies_the_same_rows_with_and_without_a_banner() {
+        let without_banner = nominal(); // no fallback, not muted -- no banner
+        let with_banner = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected {
+                word: String::from("SBC"),
+                fallback: Some(String::from("Headphones don't support LDAC")),
+                bitrate: BitrateStatus::Kbps(328),
+            },
+        )
+        .with_stat_line("USB 48k 24-bit");
+        assert!(with_banner.active_banner().is_some(), "fixture must actually exercise the banner");
+
+        let fb_without = render(&without_banner);
+        let fb_with = render(&with_banner);
+
+        let rows_without = stat_strip_ink_rows(&fb_without);
+        let rows_with = stat_strip_ink_rows(&fb_with);
+
+        assert!(!rows_without.is_empty(), "the stat strip must render some ink when a stat line is set");
+        assert_eq!(
+            rows_without, rows_with,
+            "the stat strip must occupy the SAME rows whether or not the banner is showing -- its y is a fixed grid slot (STAT_TOP), not derived from a cursor that the banner also advances"
+        );
+    }
+
+    #[test]
+    fn stat_strip_renders_at_the_fixed_stat_top_slot() {
+        let fb = render(&nominal());
+        let rows = stat_strip_ink_rows(&fb);
+        assert!(!rows.is_empty(), "nominal() sets a stat line, so it must render ink");
+        let first_row = rows[0];
+        assert!(
+            (STAT_TOP..STAT_TOP + 20).contains(&first_row),
+            "stat strip ink must start within the STAT_TOP grid slot, got y={first_row}"
+        );
     }
 }

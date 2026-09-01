@@ -29,13 +29,14 @@ use super::rail::{draw_rail, ButtonLabel, ButtonLabels};
 use super::theme::{font, icon, palette};
 use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Widget};
 
-/// Margin (px) from the title bar's left/right edges to its shield mark /
-/// status dot — the "more air" half of Andreas's title-bar tweak (the
-/// other half, using `font::icon_1x` instead of `icon_2x` for the mark
-/// itself, lives in `theme.rs`).
-const TITLE_SIDE_MARGIN: i32 = 6;
-/// Gap (px) between adjacent title-bar elements (shield -> title text,
-/// readout -> status dot).
+/// Margin (px) from the title bar's left/right edges to its content —
+/// now the same left rule `L = 12` the body content uses (design doc
+/// `.planning/design/2026-09-01-home-alignment-grid.md` section 3), so
+/// the title text and the device name directly beneath it finally stack
+/// on one shared edge.
+const TITLE_SIDE_MARGIN: i32 = 12;
+/// Gap (px) between adjacent title-bar elements (readout -> status dot,
+/// status dot -> link glyph).
 const TITLE_ELEMENT_GAP: i32 = 6;
 /// Diameter (px) of the title bar's sync-status dot.
 const STATUS_DOT_DIAMETER: u32 = 6;
@@ -56,42 +57,6 @@ fn text_width(font: &FontRenderer, text: &str) -> u32 {
         .map_or(0, |bbox| bbox.size.width)
 }
 
-/// Draws the title bar's shield mark, left-anchored at `title_left_x +
-/// `[`TITLE_SIDE_MARGIN`], and returns the x position at which the title
-/// text itself should start (the shield's right edge plus
-/// [`TITLE_ELEMENT_GAP`]).
-///
-/// `icon_1x`, not `icon_2x` — see that accessor's doc comment for why
-/// (Andreas's "smaller, more air" tweak). Centered on its own *ink*
-/// bounding box, not `VerticalPosition::Center` (which centers on the
-/// font's line metrics/ascent-descent budget, not this specific glyph's
-/// ink) — the same mismatch `theme::draw_chip`'s doc comment describes for
-/// the chip-letter fix, and the reason the shield reads visibly
-/// off-center at `icon_1x`'s small size even though it looked fine at
-/// `icon_2x`.
-///
-/// Split out of `render` (alongside [`draw_link_glyph`]) purely to keep
-/// that function's line count in check.
-fn draw_shield_mark(title_left_x: i32, title_mid_y: i32, target: &mut FrameBuffer565) -> i32 {
-    let shield_font = font::icon_1x();
-    let mut shield_buf = [0_u8; 4];
-    let shield_str: &str = icon::SHIELD.encode_utf8(&mut shield_buf);
-    let shield_x = title_left_x + TITLE_SIDE_MARGIN;
-    let shield_ink = shield_font
-        .get_rendered_dimensions_aligned(shield_str, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
-        .unwrap_or(None);
-    let shield_y = shield_ink.map_or(title_mid_y, |ink| title_mid_y - (ink.top_left.y + ink.size.height as i32 / 2));
-    let _ = shield_font.render_aligned(
-        shield_str,
-        Point::new(shield_x, shield_y),
-        VerticalPosition::Top,
-        HorizontalAlignment::Left,
-        FontColor::Transparent(palette::BRAND_BRIGHT),
-        target,
-    );
-    shield_x + text_width(&shield_font, shield_str) as i32 + TITLE_ELEMENT_GAP
-}
-
 /// Draws the A2DP/Bluetooth link glyph immediately left of
 /// `right_cursor`, in a
 /// color derived from `link_state`, and returns the updated `right_cursor`
@@ -108,10 +73,12 @@ fn draw_link_glyph(link_state: LinkState, right_cursor: i32, title_mid_y: i32, t
         LinkState::Idle => palette::TEXT_SECONDARY,
     };
 
-    // Same `icon_1x` + ink-bounding-box-centered-on-the-title-bar technique
-    // the shield mark uses in `render` (see its own doc comment for why
-    // `icon_1x`, not `icon_2x`, fits the fixed `TITLE_BAR_HEIGHT`-px bar
-    // with room to spare).
+    // `icon_1x`, not `icon_2x` -- fits the fixed `TITLE_BAR_HEIGHT`-px bar
+    // with room to spare. Centered on its own *ink* bounding box, not
+    // `VerticalPosition::Center` (which centers on the font's line
+    // metrics/ascent-descent budget, not this specific glyph's ink) --
+    // the same mismatch `theme::draw_chip`'s doc comment describes for
+    // the chip-letter fix.
     let link_font = font::icon_1x();
     let mut link_buf = [0_u8; 4];
     let link_str: &str = icon::BLUETOOTH.encode_utf8(&mut link_buf);
@@ -337,7 +304,7 @@ impl Screen {
         }
     }
 
-    /// Draws the title bar (shield mark, title, position readout, the
+    /// Draws the title bar (title text, position readout, the
     /// keyboard-output-link Bluetooth glyph, sync status dot), the content
     /// widgets (stacked vertically, sized via
     /// `Widget::measure`), and the button rail — pulling live overrides
@@ -384,7 +351,13 @@ impl Screen {
         // font's own ascent/descent metrics for us.
         let title_mid_y = chrome.title.top_left.y + chrome.title.size.height as i32 / 2;
 
-        let title_text_x = draw_shield_mark(chrome.title.top_left.x, title_mid_y, target);
+        // Title text starts directly on the left rule -- no shield mark
+        // (pico-link-d9y: the Bitwarden-era brand glyph is deleted, not
+        // replaced; see the design doc's section 5 for why nothing takes
+        // its place). This is also what fixes the 12px title/body
+        // misalignment (pico-link-nvj's D2): the title text and the
+        // device name directly beneath it now share one left edge.
+        let title_text_x = chrome.title.top_left.x + TITLE_SIDE_MARGIN;
 
         // Right side, built right-to-left so the status dot and readout
         // can each be omitted independently: status dot first (rightmost),
@@ -530,8 +503,8 @@ mod tests {
     /// caller-settable `ChromeContribution::link` -- everything else is
     /// `None`/default, so a test only ever samples pixels this specific
     /// glyph rendering could plausibly have painted (no status dot, no
-    /// readout, a one-character title to keep the shield/title text away
-    /// from the right edge this glyph draws into).
+    /// readout, a one-character title to keep the title text away from
+    /// the right edge this glyph draws into).
     struct LinkOnlyWidget(core::cell::Cell<Option<LinkState>>);
 
     impl Widget for LinkOnlyWidget {
@@ -561,7 +534,7 @@ mod tests {
     /// region when (per `link_screen`) there is no status dot/readout
     /// ahead of it, so it lands flush against the title bar's right
     /// margin. Narrow and right-aligned enough to never collide with the
-    /// "T" title text or the shield mark, both drawn from the left edge.
+    /// "T" title text, drawn from the left edge.
     fn any_pixel_near_the_right_title_edge(screen: &Screen, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
