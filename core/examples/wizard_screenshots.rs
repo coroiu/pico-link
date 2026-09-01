@@ -87,10 +87,10 @@ fn main() {
     open_wizard(&mut app);
     let named_addr = [0xAA; 6];
     let nameless_addr = [0xBB; 6];
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: named_addr, name: String::new(), rssi: -45 }));
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: nameless_addr, name: String::new(), rssi: -82 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: named_addr, name: String::new(), rssi: -45, class_of_device: 0 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: nameless_addr, name: String::new(), rssi: -82, class_of_device: 0 }));
     // The name resolves later for the first device only.
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: named_addr, name: String::from("Sony WH-1000XM5"), rssi: -45 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: named_addr, name: String::from("Sony WH-1000XM5"), rssi: -45, class_of_device: 0 }));
     save_zoomed_png(&mut app, &out_dir, "02_scanning_late_name_and_nameless");
 
     // --- Phase 2b: real-world long device names (pico-link-ok1) --
@@ -105,12 +105,12 @@ fn main() {
     app.handle_event(Event::DeviceDiscovered(DeviceEntry {
         addr: [0xCC; 6],
         name: String::from("Sennheiser Momentum 4 Wireless"),
-        rssi: -50,
+        rssi: -50, class_of_device: 0,
     }));
     app.handle_event(Event::DeviceDiscovered(DeviceEntry {
         addr: [0xDD; 6],
         name: String::from("Bang and Olufsen Beoplay H95"),
-        rssi: -60,
+        rssi: -60, class_of_device: 0,
     }));
     save_zoomed_png(&mut app, &out_dir, "02b_scanning_long_device_names");
 
@@ -121,12 +121,53 @@ fn main() {
     // level side by side.
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x10; 6], name: String::from("4 bars"), rssi: -40 }));
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x11; 6], name: String::from("3 bars"), rssi: -55 }));
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x12; 6], name: String::from("2 bars"), rssi: -65 }));
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x13; 6], name: String::from("1 bar"), rssi: -75 }));
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x14; 6], name: String::from("0 bars"), rssi: -95 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x10; 6], name: String::from("4 bars"), rssi: -40, class_of_device: 0 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x11; 6], name: String::from("3 bars"), rssi: -55, class_of_device: 0 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x12; 6], name: String::from("2 bars"), rssi: -65, class_of_device: 0 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x13; 6], name: String::from("1 bar"), rssi: -75, class_of_device: 0 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x14; 6], name: String::from("0 bars"), rssi: -95, class_of_device: 0 }));
     save_zoomed_png(&mut app, &out_dir, "02c_scanning_signal_bar_levels");
+
+    // --- Phase 2d: E9 -- a phone (major device class 0x02) discovered
+    // alongside real headphones (major device class 0x04, Audio/Video)
+    // must not show up in the list at all -- design section 9 phase 2 rule
+    // 3. Only "Cans" should render.
+    let mut app = App::new(240, 240);
+    open_wizard(&mut app);
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+        addr: [0x20; 6],
+        name: String::from("Somebody's Phone"),
+        rssi: -40,
+        class_of_device: 0x20_02_0C,
+    }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+        addr: [0x21; 6],
+        name: String::from("Cans"),
+        rssi: -40,
+        class_of_device: 0x24_04_04,
+    }));
+    save_zoomed_png(&mut app, &out_dir, "02d_scanning_class_of_device_filter");
+
+    // --- Phase 2e: E9's 12-item backstop cap -- 13 audio-classed devices
+    // discovered; only the first 12 (first-seen order) get a real row, and
+    // a 13th "Showing 12 of 13" readout row closes the list. Design
+    // section 21 Tier 1 row E9 / section 13's Class-of-Device row.
+    let mut app = App::new(240, 240);
+    open_wizard(&mut app);
+    for i in 1..=13u8 {
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+            addr: [i; 6],
+            name: format!("Device {i}"),
+            rssi: -40,
+            class_of_device: 0x24_04_04,
+        }));
+    }
+    // Scroll all the way down (12 Down presses lands on the readout row,
+    // one past the 12 capped device rows) so the "Showing 12 of 13"
+    // backstop is actually visible in the screenshot, not scrolled off
+    // the bottom of a fresh, top-scrolled list.
+    app.handle_input(vec![NavIntent::Down; 12]);
+    save_zoomed_png(&mut app, &out_dir, "02e_scanning_twelve_item_cap_readout");
 
     // --- Phase 3: nothing found ---
     let mut app = App::new(240, 240);
@@ -144,7 +185,7 @@ fn main() {
     for (step, name) in steps {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -50 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
         select_device(&mut app);
         app.handle_event(Event::ConnectStepChanged(step));
         save_zoomed_png(&mut app, &out_dir, name);
@@ -153,7 +194,7 @@ fn main() {
     // --- Phase 5: "Still trying (2)" -- the 6s surfacing point ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -50 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
     select_device(&mut app);
     app.handle_event(Event::ConnectRetrying { attempt: 1 });
     app.handle_event(Event::ConnectRetrying { attempt: 2 });
@@ -171,7 +212,7 @@ fn main() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [3; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -50 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
         select_device(&mut app);
         app.handle_event(Event::ConnectFailed { addr, reason });
         save_zoomed_png(&mut app, &out_dir, name);
@@ -180,7 +221,7 @@ fn main() {
     // --- Phase 6: plain success ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [4; 6], name: String::from("Cans"), rssi: -50 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [4; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
     select_device(&mut app);
     app.handle_event(Event::ConnectSucceeded { addr: [4; 6], degraded: false });
     save_zoomed_png(&mut app, &out_dir, "06f_succeeded_plain");
@@ -188,10 +229,10 @@ fn main() {
     // --- Phase 6: degraded success ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [5; 6], name: String::from("Cans"), rssi: -50 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [5; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
     select_device(&mut app);
     app.handle_event(Event::ConnectSucceeded { addr: [5; 6], degraded: true });
     save_zoomed_png(&mut app, &out_dir, "06g_succeeded_degraded");
 
-    println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());
+    println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());
 }

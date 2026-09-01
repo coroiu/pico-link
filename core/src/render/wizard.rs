@@ -39,7 +39,9 @@ use embedded_graphics::prelude::{Point, Size};
 use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
-use crate::app::{truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, WizardPhase};
+use crate::app::{
+    is_audio_sink, truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, WizardPhase, MAX_SCAN_LIST_ITEMS,
+};
 use crate::input::NavIntent;
 
 use super::ctx::RenderCtx;
@@ -237,6 +239,27 @@ impl PairingWizardView {
 /// [`PairingWizardView::new`] and [`PairingWizardView::sync_list`] share
 /// the exact same construction, mirroring `crate::app::build_devices_screen`'s
 /// own snapshot-and-rebuild shape.
+///
+/// Filters `devices` (`BtModel::discovered`, unfiltered raw inquiry
+/// results) down to audio sinks via [`is_audio_sink`] -- design section 9
+/// phase 2 rule 3 -- then caps the result at [`MAX_SCAN_LIST_ITEMS`]
+/// (design section 21 Tier 1 row E9 / section 13's Class-of-Device row:
+/// built as a backstop regardless of whether the filter above is doing
+/// anything, since Class-of-Device is only *Expected*, not *Confirmed*).
+/// The filter runs here, at the render layer, rather than at
+/// `App::add_device` -- `BtModel::discovered` stays the complete raw
+/// inquiry feed either way (nothing else reads it today, but nothing here
+/// should force a future reader to reconstruct filtered-out devices from
+/// C's device-discovered events again), and this bead's own text calls out
+/// that the wizard must render a correct scan list whether or not this
+/// filter exists.
+///
+/// Stable first-seen order (design section 9 rule 1) falls out for free:
+/// `devices`' own order is never touched, only truncated. Row identity
+/// (rule 2, [`ListItemKey::from`] on the address) survives the filter/cap
+/// for the same reason -- a device already shown never moves or drops out
+/// just because a later-discovered non-audio device gets filtered ahead of
+/// where it would otherwise land.
 fn build_scan_list(
     devices: &[DeviceEntry],
     phase: &Rc<RefCell<WizardPhase>>,
@@ -244,7 +267,12 @@ fn build_scan_list(
     prev_key: Option<ListItemKey>,
     prev_index: usize,
 ) -> VerticalList {
-    let items: Vec<ListItem> = devices
+    let audio_devices: Vec<DeviceEntry> = devices.iter().filter(|d| is_audio_sink(d.class_of_device)).cloned().collect();
+    let total_audio = audio_devices.len();
+    let capped: Vec<DeviceEntry> = audio_devices.into_iter().take(MAX_SCAN_LIST_ITEMS).collect();
+    let capped_len = capped.len();
+
+    let mut items: Vec<ListItem> = capped
         .iter()
         .map(|d| {
             let label = if d.name.is_empty() { String::from("(unknown device)") } else { d.name.clone() };
@@ -252,7 +280,23 @@ fn build_scan_list(
         })
         .collect();
 
-    let devices_snapshot: Vec<DeviceEntry> = devices.to_vec();
+    // Backstop readout (design section 13's Class-of-Device row fallback):
+    // a non-device informational row appended past the cap. Its index
+    // (`capped_len`) is deliberately past the end of `devices_snapshot`
+    // below, so activating it (Select/A) is a harmless no-op rather than
+    // connecting to whatever the stale index would otherwise resolve to.
+    // Deliberately no "press X to rescan" hint: this bead does not wire X
+    // to a fresh scan from here (that would need `CancelScan` + `StartScan`
+    // sequencing this bead's scope doesn't cover), and the label's ~180px
+    // budget (240px screen minus the button rail, minus the row's leading
+    // icon) truncates with an ellipsis well before a sentence that long
+    // finishes anyway -- see this bead's zoomed fixture screenshot. A short
+    // count-only readout is honest about what's actually on screen.
+    if total_audio > MAX_SCAN_LIST_ITEMS {
+        items.push(ListItem::new(format!("Showing {capped_len} of {total_audio}")));
+    }
+
+    let devices_snapshot: Vec<DeviceEntry> = capped;
     let phase_for_activate = Rc::clone(phase);
     let commands_for_activate = Rc::clone(commands);
     VerticalList::new(items)
@@ -563,7 +607,7 @@ mod tests {
     fn a_device_arriving_while_scanning_does_not_change_the_phase() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
         assert_eq!(app.navigator_depth(), 3, "the wizard must still be the top screen at Home(1)/Devices(2)/Wizard(3)");
     }
@@ -581,7 +625,7 @@ mod tests {
     fn scan_ending_with_devices_present_stays_on_scanning() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
     }
@@ -591,11 +635,131 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [3; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]); // activate the (only) row
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::StartScan));
         assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Cans") }));
+    }
+
+    #[test]
+    fn a_non_audio_class_of_device_is_excluded_from_the_scan_list_while_an_audio_sink_is_included() {
+        // Bead pico-link-znb.11 (E9), design section 9 phase 2 rule 3.
+        // Discover a phone first (major device class 0x01), then a real
+        // pair of headphones (major device class 0x04, Audio/Video) --
+        // if the phone is correctly filtered out, the headphones must be
+        // the *only* row left, so pressing Select on the default (index 0)
+        // selection connects to them, not the phone.
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        let phone_addr = [1; 6];
+        let phone_cod = 0x20_02_0C; // major device class 0x02 (Phone), minor 0x0C (smartphone)
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+            addr: phone_addr,
+            name: String::from("Somebody's Phone"),
+            rssi: -40,
+            class_of_device: phone_cod,
+        }));
+        let headphones_addr = [2; 6];
+        let headphones_cod = 0x24_04_04; // major device class 0x04 (Audio/Video), wearable headset
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+            addr: headphones_addr,
+            name: String::from("Cans"),
+            rssi: -40,
+            class_of_device: headphones_cod,
+        }));
+
+        app.handle_input(vec![NavIntent::Select]); // activate whatever landed at index 0
+        assert_eq!(app.poll_command(), Some(Command::StartScan));
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::Connect { addr: headphones_addr, name: String::from("Cans") }),
+            "the phone must have been filtered out, leaving the headphones as the only (and therefore default-selected) row"
+        );
+    }
+
+    #[test]
+    fn a_device_with_unreported_class_of_device_is_never_silently_excluded() {
+        // Judgement call made in this bead: `class_of_device == 0` (no
+        // "available" flag exists for this inquiry-result field, unlike
+        // name/rssi) means BTstack reported nothing, not "not audio" --
+        // see `is_audio_sink`'s doc comment. A device with an unreported
+        // class must still be selectable, or a device the user can see in
+        // the room becomes permanently, silently unpairable.
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        let addr = [7; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+            addr,
+            name: String::from("Mystery Cans"),
+            rssi: -40,
+            class_of_device: 0,
+        }));
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.poll_command(), Some(Command::StartScan));
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::Connect { addr, name: String::from("Mystery Cans") }),
+            "an unreported Class-of-Device must not hide a device from the scan list"
+        );
+    }
+
+    #[test]
+    fn the_scan_list_caps_at_max_scan_list_items_but_the_cap_itself_stays_selectable() {
+        // Design section 21 Tier 1 row E9 / section 13's Class-of-Device
+        // row: the 12-item cap is a backstop built regardless of whether
+        // filtering works, because Class-of-Device is only *Expected*, not
+        // *Confirmed*. 13 audio-classed devices discovered; the 12th (the
+        // cap boundary) must still be reachable and connectable.
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        for i in 1..=13u8 {
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+                addr: [i; 6],
+                name: format!("Device {i}"),
+                rssi: -40,
+                class_of_device: 0x24_04_04,
+            }));
+        }
+        // 11 Down presses from the default index 0 reaches index 11 -- the
+        // 12th (last, cap-boundary) device row.
+        app.handle_input(vec![NavIntent::Down; 11]);
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.poll_command(), Some(Command::StartScan));
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::Connect { addr: [12; 6], name: String::from("Device 12") }),
+            "the 12th device must still be present and connectable at the cap boundary"
+        );
+    }
+
+    #[test]
+    fn past_the_cap_the_readout_row_is_a_harmless_no_op_not_the_13th_device() {
+        // Companion to the cap test above: the row one past
+        // `MAX_SCAN_LIST_ITEMS` is the "showing N of M" backstop readout,
+        // not a 14th device row -- activating it must not queue a Connect
+        // for anything (in particular, not for the 13th discovered device,
+        // which the cap excludes from the list entirely).
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        for i in 1..=13u8 {
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+                addr: [i; 6],
+                name: format!("Device {i}"),
+                rssi: -40,
+                class_of_device: 0x24_04_04,
+            }));
+        }
+        // 12 Down presses from index 0 reaches index 12 -- one past the
+        // last real device row (index 11), landing on the readout row.
+        app.handle_input(vec![NavIntent::Down; 12]);
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.poll_command(), Some(Command::StartScan));
+        assert_eq!(
+            app.poll_command(),
+            None,
+            "the backstop readout row must not resolve to a device -- selecting it must be a pure no-op"
+        );
     }
 
     #[test]
@@ -616,7 +780,7 @@ mod tests {
         );
 
         let addr = [7; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         app.tick(1_500_000);
         app.handle_input(vec![NavIntent::Select]); // Scanning -> Connecting
         assert_eq!(
@@ -639,7 +803,7 @@ mod tests {
         app.tick(0);
         open_wizard(&mut app);
         let addr = [9; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]); // Scanning -> Connecting, started == 0
 
         app.tick(0);
@@ -665,7 +829,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [4; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
         app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
@@ -688,7 +852,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [5; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
         app.handle_event(Event::ConnectRetrying { attempt: 1 });
@@ -703,7 +867,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [6; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
         app.handle_event(Event::ConnectRetrying { attempt: 1 });
         app.poll_command(); // drain StartScan
@@ -719,7 +883,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [7; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
@@ -733,7 +897,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [8; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         assert_eq!(app.navigator_depth(), 3);
@@ -747,7 +911,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [9; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
         app.handle_event(Event::ConnectSucceeded { addr, degraded: true });
 
@@ -761,7 +925,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [10; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
         app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink });
@@ -773,7 +937,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [11; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
         app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink });
         app.poll_command(); // drain StartScan
@@ -790,7 +954,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [12; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
         app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout });
         app.poll_command();
@@ -851,7 +1015,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [13; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
         app.poll_command(); // drain StartScan
         app.poll_command(); // drain Connect
@@ -870,7 +1034,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [14; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
         app.handle_event(Event::ConnectRetrying { attempt: 1 }); // -> NotResponding
         app.poll_command(); // drain StartScan
@@ -888,7 +1052,7 @@ mod tests {
     #[test]
     fn b_aborts_from_succeeded() {
         assert_back_aborts_from(|app| {
-            app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [15; 6], name: String::new(), rssi: -40 }));
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [15; 6], name: String::new(), rssi: -40, class_of_device: 0 }));
             app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::ConnectSucceeded { addr: [15; 6], degraded: true });
         });
@@ -897,7 +1061,7 @@ mod tests {
     #[test]
     fn b_aborts_from_failed() {
         assert_back_aborts_from(|app| {
-            app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [16; 6], name: String::new(), rssi: -40 }));
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [16; 6], name: String::new(), rssi: -40, class_of_device: 0 }));
             app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::ConnectFailed { addr: [16; 6], reason: ConnectFailureReason::RadioError });
         });
@@ -914,7 +1078,7 @@ mod tests {
         assert_eq!(app.navigator_depth(), 3, "Home(1)/Devices(2)/Wizard(3)");
 
         let addr = [17; 6];
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         assert_eq!(app.navigator_depth(), 3);
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
         assert_eq!(app.navigator_depth(), 3);

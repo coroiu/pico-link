@@ -138,7 +138,61 @@ pub struct DeviceEntry {
     pub addr: [u8; 6],
     pub name: String,
     pub rssi: i8,
+    /// BTstack's raw 24-bit Class-of-Device from the inquiry result
+    /// (`gap_event_inquiry_result_get_class_of_device`), carried
+    /// uninterpreted -- same "core never interprets BTstack internals
+    /// blindly" rule as `addr` above. `0` means BTstack reported nothing
+    /// (there is no separate "available" flag for this field, unlike
+    /// `name`/`rssi`) and must be treated as *unknown*, never *non-audio*
+    /// -- see [`is_audio_sink`]'s doc comment. Added by bead
+    /// pico-link-znb.11 (E9, design section 21 Tier 1).
+    pub class_of_device: u32,
 }
+
+/// Decodes BTstack's raw Class-of-Device into "should this show up in the
+/// pairing wizard's scan list" (design section 9 phase 2 rule 3: "Filter by
+/// Class-of-Device to audio sinks" -- every phone and laptop in the room is
+/// noise the user cannot disambiguate, and design section 2's hard ~12-item
+/// list cap makes an unfiltered inquiry a real usability failure, not a
+/// cosmetic one).
+///
+/// Decodes the major device class (bits 8-12 of the 24-bit CoD, i.e.
+/// `(cod >> 8) & 0x1F` -- see the Bluetooth Assigned Numbers "Baseband"
+/// class-of-device format) and accepts the Audio/Video major class
+/// (`0x04`), which covers headphones/headsets/speakers alongside a handful
+/// of things that also plausibly want audio.
+///
+/// **Judgement call (this bead): filter, not rank, but with an explicit
+/// unknown-is-included escape hatch.** Design section 9 already settled on
+/// a hard filter over a ranked/demoted list. The risk that filter alone
+/// creates: a device whose CoD is `0` (not reported, no "available" flag
+/// exists for this field) or one that reports its major class oddly would
+/// otherwise be a device the user can see in the room but can never
+/// select, with nothing on screen explaining why -- silently unpairable.
+/// So `0` (unknown) is treated as *included*, not excluded; only a CoD that
+/// *positively* reports a known non-audio major class (phone, computer,
+/// etc.) is filtered out. This can never make the list too permissive in a
+/// crowded room, because [`MAX_SCAN_LIST_ITEMS`] backstops that regardless.
+#[must_use]
+pub(crate) fn is_audio_sink(class_of_device: u32) -> bool {
+    if class_of_device == 0 {
+        return true;
+    }
+    const MAJOR_DEVICE_CLASS_MASK: u32 = 0x1F;
+    const MAJOR_AUDIO_VIDEO: u32 = 0x04;
+    ((class_of_device >> 8) & MAJOR_DEVICE_CLASS_MASK) == MAJOR_AUDIO_VIDEO
+}
+
+/// Backstop cap on the pairing wizard's scan list (design section 21 Tier 1
+/// row E9 / section 13's Class-of-Device row): "cap the scan list at 12
+/// with a 'showing 12 of N' readout" -- built regardless of whether
+/// [`is_audio_sink`] filtering is working, since Class-of-Device is only
+/// marked *Expected*, not *Confirmed*, in the design doc, and a crowded
+/// room can in principle still exceed 12 audio-classed devices. Matches
+/// design section 2's hard ~12-item list rule, which exists because
+/// press-edge-only input (no key repeat) makes a longer list a genuine
+/// navigation failure, not a scrolling inconvenience.
+pub(crate) const MAX_SCAN_LIST_ITEMS: usize = 12;
 
 /// A user-initiated action queued by the devices screen for C to poll via
 /// [`App::poll_command`] (`pl_ui_poll_command` in the FFI surface). `core`
@@ -1132,7 +1186,9 @@ impl App {
                 self.set_link_state(state);
                 self.on_scan_ended_if_applicable(state);
             }
-            Event::DeviceDiscovered(device) => self.add_device(device.addr, device.name, device.rssi),
+            Event::DeviceDiscovered(device) => {
+                self.add_device(device.addr, device.name, device.rssi, device.class_of_device);
+            }
             Event::DevicesCleared => self.clear_devices(),
             Event::ConnectFailed { addr, reason } => self.record_connect_failure(addr, reason),
             Event::ConnectStepChanged(step) => self.on_connect_step_changed(step),
@@ -1367,12 +1423,13 @@ impl App {
     /// discovered device and refreshes the devices screen. Update-in-place
     /// rather than appending a duplicate row: BTstack's inquiry reports the
     /// same device repeatedly as its RSSI/name resolve.
-    pub fn add_device(&mut self, addr: [u8; 6], name: String, rssi: i8) {
+    pub fn add_device(&mut self, addr: [u8; 6], name: String, rssi: i8, class_of_device: u32) {
         if let Some(existing) = self.model.discovered.iter_mut().find(|d| d.addr == addr) {
             existing.name = name;
             existing.rssi = rssi;
+            existing.class_of_device = class_of_device;
         } else {
-            self.model.discovered.push(DeviceEntry { addr, name, rssi });
+            self.model.discovered.push(DeviceEntry { addr, name, rssi, class_of_device });
         }
         // Kept in lockstep with `model.discovered` -- see `wizard_devices`'s
         // doc comment on why the wizard widget needs its own mirror
@@ -1622,6 +1679,31 @@ mod tests {
     }
 
     #[test]
+    fn is_audio_sink_accepts_the_audio_video_major_device_class() {
+        // 0x24_04_04: real headphones-shaped CoD (major device class 0x04,
+        // Audio/Video; minor device class 0x04, wearable headset).
+        assert!(is_audio_sink(0x24_04_04));
+        // The major-class bits alone (no service-class bits set) must
+        // still decode correctly.
+        assert!(is_audio_sink(0x04 << 8));
+    }
+
+    #[test]
+    fn is_audio_sink_rejects_known_non_audio_major_device_classes() {
+        assert!(!is_audio_sink(0x20_02_0C), "major device class 0x02 (Phone) must be excluded");
+        assert!(!is_audio_sink(0x01 << 8), "major device class 0x01 (Computer) must be excluded");
+    }
+
+    #[test]
+    fn is_audio_sink_treats_an_unreported_class_of_device_as_unknown_not_excluded() {
+        // `0` means BTstack reported nothing (no separate "available" flag
+        // exists for this inquiry-result field) -- must never be treated
+        // as "known non-audio", or a device with odd/missing CoD reporting
+        // becomes silently unpairable with no way for the user to tell why.
+        assert!(is_audio_sink(0));
+    }
+
+    #[test]
     fn a_fresh_app_is_dirty_and_renders_the_initial_screen() {
         let app = App::new(240, 240);
         assert!(app.dirty());
@@ -1713,7 +1795,7 @@ mod tests {
         assert_eq!(app.navigator_depth(), 2, "LinkStateChanged must not pop the pushed screen");
         assert_eq!(app.current_screen_title(), "detail");
 
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         assert_eq!(app.navigator_depth(), 2, "DeviceDiscovered must not pop the pushed screen");
         assert_eq!(app.current_screen_title(), "detail");
 
@@ -2193,7 +2275,7 @@ mod tests {
         // a root rebuild the same way pico-link-a67 already proved pushed
         // screens survive one.
         app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         app.handle_event(Event::DevicesCleared);
 
         assert_eq!(app.navigator_depth(), 1, "a live Bluetooth event must not push or pop anything");
@@ -2356,7 +2438,7 @@ mod tests {
 
         // A second, unrelated event folds through `rebuild_root` again --
         // must not disturb the connected model or queue anything either.
-        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 1, 1, 1, 1, 1], name: String::from("Other"), rssi: -55 }));
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 1, 1, 1, 1, 1], name: String::from("Other"), rssi: -55, class_of_device: 0 }));
         assert_no_commands_queued(&mut app);
         assert_link_still_connected(&app);
         assert_home_hero_renders_connected(&mut app);

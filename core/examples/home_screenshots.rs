@@ -64,7 +64,7 @@ fn main() {
     // `BtModel::connected_codec` instead of the old hardcoded `NoLink`. ---
     let mut app = App::new(240, 240);
     let addr = [0xCC; 6];
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Sony WH-1000XM5"), rssi: -40 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Sony WH-1000XM5"), rssi: -40, class_of_device: 0 }));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     save_zoomed_png(&mut app, &out_dir, "02_connected_ldac");

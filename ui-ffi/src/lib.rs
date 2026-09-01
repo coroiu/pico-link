@@ -872,6 +872,24 @@ pub struct PlLinkStateChangedPayload {
 /// (see the module doc's memory rules). A null `name` (regardless of
 /// `name_len`) is treated as an empty device name. `name`/`addr` are
 /// borrowed for the duration of the [`pl_ui_push_event`] call only.
+///
+/// `class_of_device` added by bead pico-link-znb.11 (E9, design section 21
+/// Tier 1) -- [`PL_EVENT_ABI_VERSION`] bumped 3 -> 4 for it, same class of
+/// change as [`PlConnectSucceededPayload::addr`]'s 1 -> 2 bump: a
+/// non-additive payload shape change to an *existing* tag, not a new tag.
+/// This is BTstack's raw 24-bit Class-of-Device field
+/// (`gap_event_inquiry_result_get_class_of_device`), reported as a `u32`
+/// with the top byte always zero -- carried through uninterpreted, exactly
+/// like `addr` (see [`pico_link_core::app::DeviceEntry::addr`]'s doc
+/// comment for why `core` never blindly interprets BTstack internals):
+/// `core` decodes the major-device-class bits itself
+/// (`pico_link_core::app::is_audio_sink`) rather than C pre-deciding
+/// "is this an audio sink" and losing the raw value. A value of `0` means
+/// BTstack did not report one (unlike `name`/`rssi`, the inquiry-result
+/// accessor has no "available" flag of its own, so `0` is the only
+/// distinguishable "absent" sentinel) and is treated as *unknown*, not
+/// *non-audio* -- see `is_audio_sink`'s doc comment for why an unknown
+/// class must never be silently excluded from the scan list.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlDeviceDiscoveredPayload {
@@ -879,6 +897,7 @@ pub struct PlDeviceDiscoveredPayload {
     pub name: *const u8,
     pub name_len: usize,
     pub rssi: i8,
+    pub class_of_device: u32,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectFailed`.
@@ -1239,7 +1258,12 @@ pub union PlEventPayload {
 // bump as the 1->2 one above (see that struct's doc comment for the full
 // rationale -- moving the auto-reconnect policy decision to `core`'s side
 // of the seam).
-pub const PL_EVENT_ABI_VERSION: u32 = 3;
+//
+// Bead pico-link-znb.11 (E9), design section 21 Tier 1 row E9 / section 9
+// phase 2 rule 3: bumped 3 -> 4. PlDeviceDiscoveredPayload gained
+// `class_of_device` -- a non-additive shape change to an existing tag's
+// payload, same class of bump as both above (see that field's doc comment).
+pub const PL_EVENT_ABI_VERSION: u32 = 4;
 
 /// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
@@ -1326,7 +1350,7 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                 let bytes = unsafe { core::slice::from_raw_parts(payload.name, payload.name_len) };
                 String::from_utf8_lossy(bytes).into_owned()
             };
-            Event::DeviceDiscovered(DeviceEntry { addr, name, rssi: payload.rssi })
+            Event::DeviceDiscovered(DeviceEntry { addr, name, rssi: payload.rssi, class_of_device: payload.class_of_device })
         }
         PlEventTag::DevicesCleared => Event::DevicesCleared,
         PlEventTag::ConnectFailed => {
@@ -2227,6 +2251,47 @@ mod tests {
         }
         assert!(PlEventTag::try_from(13u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn pl_ui_push_event_carries_class_of_device_through_to_the_model() {
+        // Bead pico-link-znb.11 (E9): PlDeviceDiscoveredPayload::class_of_device
+        // must round-trip all the way from the FFI event into
+        // BtModel::discovered's DeviceEntry -- the whole point of carrying
+        // it across the seam at all is that `core`, not C, decides which
+        // devices are audio sinks.
+        let ui = new_ui();
+        let addr = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let name = b"Cans";
+        // 0x240404: a real headphones-shaped Class-of-Device (major
+        // service "Audio" bit set, major device class 0x04 Audio/Video,
+        // minor device class 0x04 wearable headset) -- not just a bare
+        // major-class nibble, so this also proves the full 24-bit value
+        // survives, not merely whichever bits a lossy carry might keep.
+        let class_of_device: u32 = 0x24_04_04;
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::DeviceDiscovered as u32,
+            payload: PlEventPayload {
+                device_discovered: PlDeviceDiscoveredPayload {
+                    addr,
+                    name: name.as_ptr(),
+                    name_len: name.len(),
+                    rssi: -40,
+                    class_of_device,
+                },
+            },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            let model = (*ui).app.model();
+            assert_eq!(model.discovered.len(), 1, "the device must have been folded into BtModel::discovered");
+            assert_eq!(
+                model.discovered[0].class_of_device, class_of_device,
+                "class_of_device must round-trip byte-for-byte, not just its top bits"
+            );
+            pl_ui_destroy(ui);
+        }
     }
 
     #[test]
