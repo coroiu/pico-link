@@ -101,6 +101,17 @@ static volatile uint32_t s_sof_miss_avail;     // no arrival AND AVAIL set   -> 
 static volatile uint32_t s_sof_miss_unavail;   // no arrival AND AVAIL clear -> we were not ready
 static volatile uint32_t s_sof_last_pkt_count; // packet_count as of the previous SOF
 
+// Bead pico-link-2ap.4: TRUE packet delta accumulator, alongside (not
+// replacing) the got/miss_avail/miss_unavail boolean counters above. Those
+// counters are a SATURATING BOOLEAN per SOF interval -- two packets
+// accounted between consecutive SOF samples count as one "got" and the
+// NEIGHBOURING interval reads as a miss, aliasing a healthy 2-then-0
+// pattern down to exactly 0.500 and never lower. s_sof_pkts sums the raw
+// packet_count delta every interval instead, so sof_pkts/sof_streaming is
+// a true ratio uncontaminated by that aliasing. Report BOTH ratios side by
+// side -- do not remove the boolean counters, the comparison IS the point.
+static volatile uint32_t s_sof_pkts;
+
 // Bead pico-link-06m: incremented from INSIDE the patched pico-sdk TinyUSB
 // (rp2040_usb.c, _hw_endpoint_buffer_control_update32) where stock TinyUSB
 // instead calls panic("ep %02X was already available") -- an endpoint buffer
@@ -156,6 +167,7 @@ void pl_usb_sof_isr_sample(uint32_t frame_count) {
             s_sof_hw_unavail++;
         }
         uint32_t pc = pl_usb_audio_packet_count();
+        s_sof_pkts += (pc - s_sof_last_pkt_count);
         if (pc != s_sof_last_pkt_count) {
             s_sof_got++;
         } else if (hw_avail) {
@@ -436,11 +448,16 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
     // got + miss_avail + miss_unavail == sof_streaming. hw_unavail is now
     // sampled in true ISR context (fix 1) -- its distribution is expected
     // to differ materially from the pre-wbq worker-context reading.
+    // sof_pkts (pico-link-2ap.4): true summed packet-count delta, alongside
+    // the boolean got/miss_avail/miss_unavail counters above -- see the
+    // s_sof_pkts doc comment. sof_pkts/sof_streaming is the un-aliased
+    // ratio; got/sof_streaming is the (possibly aliased) old one. Both are
+    // cumulative since boot, same as the other counters on this line.
     pl_log(
-        "usb-sof-2ap: sof_streaming=%lu got=%lu miss_avail=%lu miss_unavail=%lu hw_unavail=%lu\r\n",
+        "usb-sof-2ap: sof_streaming=%lu got=%lu miss_avail=%lu miss_unavail=%lu hw_unavail=%lu sof_pkts=%lu\r\n",
         (unsigned long)s_sof_streaming, (unsigned long)s_sof_got,
         (unsigned long)s_sof_miss_avail, (unsigned long)s_sof_miss_unavail,
-        (unsigned long)s_sof_hw_unavail
+        (unsigned long)s_sof_hw_unavail, (unsigned long)s_sof_pkts
     );
 
     // Bead pico-link-pbv/pico-link-6vv (C2-8) acceptance criterion A6
