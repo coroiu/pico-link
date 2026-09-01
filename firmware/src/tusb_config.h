@@ -164,8 +164,15 @@ extern "C" {
 // is currently set by pl_usb_pump_worker_irq's free-running 1ms timer, not
 // the bus -- a candidate mechanism for the pico-link-2ap halving. See
 // firmware/sdk-patches/README.md and bead pico-link-2ap.6.
+//
+// DEFAULT ON as of bead pico-link-2ap.6 (2026-09-01): this is the fix for the
+// pico-link-2ap halving, verified on hardware over ~960s of continuous
+// streaming across two independent soaks (786 clean one-second intervals,
+// minimum packets-per-SOF 0.9706 and 0.9990, nothing below 0.95, against a
+// pre-fix control that sat at 0.4989-0.5018). Set to 0 to fall back to the
+// stock 0.18.0 task-context re-arm, which reintroduces the halving.
 #ifndef PL_USB_ISO_XFER_ISR
-#define PL_USB_ISO_XFER_ISR 0
+#define PL_USB_ISO_XFER_ISR 1
 #endif
 
 #ifdef __cplusplus
