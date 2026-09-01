@@ -59,6 +59,35 @@
 // pl_bt_enqueue_persist_write() (bt.h) -- it never touches flash itself.
 // pl_persist_init() is the one exception, and is safe for a structural
 // reason, not a lock -- see its own doc comment in persist.c.
+//
+// KNOWN MVP LIMITATION, stated deliberately, not accidental (code review,
+// 2026-09-01): a freshly successful connect cannot be persisted while
+// streaming continues without a gap. Command::PersistDevice fires at
+// Event::ConnectSucceeded/A2DP's STREAM_STARTED, at which point
+// pl_a2dp_streaming() is ALREADY true (state flips non-idle at
+// STREAM_ESTABLISHED, before STREAM_STARTED even fires) and stays true for
+// as long as audio keeps flowing -- so "connect, stream continuously, pull
+// power before ever pausing" loses the just-staged device record. The
+// link KEY itself is NOT subject to this gap (BTstack writes it
+// synchronously, unconditionally, during SSP pairing, before streaming
+// begins) -- what's lost is only "which address to auto-reconnect to",
+// costing the user one manual reconnect (scan+select, no re-pairing
+// dance), not a full loss of persistence. Closing this gap would mean
+// loosening the no-flash-while-streaming gate (e.g. permitting a write
+// during PRIMING before real audio flows) -- an audio-safety-affecting
+// design call intentionally left for a follow-up, not made here.
+//
+// KNOWN GAP, not fixed here (code review finding 2, 2026-09-01): nothing in
+// core (home.rs/app.rs's Bluetooth-menu-row and Scan-row activation) gates
+// opening the pairing wizard on the current link_state, so a user CAN scan
+// and pair a second device while already connected and streaming to a
+// first. BTstack's own put_link_key call for that new pairing is
+// unconditional and NOT gated by pl_a2dp_streaming() -- this bead turned it
+// from a no-op (hci_set_link_key_db was never wired before) into a real
+// flash write, so this is new exposure this bead introduces, not
+// pre-existing. Fixing it is a UX/product decision (block or warn on
+// scan-while-connected), not a persistence-layer one -- left for a
+// follow-up bead.
 void pl_persist_init(void);
 
 // Blank vs corrupt, distinguished at this layer (design point 5 -- upstream
