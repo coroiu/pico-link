@@ -211,9 +211,6 @@ pub mod font {
 /// at `U+0040` (`-e 64`), which has to be derived (or probed) rather than
 /// looked up.
 pub mod icon {
-    /// A shield brand mark, for chrome (e.g. the title bar).
-    /// Probed in the design-review spike's `core/examples/icon_probe.rs`.
-    pub const SHIELD: char = '\u{FC}';
     /// A right-pointing solid caret/triangle — a row/field's "this is
     /// selected, activate to go further" disclosure indicator.
     ///
@@ -408,9 +405,9 @@ where
 /// Falls back to drawing nothing (no icon, no background) if `icon` has
 /// no glyph in [`font::icon_4x`] — mirrors [`draw_chip`]'s no-ink
 /// fallback; every codepoint this module actually calls this with
-/// ([`icon::SHIELD`], [`icon::BLUETOOTH`], [`icon::COG`]) has been probed
-/// to render cleanly, so this path is a defensive no-panic guard, not an
-/// expected case.
+/// ([`icon::BLUETOOTH`], [`icon::COG`]) has been probed to render
+/// cleanly, so this path is a defensive no-panic guard, not an expected
+/// case.
 ///
 /// # Errors
 ///
