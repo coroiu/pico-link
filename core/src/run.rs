@@ -37,10 +37,19 @@
 //!     last_input = now
 //!     if Asleep: set_power(On); Active; app.mark_dirty(); DROP intents
 //!     else:      app.handle_input(intents)
-//! else if Active && now - last_input >= idle_timeout:
+//! else if Active && app.is_at_home_root() && now - last_input >= idle_timeout:
 //!     set_power(Off); Asleep
 //! if app.dirty() && Active: render + flush // blanked while Asleep
 //! ```
+//!
+//! The `app.is_at_home_root()` guard (bead pico-link-4vb.3) is what keeps
+//! the screensaver from ever firing away from Home -- most importantly,
+//! never during the pairing wizard, where a blanked screen reads as a
+//! crash. It only gates *arming* (transitioning `Active` -> `Asleep`); it
+//! does not reset `last_input`, so navigating away from Home and back
+//! doesn't get a free extension -- the same idle clock keeps running the
+//! whole time, and any `NavIntent` (including the presses that navigate)
+//! already resets it via the branch above.
 //!
 //! Two decisions worth calling out because they are easy to get backwards:
 //!
@@ -319,7 +328,10 @@ impl Runner {
 
         if intents.is_empty() {
             if let Some(idle_timeout) = self.idle_timeout {
-                if self.power_state == PowerState::Active && frame_start.saturating_duration_since(self.last_input) >= idle_timeout {
+                if self.power_state == PowerState::Active
+                    && app.is_at_home_root()
+                    && frame_start.saturating_duration_since(self.last_input) >= idle_timeout
+                {
                     match platform.display().set_power(DisplayPower::Off) {
                         Ok(()) => self.power_errors.on_ok(),
                         Err(error) => self.power_errors.on_err(&error),
@@ -435,8 +447,8 @@ impl Runner {
 /// `idle_timeout` is the idle-screensaver seam: `None` disables it
 /// entirely (the display is never told to power off); `Some` blanks the
 /// display via `DisplaySurface::set_power` after that much wall-clock time
-/// with no polled input, and restores it on the next input (see the
-/// module doc for the full state machine).
+/// with no polled input **while `app.is_at_home_root()`**, and restores it
+/// on the next input (see the module doc for the full state machine).
 ///
 /// `deep_sleep_timeout` is the deeper power tier's seam (see the module
 /// doc's "Deep sleep" section): `None` disables it entirely, mirroring
@@ -929,11 +941,14 @@ mod tests {
         // deliberately unbound there (Tier 1 scope boundary: volume is
         // Tier 2/E16). This test's proof only needs *some* focusable
         // content whose selection visibly moves on `Down`, decoupled from
-        // whatever Home's own content happens to be -- a plain pushed
+        // whatever Home's own content happens to be -- a plain
         // `VerticalList` screen, the same shape `navigator.rs`'s own
         // tests use, serves that purpose without coupling this run-loop
-        // test to Home's domain-specific input contract.
-        app.push_screen_for_test(crate::render::Screen::new(
+        // test to Home's domain-specific input contract. It replaces the
+        // *root* (not pushed on top, see pico-link-4vb.3) so the navigator
+        // stays at depth 1/Home root -- the screensaver's arming gate --
+        // rather than looking like the pairing wizard or a pushed screen.
+        app.replace_root_for_test(crate::render::Screen::new(
             "probe",
             alloc::vec![alloc::boxed::Box::new(crate::render::VerticalList::new(alloc::vec![
                 crate::render::ListItem::new("row 0"),
@@ -999,6 +1014,61 @@ mod tests {
         });
 
         assert!(power_calls.borrow().is_empty(), "idle_timeout: None must disable the screensaver entirely");
+    }
+
+    #[test]
+    fn no_input_past_the_idle_timeout_off_home_root_never_blanks_the_display() {
+        // Regression test for bead pico-link-4vb.3: the screensaver must
+        // never arm away from Home (most importantly, never during the
+        // pairing wizard -- a blanked screen mid-pairing reads as a
+        // crash). Pushing a second screen (mirroring the wizard/Devices/
+        // Settings shape: depth > 1) is enough to prove the gate, without
+        // coupling this test to the wizard's own domain-specific state --
+        // see `waking_input_is_swallowed_but_the_next_input_reaches_the_app`
+        // above for the same pattern.
+        let idle_timeout = Duration::from_secs(60);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(); 3]);
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(crate::render::Screen::new("probe", alloc::vec![]));
+        assert_eq!(app.navigator_depth(), 2, "sanity: not at Home root");
+
+        let mut iterations = 0;
+        run(&mut platform, &mut app, Duration::from_millis(0), Some(idle_timeout), None, || {
+            iterations += 1;
+            if iterations == 2 {
+                clock.advance(idle_timeout + Duration::from_millis(1));
+            }
+            iterations <= 3
+        });
+
+        assert!(power_calls.borrow().is_empty(), "the screensaver must never arm while off the Home root, no matter how much idle time passes");
+    }
+
+    #[test]
+    fn returning_to_home_root_arms_the_screensaver_again_after_leaving_it() {
+        // Complements the test above: once the navigator is *back* at Home
+        // root, the same idle clock (never reset just by moving around --
+        // see the module doc's note on `app.is_at_home_root()`) can still
+        // trigger the blank. `push_screen_for_test`/`Navigator::pop` stand
+        // in for "the user opened Devices, then backed out to Home",
+        // without depending on the real Devices/wizard screens.
+        let idle_timeout = Duration::from_secs(60);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(); 3]);
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(crate::render::Screen::new("probe", alloc::vec![]));
+        app.pop_screen_for_test();
+        assert_eq!(app.navigator_depth(), 1, "sanity: back at Home root");
+
+        let mut iterations = 0;
+        run(&mut platform, &mut app, Duration::from_millis(0), Some(idle_timeout), None, || {
+            iterations += 1;
+            if iterations == 2 {
+                clock.advance(idle_timeout + Duration::from_millis(1));
+            }
+            iterations <= 3
+        });
+
+        assert_eq!(*power_calls.borrow(), vec![crate::platform::DisplayPower::Off], "back at Home root, the screensaver must still arm once idle_timeout elapses");
     }
 
     // --- Deep sleep ---

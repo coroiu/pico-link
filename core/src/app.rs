@@ -1054,6 +1054,20 @@ impl App {
         self.navigator.depth()
     }
 
+    /// Whether the navigator is currently showing Home at the root of its
+    /// stack (depth 1) -- either face (design section 4/7's `HomeFace`).
+    /// `false` for any pushed screen, including Devices (depth 2),
+    /// Settings (depth 2), and the pairing wizard (depth 3, see
+    /// `crate::render::wizard`'s own navigator-depth tests) -- the pairing
+    /// wizard in particular must never be mistaken for "at Home root": a
+    /// blanked screen mid-pairing reads as a crash (bead pico-link-4vb.3).
+    /// `crate::run::Runner::step` uses this to gate the idle-screensaver
+    /// tier so it arms only here.
+    #[must_use]
+    pub fn is_at_home_root(&self) -> bool {
+        self.navigator_depth() == 1
+    }
+
     /// The currently visible screen's title. Exposed for tests/diagnostics
     /// -- in particular, proving that a Bluetooth [`Event`] mid-navigation
     /// doesn't silently pop the user back to the root screen (see
@@ -1090,6 +1104,28 @@ impl App {
     #[cfg(test)]
     pub(crate) fn push_screen_for_test(&mut self, screen: Screen) {
         self.navigator.push(screen);
+    }
+
+    /// Test-only: pops the top screen off the navigator stack, the
+    /// counterpart to [`App::push_screen_for_test`] -- lets a test
+    /// simulate "the user backed out to a previous screen" (e.g. back to
+    /// Home root) without going through real screen-specific `B` handling.
+    /// Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn pop_screen_for_test(&mut self) {
+        self.navigator.pop();
+    }
+
+    /// Test-only: replaces the navigator's *root* screen with an arbitrary
+    /// one, staying at depth 1 (Home root) -- unlike
+    /// [`App::push_screen_for_test`], which adds a screen on top. Lets a
+    /// test exercise generic run-loop behavior (e.g. focus/selection) that
+    /// needs some focusable content, while still satisfying
+    /// [`App::is_at_home_root`] (bead pico-link-4vb.3's screensaver gate)
+    /// the way real Home content does. Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn replace_root_for_test(&mut self, screen: Screen) {
+        self.navigator.replace_root(screen);
     }
 
     /// Test-only: enqueues a [`Command`] directly, bypassing the UI

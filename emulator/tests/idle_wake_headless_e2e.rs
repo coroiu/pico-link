@@ -13,16 +13,26 @@
 //! To keep this fast and non-flaky it uses a short `idle_timeout` (tens of
 //! milliseconds) with a comfortable safety margin (the loop runs for
 //! several times the timeout before checking), not the real
-//! `DEFAULT_IDLE_TIMEOUT` (120s) `main.rs` wires up -- waiting out 120 real
+//! `DEFAULT_IDLE_TIMEOUT` (60s) `main.rs` wires up -- waiting out 60 real
 //! seconds in a test would be its own kind of bad.
 //!
-//! Deliberately a *single* `run` call for the whole scenario (initial
-//! render -> idle -> inject -> woken), not three separate calls: `run`'s
+//! Two scenarios (bead pico-link-4vb.3 added the second one, and adapted
+//! the first): the screensaver must blank while idle **at Home root**, and
+//! must **never** blank away from it -- most importantly, never in the
+//! middle of the pairing wizard, where a blanked screen reads as a crash.
+//! `core/src/run.rs`'s own unit tests already prove the arm/disarm/wake
+//! state machine and the Home-root gate in isolation (see
+//! `no_input_past_the_idle_timeout_off_home_root_never_blanks_the_display`
+//! and its neighbors); what only a headless run can prove is that the real
+//! `App`/`Navigator`/screen stack, driven the way a user would, ends up
+//! producing an actually-blank (or actually-not-blank) framebuffer.
+//!
+//! Deliberately a *single* `run` call per scenario, not several: `run`'s
 //! `Active`/`Asleep` state is local to each invocation (correct for
 //! production, where it's called exactly once for the process's whole
 //! lifetime) -- calling it again mid-scenario would silently reset that
 //! state to `Active` even though the real display is still physically
-//! `Off`, which would make this test pass without ever exercising the
+//! `Off`, which would make a test pass without ever exercising the
 //! wake-swallows-first-input path it exists to prove. Screenshots and the
 //! injected `NavIntent` are instead taken/pushed from inside the
 //! `should_continue` closure, which `run` calls once per iteration on this
@@ -38,11 +48,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pico_link_core::input::NavIntent;
-use pico_link_core::render::chrome::TITLE_BAR_HEIGHT;
-use pico_link_core::render::theme::palette;
 use pico_link_core::{run, App};
-use embedded_graphics::prelude::RgbColor;
-use emulator::platform::{FileStorage, HostPlatform, HttpInput, RecordingPowerControl, SharedHeadlessSurface};
+use emulator::platform::{FileStorage, HeadlessSurface, HostPlatform, HttpInput, RecordingPowerControl, SharedHeadlessSurface};
 
 const WIDTH: u32 = 240;
 const HEIGHT: u32 = 240;
@@ -96,41 +103,27 @@ fn is_all_black(image: &image::RgbImage) -> bool {
     image.pixels().all(|p| *p == image::Rgb([0, 0, 0]))
 }
 
-#[test]
-fn driving_to_idle_blanks_the_headless_screenshot_and_an_injected_intent_restores_it() {
+/// [`new_platform`]'s return type, factored out (clippy's `type_complexity`
+/// lint runs at `-D warnings` in this workspace).
+type NewPlatform = (HostPlatform<SharedHeadlessSurface, HttpInput>, Arc<Mutex<VecDeque<NavIntent>>>, Arc<Mutex<HeadlessSurface>>);
+
+fn new_platform() -> NewPlatform {
     let input_queue: Arc<Mutex<VecDeque<NavIntent>>> = Arc::new(Mutex::new(VecDeque::new()));
     let surface = SharedHeadlessSurface::new();
     let surface_handle = surface.handle();
-    // A second handle purely for the closure to capture into, so the
-    // `surface_handle` name above stays free for the post-`run` final
-    // read without fighting the closure's own capture.
-    let surface_handle_for_closure = surface.handle();
-
     let kv_storage_path = std::env::temp_dir().join(format!("pico-link-idle-wake-e2e-test-{}.json", uuid::Uuid::new_v4()));
     let kv_storage = FileStorage::new(kv_storage_path).expect("open a temp kv store");
-    let mut platform = HostPlatform::new(surface, HttpInput::new(Arc::clone(&input_queue)), kv_storage, RecordingPowerControl::new());
+    let platform = HostPlatform::new(surface, HttpInput::new(Arc::clone(&input_queue)), kv_storage, RecordingPowerControl::new());
+    (platform, input_queue, surface_handle)
+}
+
+#[test]
+fn driving_to_idle_at_home_root_blanks_the_headless_screenshot_and_an_injected_intent_restores_it() {
+    let (mut platform, input_queue, surface) = new_platform();
+    let surface_handle_for_closure = Arc::clone(&surface);
 
     let mut app = App::new(WIDTH, HEIGHT);
-
-    let row0_y = TITLE_BAR_HEIGHT + 2;
-    // x=200: clear of the row's chip/text on this short label, and inside
-    // the 240px-wide (Epic B2) panel -- see the identical comment in
-    // `headless_http_drive.rs`.
-    let sample_x = 200;
-    let highlight = palette::SURFACE_ELEVATED;
-    let highlight_rgb8 = image::Rgb([highlight.r() << 3, highlight.g() << 2, highlight.b() << 3]);
-
-    // Home (the root screen since `pico-link-znb.8`/E7) has no focusable
-    // list of its own on its status face (Up/Down is unbound there in
-    // Tier 1 -- see `pico_link_core::render::home`'s module doc), so this
-    // test's row-selection proof needs the Devices screen underneath it.
-    // Queued before `run` starts, so iteration 1's single `poll()` drains
-    // both and lands on Devices (row 0, "Scan for headphones",
-    // pre-selected) before `CHECKPOINT_INITIAL` captures its screenshot:
-    // centre toggles Home to its menu face (Bluetooth pre-selected),
-    // centre again activates that row, pushing Devices.
-    input_queue.lock().unwrap().push_back(NavIntent::Select);
-    input_queue.lock().unwrap().push_back(NavIntent::Select);
+    assert!(app.is_at_home_root(), "sanity: a fresh App starts at Home root");
 
     let mut initial_screenshot: Option<image::RgbImage> = None;
     let mut idle_screenshot: Option<image::RgbImage> = None;
@@ -148,27 +141,87 @@ fn driving_to_idle_blanks_the_headless_screenshot_and_an_injected_intent_restore
             let png = surface_handle_for_closure.lock().unwrap().encode_png().expect("a frame was flushed before going idle");
             idle_screenshot = Some(image::load_from_memory(&png).expect("valid PNG").to_rgb8());
 
-            // The wake-triggering input: queued now, so the very next
-            // iteration's `poll()` (this one, about to run) sees it.
+            // Down is unbound on Home's status face (Tier 1 scope
+            // boundary -- see `pico_link_core::render::home`'s module
+            // doc), so this both wakes the display AND is guaranteed not
+            // to move anything if (incorrectly) delivered to the app --
+            // the pixel-identical assertion below is a strong proof
+            // either way.
             input_queue.lock().unwrap().push_back(NavIntent::Down);
         }
 
         iterations <= TOTAL_ITERATIONS
     });
 
+    assert_eq!(app.navigator_depth(), 1, "sanity: never navigated away from Home root during this scenario");
+
     let initial_screenshot = initial_screenshot.expect("checkpoint 1 must have run");
     let idle_screenshot = idle_screenshot.expect("the idle checkpoint must have run");
 
     assert!(!is_all_black(&initial_screenshot), "the initial render must show real content, not coincidentally start black");
-    assert_eq!(*initial_screenshot.get_pixel(sample_x, row0_y), highlight_rgb8, "row 0 starts selected");
+    assert!(is_all_black(&idle_screenshot), "the headless screenshot must be all-black once the idle timeout has elapsed at Home root");
 
-    assert!(is_all_black(&idle_screenshot), "the headless screenshot must be all-black once the idle timeout has elapsed");
-
-    let woken_png = surface_handle.lock().unwrap().encode_png().expect("the wake iteration flushed a fresh frame");
+    let woken_png = surface.lock().unwrap().encode_png().expect("the wake iteration flushed a fresh frame");
     let woken_screenshot = image::load_from_memory(&woken_png).expect("valid PNG").to_rgb8();
     assert!(!is_all_black(&woken_screenshot), "the injected intent must restore the display, not leave it blanked");
     assert_eq!(
         woken_screenshot, initial_screenshot,
-        "the wake-triggering intent must be dropped (not delivered to the app), so the restored frame is pixel-identical to the pre-idle one -- row 0 still selected, nothing navigated"
+        "the wake-triggering intent must be dropped (not delivered to the app), so the restored frame is pixel-identical to the pre-idle one"
     );
+}
+
+#[test]
+fn idle_past_the_timeout_never_blanks_the_display_while_inside_the_pairing_wizard() {
+    // Regression test for bead pico-link-4vb.3: a blanked screen mid-
+    // pairing reads as a crash, so the screensaver must never arm once
+    // the navigator has left Home root -- the pairing wizard (depth 3)
+    // most of all.
+    let (mut platform, input_queue, surface) = new_platform();
+    let surface_handle_for_closure = Arc::clone(&surface);
+
+    let mut app = App::new(WIDTH, HEIGHT);
+
+    // Home status -> menu face (Bluetooth pre-selected) -> pushes Devices
+    // -> "Scan for headphones" row pushes the wizard. Queued before `run`
+    // starts, so iteration 1's single `poll()` drains all three and lands
+    // on the wizard's Instructions phase before `CHECKPOINT_INITIAL`
+    // captures its screenshot.
+    {
+        let mut queue = input_queue.lock().unwrap();
+        queue.push_back(NavIntent::Select);
+        queue.push_back(NavIntent::Select);
+        queue.push_back(NavIntent::Select);
+    }
+
+    let mut initial_screenshot: Option<image::RgbImage> = None;
+    let mut idle_screenshot: Option<image::RgbImage> = None;
+
+    let mut iterations = 0u32;
+    run(&mut platform, &mut app, FRAME_BUDGET, Some(TEST_IDLE_TIMEOUT), None, || {
+        iterations += 1;
+
+        if iterations == CHECKPOINT_INITIAL {
+            let png = surface_handle_for_closure.lock().unwrap().encode_png().expect("iteration 1 flushed");
+            initial_screenshot = Some(image::load_from_memory(&png).expect("valid PNG").to_rgb8());
+        }
+
+        if iterations == CHECKPOINT_IDLE_AND_INJECT {
+            let png = surface_handle_for_closure.lock().unwrap().encode_png().expect("a frame was flushed before going idle");
+            idle_screenshot = Some(image::load_from_memory(&png).expect("valid PNG").to_rgb8());
+        }
+
+        iterations <= TOTAL_ITERATIONS
+    });
+
+    assert_eq!(app.navigator_depth(), 3, "sanity: the wizard is open at Home(1)/Devices(2)/Wizard(3)");
+
+    let initial_screenshot = initial_screenshot.expect("checkpoint 1 must have run");
+    let idle_screenshot = idle_screenshot.expect("the idle checkpoint must have run");
+
+    assert!(!is_all_black(&initial_screenshot), "the wizard's initial render must show real content");
+    assert!(
+        !is_all_black(&idle_screenshot),
+        "the screensaver must never blank the display while inside the pairing wizard, no matter how much idle time passes"
+    );
+    assert_eq!(idle_screenshot, initial_screenshot, "the wizard screen must be untouched -- no blank, no navigation, nothing queued to wake");
 }
