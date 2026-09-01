@@ -104,7 +104,7 @@ option(PL_DEBUG_REMOTE "Enable debug NavIntent injection over the CDC console (u
 # OFF). Default OFF -- this A/B tests a candidate mechanism for the
 # pico-link-2ap halving, not a shipping behaviour change. See
 # firmware/src/tusb_config.h and firmware/sdk-patches/README.md.
-option(PL_USB_ISO_XFER_ISR "EXPERIMENTAL: re-arm ISO-OUT from true USB ISR context instead of tud_task()" OFF)
+option(PL_USB_ISO_XFER_ISR "Re-arm ISO-OUT from true USB ISR context instead of tud_task() -- the pico-link-2ap halving fix, ON by default since bead pico-link-2ap.6" ON)
 
 # Bead pico-link-ufh: software+hardware watchdog supervisor. Armed by
 # default in EVERY build, including debug -- a watchdog only armed in
