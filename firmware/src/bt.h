@@ -96,6 +96,49 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
 // handler (a2dp.c), never from the media timer path.
 void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t name_len, uint32_t nominal_bitrate_bps);
 
+// Bead pico-link-4vb.7 (T3), design section 5.3's "Why the name rides on
+// Connect": PL_COMMAND_TAG_CONNECT's handler (and pl_bt_debug_connect, the
+// PL_DEBUG_REMOTE bypass) cache `{addr, name, name_len}` as the in-flight
+// connect target. persist.c calls this to read that cached name back when
+// it writes the device record (pl_persist_save_device_now, a2dp.c's
+// STREAM_ESTABLISHED handler) -- at that point C has only `addr`, and this
+// cache is the sole place the name it was told about at Connect time still
+// lives. Writes `*out_name_len = 0` (leave `out_name` untouched -- caller
+// must not read it) if no cached target matches `addr` (a stale/mismatched
+// connect, or the debug-connect bypass, which never caches a name) --
+// callers treat that the same as "no name to contribute" (persist.c's RMW
+// convention). Safe from any context: reads happen from the
+// cyw43/BTstack background async_context (persist.c's callers), writes
+// from thread context (bt.c's own command handlers) -- see
+// pl_bt_set_connect_target's doc comment in bt.c for why a critical
+// section still guards both sides despite the two never running
+// concurrently in practice today.
+void pl_bt_get_connect_target_name(const uint8_t addr[6], uint8_t out_name[32], uint8_t *out_name_len);
+
+// Bead pico-link-4vb.7 (T3), design section 5.1: pushes
+// PlEventTag::PairedDeviceUpserted -- called from persist.c's
+// pl_persist_do_write (the single place a device record write actually
+// lands, bt.c's PL_BT_PENDING_PERSIST_WRITE drain and a2dp.c's
+// STREAM_ESTABLISHED handler both funnel through it) and from bt.c's own
+// boot sequence (pl_bt_init's BTSTACK_EVENT_STATE case), once per record
+// persist.c loaded at boot. `name`/`name_len` follow
+// PlPairedDeviceUpsertedPayload's convention (fixed 32-byte buffer, copied
+// by value). Safe from IRQ or thread context -- routes through
+// pl_bt_ring_push, same as every other push helper in this header.
+void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq);
+
+// Bead pico-link-4vb.7 (T3), design section 5.1: pushes
+// PlEventTag::PairedDeviceForgotten. Called from persist.c's
+// pl_persist_forget_device on success.
+void pl_bt_push_paired_device_forgotten(const uint8_t addr[6]);
+
+// Bead pico-link-4vb.7 (T3), design section 5.1: pushes
+// PlEventTag::PairedStoreFull (no payload). Called from persist.c's
+// pl_persist_do_write when every slot is occupied by a different address
+// (S18 -- never silently evict, so the UI must hear about a refused
+// write).
+void pl_bt_push_paired_store_full(void);
+
 #ifdef PL_DEBUG_REMOTE
 // Bead pico-link-g48: debug-only direct connect to a host-supplied
 // BD_ADDR, bypassing GAP inquiry/discovery entirely -- lets an unattended
