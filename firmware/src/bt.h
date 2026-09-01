@@ -69,8 +69,13 @@ void pl_bt_push_link_state_connected(void);
 // constants matching those discriminants exactly).
 void pl_bt_push_connect_step(uint32_t step);
 
-// Pushes Event::ConnectSucceeded{degraded}.
-void pl_bt_push_connect_succeeded(bool degraded);
+// Pushes Event::ConnectSucceeded{addr, degraded}. `addr` added by bead
+// pico-link-cz0.6 (M5 persistence, PL_EVENT_ABI_VERSION bumped 1 -> 2) so
+// core's auto-reconnect persistence policy always knows which device
+// succeeded, including via the PL_DEBUG_REMOTE bypass path (which never
+// drives the wizard, core's only other source for this) -- see
+// PlConnectSucceededPayload's doc comment in ui-ffi/src/lib.rs.
+void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded);
 
 // Pushes Event::ConnectFailed{addr, reason}. `reason` is the raw wire
 // value of ui-ffi's PlFailureReason (PL_FAILURE_REASON_* constants,

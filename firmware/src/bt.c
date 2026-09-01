@@ -26,6 +26,7 @@
 
 #include "a2dp.h"
 #include "bt.h"
+#include "persist.h"
 #include "pico_link_ui.h"
 #include "usb_pump.h"
 #include "watchdog_sup.h"
@@ -273,12 +274,13 @@ void pl_bt_push_connect_step(uint32_t step) {
     pl_bt_ring_push(event, NULL, 0);
 }
 
-void pl_bt_push_connect_succeeded(bool degraded) {
+void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_CONNECT_SUCCEEDED,
         .payload = {.connect_succeeded = {.degraded = degraded ? 1 : 0}},
     };
+    memcpy(event.payload.connect_succeeded.addr, addr, 6);
     pl_bt_ring_push(event, NULL, 0);
 }
 
@@ -309,6 +311,29 @@ void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t nam
         event.payload.codec_changed.name_len = name_len;
     }
     memcpy(event.payload.codec_changed.name, name, name_len);
+    pl_bt_ring_push(event, NULL, 0);
+}
+
+// Bead pico-link-cz0.6 (M5 persistence): pushes Event::StoreLoaded{status,
+// device_addr}. Called exactly once, from pl_bt_init below (thread
+// context -- main() calls it directly, before the superloop even starts),
+// right after pl_persist_init() has read the flash store. `status` is the
+// raw wire value of ui-ffi's PlStoreStatus (see ui-ffi/src/lib.rs);
+// `has_device`/`addr` carry the last-used device, if any, so core's
+// auto-reconnect POLICY (Rust, per design point 7) can queue
+// Command::Connect for it -- C only loaded, staged and (later) flushes,
+// never decides whether to reconnect.
+static void pl_bt_push_store_loaded(uint32_t status, bool has_device, const uint8_t *addr) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_STORE_LOADED,
+        .payload = {.store_loaded = {.status = (uint8_t)status, .has_device = has_device ? 1 : 0}},
+    };
+    if (has_device) {
+        memcpy(event.payload.store_loaded.addr, addr, 6);
+    } else {
+        memset(event.payload.store_loaded.addr, 0, 6);
+    }
     pl_bt_ring_push(event, NULL, 0);
 }
 
@@ -424,6 +449,22 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                 pl_log("BT: HCI_STATE_WORKING -- radio up\r\n");
                 hci_send_cmd(&hci_read_local_version_information);
+
+                // Bead pico-link-cz0.6 (M5 persistence): NOW it's safe to
+                // let core's auto-reconnect policy queue a Connect command
+                // (radio is fully up) -- pushed before pl_bt_start_scan()
+                // below so the queued Connect, once drained, lands ahead of
+                // a fresh inquiry in the deferred pending queue. Reads
+                // straight from persist.c's boot-time getters -- no
+                // re-read of flash, pl_persist_init() already did that in
+                // pl_bt_init above.
+                uint8_t boot_device_addr[6] = {0};
+                bool boot_has_device = pl_persist_boot_has_device();
+                if (boot_has_device) {
+                    pl_persist_boot_device_addr(boot_device_addr);
+                }
+                pl_bt_push_store_loaded((uint32_t)pl_persist_boot_status(), boot_has_device, boot_device_addr);
+
                 pl_bt_start_scan();
             }
             break;
@@ -607,6 +648,19 @@ static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
 void pl_bt_init(struct PlUi *ui) {
     g_ui = ui;
 
+    // Bead pico-link-cz0.6 (M5 persistence): MUST run before
+    // hci_power_control(HCI_POWER_ON) below -- hci_set_link_key_db (inside
+    // pl_persist_init) is a no-op once the HCI layer is already using a
+    // NULL link_key_db (hci.c:567-612), and BTstack itself only reads the
+    // link-key DB after power-on. Also before pl_a2dp_init's
+    // gap_set_local_name/gap_discoverable_control calls -- no ordering
+    // requirement between them today, but keeping storage bring-up first is
+    // the more defensive order. Event::StoreLoaded itself is NOT pushed
+    // here -- see pl_bt_packet_handler's BTSTACK_EVENT_STATE case below for
+    // why (queuing core's auto-reconnect Command::Connect this early would
+    // race hci_power_control's own async power-up).
+    pl_persist_init();
+
     // RSSI + EIR (Extended Inquiry Response, which is where a discovered
     // device's name comes from) -- without this, GAP_EVENT_INQUIRY_RESULT
     // never has a name available and every device would show as
@@ -687,6 +741,23 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_A2DP);
             pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
             pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_RET);
+            break;
+        }
+
+        case PL_COMMAND_TAG_PERSIST_DEVICE: {
+            // Bead pico-link-cz0.6 (M5 persistence), design point 7: core's
+            // auto-reconnect/remember-this-device POLICY decided (on
+            // Event::ConnectSucceeded) that `addr` is worth remembering;
+            // this is C's side of that -- stage it, don't write flash here
+            // (thread context, but still subject to the same streaming
+            // gate persist.c's own service loop applies -- staging itself
+            // is cheap and safe regardless).
+            const uint8_t *addr = command.payload.connect.addr;
+            pl_log(
+                "BT: PL_CMD_PERSIST_DEVICE %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4],
+                addr[5]
+            );
+            pl_persist_request_save_device(addr);
             break;
         }
 

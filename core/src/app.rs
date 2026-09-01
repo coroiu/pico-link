@@ -97,6 +97,16 @@ pub enum Command {
     /// `CancelScan` similarly needed its own follow-up bead
     /// (pico-link-znb.2) for its C-side handling.
     CancelConnect { addr: [u8; 6] },
+    /// `core`'s auto-reconnect/remember-this-device POLICY output (bead
+    /// pico-link-cz0.6, M5 persistence design point 7): "please persist
+    /// `addr` as the last-used device." Queued by
+    /// [`App::on_connect_succeeded`] once a connect attempt actually
+    /// succeeds -- `core` decides *when* a device is worth remembering;
+    /// C only stages the write, gates it against the streaming/timing
+    /// constraints flash access has on this hardware, and eventually
+    /// flushes it. `core` has no flash of its own and never writes
+    /// anything itself.
+    PersistDevice { addr: [u8; 6] },
 }
 
 /// Why a connect attempt failed, as reported by C over
@@ -135,6 +145,28 @@ pub enum ConnectFailureReason {
     /// The radio/HCI layer itself reported an error (not a per-device
     /// remote-side rejection) -- typically transient, worth retrying.
     RadioError,
+}
+
+/// What C's flash-backed store looked like at boot, as reported by
+/// [`Event::StoreLoaded`] (bead pico-link-cz0.6, M5 persistence design
+/// point 5). `core` has no flash of its own -- this is purely what C found,
+/// so a fresh/reset store is never rendered identically to a healthy one
+/// that simply has no device saved yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreStatus {
+    /// No marker tag at all -- genuinely first boot, an empty store.
+    FirstBoot,
+    /// A device record was found and its CRC checked out (or the marker
+    /// was present with no device record yet, which is also a valid,
+    /// healthy store -- just nothing to reconnect to).
+    Loaded,
+    /// The marker was fine but the device record's CRC16 failed -- that
+    /// one record was dropped; the store is otherwise intact.
+    RecordCorrupt,
+    /// The marker's schema version didn't match this firmware's -- this
+    /// project's own records were dropped, but BTstack's link-key tags
+    /// (a separate namespace) were left untouched.
+    VersionMismatch,
 }
 
 impl ConnectFailureReason {
@@ -193,7 +225,13 @@ pub enum Event {
     /// comment for why that distinction matters enough to be its own
     /// event rather than inferred from `LinkStateChanged(Connected)`
     /// alone, which carries no fallback information).
-    ConnectSucceeded { degraded: bool },
+    /// `addr` added by bead pico-link-cz0.6 (M5 persistence): which device
+    /// this success is for, so [`App::on_connect_succeeded`] can queue
+    /// [`Command::PersistDevice`] correctly REGARDLESS of whether the
+    /// connection was driven by the wizard (which separately tracks `addr`
+    /// on [`WizardPhase`]) or the `PL_DEBUG_REMOTE` bypass path (which does
+    /// not touch the wizard at all) -- see that method's doc comment.
+    ConnectSucceeded { addr: [u8; 6], degraded: bool },
     /// C's own ~2s timer firing (design section 9 phase 6, section 14's
     /// C9 "auto-dismiss timer event" -- explicitly *not* a core-owned
     /// clock feature, see [`crate::app`]'s `now_us`/`tick` doc comments
@@ -211,6 +249,17 @@ pub enum Event {
     /// for why `core` never derives the name/bitrate itself. Added by
     /// bead pico-link-1v5, closing the Home hero's hardcoded `NO LINK`.
     CodecChanged(ConnectedCodec),
+    /// C's flash-backed store finished loading at boot (bead pico-link-cz0.6,
+    /// M5 persistence) -- fired exactly once, after the radio is confirmed
+    /// up (see `firmware/src/bt.c`'s `BTSTACK_EVENT_STATE`/
+    /// `HCI_STATE_WORKING` case; pushed there rather than at `pl_bt_init`
+    /// itself so a queued auto-reconnect can't race `hci_power_control`'s
+    /// own async power-up). `device_addr` is `Some` when a valid device
+    /// record was found -- `core`'s auto-reconnect policy
+    /// ([`App::on_store_loaded`]) queues [`Command::Connect`] for it,
+    /// reusing the exact same command the wizard's own device-row
+    /// activation uses; `core` never opens a connection itself.
+    StoreLoaded { status: StoreStatus, device_addr: Option<[u8; 6]> },
 }
 
 /// Phase 4's four named connect sub-steps (design section 9): naming the
@@ -390,6 +439,15 @@ pub struct BtModel {
     /// method's doc comment for why clearing keys off the *link state*
     /// rather than a dedicated disconnect event (bead pico-link-1v5).
     pub connected_codec: Option<ConnectedCodec>,
+    /// What C's flash-backed store looked like at boot (bead pico-link-cz0.6,
+    /// M5 persistence) -- `None` until [`Event::StoreLoaded`] has arrived
+    /// (i.e. before the radio has finished powering on). Not yet rendered
+    /// by any screen in this bead's scope -- populated so a reset/corrupt
+    /// store is representable ahead of the screen that will surface it
+    /// (design point 5's "never renders identically to a new one"),
+    /// mirroring `last_connect_failure`'s own "populated ahead of its
+    /// screen" precedent above.
+    pub store_status: Option<StoreStatus>,
 }
 
 /// A Bluetooth device address, aliased for readability at call sites that
@@ -722,9 +780,10 @@ impl App {
             Event::ConnectFailed { addr, reason } => self.record_connect_failure(addr, reason),
             Event::ConnectStepChanged(step) => self.on_connect_step_changed(step),
             Event::ConnectRetrying { attempt } => self.on_connect_retrying(attempt),
-            Event::ConnectSucceeded { degraded } => self.on_connect_succeeded(degraded),
+            Event::ConnectSucceeded { addr, degraded } => self.on_connect_succeeded(addr, degraded),
             Event::WizardAutoDismiss => self.on_wizard_auto_dismiss(),
             Event::CodecChanged(codec) => self.set_connected_codec(codec),
+            Event::StoreLoaded { status, device_addr } => self.on_store_loaded(status, device_addr),
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -819,9 +878,36 @@ impl App {
     /// Folds one [`Event::ConnectSucceeded`] into [`WizardPhase`] -- the
     /// phase 6 success outcome, from either `Connecting` or
     /// `NotResponding`.
-    fn on_connect_succeeded(&mut self, degraded: bool) {
+    ///
+    /// Also queues [`Command::PersistDevice { addr }`] (bead pico-link-cz0.6,
+    /// M5 persistence design point 7 -- `core`'s auto-reconnect/remember-
+    /// this-device POLICY: a connect that actually succeeded is worth
+    /// remembering), unconditionally -- `addr` comes straight off the event
+    /// itself (see [`Event::ConnectSucceeded`]'s doc comment for why that,
+    /// not `WizardPhase`, is the source of truth: it works identically for
+    /// a wizard-driven connect and the `PL_DEBUG_REMOTE` bypass, which
+    /// never touches `WizardPhase` at all).
+    fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
+        self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
         *self.wizard_phase.borrow_mut() = WizardPhase::Succeeded { degraded };
         self.dirty = true;
+    }
+
+    /// Folds one [`Event::StoreLoaded`] -- records `status` in [`BtModel`]
+    /// and, if a device was found, queues [`Command::Connect`] for it (the
+    /// auto-reconnect policy itself: reusing the exact command the wizard's
+    /// device-row activation already uses, per design point 7 -- `core`
+    /// decides, C only loads/stages/flushes). Does not touch the wizard or
+    /// rebuild the root screen -- this fires once at boot, before the user
+    /// has done anything, and the queued `Connect` drives the same
+    /// `LinkStateChanged`/`ConnectStepChanged`/`ConnectSucceeded` event
+    /// flow a manual connect would, which is what actually updates the UI
+    /// as the auto-reconnect proceeds.
+    fn on_store_loaded(&mut self, status: StoreStatus, device_addr: Option<[u8; 6]>) {
+        self.model.store_status = Some(status);
+        if let Some(addr) = device_addr {
+            self.commands.borrow_mut().push_back(Command::Connect { addr });
+        }
     }
 
     /// Folds one [`Event::WizardAutoDismiss`] -- pops the wizard back to
@@ -1594,8 +1680,13 @@ mod tests {
         assert_eq!(app.navigator_depth(), 3);
         assert_no_commands_queued(&mut app);
 
-        app.handle_event(Event::ConnectSucceeded { degraded });
+        app.handle_event(Event::ConnectSucceeded { addr: DGX_ADDR, degraded });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded });
+        // Bead pico-link-cz0.6 (M5 persistence): a real success now always
+        // queues PersistDevice -- drain exactly that one command rather
+        // than asserting the queue is empty (which this test did before
+        // that bead landed).
+        assert_eq!(app.poll_command(), Some(Command::PersistDevice { addr: DGX_ADDR }));
         assert_no_commands_queued(&mut app);
         assert_link_still_connected(&app);
 
@@ -1705,5 +1796,61 @@ mod tests {
             !fb.pixels().any(|p| p.1 == palette::STATUS_ERROR),
             "STATUS_ERROR ink anywhere means Home rendered NO LINK despite a connected model"
         );
+    }
+
+    // --- bead pico-link-cz0.6 (M5 persistence): StoreLoaded / PersistDevice ---
+
+    #[test]
+    fn store_loaded_with_a_device_queues_connect_and_records_the_status() {
+        let mut app = App::new(240, 240);
+        let addr = [1, 2, 3, 4, 5, 6];
+        app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded, device_addr: Some(addr) });
+
+        assert_eq!(app.model().store_status, Some(StoreStatus::Loaded));
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::Connect { addr }),
+            "a loaded device record must queue the same Connect command a manual wizard selection uses"
+        );
+        assert_eq!(app.poll_command(), None, "exactly one Connect, nothing else");
+    }
+
+    #[test]
+    fn store_loaded_with_no_device_records_status_but_queues_nothing() {
+        let mut app = App::new(240, 240);
+        app.handle_event(Event::StoreLoaded { status: StoreStatus::FirstBoot, device_addr: None });
+
+        assert_eq!(app.model().store_status, Some(StoreStatus::FirstBoot));
+        assert_eq!(app.poll_command(), None, "no saved device -- nothing to auto-reconnect to");
+    }
+
+    #[test]
+    fn connect_succeeded_queues_persist_device_for_the_events_own_address() {
+        let mut app = App::new(240, 240);
+        let addr = [7, 7, 7, 7, 7, 7];
+
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::PersistDevice { addr }),
+            "a connect that actually succeeded must be queued for persistence"
+        );
+        assert_eq!(app.poll_command(), None);
+    }
+
+    #[test]
+    fn connect_succeeded_persists_even_with_the_wizard_closed() {
+        // The debug-remote bypass path (firmware/src/bt.c's
+        // pl_bt_debug_connect) never drives the wizard -- this is exactly
+        // why Event::ConnectSucceeded carries its own `addr` (bead
+        // pico-link-cz0.6) rather than requiring core to read it back off
+        // WizardPhase, which stays WizardPhase::default() (Instructions)
+        // for the whole debug-bypass path. Persistence must still work.
+        let mut app = App::new(240, 240);
+        let addr = [42, 42, 42, 42, 42, 42];
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        assert_eq!(app.poll_command(), Some(Command::PersistDevice { addr }));
+        assert_eq!(app.poll_command(), None);
     }
 }

@@ -179,6 +179,7 @@ add_executable(pico_link
     src/pcm_ring.c
     src/usb_reset.c
     src/watchdog_sup.c
+    src/persist.c
     # Bead pico-link-cz0.5.4 (LDAC L0): temporary on-target benchmark, see
     # ldac_bench.h's module doc. Always compiled in (like codec_sbc.c);
     # pl_ldac_bench_run() is only ever CALLED under PL_DIAG_LDAC_BENCH
@@ -282,6 +283,31 @@ target_compile_definitions(pico_link PRIVATE
     PICO_PANIC_FUNCTION=pl_panic_c_hook
 )
 
+# Bead pico-link-cz0.6 (M5 persistence): shift the BTstack flash-bank store
+# DOWN by one extra 4KB sector from pico-sdk's own default
+# (PICO_FLASH_BANK_STORAGE_OFFSET = PICO_FLASH_SIZE_BYTES -
+# PICO_FLASH_BANK_TOTAL_SIZE, i.e. the literal last 8KB of flash --
+# pico/btstack_flash_bank.h). Measured directly from this board's own
+# pico_link.uf2 (`python3 -c` decoding its UF2 blocks): pico-sdk 2.x's
+# `pico_add_extra_outputs` appends a 256-byte "absolute" family/metadata
+# block (UF2 family id 0xe48bff57) at the FIXED address 0x10FFFF00 -- the
+# very last 256 bytes of this 16MB part's flash -- on every build, and (per
+# the RP2350 UF2/PICOBOOT convention this implements) that block is written
+# to physical flash by the mass-storage BOOTSEL drag-and-drop path on every
+# reflash, not just interpreted in transit. The stock last-8KB TLV window
+# ([FLASH_SIZE-8KB, FLASH_SIZE)) has that block sitting INSIDE its second
+# (higher-address) bank, so a reflash could silently clobber the tail of our
+# own store, or a TLV write could clobber picotool/bootrom's own metadata --
+# exactly the "reflash requirement not met" failure mode this bead's
+# acceptance criterion warns against. Moving the whole 8KB window one more
+# sector earlier leaves that block's sector entirely untouched by either
+# side. PICO_FLASH_BANK_TOTAL_SIZE is left at its default (2 sectors, 8KB) --
+# only the offset moves.
+math(EXPR PL_FLASH_BANK_STORAGE_OFFSET "16 * 1024 * 1024 - 3 * 4096")
+target_compile_definitions(pico_link PRIVATE
+    PICO_FLASH_BANK_STORAGE_OFFSET=${PL_FLASH_BANK_STORAGE_OFFSET}u
+)
+
 if(PL_DEBUG_REMOTE)
     # Gates main.c's call into debug_remote.c (only compiled in above when
     # PL_DEBUG_REMOTE is ON) -- see src/debug_remote.h's module doc.
@@ -316,6 +342,13 @@ target_link_libraries(pico_link
     # pico_btstack_hci_transport_cyw43 and pico_btstack_base transitively.
     pico_btstack_classic
     pico_btstack_cyw43
+    # Bead pico-link-cz0.6 (M5 persistence): pico_flash_bank_instance() --
+    # links pico_flash transitively. btstack_tlv_flash_bank.c and
+    # btstack_link_key_db_tlv.c are already compiled into
+    # pico_btstack_base/pico_btstack_classic (verified by reading
+    # src/rp2_common/pico_btstack/CMakeLists.txt); this target supplies only
+    # the RP2350-specific hal_flash_bank_t implementation persist.c calls.
+    pico_btstack_flash_bank
     # M4 S1 (bead pico-link-cz0.5.2): BTstack's own bluedroid-derived SBC
     # encoder, ships in the pico-sdk (rp2_common/pico_btstack/CMakeLists.txt)
     # -- no new fetch, no new submodule (design sec 11.6).

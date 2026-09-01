@@ -193,7 +193,7 @@ fn main() {
     start_scan(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [4; 6], name: String::from("Cans"), rssi: -50 }));
     select_device(&mut app);
-    app.handle_event(Event::ConnectSucceeded { degraded: false });
+    app.handle_event(Event::ConnectSucceeded { addr: [4; 6], degraded: false });
     save_zoomed_png(&mut app, &out_dir, "06f_succeeded_plain");
 
     // --- Phase 6: degraded success ---
@@ -202,7 +202,7 @@ fn main() {
     start_scan(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [5; 6], name: String::from("Cans"), rssi: -50 }));
     select_device(&mut app);
-    app.handle_event(Event::ConnectSucceeded { degraded: true });
+    app.handle_event(Event::ConnectSucceeded { addr: [5; 6], degraded: true });
     save_zoomed_png(&mut app, &out_dir, "06g_succeeded_degraded");
 
     println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());

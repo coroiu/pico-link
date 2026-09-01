@@ -99,6 +99,7 @@
 #include "codec_sbc.h"
 #include "codec_table.h"
 #include "pcm_ring.h"
+#include "persist.h"
 #include "pl_prio.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
@@ -1594,7 +1595,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // construction (codec_table.c's own array-order-is-preference
             // rule); s_ctx.codec is always non-NULL here (STREAM_STARTED
             // cannot be reached without a prior successful codec init).
-            pl_bt_push_connect_succeeded(PL_CODEC_COUNT > 0 && s_ctx.codec != PL_CODECS[0]);
+            pl_bt_push_connect_succeeded(s_ctx.connect_addr, PL_CODEC_COUNT > 0 && s_ctx.codec != PL_CODECS[0]);
             break;
 
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
@@ -1610,6 +1611,13 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.flush_frames += pl_pcm_reset();
             s_ctx.state = s_ctx.auto_resume ? PL_A2DP_MEDIA_PRIMING : PL_A2DP_MEDIA_IDLE;
             s_ctx.auto_resume = false;
+            // Bead pico-link-cz0.6 (M5 persistence), design point 4: "flush
+            // on stream stop" -- only a real stop (state is now IDLE, not a
+            // PRIMING auto-resume) counts as one. Flag-only, see
+            // pl_a2dp_connect's call site above for why.
+            if (s_ctx.state == PL_A2DP_MEDIA_IDLE) {
+                pl_persist_request_urgent_flush();
+            }
             break;
 
         case A2DP_SUBEVENT_STREAM_RELEASED:
@@ -1627,6 +1635,9 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.rtp_next = 0;
             // Bead pico-link-pbv round 2 (C2-6): count the discard.
             s_ctx.flush_frames += pl_pcm_reset();
+            // Bead pico-link-cz0.6 (M5 persistence): stream stop, see the
+            // STREAM_SUSPENDED case above.
+            pl_persist_request_urgent_flush();
             break;
 
         case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
@@ -1645,6 +1656,9 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 btstack_run_loop_remove_timer(&s_ctx.media_timer);
                 s_ctx.timer_armed = false;
             }
+            // Bead pico-link-cz0.6 (M5 persistence): stream stop, see the
+            // STREAM_SUSPENDED case above.
+            pl_persist_request_urgent_flush();
             break;
 
         case A2DP_SUBEVENT_STREAMING_CAN_SEND_MEDIA_PACKET_NOW:
@@ -1731,10 +1745,22 @@ void pl_a2dp_init(struct PlUi *ui) {
     pl_log("a2dp: init OK, %u codec row(s) registered\r\n", (unsigned)PL_CODEC_COUNT);
 }
 
+bool pl_a2dp_streaming(void) {
+    return s_ctx.state != PL_A2DP_MEDIA_IDLE;
+}
+
 void pl_a2dp_connect(const uint8_t *addr) {
     bd_addr_t local_addr;
     memcpy(local_addr, addr, 6);
     memcpy(s_ctx.connect_addr, addr, 6);
+
+    // Bead pico-link-cz0.6 (M5 persistence), design point 4: "forced flush
+    // ... BEFORE arming a stream" -- this is that call site. Runs in the
+    // cyw43/BTstack background IRQ (pico-link-ouw's deferred-queue
+    // consumer), so this only flags urgency -- the actual write (if any is
+    // pending) happens on the superloop's next iteration, in thread
+    // context, once it's confirmed safe. A no-op if nothing is pending.
+    pl_persist_request_urgent_flush();
 
     uint8_t status = a2dp_source_establish_stream(local_addr, &s_ctx.a2dp_cid);
     if (status != ERROR_CODE_SUCCESS) {

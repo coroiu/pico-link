@@ -32,6 +32,7 @@
 #include "input.h"
 #include "ldac_bench.h"
 #include "panic_recorder.h"
+#include "persist.h"
 #include "pico_link_ui.h"
 #include "pl_log_ring.h"
 #include "pl_loop_prof.h"
@@ -531,6 +532,12 @@ int main(void) {
         pl_bt_poll_commands(ui);
         // Bead pico-link-p1r.
         pl_loop_prof_record(PL_LOOP_PHASE_BT_POLL_CMDS, time_us_64() - bt_poll_cmds_start_us);
+
+        // Bead pico-link-cz0.6 (M5 persistence): the ONLY place a real flash
+        // write happens -- thread context, every iteration, cheap when
+        // nothing is pending (see persist.h's module doc for the full
+        // streaming/settle/rate-limit gate).
+        pl_persist_service();
 #endif
         pl_wdt_mark(PL_WDT_CP_REPORT);
 

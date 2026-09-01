@@ -53,7 +53,7 @@ use alloc::vec::Vec;
 #[cfg(not(test))]
 use embedded_alloc::LlffHeap as Heap;
 use pico_link_core::{
-    App, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, NavIntent,
+    App, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, NavIntent, StoreStatus,
 };
 
 // --- critical-section implementation ---
@@ -795,9 +795,22 @@ pub struct PlConnectRetryingPayload {
 /// from a garbage byte is already undefined behaviour in Rust; a `u8`
 /// isn't), same rationale as every `u32` tag/state/reason field above. Any
 /// nonzero value is treated as `true`.
+///
+/// `addr` added by bead pico-link-cz0.6 (M5 persistence, [`PL_EVENT_ABI_VERSION`]
+/// bumped 1 -> 2 for it -- a non-additive payload shape change, unlike every
+/// new *tag* this module has added before): previously `core` could only
+/// learn which device just succeeded by reading it back off `WizardPhase`
+/// (`Connecting`/`NotResponding` both carry `addr`), which is silently
+/// `None` for a connection C initiated OUTSIDE the wizard (the
+/// `PL_DEBUG_REMOTE` bypass, `firmware/src/bt.c`'s `pl_bt_debug_connect` --
+/// exactly the path unattended hardware testing uses). Carrying `addr`
+/// directly here means auto-reconnect persistence (design point 7) works
+/// identically whether the connection was driven by a real d-pad press or
+/// the debug bypass.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectSucceededPayload {
+    pub addr: [u8; 6],
     pub degraded: u8,
 }
 
@@ -843,6 +856,68 @@ pub struct PlCodecChangedPayload {
     pub nominal_bitrate_bps: u32,
 }
 
+/// Mirrors [`pico_link_core::StoreStatus`]'s four variants 1:1 (bead
+/// pico-link-cz0.6, M5 persistence). Explicit discriminants pinned for the
+/// same reason as [`PlLinkState`]'s -- see [`PlStoreLoadedPayload::status`]'s
+/// doc comment. These numeric values also match `firmware/src/persist.h`'s
+/// `pl_persist_status_t` C enum exactly -- both sides are pinned
+/// independently rather than one generating the other (persist.h predates
+/// and is not itself part of this FFI surface), so a change to either must
+/// update the other by hand.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlStoreStatus {
+    FirstBoot = 0,
+    Loaded = 1,
+    RecordCorrupt = 2,
+    VersionMismatch = 3,
+}
+
+impl core::convert::TryFrom<u8> for PlStoreStatus {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see [`PlLinkState`]'s
+    /// `TryFrom` impl for the full rationale (pico-link-ptu).
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlStoreStatus::FirstBoot),
+            1 => Ok(PlStoreStatus::Loaded),
+            2 => Ok(PlStoreStatus::RecordCorrupt),
+            3 => Ok(PlStoreStatus::VersionMismatch),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<PlStoreStatus> for StoreStatus {
+    fn from(status: PlStoreStatus) -> Self {
+        match status {
+            PlStoreStatus::FirstBoot => StoreStatus::FirstBoot,
+            PlStoreStatus::Loaded => StoreStatus::Loaded,
+            PlStoreStatus::RecordCorrupt => StoreStatus::RecordCorrupt,
+            PlStoreStatus::VersionMismatch => StoreStatus::VersionMismatch,
+        }
+    }
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::StoreLoaded` (bead
+/// pico-link-cz0.6, M5 persistence). `status` is a plain `u8`, not
+/// [`PlStoreStatus`] -- same reason as every other union-member
+/// tag/state/reason field in this module (see
+/// [`PlLinkStateChangedPayload::state`]'s doc comment); convert via
+/// [`PlStoreStatus::try_from`], never by transmuting. `addr` is only
+/// meaningful when `has_device != 0` -- mirrors
+/// [`PlConnectSucceededPayload::degraded`]'s "any nonzero value is true"
+/// convention for the same reason (no validity invariant to violate on a
+/// plain `u8`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlStoreLoadedPayload {
+    pub status: u8,
+    pub has_device: u8,
+    pub addr: [u8; 6],
+}
+
 /// Which variant of [`PlEventPayload`] is active in a given [`PlEvent`].
 /// `DevicesCleared`/`WizardAutoDismiss` carry no data -- the payload union
 /// is simply unread for those tags (see [`PlEventPayload`]'s doc comment).
@@ -869,6 +944,9 @@ pub enum PlEventTag {
     ConnectSucceeded = 6,
     WizardAutoDismiss = 7,
     CodecChanged = 8,
+    /// Bead pico-link-cz0.6 (M5 persistence). Purely additive like the rest
+    /// of this enum -- [`PL_EVENT_ABI_VERSION`] is unchanged.
+    StoreLoaded = 9,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -888,6 +966,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             6 => Ok(PlEventTag::ConnectSucceeded),
             7 => Ok(PlEventTag::WizardAutoDismiss),
             8 => Ok(PlEventTag::CodecChanged),
+            9 => Ok(PlEventTag::StoreLoaded),
             _ => Err(()),
         }
     }
@@ -910,6 +989,7 @@ pub union PlEventPayload {
     pub connect_retrying: PlConnectRetryingPayload,
     pub connect_succeeded: PlConnectSucceededPayload,
     pub codec_changed: PlCodecChangedPayload,
+    pub store_loaded: PlStoreLoadedPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -917,7 +997,12 @@ pub union PlEventPayload {
 /// that isn't purely additive (a new tag/payload variant does not need a
 /// bump -- old tags are unaffected); see the module section doc for the
 /// version-guard rationale.
-pub const PL_EVENT_ABI_VERSION: u32 = 1;
+// Bead pico-link-cz0.6 (M5 persistence): bumped 1 -> 2.
+// PlConnectSucceededPayload gained `addr` -- a non-additive shape change to
+// an existing tag's payload (see that struct's doc comment) -- so every
+// producer/consumer in this one coordinated build picks up the new field
+// together; nothing outside this repo speaks this ABI.
+pub const PL_EVENT_ABI_VERSION: u32 = 2;
 
 /// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
@@ -1046,7 +1131,7 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             // Reading it is sound regardless of `degraded`'s value -- see
             // `PlConnectSucceededPayload`'s doc comment.
             let payload = unsafe { event.payload.connect_succeeded };
-            Event::ConnectSucceeded { degraded: payload.degraded != 0 }
+            Event::ConnectSucceeded { addr: payload.addr, degraded: payload.degraded != 0 }
         }
         PlEventTag::WizardAutoDismiss => Event::WizardAutoDismiss,
         PlEventTag::CodecChanged => {
@@ -1063,6 +1148,23 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                 word,
                 nominal_bitrate_bps: payload.nominal_bitrate_bps,
             })
+        }
+        PlEventTag::StoreLoaded => {
+            // SAFETY: `tag` says this union currently holds `store_loaded`.
+            // Reading it is sound regardless of field values -- every
+            // field is a plain integer/byte-array type with no validity
+            // invariant to violate (see `PlStoreLoadedPayload`'s doc
+            // comment).
+            let payload = unsafe { event.payload.store_loaded };
+            let status = match PlStoreStatus::try_from(payload.status) {
+                Ok(status) => status,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            let device_addr = if payload.has_device != 0 { Some(payload.addr) } else { None };
+            Event::StoreLoaded { status: status.into(), device_addr }
         }
     };
     ui.app.handle_event(core_event);
@@ -1104,6 +1206,11 @@ pub enum PlCommandTag {
     /// (pico-link-znb.2). See this bead's completion report for the
     /// explicit callout; file the C-side bead against this tag.
     CancelConnect = 4,
+    /// Bead pico-link-cz0.6 (M5 persistence), design point 7: `core`'s
+    /// auto-reconnect/remember-this-device POLICY output. Carries the
+    /// target `addr` via the same `connect` payload member `Connect`/
+    /// `CancelConnect` use -- see [`PlCommandPayload`]'s doc comment.
+    PersistDevice = 5,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -1175,6 +1282,9 @@ fn pl_command_from(command: Command) -> PlCommand {
         }
         Command::CancelConnect { addr } => {
             PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::CancelConnect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
+        }
+        Command::PersistDevice { addr } => {
+            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::PersistDevice, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
         }
     }
 }
@@ -1298,7 +1408,7 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            tag: 9, // one past CodecChanged = 8, the highest legal PlEventTag
+            tag: 10, // one past StoreLoaded = 9, the highest legal PlEventTag
             payload: bogus_payload,
         };
         unsafe {
@@ -1378,7 +1488,7 @@ mod tests {
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::ConnectSucceeded as u32,
-                payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { degraded: 1 } },
+                payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { addr: [0; 6], degraded: 1 } },
             },
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
@@ -1444,6 +1554,70 @@ mod tests {
     }
 
     #[test]
+    fn pl_ui_push_event_store_loaded_with_a_device_queues_connect() {
+        // Bead pico-link-cz0.6 (M5 persistence): round-trips
+        // PlEventTag::StoreLoaded with has_device=1 all the way through to
+        // core's Command::Connect queue, and asserts the model's
+        // store_status was recorded -- the actual gap this event exists to
+        // close (design point 5's "never renders identically to a new
+        // one"), not just "doesn't panic".
+        let ui = new_ui();
+        let addr = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::StoreLoaded as u32,
+            payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: PlStoreStatus::Loaded as u8, has_device: 1, addr } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+            assert_eq!((*ui).app.model().store_status, Some(pico_link_core::StoreStatus::Loaded));
+
+            let cmd = pl_ui_poll_command(ui);
+            assert_eq!(cmd.version, PL_COMMAND_ABI_VERSION);
+            assert!(matches!(cmd.tag, PlCommandTag::Connect));
+            assert_eq!(cmd.payload.connect.addr, addr);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_store_loaded_with_no_device_queues_nothing() {
+        let ui = new_ui();
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::StoreLoaded as u32,
+            payload: PlEventPayload {
+                store_loaded: PlStoreLoadedPayload { status: PlStoreStatus::FirstBoot as u8, has_device: 0, addr: [0; 6] },
+            },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+            assert_eq!((*ui).app.model().store_status, Some(pico_link_core::StoreStatus::FirstBoot));
+
+            let cmd = pl_ui_poll_command(ui);
+            assert!(matches!(cmd.tag, PlCommandTag::None), "no device -- nothing to auto-reconnect to");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_nested_store_status() {
+        let ui = new_ui();
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::StoreLoaded as u32,
+            payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: 99, has_device: 0, addr: [0; 6] } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range nested store status should be counted, not matched-on");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
     fn pl_ui_push_event_rejects_out_of_range_nested_connect_step() {
         // Same gap as the nested link-state/failure-reason tests above,
         // one layer deeper for the new `ConnectStepChanged` payload: the
@@ -1503,11 +1677,12 @@ mod tests {
             PlEventTag::ConnectSucceeded,
             PlEventTag::WizardAutoDismiss,
             PlEventTag::CodecChanged,
+            PlEventTag::StoreLoaded,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        assert!(PlEventTag::try_from(9u32).is_err());
+        assert!(PlEventTag::try_from(10u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
