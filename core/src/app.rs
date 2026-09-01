@@ -2412,6 +2412,53 @@ mod tests {
     }
 
     #[test]
+    fn truncate_device_name_backs_off_to_a_utf8_character_boundary_instead_of_panicking() {
+        // Code review on pico-link-4vb.4: every prior test used a pure-ASCII
+        // name, so the exact bug class the design called out ("a
+        // byte-boundary truncation would panic or corrupt on any non-ASCII
+        // device name") had zero coverage. U+65E5 ("日") is 3 bytes; 11 of
+        // them is 33 bytes, one over MAX_DEVICE_NAME_BYTES (32), and byte 32
+        // lands one byte into the 11th character -- exactly the mid-character
+        // cut that a naive `&name[..32]` would panic on.
+        let name: String = "日".repeat(11);
+        assert_eq!(name.len(), 33, "fixture must actually exceed MAX_DEVICE_NAME_BYTES for this test to be meaningful");
+        assert!(!name.is_char_boundary(MAX_DEVICE_NAME_BYTES), "fixture must land mid-character at the cut point, or this test proves nothing");
+
+        let truncated = truncate_device_name(&name);
+
+        // A `String` can never hold invalid UTF-8, so the fact this line
+        // returned at all (rather than panicking inside the slice) is the
+        // real assertion; `chars().count()` re-parsing cleanly is belt and
+        // braces confirmation there's no corruption hiding in a `String`
+        // built some other way in the future.
+        assert_eq!(truncated.chars().count(), 10, "must back off a full character rather than keep a partial one");
+        assert_eq!(truncated.len(), 30, "the boundary one character back from byte 32 is byte 30");
+        assert!(truncated.len() <= MAX_DEVICE_NAME_BYTES);
+    }
+
+    #[test]
+    fn connect_wire_path_carries_a_utf8_truncated_name_for_a_multibyte_device() {
+        // Covers the same bug class as the test above but through the real
+        // `Command::Connect` wire path (auto-reconnect on `StoreLoaded`),
+        // the path `ui-ffi` copies byte-for-byte into the C struct -- so this
+        // is also the cheapest proxy for the FFI seam without touching
+        // `ui-ffi` itself.
+        let mut app = App::new(240, 240);
+        let addr = [9, 9, 9, 9, 9, 9];
+        let long_name: String = "日".repeat(11);
+        app.handle_event(upsert(addr, &long_name, 1));
+        app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
+
+        let expected_name = truncate_device_name(&long_name);
+        assert_eq!(expected_name.len(), 30, "sanity: the fixture name must actually need truncating");
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::Connect { addr, name: expected_name }),
+            "the wire-path Connect command must carry the same char-boundary-truncated name, not the raw 33-byte original"
+        );
+    }
+
+    #[test]
     fn store_loaded_with_no_paired_devices_records_status_but_queues_nothing() {
         let mut app = App::new(240, 240);
         app.handle_event(Event::StoreLoaded { status: StoreStatus::FirstBoot });
