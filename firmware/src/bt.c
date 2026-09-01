@@ -247,12 +247,20 @@ static void pl_bt_push_devices_cleared(void) {
     pl_bt_ring_push(event, NULL, 0);
 }
 
-static void pl_bt_push_device_discovered(const uint8_t *addr, const uint8_t *name, uint16_t name_len, int8_t rssi) {
+// `class_of_device` added by bead pico-link-znb.11 (E9) -- BTstack's raw
+// 24-bit Class-of-Device from the inquiry result, passed through
+// uninterpreted (core decides is-audio-sink, see PlDeviceDiscoveredPayload's
+// doc comment in pico_link_ui.h). PL_EVENT_ABI_VERSION bumped 3 -> 4 for the
+// payload shape change.
+static void pl_bt_push_device_discovered(
+    const uint8_t *addr, const uint8_t *name, uint16_t name_len, int8_t rssi, uint32_t class_of_device
+) {
     struct PlEvent event = {.version = PL_EVENT_ABI_VERSION, .tag = PL_EVENT_TAG_DEVICE_DISCOVERED};
     memcpy(event.payload.device_discovered.addr, addr, 6);
     event.payload.device_discovered.name = NULL; // patched at drain time -- see pl_bt_drain_events
     event.payload.device_discovered.name_len = name_len;
     event.payload.device_discovered.rssi = rssi;
+    event.payload.device_discovered.class_of_device = class_of_device;
     pl_bt_ring_push(event, name, name_len);
 }
 
@@ -535,11 +543,13 @@ static void pl_bt_handle_inquiry_result(const uint8_t *packet) {
         memcpy(name_buf, gap_event_inquiry_result_get_name(packet), name_len);
     }
 
+    uint32_t class_of_device = gap_event_inquiry_result_get_class_of_device(packet);
+
     pl_log(
-        "BT: inquiry result %02x:%02x:%02x:%02x:%02x:%02x rssi=%d name=\"%.*s\"\r\n",
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], rssi, (int)name_len, name_buf
+        "BT: inquiry result %02x:%02x:%02x:%02x:%02x:%02x rssi=%d cod=0x%06lx name=\"%.*s\"\r\n",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], rssi, (unsigned long)class_of_device, (int)name_len, name_buf
     );
-    pl_bt_push_device_discovered(addr, (const uint8_t *)name_buf, name_len, rssi);
+    pl_bt_push_device_discovered(addr, (const uint8_t *)name_buf, name_len, rssi, class_of_device);
 }
 
 static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {

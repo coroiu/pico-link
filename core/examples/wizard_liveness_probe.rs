@@ -56,7 +56,7 @@ fn main() {
     app.handle_input(vec![NavIntent::Select]);
 
     let addr = [0xAA; 6];
-    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: "Sony WH-1000XM5".into(), rssi: -40 }));
+    app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: "Sony WH-1000XM5".into(), rssi: -40, class_of_device: 0 }));
 
     // Phase 2 -> phase 4 (Connecting): activates the only scan-result row.
     // `WizardPhase::Connecting::started` is backfilled from this same
