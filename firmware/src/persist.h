@@ -49,33 +49,37 @@
 // cyw43/BTstack background async_context, a real IRQ, not a poll. The TLV
 // store's own store_tag/get_tag/delete_tag have no locking of their own
 // (btstack_tlv_flash_bank.c), so ANY call into them from thread context
-// races that IRQ. The actual write therefore happens ONLY from
-// pl_persist_execute_pending_write(), which bt.c calls exclusively from ITS
-// existing pending-queue drain (the pico-link-ouw idiom) -- i.e. from the
-// same async_context BTstack's own link-key write runs on, which serializes
-// every callback on it to completion before the next starts. Thread context
-// (pl_persist_service(), the superloop, called every iteration) only
-// DECIDES when a write is due and safe, then enqueues a request via
-// pl_bt_enqueue_persist_write() (bt.h) -- it never touches flash itself.
-// pl_persist_init() is the one exception, and is safe for a structural
-// reason, not a lock -- see its own doc comment in persist.c.
+// races that IRQ. Every actual write in this module therefore happens on
+// that SAME async_context -- never thread context -- via one of two paths:
+// pl_persist_execute_pending_write() (bt.c's pending-queue drain, the
+// pico-link-ouw idiom, for low-value deferred writes) or
+// pl_persist_save_device_now() (called directly from a2dp.c, which already
+// runs on that context -- see the ORDERING section below and that
+// function's own doc comment). Thread context (pl_persist_service(), the
+// superloop) only ever DECIDES when a deferred write is due and enqueues a
+// request via pl_bt_enqueue_persist_write() (bt.h); it never touches flash
+// itself. pl_persist_init() is the one exception to "async_context only",
+// and is safe for a structural reason, not a lock -- see its own doc
+// comment in persist.c.
 //
-// KNOWN MVP LIMITATION, stated deliberately, not accidental (code review,
-// 2026-09-01): a freshly successful connect cannot be persisted while
-// streaming continues without a gap. Command::PersistDevice fires at
-// Event::ConnectSucceeded/A2DP's STREAM_STARTED, at which point
-// pl_a2dp_streaming() is ALREADY true (state flips non-idle at
-// STREAM_ESTABLISHED, before STREAM_STARTED even fires) and stays true for
-// as long as audio keeps flowing -- so "connect, stream continuously, pull
-// power before ever pausing" loses the just-staged device record. The
-// link KEY itself is NOT subject to this gap (BTstack writes it
-// synchronously, unconditionally, during SSP pairing, before streaming
-// begins) -- what's lost is only "which address to auto-reconnect to",
-// costing the user one manual reconnect (scan+select, no re-pairing
-// dance), not a full loss of persistence. Closing this gap would mean
-// loosening the no-flash-while-streaming gate (e.g. permitting a write
-// during PRIMING before real audio flows) -- an audio-safety-affecting
-// design call intentionally left for a follow-up, not made here.
+// ORDERING (Andreas's ruling, 2026-09-01, follow-up to finding 1's fix):
+// the device record is written as part of ESTABLISHING the connection, not
+// staged in RAM for a quiet window that may never come. pl_persist_save_device_now()
+// is called synchronously from a2dp.c's A2DP_SUBEVENT_STREAM_ESTABLISHED
+// handler, BEFORE the stream state flips to PRIMING -- i.e. before
+// pl_a2dp_streaming() can become true for this connection and before any
+// audio has started toward the headphones. A short delay before first
+// sound (this write's ~9ms worst case) is invisible; a lost pairing costs
+// a physical headphone factory reset (pico-link-7ur), which is why this
+// bead was promoted to P1. THE ONE CARVE-OUT: if pl_usb_audio_streaming()
+// is already true at that moment (the USB host was already sending
+// isochronous audio when pairing completed), ISO-OUT is live and a missed
+// re-arm is PERMANENT (audio_device.c:759-762) -- that case falls back to
+// the conservative RAM-staged path instead of writing immediately,
+// tracked as pico-link-lmf (not fixed here, deliberately not made worse).
+// The 2s settle / 10s PL_PERSIST_MIN_INTERVAL_US rate limits still apply
+// to LATER, low-value updates (volume, codec, MRU bumps) via
+// pl_persist_service() -- they no longer gate the pairing-time record.
 //
 // KNOWN GAP, not fixed here (code review finding 2, 2026-09-01): nothing in
 // core (home.rs/app.rs's Bluetooth-menu-row and Scan-row activation) gates
@@ -161,6 +165,24 @@ void pl_persist_request_urgent_flush(void);
 // bt.c's PL_BT_PENDING_PERSIST_WRITE case. Calling this from thread context
 // reintroduces the exact race code-review finding 1 closed.
 void pl_persist_execute_pending_write(void);
+
+// Andreas's ruling, 2026-09-01: writes the device record SYNCHRONOUSLY, as
+// part of establishing the connection -- see this header's module doc
+// (ORDERING) for the full rationale and the one carve-out
+// (pl_usb_audio_streaming() already true, tracked pico-link-lmf). Stages
+// via pl_persist_request_save_device() and falls back to the normal
+// deferred/gated path instead of writing when that carve-out applies;
+// otherwise writes immediately and clears any pending/urgent/enqueued
+// state for the record just written.
+//
+// # Calling contract
+//
+// MUST be called ONLY from the cyw43/BTstack background async_context --
+// today that means exclusively from a2dp.c's
+// A2DP_SUBEVENT_STREAM_ESTABLISHED case, BEFORE the stream state advances
+// to PRIMING. Calling this from thread context reintroduces the exact race
+// code-review finding 1 closed.
+void pl_persist_save_device_now(const uint8_t addr[6]);
 
 // Tag namespace, exposed so a future preset-store implementation (hardening,
 // not MVP -- design point 8/pico-link-ryw) reuses this exact scheme rather

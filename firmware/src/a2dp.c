@@ -1519,6 +1519,23 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.flush_frames += pl_pcm_reset();
 
             pl_log("a2dp: stream established, max_media_payload_size=%d\r\n", s_ctx.max_media_payload_size);
+
+            // Bead pico-link-cz0.6 follow-up (Andreas's ruling, 2026-09-01):
+            // persist the device record HERE, synchronously, before
+            // priming proceeds -- not staged in RAM for a quiet window
+            // that may never come. This is the fix for the ordering
+            // defect the code review's Finding 1 fix left open: this
+            // handler runs on the cyw43/BTstack background async_context
+            // (same context BTstack's own put_link_key uses), so calling
+            // straight into persist.c here is already safe -- see
+            // pl_persist_save_device_now's doc comment (persist.h) for the
+            // full rationale and its one carve-out (USB audio already
+            // live, pico-link-lmf). Must run BEFORE the PRIMING transition
+            // below, or pl_a2dp_streaming() would already read true and
+            // the write would be no different from the deferred path this
+            // ruling exists to bypass.
+            pl_persist_save_device_now(s_ctx.connect_addr);
+
             // design sec 3.5 case 3: prime before starting -- see this
             // file's PL_A2DP_MEDIA_PRIMING doc comment.
             s_ctx.state = PL_A2DP_MEDIA_PRIMING;

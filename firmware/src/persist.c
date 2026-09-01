@@ -251,39 +251,64 @@ void pl_persist_request_save_device(const uint8_t addr[6]) {
 // (btstack_tlv_flash_bank_store_tag/get_tag/delete_tag are a multi-step
 // sequence over plain, non-atomic struct fields -- check space, maybe
 // migrate, write value, write header, delete old entries, THEN mutate
-// self->write_offset). Before this fix, persist.c called store_tag/get_tag
-// directly from THREAD context (pl_persist_service, the superloop) while
-// BTstack writes link keys into that SAME instance synchronously from
-// inside its own HCI event dispatch (hci.c's put_link_key), which runs on
-// the cyw43/BTstack background async_context -- a real low-priority
-// hardware IRQ, not a cooperative poll. A thread-context TLV call
-// preempted mid-sequence by that IRQ (or vice versa) corrupts write_offset
-// and the bank bookkeeping -- reachable on the exact acceptance path,
-// since pl_a2dp_connect() (a2dp.c) requests an urgent flush immediately
-// before establishing the very stream whose pairing just triggered
-// BTstack's own link-key write for the same device.
+// self->write_offset). BTstack writes link keys into that SAME instance
+// synchronously from inside its own HCI event dispatch (hci.c's
+// put_link_key), which runs on the cyw43/BTstack background
+// async_context -- a real low-priority hardware IRQ, not a cooperative
+// poll. A THREAD-CONTEXT TLV call preempted mid-sequence by that IRQ (or
+// vice versa) corrupts write_offset and the bank bookkeeping.
 //
-// FIX: reuse pico-link-ouw's established idiom (bt.c's pl_bt_pending_push/
-// pl_bt_pending_service -- see that bead's module doc in bt.c) rather than
-// inventing a second mechanism. This function -- the only place that
-// actually touches s_tlv_impl for a WRITE after boot -- is now called
-// EXCLUSIVELY from pl_bt_pending_service (bt.c), which itself only ever
-// runs from pl_bt_wdt_heartbeat_handler: a btstack_run_loop timer callback
-// dispatched through the SAME async_context_threadsafe_background work
-// queue that runs BTstack's own HCI event dispatch (including put_link_key).
-// That queue serializes every callback registered on it to completion
-// before starting the next -- so once both sides run through it, they
-// cannot preempt each other, closing the race by construction rather than
-// by adding a lock. pl_persist_service() (thread context, unchanged
-// responsibility: streaming/settle/rate-limit gating) now only DECIDES
-// when a write is due and enqueues a request via pl_bt_enqueue_persist_write()
-// (bt.h) -- it never touches s_tlv_impl itself.
+// FIX: every actual flash write in this file goes through this one static
+// helper, and every caller of it is on the SAME async_context BTstack's own
+// put_link_key runs on -- never thread context. That queue
+// (async_context_threadsafe_background) serializes every callback
+// registered on it to completion before starting the next, so once both
+// sides run through it, they cannot preempt each other -- the race is
+// closed by construction, not by a lock. Two callers, both IRQ/async_context:
+// pl_persist_execute_pending_write() (bt.c's pending-queue drain, the
+// pico-link-ouw idiom, for LOW-VALUE deferred writes -- volume/codec/MRU
+// bumps) and pl_persist_save_device_now() (a2dp.c's STREAM_ESTABLISHED
+// handler, called directly and synchronously -- see that function's own
+// doc comment for why a queue+wait round-trip isn't needed there).
+static void pl_persist_do_write(const uint8_t addr[6]) {
+    pl_persist_marker_t marker = {.schema_version = PL_PERSIST_SCHEMA_VERSION};
+    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_MARKER, 0), (const uint8_t *)&marker, sizeof(marker));
+
+    pl_persist_device_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    memcpy(rec.addr, addr, 6);
+    rec.mru_seq = s_next_mru_seq++;
+    // name/codec_id/ldac_quality/volume/flags/preset_id: left zeroed for
+    // this MVP slice (design's explicit scope: "MVP slice = marker + one
+    // device record + the link key"). A follow-up bead threading the
+    // discovered name and negotiated codec through PlCommandTag::PersistDevice's
+    // payload can populate these without a format change.
+    rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
+
+    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, PL_PERSIST_DEVICE_SLOT), (const uint8_t *)&rec, sizeof(rec));
+
+    s_last_write_us = time_us_64();
+    s_have_last_write = true;
+    pl_log(
+        "persist: wrote device record %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu)\r\n", rec.addr[0], rec.addr[1], rec.addr[2],
+        rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq
+    );
+}
+
+// Called EXCLUSIVELY from pl_bt_pending_service (bt.c), which itself only
+// ever runs from pl_bt_wdt_heartbeat_handler -- see pl_persist_do_write's
+// doc comment above for the full reentrancy rationale. Handles LOW-VALUE
+// deferred writes (a staged save that missed the synchronous pairing-time
+// path below, or a future volume/codec/MRU update) -- rate-limited and
+// settle-gated by pl_persist_service(), thread context, which only decides
+// WHEN this is due and enqueues the request; it never touches s_tlv_impl
+// itself.
 //
 // # Safety / calling contract
 //
 // MUST be called only from bt.c's pending-queue drain (async_context/IRQ
 // context). Calling this from thread context reintroduces exactly the race
-// this fix closes.
+// pl_persist_do_write's doc comment describes.
 void pl_persist_execute_pending_write(void) {
     if (!s_pending) {
         s_write_enqueued = false;
@@ -301,31 +326,77 @@ void pl_persist_execute_pending_write(void) {
         return;
     }
 
-    pl_persist_marker_t marker = {.schema_version = PL_PERSIST_SCHEMA_VERSION};
-    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_MARKER, 0), (const uint8_t *)&marker, sizeof(marker));
-
-    pl_persist_device_record_t rec;
-    memset(&rec, 0, sizeof(rec));
-    memcpy(rec.addr, s_pending_addr, 6);
-    rec.mru_seq = s_next_mru_seq++;
-    // name/codec_id/ldac_quality/volume/flags/preset_id: left zeroed for
-    // this MVP slice (design's explicit scope: "MVP slice = marker + one
-    // device record + the link key"). A follow-up bead threading the
-    // discovered name and negotiated codec through PlCommandTag::PersistDevice's
-    // payload can populate these without a format change.
-    rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
-
-    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, PL_PERSIST_DEVICE_SLOT), (const uint8_t *)&rec, sizeof(rec));
+    pl_persist_do_write(s_pending_addr);
 
     s_pending = false;
     s_urgent = false;
     s_write_enqueued = false;
-    s_last_write_us = time_us_64();
-    s_have_last_write = true;
+}
+
+// Andreas's ruling, 2026-09-01 (follow-up to code-review finding 1's fix):
+// writing the device record is part of ESTABLISHING the connection, not a
+// chore staged in RAM for a quiet window that may never come -- see
+// persist.h's module doc for the full ordering rationale. Called directly
+// and SYNCHRONOUSLY from a2dp.c's A2DP_SUBEVENT_STREAM_ESTABLISHED handler,
+// BEFORE s_ctx.state flips to PL_A2DP_MEDIA_PRIMING -- i.e. before
+// pl_a2dp_streaming() can become true for this connection, and before any
+// audio has started flowing toward the headphones. A short delay before
+// first sound (this write's ~9ms worst case) is invisible; a lost pairing
+// costs a physical headphone factory reset (pico-link-7ur).
+//
+// No queue+wait round-trip needed to reach the required async_context: the
+// caller (a2dp.c's own AVDTP/A2DP packet handler) is ALREADY running on the
+// cyw43/BTstack background async_context -- the exact same serialized
+// execution stream pl_persist_execute_pending_write's callers use and
+// BTstack's own put_link_key runs on (see a2dp.c's own module doc: "another
+// IRQ-context producer, same IRQ context bt.c's own HCI packet handler
+// does"). So this function calling pl_persist_do_write directly is already
+// mutually exclusive with put_link_key by construction -- deferring onto
+// bt.c's pending queue and then busy-waiting for it to drain would cross a
+// context boundary that does not need crossing, and would only add latency
+// audio would still have to wait on.
+//
+// THE ONE CARVE-OUT (pico-link-lmf, NOT fixed here, deliberately not made
+// worse): if pl_usb_audio_streaming() is already true -- the USB host was
+// already sending isochronous audio to this dongle when the pairing
+// completed -- ISO-OUT is live and a single missed re-arm past this
+// function's blackout is PERMANENT (audio_device.c:759-762), needing a
+// physical unplug to recover. That is a materially worse failure than a
+// delayed/lost device record, so this case falls back to the conservative
+// RAM-staged path instead (pl_persist_request_save_device): the record is
+// NOT written now, only staged, and pl_persist_service()'s normal
+// streaming-gated path picks it up once safe -- same behaviour as before
+// this ruling, for this one case only.
+//
+// # Safety / calling contract
+//
+// MUST be called only from the cyw43/BTstack background async_context --
+// today that means exclusively from a2dp.c's A2DP_SUBEVENT_STREAM_ESTABLISHED
+// case. Calling this from thread context reintroduces the exact race
+// code-review finding 1 closed.
+void pl_persist_save_device_now(const uint8_t addr[6]) {
+    if (pl_usb_audio_streaming()) {
+        pl_log(
+            "persist: USB audio already live at pairing time -- staging %02x:%02x:%02x:%02x:%02x:%02x instead of "
+            "writing now (pico-link-lmf carve-out)\r\n",
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+        );
+        pl_persist_request_save_device(addr);
+        return;
+    }
+
     pl_log(
-        "persist: wrote device record %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu)\r\n", rec.addr[0], rec.addr[1], rec.addr[2],
-        rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq
+        "persist: writing device record synchronously at pairing time for %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0],
+        addr[1], addr[2], addr[3], addr[4], addr[5]
     );
+    pl_persist_do_write(addr);
+
+    // The record is now durably on flash -- clear any stale staged
+    // request for the same (or a different, e.g. a fast device-switch)
+    // address so pl_persist_service() doesn't redundantly re-enqueue it.
+    s_pending = false;
+    s_urgent = false;
+    s_write_enqueued = false;
 }
 
 void pl_persist_service(void) {
