@@ -133,6 +133,13 @@
 // A2DP media stream -- matches a2dp_source_demo.c's own AUDIO_TIMEOUT_MS.
 #define PL_A2DP_AUDIO_TIMEOUT_MS 10
 
+// Bead pico-link-648: delay before the single bounded 0x0b retry. Measured
+// on hardware (bead comments, 2026-09-01): the stale ACL cleared itself
+// about 1s after the 0x0b failure. Rounded up for margin, still well
+// inside the couple of seconds a fresh boot's auto-reconnect can afford to
+// spend.
+#define PL_A2DP_RECONNECT_RETRY_DELAY_MS 1500
+
 // Bead pico-link-pbv: PL_A2DP_MAX_FRAMES_PER_TICK (a fixed constant, 5) is
 // GONE. Round 1 replaced it with s_ctx.frames_per_tick_cap, a per-stream
 // FRAME-COUNT cap computed from the negotiated payload size and the
@@ -243,6 +250,24 @@ typedef struct {
     pl_a2dp_media_state_t state;
     btstack_timer_source_t media_timer;
     bool timer_armed;
+
+    // Bead pico-link-648: bounded single retry for
+    // ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS (0x0b) at
+    // A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED. Measured on hardware:
+    // after a short-gap reboot the headset still holds the old ACL, HCI
+    // reports 0x0b, and BTstack frees the failed attempt's own connection
+    // object with no resume path (see pl_a2dp_failure_reason_for_status's
+    // doc comment) -- but a SECOND, unsolicited
+    // HCI_EVENT_CONNECTION_COMPLETE with status=0x00 on a fresh handle
+    // follows about a second later with nothing on our side asking for it
+    // (most likely the headset's own auto-reconnect re-paging us). This
+    // timer waits out that window once, then reissues establish_stream on
+    // the (by then) cleared ACL. reconnect_retry_used caps it at exactly
+    // one attempt per connect() call -- a second 0x0b after the retry is
+    // reported to the UI as a real failure, same as any other status.
+    btstack_timer_source_t reconnect_retry_timer;
+    bool reconnect_retry_armed; // true iff reconnect_retry_timer is currently added to the run loop
+    bool reconnect_retry_used;  // true once this connect() attempt has already spent its one retry
 
     int max_media_payload_size;
     // Bead pico-link-85v (D1): rtp_next replaces the old rtp_timestamp --
@@ -1130,6 +1155,74 @@ static uint32_t pl_a2dp_failure_reason_for_status(uint8_t status) {
     }
 }
 
+// Bead pico-link-648. Extracted from pl_a2dp_connect() (below) so the
+// 0x0b retry handler can reissue establish_stream WITHOUT going through
+// pl_a2dp_connect()'s own reset of reconnect_retry_used -- that reset is
+// what caps this at exactly one retry per connect() call; calling it again
+// from the retry path itself would turn "one retry" into "retry forever
+// against a headset that keeps saying 0x0b".
+static void pl_a2dp_establish_stream_now(const uint8_t *addr) {
+    bd_addr_t local_addr;
+    memcpy(local_addr, addr, 6);
+    memcpy(s_ctx.connect_addr, addr, 6);
+
+    // Bead pico-link-cz0.6 (M5 persistence), design point 4: "forced flush
+    // ... BEFORE arming a stream" -- this is that call site. Runs in the
+    // cyw43/BTstack background IRQ (pico-link-ouw's deferred-queue
+    // consumer), so this only flags urgency -- the actual write (if any is
+    // pending) happens on the superloop's next iteration, in thread
+    // context, once it's confirmed safe. A no-op if nothing is pending.
+    pl_persist_request_urgent_flush();
+
+    uint8_t status = a2dp_source_establish_stream(local_addr, &s_ctx.a2dp_cid);
+    if (status != ERROR_CODE_SUCCESS) {
+        pl_log("a2dp: establish_stream rejected, status=0x%02x\r\n", status);
+        pl_bt_push_connect_failed(addr, PL_FAILURE_REASON_RADIO_ERROR);
+        return;
+    }
+    pl_bt_push_connect_step(PL_CONNECT_STEP_SETTING_UP_AUDIO);
+}
+
+// Bead pico-link-648: cancels any pending 0x0b retry. Safe to call even
+// when nothing is armed (btstack_run_loop_remove_timer is a no-op on a
+// timer that isn't currently added -- same idiom as
+// pl_a2dp_media_timer_arm above). Called on a fresh connect() (a new
+// attempt supersedes any stale retry from a previous one), on a
+// successful SIGNALING_CONNECTION_ESTABLISHED, on user disconnect, and on
+// SIGNALING_CONNECTION_RELEASED -- so a stale timer can never fire into a
+// live or torn-down session.
+static void pl_a2dp_reconnect_retry_cancel(void) {
+    if (!s_ctx.reconnect_retry_armed) {
+        return;
+    }
+    btstack_run_loop_remove_timer(&s_ctx.reconnect_retry_timer);
+    s_ctx.reconnect_retry_armed = false;
+}
+
+static void pl_a2dp_reconnect_retry_handler(btstack_timer_source_t *ts) {
+    (void)ts;
+    s_ctx.reconnect_retry_armed = false;
+    pl_log("a2dp: 0x0b retry firing, reissuing establish_stream (single bounded retry)\r\n");
+    pl_a2dp_establish_stream_now(s_ctx.connect_addr);
+}
+
+// Bead pico-link-648: arms the one bounded retry. Marks
+// reconnect_retry_used so a second 0x0b (from this retry itself, or any
+// later failure before the next fresh connect()) is reported to the UI as
+// a real failure instead of retrying again.
+static void pl_a2dp_reconnect_retry_arm(void) {
+    s_ctx.reconnect_retry_used = true;
+    pl_log(
+        "a2dp: 0x0b (ACL connection already exists) -- arming single bounded retry in %ums\r\n",
+        (unsigned)PL_A2DP_RECONNECT_RETRY_DELAY_MS
+    );
+    btstack_run_loop_remove_timer(&s_ctx.reconnect_retry_timer); // safe even if not currently added
+    btstack_run_loop_set_timer_handler(&s_ctx.reconnect_retry_timer, pl_a2dp_reconnect_retry_handler);
+    btstack_run_loop_set_timer(&s_ctx.reconnect_retry_timer, PL_A2DP_RECONNECT_RETRY_DELAY_MS);
+    btstack_run_loop_add_timer(&s_ctx.reconnect_retry_timer);
+    s_ctx.reconnect_retry_armed = true;
+}
+
 static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -1147,9 +1240,25 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             if (status != ERROR_CODE_SUCCESS) {
                 pl_log("a2dp: signaling connection FAILED status=0x%02x\r\n", status);
                 s_ctx.a2dp_cid = 0;
+                // Bead pico-link-648: 0x0b means the stale ACL from before
+                // a reboot is still up on the headset's side -- see this
+                // field's doc comment on pl_a2dp_ctx_t. Retry exactly
+                // once; a second 0x0b (reconnect_retry_used already true)
+                // falls through to the normal failure report below, same
+                // as every other status.
+                if (status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS && !s_ctx.reconnect_retry_used) {
+                    pl_a2dp_reconnect_retry_arm();
+                    break;
+                }
                 pl_bt_push_connect_failed(s_ctx.connect_addr, pl_a2dp_failure_reason_for_status(status));
                 break;
             }
+            // A real success cancels any retry that might still be armed
+            // (shouldn't happen -- the retry path re-issues on the same
+            // connect_addr -- but a fresh connect() racing a stale timer
+            // is exactly the "cannot fire into a live session" case this
+            // bead's acceptance criteria calls out).
+            pl_a2dp_reconnect_retry_cancel();
             s_ctx.a2dp_cid = cid;
             // Fresh discovery pass starting -- clear any capability bits
             // left over from a previous connection attempt.
@@ -1430,6 +1539,21 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             uint8_t status = a2dp_subevent_stream_established_get_status(packet);
             if (status != ERROR_CODE_SUCCESS) {
                 pl_log("a2dp: stream establish FAILED status=0x%02x\r\n", status);
+                // Bead pico-link-648, measured on hardware: BTstack's
+                // a2dp_source layer cascades the SAME underlying failure
+                // that just came through
+                // A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED into this
+                // higher-level completion event too, synchronously, same
+                // call stack. If we just armed a 0x0b retry for that
+                // failure, don't ALSO tell the UI it failed -- that would
+                // flash a failure screen for an attempt we're still
+                // retrying. reconnect_retry_armed is only true here in
+                // that exact window (it's cleared before this handler can
+                // run again for a genuinely new attempt).
+                if (s_ctx.reconnect_retry_armed) {
+                    pl_log("a2dp: suppressing UI failure push -- 0x0b retry already armed for this attempt\r\n");
+                    break;
+                }
                 pl_bt_push_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_REJECTED);
                 break;
             }
@@ -1696,6 +1820,10 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
         case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
             pl_wdt_set_enabled(PL_WDT_MEDIA, false);
             pl_log("a2dp: signaling connection released\r\n");
+            // Bead pico-link-648: belt-and-suspenders -- if a retry was
+            // still armed when the signaling connection went away some
+            // other way, don't let it fire into whatever comes next.
+            pl_a2dp_reconnect_retry_cancel();
             s_ctx.a2dp_cid = 0;
             s_ctx.codec = NULL;
             s_ctx.state = PL_A2DP_MEDIA_IDLE;
@@ -1803,28 +1931,20 @@ bool pl_a2dp_streaming(void) {
 }
 
 void pl_a2dp_connect(const uint8_t *addr) {
-    bd_addr_t local_addr;
-    memcpy(local_addr, addr, 6);
-    memcpy(s_ctx.connect_addr, addr, 6);
-
-    // Bead pico-link-cz0.6 (M5 persistence), design point 4: "forced flush
-    // ... BEFORE arming a stream" -- this is that call site. Runs in the
-    // cyw43/BTstack background IRQ (pico-link-ouw's deferred-queue
-    // consumer), so this only flags urgency -- the actual write (if any is
-    // pending) happens on the superloop's next iteration, in thread
-    // context, once it's confirmed safe. A no-op if nothing is pending.
-    pl_persist_request_urgent_flush();
-
-    uint8_t status = a2dp_source_establish_stream(local_addr, &s_ctx.a2dp_cid);
-    if (status != ERROR_CODE_SUCCESS) {
-        pl_log("a2dp: establish_stream rejected, status=0x%02x\r\n", status);
-        pl_bt_push_connect_failed(addr, PL_FAILURE_REASON_RADIO_ERROR);
-        return;
-    }
-    pl_bt_push_connect_step(PL_CONNECT_STEP_SETTING_UP_AUDIO);
+    // Bead pico-link-648: a fresh top-level connect attempt gets its own
+    // single retry budget, and supersedes any retry still armed from a
+    // previous attempt (e.g. the user backed out and reconnected inside
+    // the retry's ~1.5s window).
+    pl_a2dp_reconnect_retry_cancel();
+    s_ctx.reconnect_retry_used = false;
+    pl_a2dp_establish_stream_now(addr);
 }
 
 void pl_a2dp_disconnect(void) {
+    // Bead pico-link-648: a user-initiated disconnect must not let a
+    // pending 0x0b retry fire later and reopen a session the user just
+    // closed.
+    pl_a2dp_reconnect_retry_cancel();
     if (s_ctx.a2dp_cid == 0) {
         pl_log("a2dp: disconnect requested, no active a2dp_cid, no-op\r\n");
         return;
