@@ -22,7 +22,7 @@ use std::time::Duration;
 use pico_link_core::render::chrome::TITLE_BAR_HEIGHT;
 use pico_link_core::render::theme::palette;
 use pico_link_core::render::ROW_HEIGHT;
-use pico_link_core::App;
+use pico_link_core::{App, Event, PairedDevice};
 use embedded_graphics::prelude::RgbColor;
 use emulator::desktop::HttpServer;
 use emulator::platform::{FileStorage, HostPlatform, HttpInput, RecordingPowerControl, SharedHeadlessSurface};
@@ -107,6 +107,17 @@ fn injecting_a_navintent_over_http_moves_the_selection_and_is_observable_in_the_
     let mut platform = HostPlatform::new(surface, HttpInput::new(input_queue), kv_storage, RecordingPowerControl::new());
 
     let mut app = App::new(WIDTH, HEIGHT);
+    // Bead pico-link-4vb.4 (T5): the Devices screen renders `BtModel::paired`
+    // now, not scan results -- with nothing remembered, its only row is
+    // "Pair new headphones" and Down has nowhere to move the selection to.
+    // One paired device gives the two-row list this test's row0/row1
+    // selection proof needs (row 0: the paired device, row 1: "Pair new
+    // headphones").
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice {
+        addr: [1, 2, 3, 4, 5, 6],
+        name: String::from("Test Headphones"),
+        mru_seq: 1,
+    }));
 
     // Pixel coordinates for row 0's and row 1's selection-highlight fill,
     // per `core/src/render/list.rs` (`ROW_HEIGHT`, row top = chrome
@@ -133,8 +144,8 @@ fn injecting_a_navintent_over_http_moves_the_selection_and_is_observable_in_the_
     // see `pico_link_core::render::home`'s module doc), so the row-
     // selection proof below needs Devices' list underneath it. Centre
     // toggles Home to its menu face (Bluetooth pre-selected), centre
-    // again activates that row, pushing Devices with its own row 0
-    // ("Scan for headphones") pre-selected. ---
+    // again activates that row, pushing Devices with its own row 0 (the
+    // one paired device seeded above) pre-selected. ---
     let (status, body) = post(addr, "/api/input", b"\"Select\"");
     assert_eq!(status, 200, "POST /api/input (Select, Home -> menu face) did not succeed: {}", String::from_utf8_lossy(&body));
     let mut iterations = 0;

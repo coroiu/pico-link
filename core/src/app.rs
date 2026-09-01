@@ -18,19 +18,63 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::convert::Infallible;
 use core::time::Duration;
+
+use embedded_graphics::prelude::Size;
+use embedded_graphics::primitives::Rectangle;
 
 use crate::input::NavIntent;
 use crate::render::home::build_home_screen;
+use crate::render::theme::palette;
 use crate::render::wizard::build_wizard_screen;
-use crate::render::{Action, FrameBuffer565, Instant, ListItem, ListItemKey, Navigator, RenderCtx, Screen, VerticalList};
+use crate::render::{
+    Action, ButtonLabel, ChromeContribution, ConfirmView, FocusEvent, FrameBuffer565, Instant, ListItem, ListItemKey, MenuItem,
+    Navigator, RenderCtx, Screen, VerticalList, Widget,
+};
 
-/// The devices screen's "Scan for headphones" row's identity key. Not
+/// The devices screen's "Pair new headphones" row's identity key (bead
+/// pico-link-4vb.4, design `.planning/design/2026-09-01-remembered-devices.md`
+/// section 4). Replaces the old `SCAN_ROW_KEY` -- the row it names no longer
+/// starts a scan directly (it opens the wizard, or the pick-one-to-forget
+/// flow when the store is full), so the old name was already stale. Not
 /// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
 /// instead — see [`ListItemKey::from`]'s doc comment for why this can
 /// never collide with a real device's key (a device key's top two bytes
-/// are always `0`; this sentinel's are always `0xFF`).
-const SCAN_ROW_KEY: ListItemKey = ListItemKey::from_bytes([0xFF; 8]);
+/// are always `0`; this sentinel's are always `0xFE` -- distinct from the
+/// old `0xFF` sentinel in case any stale carried-forward selection key from
+/// a pre-upgrade build is ever compared against it).
+const PAIR_NEW_ROW_KEY: ListItemKey = ListItemKey::from_bytes([0xFE; 8]);
+
+/// How many devices the flash store can remember (design section 6: slots
+/// `PL:D:0`..`PL:D:7`). The Devices screen gates opening the wizard on this
+/// *before* any radio work (design section 4) -- fullness must be
+/// discoverable without `BTstack` ever attempting a pairing that a full store
+/// would then refuse to persist.
+const MAX_PAIRED_DEVICES: usize = 8;
+
+/// The remembered-device name's on-flash/on-wire cap -- matches
+/// `firmware/src/persist.c`'s `pl_persist_device_record_t::name[32]` and
+/// [`PlConnectPayload::name`]/[`PlPairedDeviceUpsertedPayload::name`]'s wire
+/// buffers exactly (design section 5.1/5.3).
+const MAX_DEVICE_NAME_BYTES: usize = 32;
+
+/// Truncates `name` to at most [`MAX_DEVICE_NAME_BYTES`], respecting a
+/// UTF-8 **character** boundary -- design section 5.3, "Rust owns text; C
+/// owns bytes": `core` is the only side of the FFI seam that can safely
+/// find a char boundary (C only ever sees bytes), so this must happen
+/// before a name is ever placed on a [`Command::Connect`], not after it
+/// crosses into `ui-ffi`'s fixed-size wire buffer.
+pub(crate) fn truncate_device_name(name: &str) -> String {
+    if name.len() <= MAX_DEVICE_NAME_BYTES {
+        return String::from(name);
+    }
+    let mut end = MAX_DEVICE_NAME_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    String::from(&name[..end])
+}
 
 /// Floor applied to [`Widget::redraw_after`]'s returned [`Duration`]
 /// before it is added to `ctx.now()` to produce [`App::next_redraw_at`]
@@ -84,17 +128,6 @@ pub enum LinkState {
     Connected,
 }
 
-impl LinkState {
-    fn label(self) -> &'static str {
-        match self {
-            LinkState::Idle => "Idle",
-            LinkState::Scanning => "Scanning...",
-            LinkState::Connecting => "Connecting...",
-            LinkState::Connected => "Connected",
-        }
-    }
-}
-
 /// One discovered Bluetooth device, as reported by C over
 /// [`Event::DeviceDiscovered`] (`pl_ui_push_event` in the FFI surface).
 /// `addr` is a 6-byte Bluetooth device address, big-endian as BTstack itself
@@ -111,10 +144,25 @@ pub struct DeviceEntry {
 /// [`App::poll_command`] (`pl_ui_poll_command` in the FFI surface). `core`
 /// never acts on these itself -- it has no Bluetooth stack to act with --
 /// it only records "the user asked for this" and hands it back out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// No longer `Copy` as of bead pico-link-4vb.4 (T4) -- [`Command::Connect`]
+/// gained a `String` field (see its own doc comment), which isn't `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     StartScan,
-    Connect { addr: [u8; 6] },
+    /// `name` added by bead pico-link-4vb.4 (T4), design section 5.3
+    /// (alternative A: "name rides on Connect", chosen over a separate
+    /// `SetDeviceName` command sent first -- see that section's cost
+    /// analysis). Already truncated to [`MAX_DEVICE_NAME_BYTES`] on a
+    /// UTF-8 character boundary by [`truncate_device_name`] before this
+    /// variant is ever constructed -- `core` owns text, C only ever sees
+    /// bytes. An empty `name` is a legal, deliberate value for a retry
+    /// reissued from [`WizardPhase::NotResponding`]/[`WizardPhase::Failed`]
+    /// (which carry no name of their own): C's read-modify-write persist
+    /// path (design section 6) treats an empty name as "keep whatever name
+    /// the record already has", so this never regresses an already-known
+    /// name.
+    Connect { addr: [u8; 6], name: String },
     /// User-initiated: stop an in-flight inquiry scan. The wizard screen
     /// (pico-link-znb.7) binds this to B once it exists -- this bead only
     /// delivers the command itself, no binding. Needed because the inquiry
@@ -147,6 +195,15 @@ pub enum Command {
     /// flushes it. `core` has no flash of its own and never writes
     /// anything itself.
     PersistDevice { addr: [u8; 6] },
+    /// User-initiated "forget this remembered device" (bead pico-link-4vb.4,
+    /// T5, design section 5.3) -- the Devices screen's X action on a paired
+    /// row, or the pick-one-to-forget flow's own confirm when the store is
+    /// full. `core` does not remove `addr` from [`BtModel::paired`] itself
+    /// on queuing this -- the single-writer rule (design section 3) means
+    /// `paired` only changes on a real [`Event::PairedDeviceForgotten`]
+    /// echoed back once C's delete (record + link key, design section 6)
+    /// actually lands.
+    ForgetDevice { addr: [u8; 6] },
 }
 
 /// Why a connect attempt failed, as reported by C over
@@ -294,12 +351,51 @@ pub enum Event {
     /// up (see `firmware/src/bt.c`'s `BTSTACK_EVENT_STATE`/
     /// `HCI_STATE_WORKING` case; pushed there rather than at `pl_bt_init`
     /// itself so a queued auto-reconnect can't race `hci_power_control`'s
-    /// own async power-up). `device_addr` is `Some` when a valid device
-    /// record was found -- `core`'s auto-reconnect policy
-    /// ([`App::on_store_loaded`]) queues [`Command::Connect`] for it,
-    /// reusing the exact same command the wizard's own device-row
-    /// activation uses; `core` never opens a connection itself.
-    StoreLoaded { status: StoreStatus, device_addr: Option<[u8; 6]> },
+    /// own async power-up), and always the *terminator* of C's boot push
+    /// sequence: `count` x [`Event::PairedDeviceUpserted`], then this event
+    /// (design section 5.2).
+    ///
+    /// Reshaped by bead pico-link-4vb.4 (T4), design section 5.2 -- the old
+    /// `device_addr: Option<[u8; 6]>` field is REMOVED. That field was C
+    /// DECIDING which device to auto-reconnect to; with eight slots that's
+    /// a real policy, not "the one slot", and design point 7 puts that
+    /// policy on `core`'s side of the seam. `core`'s auto-reconnect policy
+    /// ([`App::on_store_loaded`]) now computes the target itself, once
+    /// every preceding `PairedDeviceUpserted` has folded into
+    /// [`BtModel::paired`]: `paired.iter().max_by_key(|d| d.mru_seq)`,
+    /// queuing [`Command::Connect`] for it -- reusing the exact same
+    /// command the Devices screen's own paired-row activation uses; `core`
+    /// never opens a connection itself.
+    StoreLoaded { status: StoreStatus },
+    /// One remembered (paired) device the flash store holds -- pushed
+    /// either at boot (C's `count` x this event ahead of
+    /// [`Event::StoreLoaded`], design section 5.2) or after a device is
+    /// newly persisted/updated. The single-writer rule (design section 3):
+    /// this is one of exactly two events that mutate [`BtModel::paired`]
+    /// (the other is [`Event::PairedDeviceForgotten`]) -- `core` never
+    /// optimistically appends a row on [`Event::ConnectSucceeded`], because
+    /// then `core`'s list and flash could disagree (a full store, a CRC
+    /// failure, a deferred write) and a row for a device that was never
+    /// actually persisted is exactly the "silently forgot your pairing"
+    /// defect this whole line of work exists to kill. Bead pico-link-4vb.4
+    /// (T4).
+    PairedDeviceUpserted(PairedDevice),
+    /// A remembered device was removed from the flash store (a real
+    /// deletion C echoed back, not merely requested -- see
+    /// [`Command::ForgetDevice`]'s doc comment). The other of the two
+    /// events allowed to mutate [`BtModel::paired`] (design section 3).
+    /// Bead pico-link-4vb.4 (T4).
+    PairedDeviceForgotten { addr: DeviceAddr },
+    /// The flash store refused a save because every slot already held a
+    /// *different* address (design section 3: "must never silently
+    /// evict"). Carries no payload -- there is nothing more specific to
+    /// report than "full". The Devices screen already gates opening the
+    /// wizard on `paired.len() < MAX_PAIRED_DEVICES` before any radio work
+    /// (design section 4), so this is the defensive fallback for a race
+    /// that gate can't fully close (e.g. two connect attempts racing each
+    /// other), not the primary way fullness is discovered. Bead
+    /// pico-link-4vb.4 (T4).
+    PairedStoreFull,
 }
 
 /// Phase 4's four named connect sub-steps (design section 9): naming the
@@ -343,7 +439,7 @@ impl ConnectStep {
 /// core knows about the Bluetooth link and discovered devices", while this
 /// is "which of the wizard's six phases is currently on screen and that
 /// phase's own local data" -- e.g. the scan list itself lives in
-/// `BtModel::devices` (read live, not duplicated here), but "the user is
+/// `BtModel::discovered` (read live, not duplicated here), but "the user is
 /// on the not-responding screen, this is attempt 3" has no other home.
 ///
 /// Deliberately carries its own `addr`/`reason` on the phases that need
@@ -358,7 +454,7 @@ pub enum WizardPhase {
     /// Phase 1 (formerly "instructions", now removed -- pico-link-4vb.2:
     /// Andreas wanted the wizard to open straight into scanning rather
     /// than requiring an A press first). Scanning (10.24s, C-timed)
-    /// and/or showing whatever's accumulated in `BtModel::devices` so far
+    /// and/or showing whatever's accumulated in `BtModel::discovered` so far
     /// -- this phase covers both "still actively scanning" and "scan
     /// finished, results on screen, user is choosing one", since nothing
     /// about the rendered content differs between them. `started` is when
@@ -468,7 +564,34 @@ pub enum HomeFace {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BtModel {
     pub link_state: LinkState,
-    pub devices: Vec<DeviceEntry>,
+    /// Inquiry-scan results. **Wizard-only reader** -- renamed from
+    /// `devices` by bead pico-link-4vb.4 (T4), design section 3: the rename
+    /// is the point, not cosmetics, because it turns "the Devices screen
+    /// reads scan results" from a habit into a compile error. Mutated only
+    /// by [`App::add_device`]/[`App::clear_devices`] (via
+    /// [`Event::DeviceDiscovered`]/[`Event::DevicesCleared`]).
+    pub discovered: Vec<DeviceEntry>,
+    /// Remembered (paired) devices, restored from C's flash store --
+    /// **Devices-screen-only reader** (design section 4). The single
+    /// source of truth is C's flash: `core` never invents a row here, and
+    /// mutates this list only by folding [`Event::PairedDeviceUpserted`]/
+    /// [`Event::PairedDeviceForgotten`] -- see those variants' doc comments
+    /// for the single-writer rule (design section 3). Deliberately carries
+    /// no codec/volume/preset fields -- those are per-device *settings*
+    /// with no screen yet (Tier 2, design section 9's task table), and
+    /// their flash bytes are already reserved; adding model fields nobody
+    /// reads would be gold-plating. Bead pico-link-4vb.4 (T4).
+    pub paired: Vec<PairedDevice>,
+    /// Which [`PairedDevice::addr`] (if any) the live A2DP link is
+    /// currently connected to -- lets the Devices screen pin that device
+    /// at the top (design section 4). Set by [`App::on_connect_succeeded`]
+    /// and cleared by [`App::set_link_state`] whenever the link leaves
+    /// [`LinkState::Connected`], the exact same lifecycle
+    /// [`BtModel::connected_codec`] already follows and for the same
+    /// reason (see that field's doc comment) -- every path off `Connected`
+    /// already flows through `set_link_state`, so this can't race a
+    /// disconnect C forgot to send. Bead pico-link-4vb.4 (T4/T5).
+    pub connected_addr: Option<DeviceAddr>,
     /// The most recent connect failure, if any (and not yet superseded by
     /// a new attempt). Not yet rendered by any screen in this bead's scope
     /// -- populated so the data exists and is representable ahead of the
@@ -492,11 +615,41 @@ pub struct BtModel {
     /// mirroring `last_connect_failure`'s own "populated ahead of its
     /// screen" precedent above.
     pub store_status: Option<StoreStatus>,
+    /// Whether the flash store most recently refused a save because every
+    /// slot held a different address (see [`Event::PairedStoreFull`]'s doc
+    /// comment). Not yet rendered by any screen -- the Devices screen
+    /// already gates pairing on `paired.len() < MAX_PAIRED_DEVICES` before
+    /// any radio work, so this is populated ahead of the screen that will
+    /// eventually surface the race this can't fully close, mirroring
+    /// `last_connect_failure`/`store_status`'s own precedent above. Bead
+    /// pico-link-4vb.4 (T4).
+    pub store_full: bool,
 }
 
 /// A Bluetooth device address, aliased for readability at call sites that
 /// pair it with a [`ConnectFailureReason`].
 pub type DeviceAddr = [u8; 6];
+
+/// One remembered (paired) device, as reported by C over
+/// [`Event::PairedDeviceUpserted`] -- restored from the flash store at boot
+/// or freshly persisted after a successful pairing. Bead pico-link-4vb.4
+/// (T4), design `.planning/design/2026-09-01-remembered-devices.md`
+/// section 3.
+///
+/// Deliberately carries no codec/volume/flags/preset fields -- see
+/// [`BtModel::paired`]'s doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedDevice {
+    pub addr: DeviceAddr,
+    /// Possibly empty -- rendered `(unknown device)` plus the address's
+    /// last three bytes as the discriminator (design section 4/13).
+    pub name: String,
+    /// Monotonic use-sequence C assigns (never a wall clock -- this board
+    /// has no RTC). The Devices screen's ordering key (design section 4:
+    /// MRU-descending), and what [`App::on_store_loaded`]'s auto-reconnect
+    /// policy maximizes over.
+    pub mru_seq: u32,
+}
 
 /// The live A2DP link's negotiated codec, as reported by C over
 /// [`Event::CodecChanged`] (`pl_ui_push_event` in the FFI surface, fired
@@ -529,26 +682,6 @@ pub struct ConnectedCodec {
     pub nominal_bitrate_bps: u32,
 }
 
-/// Builds the devices screen: a "Scan for headphones" row (its sublabel is
-/// the live [`LinkState`] label) followed by one row per discovered
-/// [`DeviceEntry`]. Selecting the scan row queues [`Command::StartScan`];
-/// selecting a device row queues [`Command::Connect`] with that device's
-/// address. Rebuilt from scratch on every state change (see
-/// [`App::rebuild_root`]) rather than mutated in place -- simplest correct
-/// thing for a list this small, and it keeps the closures below trivially
-/// `'static` (each rebuild captures a fresh, owned snapshot).
-///
-/// Every row carries a [`ListItemKey`] -- [`SCAN_ROW_KEY`] for the fixed
-/// scan row, `device.addr` (via `From<[u8; 6]>`) for a device row -- so
-/// `prev_key`/`prev_index` (the outgoing screen's
-/// [`Navigator::root_selected_key`]/[`Navigator::root_selected_index`])
-/// can carry the user's selection forward **by identity** through
-/// [`VerticalList::with_selected_identity`]: a device arriving, being
-/// renamed in place, or a stale one dropping out of `model.devices` no
-/// longer moves the selection just because the *index* it used to occupy
-/// now means something else. `prev_key` of `None`/not-found falls back to
-/// clamping `prev_index` -- see that method's doc comment for the exact
-/// rule. `(None, 0)` (first build) starts at row 0.
 /// The Devices screen's fixed title -- previously "Pico Link" from back
 /// when this screen was the navigator root (pre-`pico-link-znb.8`/E7);
 /// renamed now that it's reached by "A"/the menu face's "Bluetooth" row
@@ -561,6 +694,39 @@ pub struct ConnectedCodec {
 /// WIZARD_TITLE`] already uses one level up.
 pub(crate) const DEVICES_TITLE: &str = "Devices";
 
+/// A paired device's display label -- its name, or, if C never reported one
+/// (or it hasn't resolved yet), `(unknown device)` plus the address's last
+/// three bytes as the discriminator (design section 4/13's rule that a
+/// nameless row must still be distinguishable from every other nameless
+/// row).
+fn paired_device_label(device: &PairedDevice) -> String {
+    if device.name.is_empty() {
+        format!("(unknown device) {:02X}:{:02X}:{:02X}", device.addr[3], device.addr[4], device.addr[5])
+    } else {
+        device.name.clone()
+    }
+}
+
+/// Builds the devices screen (bead pico-link-4vb.4, T5, design section 4):
+/// the connected device (if any) pinned first, sublabelled `Connected`;
+/// then every other paired device, MRU-descending, sublabelled `Paired`;
+/// then `Pair new headphones` last. **No RSSI, no address, no availability
+/// dot** -- design section 4/18: never claim availability that hasn't been
+/// verified, and the recurring "switch device" job belongs under the
+/// cursor while the rare "pair a new one" job belongs at the end.
+///
+/// Replaces the old scan-result rendering entirely -- see
+/// [`BtModel::discovered`]/[`BtModel::paired`]'s doc comments for the
+/// "wizard-only" / "Devices-screen-only" reader split this enforces.
+///
+/// Every row carries a [`ListItemKey`] (`device.addr` via `From<[u8; 6]>`,
+/// or [`PAIR_NEW_ROW_KEY`] for the fixed last row) so `prev_key`/
+/// `prev_index` can carry the user's selection forward **by identity**
+/// through [`VerticalList::with_selected_identity`] -- a device arriving,
+/// being renamed in place, reordering by a fresh `mru_seq`, or dropping out
+/// entirely no longer moves the selection just because the *index* it used
+/// to occupy now means something else. `prev_key` of `None`/not-found
+/// falls back to clamping `prev_index` -- see that method's doc comment.
 pub(crate) fn build_devices_screen(
     model: &BtModel,
     prev_key: Option<ListItemKey>,
@@ -569,58 +735,203 @@ pub(crate) fn build_devices_screen(
     wizard_phase: &Rc<RefCell<WizardPhase>>,
     wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
 ) -> Screen {
-    let mut items =
-        vec![ListItem::new("Scan for headphones").with_sublabel(model.link_state.label()).with_key(SCAN_ROW_KEY)];
-    if model.devices.is_empty() {
-        // A single-row list has nowhere for Up/Down to move the selection
-        // to, which also reads as a dead screen to a first-time user --
-        // an explicit "nothing found yet" row keeps the list navigable
-        // and communicates the empty state instead of just looking inert.
-        // No key: it's a transient placeholder, not a persistent entity
-        // worth carrying a selection onto.
-        items.push(ListItem::new("No devices found").with_sublabel("Select Scan to search"));
-    }
-    for device in &model.devices {
-        let label = if device.name.is_empty() { String::from("(unknown device)") } else { device.name.clone() };
-        let sublabel = format!(
-            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}  RSSI {}",
-            device.addr[0], device.addr[1], device.addr[2], device.addr[3], device.addr[4], device.addr[5], device.rssi
-        );
-        items.push(ListItem::new(label).with_sublabel(sublabel).with_key(ListItemKey::from(device.addr)));
-    }
+    let connected = model.connected_addr.and_then(|addr| model.paired.iter().find(|d| d.addr == addr));
+    let mut others: Vec<&PairedDevice> =
+        model.paired.iter().filter(|d| Some(d.addr) != model.connected_addr).collect();
+    others.sort_by_key(|d| core::cmp::Reverse(d.mru_seq));
 
-    let devices_snapshot: Vec<DeviceEntry> = model.devices.clone();
+    let mut ordered: Vec<PairedDevice> = Vec::with_capacity(model.paired.len());
+    if let Some(device) = connected {
+        ordered.push(device.clone());
+    }
+    ordered.extend(others.into_iter().cloned());
+
+    let mut items: Vec<ListItem> = ordered
+        .iter()
+        .map(|device| {
+            let sublabel = if Some(device.addr) == model.connected_addr { "Connected" } else { "Paired" };
+            ListItem::new(paired_device_label(device)).with_sublabel(sublabel).with_key(ListItemKey::from(device.addr))
+        })
+        .collect();
+    items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY));
+
+    let paired_len = model.paired.len();
+    let connected_addr = model.connected_addr;
+    let ordered_for_activate = ordered.clone();
+    let paired_for_full = model.paired.clone();
     let commands_for_activate = Rc::clone(commands);
     let wizard_phase_for_activate = Rc::clone(wizard_phase);
     let wizard_devices_for_activate = Rc::clone(wizard_devices);
     let list = VerticalList::new(items)
         .on_activate_index(move |index| {
-            if index == 0 {
-                // pico-link-4vb.2: selecting "Scan" opens the pairing
-                // wizard straight into phase 2 (scanning) and queues
-                // `Command::StartScan` immediately -- the old instructions
-                // phase 1 (press A to start) is gone; the user shouldn't
-                // have to press anything before scanning begins. Resetting
-                // `wizard_phase`/`wizard_devices` here (rather than only
-                // when the wizard widget itself is constructed) covers
-                // re-opening the wizard after a previous session ended in
-                // a terminal phase (Succeeded/Failed/NothingFound) --
-                // without this the wizard would briefly flash its last
-                // outcome before the scan result replaces it.
+            if let Some(device) = ordered_for_activate.get(index) {
+                if Some(device.addr) == connected_addr {
+                    // A on the connected row: no reconnect to do -- push
+                    // the stub device-detail screen, the same
+                    // labelled-row-needs-a-destination precedent
+                    // `build_settings_screen` set (design section 4).
+                    let title = paired_device_label(device);
+                    return Action::PushView(Box::new(move || build_device_detail_screen(title)));
+                }
+                // A on any other paired row: switch to it, reusing the
+                // wizard (design section 4/S8) -- `Command::Connect` +
+                // pushing straight into `Connecting`, no new phase.
+                commands_for_activate
+                    .borrow_mut()
+                    .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
+                *wizard_phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
+                let phase = Rc::clone(&wizard_phase_for_activate);
+                let devices = Rc::clone(&wizard_devices_for_activate);
+                let commands = Rc::clone(&commands_for_activate);
+                return Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)));
+            }
+            // "Pair new headphones", the fixed last row. Gated on capacity
+            // *before* any radio work (design section 4): under the cap,
+            // open the wizard exactly as before; at the cap, open the
+            // pick-one-to-forget flow instead.
+            if paired_len < MAX_PAIRED_DEVICES {
                 *wizard_phase_for_activate.borrow_mut() = WizardPhase::scanning_pending();
                 wizard_devices_for_activate.borrow_mut().clear();
                 commands_for_activate.borrow_mut().push_back(Command::StartScan);
                 let phase = Rc::clone(&wizard_phase_for_activate);
                 let devices = Rc::clone(&wizard_devices_for_activate);
                 let commands = Rc::clone(&commands_for_activate);
-                return Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)));
-            } else if let Some(device) = devices_snapshot.get(index - 1) {
-                commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
+                Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)))
+            } else {
+                let paired = paired_for_full.clone();
+                let commands = Rc::clone(&commands_for_activate);
+                Action::PushView(Box::new(move || build_forget_picker_screen(paired, commands)))
             }
-            Action::None
         })
         .with_selected_identity(prev_key, prev_index);
-    Screen::new(DEVICES_TITLE, vec![Box::new(list)])
+
+    let view = DevicesListView { list, row_devices: ordered, commands: Rc::clone(commands) };
+    Screen::new(DEVICES_TITLE, vec![Box::new(view)])
+}
+
+/// Wraps [`VerticalList`] to add the Devices screen's X action (design
+/// section 4: "X opens a forget confirm") on top of it -- `VerticalList`
+/// itself has no opinion about `ShortcutX` (see `crate::input::NavIntent::
+/// ShortcutX`'s doc comment), so this is the same "small wrapper widget
+/// intercepts one `NavIntent` variant, delegates the rest" shape
+/// `crate::render::wizard::PairingWizardView` already uses for its own
+/// phase-specific `ShortcutX` handling.
+struct DevicesListView {
+    list: VerticalList,
+    /// Parallel to `list`'s rows *up to* the fixed "Pair new headphones"
+    /// row (which carries no entry here) -- lets `on_intent` map the
+    /// currently selected index back to a real device without needing a
+    /// `ListItemKey` -> address lookup.
+    row_devices: Vec<PairedDevice>,
+    commands: Rc<RefCell<VecDeque<Command>>>,
+}
+
+impl Widget for DevicesListView {
+    fn measure(&self, constraints: Size, ctx: &RenderCtx) -> Size {
+        self.list.measure(constraints, ctx)
+    }
+
+    fn is_focusable(&self) -> bool {
+        self.list.is_focusable()
+    }
+
+    fn on_focus(&mut self, event: FocusEvent) -> Action {
+        self.list.on_focus(event)
+    }
+
+    fn on_intent(&mut self, intent: NavIntent) -> Action {
+        if intent == NavIntent::ShortcutX {
+            let index = self.list.selected_index();
+            return if let Some(device) = self.row_devices.get(index) {
+                let addr = device.addr;
+                let label = paired_device_label(device);
+                let commands = Rc::clone(&self.commands);
+                Action::PushView(Box::new(move || build_forget_confirm_screen(addr, &label, commands)))
+            } else {
+                // The fixed "Pair new headphones" row has nothing to forget.
+                Action::None
+            };
+        }
+        self.list.on_intent(intent)
+    }
+
+    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
+        let index = self.list.selected_index();
+        let x = if index < self.row_devices.len() {
+            ButtonLabel::Live(String::from("forget"))
+        } else {
+            ButtonLabel::Inert
+        };
+        Some(ChromeContribution { x: Some(x), ..ChromeContribution::default() })
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        Some(self.list.selected_index())
+    }
+
+    fn selected_key(&self) -> Option<ListItemKey> {
+        self.list.selected_key()
+    }
+
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+        self.list.render(area, ctx, target)
+    }
+}
+
+/// The pick-one-to-forget screen (design section 4): reached only when
+/// `Pair new headphones` is activated while `paired.len() ==
+/// MAX_PAIRED_DEVICES` -- fullness discovered and resolved entirely
+/// before any radio work. Every row pushes the same
+/// [`build_forget_confirm_screen`] a device row's X action does.
+const FORGET_PICKER_TITLE: &str = "Pick one to forget";
+
+fn build_forget_picker_screen(paired: Vec<PairedDevice>, commands: Rc<RefCell<VecDeque<Command>>>) -> Screen {
+    let items: Vec<ListItem> =
+        paired.iter().map(|device| ListItem::new(paired_device_label(device)).with_key(ListItemKey::from(device.addr))).collect();
+    let paired_for_activate = paired;
+    let list = VerticalList::new(items).on_activate_index(move |index| {
+        if let Some(device) = paired_for_activate.get(index) {
+            let addr = device.addr;
+            let label = paired_device_label(device);
+            let commands = Rc::clone(&commands);
+            return Action::PushView(Box::new(move || build_forget_confirm_screen(addr, &label, commands)));
+        }
+        Action::None
+    });
+    Screen::new(FORGET_PICKER_TITLE, vec![Box::new(list)])
+}
+
+/// The forget-confirmation screen -- destructive-action confirm, per
+/// [`ConfirmView`]'s own precedent (design section 4's X action, and the
+/// pick-one-to-forget flow above). Cancel is row 0 (the safe default);
+/// Forget is row 1, styled in [`palette::STATUS_ERROR`], and is the only
+/// row that queues [`Command::ForgetDevice`] -- `core` does not remove
+/// `addr` from [`BtModel::paired`] itself (see that command's doc comment
+/// for the single-writer rule this preserves).
+const FORGET_CONFIRM_TITLE: &str = "Forget device?";
+
+fn build_forget_confirm_screen(addr: DeviceAddr, label: &str, commands: Rc<RefCell<VecDeque<Command>>>) -> Screen {
+    let headline = format!("Forget {label}?");
+    let rows = vec![MenuItem::new("Cancel"), MenuItem::new("Forget").with_label_color(palette::STATUS_ERROR)];
+    let view = ConfirmView::new(headline, rows).on_activate_index(move |index| {
+        if index == 1 {
+            commands.borrow_mut().push_back(Command::ForgetDevice { addr });
+        }
+        Action::PopView
+    });
+    Screen::new(FORGET_CONFIRM_TITLE, vec![Box::new(view)])
+}
+
+/// The connected device's detail screen -- a stub, per the exact precedent
+/// [`build_settings_screen`] set for the Settings row (design section 4: a
+/// labelled, reachable row must have *somewhere* to go; its real content is
+/// design section 10's job, not this bead's). `title` is the device's own
+/// display label (its name, or the `(unknown device)` fallback), matching
+/// [`ChromeContribution::title`]'s override precedent used elsewhere for a
+/// detail view showing its own item's identity instead of a screen-level
+/// static title.
+fn build_device_detail_screen(title: String) -> Screen {
+    Screen::new(title, vec![])
 }
 
 /// The Settings screen's fixed title. Placeholder content only (no rows)
@@ -693,7 +1004,7 @@ pub struct App {
     /// pushing" at the state level: no `Navigator` stack operation is
     /// involved in a phase advance at all, pushing or otherwise.
     wizard_phase: Rc<RefCell<WizardPhase>>,
-    /// A live mirror of `model.devices`, shared with the wizard widget the
+    /// A live mirror of `model.discovered`, shared with the wizard widget the
     /// same way `wizard_phase` is -- kept in lockstep by [`App::add_device`]/
     /// [`App::clear_devices`] purely so the wizard's scan-list rendering
     /// doesn't need a borrowed reference into `App` itself (which nothing
@@ -829,7 +1140,10 @@ impl App {
             Event::ConnectSucceeded { addr, degraded } => self.on_connect_succeeded(addr, degraded),
             Event::WizardAutoDismiss => self.on_wizard_auto_dismiss(),
             Event::CodecChanged(codec) => self.set_connected_codec(codec),
-            Event::StoreLoaded { status, device_addr } => self.on_store_loaded(status, device_addr),
+            Event::StoreLoaded { status } => self.on_store_loaded(status),
+            Event::PairedDeviceUpserted(device) => self.on_paired_device_upserted(device),
+            Event::PairedDeviceForgotten { addr } => self.on_paired_device_forgotten(addr),
+            Event::PairedStoreFull => self.on_paired_store_full(),
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -935,25 +1249,63 @@ impl App {
     /// never touches `WizardPhase` at all).
     fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
         self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
+        self.model.connected_addr = Some(addr);
         *self.wizard_phase.borrow_mut() = WizardPhase::Succeeded { degraded };
         self.dirty = true;
     }
 
     /// Folds one [`Event::StoreLoaded`] -- records `status` in [`BtModel`]
-    /// and, if a device was found, queues [`Command::Connect`] for it (the
-    /// auto-reconnect policy itself: reusing the exact command the wizard's
-    /// device-row activation already uses, per design point 7 -- `core`
-    /// decides, C only loads/stages/flushes). Does not touch the wizard or
-    /// rebuild the root screen -- this fires once at boot, before the user
-    /// has done anything, and the queued `Connect` drives the same
-    /// `LinkStateChanged`/`ConnectStepChanged`/`ConnectSucceeded` event
-    /// flow a manual connect would, which is what actually updates the UI
-    /// as the auto-reconnect proceeds.
-    fn on_store_loaded(&mut self, status: StoreStatus, device_addr: Option<[u8; 6]>) {
+    /// and runs the auto-reconnect policy: `core` decides *whether* and
+    /// *which* device to reconnect to, C only loads/stages/flushes (design
+    /// point 7). Reshaped by bead pico-link-4vb.4 (T4), design section 5.2:
+    /// this event no longer carries an address -- by the time it arrives,
+    /// every `Event::PairedDeviceUpserted` C pushed ahead of it (its own
+    /// boot sequence's `count` records) has already folded into
+    /// [`BtModel::paired`] (see [`App::on_paired_device_upserted`]), so the
+    /// target is simply the highest `mru_seq` in that list. Queues the
+    /// exact same [`Command::Connect`] a manual paired-row activation uses.
+    /// Does not touch the wizard or rebuild the root screen -- this fires
+    /// once at boot, before the user has done anything, and the queued
+    /// `Connect` drives the same `LinkStateChanged`/`ConnectStepChanged`/
+    /// `ConnectSucceeded` event flow a manual connect would, which is what
+    /// actually updates the UI as the auto-reconnect proceeds.
+    fn on_store_loaded(&mut self, status: StoreStatus) {
         self.model.store_status = Some(status);
-        if let Some(addr) = device_addr {
-            self.commands.borrow_mut().push_back(Command::Connect { addr });
+        if let Some(device) = self.model.paired.iter().max_by_key(|d| d.mru_seq) {
+            let addr = device.addr;
+            let name = truncate_device_name(&device.name);
+            self.commands.borrow_mut().push_back(Command::Connect { addr, name });
         }
+    }
+
+    /// Folds one [`Event::PairedDeviceUpserted`] into [`BtModel::paired`] --
+    /// update-in-place if `addr` is already known (a rename, an `mru_seq`
+    /// bump), append otherwise. One of exactly two writers of `paired`
+    /// (design section 3's single-writer rule -- see that event's doc
+    /// comment). Bead pico-link-4vb.4 (T4).
+    fn on_paired_device_upserted(&mut self, device: PairedDevice) {
+        if let Some(existing) = self.model.paired.iter_mut().find(|d| d.addr == device.addr) {
+            *existing = device;
+        } else {
+            self.model.paired.push(device);
+        }
+        self.rebuild_root();
+    }
+
+    /// Folds one [`Event::PairedDeviceForgotten`] into [`BtModel::paired`] --
+    /// the other of the two writers (design section 3). A no-op if `addr`
+    /// isn't currently known (e.g. a stray/duplicate echo).
+    fn on_paired_device_forgotten(&mut self, addr: DeviceAddr) {
+        self.model.paired.retain(|d| d.addr != addr);
+        self.rebuild_root();
+    }
+
+    /// Folds one [`Event::PairedStoreFull`] -- see that event's and
+    /// [`BtModel::store_full`]'s doc comments for why this is populated
+    /// ahead of any screen actually reading it.
+    fn on_paired_store_full(&mut self) {
+        self.model.store_full = true;
+        self.dirty = true;
     }
 
     /// Folds one [`Event::WizardAutoDismiss`] -- pops all the way back to
@@ -993,6 +1345,10 @@ impl App {
         self.model.link_state = state;
         if state != LinkState::Connected {
             self.model.connected_codec = None;
+            // `connected_addr` (bead pico-link-4vb.4, T5) follows the exact
+            // same lifecycle as `connected_codec`, for the same reason --
+            // see `BtModel::connected_addr`'s doc comment.
+            self.model.connected_addr = None;
         }
         self.rebuild_root();
     }
@@ -1012,23 +1368,23 @@ impl App {
     /// rather than appending a duplicate row: BTstack's inquiry reports the
     /// same device repeatedly as its RSSI/name resolve.
     pub fn add_device(&mut self, addr: [u8; 6], name: String, rssi: i8) {
-        if let Some(existing) = self.model.devices.iter_mut().find(|d| d.addr == addr) {
+        if let Some(existing) = self.model.discovered.iter_mut().find(|d| d.addr == addr) {
             existing.name = name;
             existing.rssi = rssi;
         } else {
-            self.model.devices.push(DeviceEntry { addr, name, rssi });
+            self.model.discovered.push(DeviceEntry { addr, name, rssi });
         }
-        // Kept in lockstep with `model.devices` -- see `wizard_devices`'s
+        // Kept in lockstep with `model.discovered` -- see `wizard_devices`'s
         // doc comment on why the wizard widget needs its own mirror
         // rather than a borrow into `self.model`.
-        self.wizard_devices.borrow_mut().clone_from(&self.model.devices);
+        self.wizard_devices.borrow_mut().clone_from(&self.model.discovered);
         self.rebuild_root();
     }
 
     /// Clears the discovered-device list, e.g. at the start of a fresh
     /// scan.
     pub fn clear_devices(&mut self) {
-        self.model.devices.clear();
+        self.model.discovered.clear();
         self.wizard_devices.borrow_mut().clear();
         self.rebuild_root();
     }
@@ -1046,8 +1402,8 @@ impl App {
         // `ConnectFailed` with the wizard closed or already past this
         // attempt just sets a phase nothing is currently rendering, which
         // is harmless and gets overwritten the next time the wizard opens
-        // (`build_devices_screen`'s row-0 activation resets it to
-        // `WizardPhase::scanning_pending`).
+        // (`build_devices_screen`'s "Pair new headphones" row activation
+        // resets it to `WizardPhase::scanning_pending`).
         *self.wizard_phase.borrow_mut() = WizardPhase::Failed { addr, reason };
         self.rebuild_root();
     }
@@ -1307,6 +1663,10 @@ mod tests {
         // Home's status face has no focusable list of its own (Up/Down
         // is unbound there in Tier 1 -- see `render::home`'s module doc),
         // so this proof needs the Devices screen's list underneath it.
+        // Bead pico-link-4vb.4 (T5): with nothing remembered, Devices has
+        // only one row ("Pair new headphones") and Down has nowhere to go
+        // -- one paired device gives it a second row to move onto.
+        app.handle_event(upsert([1, 2, 3, 4, 5, 6], "Test Headphones", 1));
         open_devices(&mut app);
 
         // x=200: past the chip/accent area and these short labels' text,
@@ -1366,113 +1726,225 @@ mod tests {
         assert_eq!(app.current_screen_title(), "detail");
     }
 
+    /// Bead pico-link-4vb.4 (T5): the Devices screen no longer reads
+    /// `BtModel::discovered` (the wizard's own scan list, see that field's
+    /// doc comment) -- it reads `BtModel::paired`, mutated only by
+    /// [`Event::PairedDeviceUpserted`]/[`Event::PairedDeviceForgotten`].
+    /// Shorthand for building one such event in these tests.
+    fn upsert(addr: [u8; 6], name: &str, mru_seq: u32) -> Event {
+        Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq })
+    }
+
     #[test]
-    fn a_device_arriving_mid_navigation_does_not_reset_the_devices_screens_selection() {
+    fn a_paired_device_upserted_mid_navigation_does_not_reset_the_devices_screens_selection() {
         let mut app = App::new(240, 240);
+        // MRU-descending (design section 4): B (seq 2) sorts above A (seq 1).
+        // Upserted BEFORE opening Devices so the screen's very first build
+        // already reflects them -- Home's Bluetooth row always opens
+        // Devices with `(prev_key: None, prev_index: 0)`, so starting
+        // selection is row 0 of whatever the model holds at that moment.
+        app.handle_event(upsert([1, 1, 1, 1, 1, 1], "Device A", 1));
+        app.handle_event(upsert([2, 2, 2, 2, 2, 2], "Device B", 2));
         open_devices(&mut app);
-        // Two devices so there's a non-zero selection to move to and lose.
-        app.add_device([1, 1, 1, 1, 1, 1], String::from("Device A"), -50);
-        app.add_device([2, 2, 2, 2, 2, 2], String::from("Device B"), -60);
 
-        // Devices list rows: 0 = "Scan for headphones", 1 = Device A, 2 = Device B.
-        app.handle_input(vec![NavIntent::Down, NavIntent::Down]);
-        assert_eq!(app.devices_selected_index_for_test(), Some(2), "selection should be on Device B's row");
+        // Devices rows: 0 = Device B, 1 = Device A, 2 = "Pair new headphones".
+        app.handle_input(vec![NavIntent::Down]);
+        assert_eq!(app.devices_selected_index_for_test(), Some(1), "selection should be on Device A's row");
 
-        // A third device arriving must not snap the selection back to row 0
-        // -- proving `App::rebuild_root`'s `Navigator::replace_at(1, ...)`
-        // path (added alongside `replace_root` by `pico-link-znb.8`/E7,
-        // since Devices is no longer the root itself) carries the
-        // selection forward exactly the way `replace_root` always has.
-        app.add_device([3, 3, 3, 3, 3, 3], String::from("Device C"), -70);
-        assert_eq!(app.devices_selected_index_for_test(), Some(2), "a new device must not reset the user's selection");
+        // A third device, sorting below both, must not snap the selection
+        // back to row 0 -- proving `App::rebuild_root`'s
+        // `Navigator::replace_at(1, ...)` path carries the selection
+        // forward the way `replace_root` always has.
+        app.handle_event(upsert([3, 3, 3, 3, 3, 3], "Device C", 0));
+        assert_eq!(app.devices_selected_index_for_test(), Some(1), "a new device must not reset the user's selection");
 
         // Same for a link-state change while browsing.
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
-        assert_eq!(app.devices_selected_index_for_test(), Some(2), "a link-state change must not reset the user's selection");
+        assert_eq!(app.devices_selected_index_for_test(), Some(1), "a link-state change must not reset the user's selection");
     }
 
-    // --- pico-link-znb.4: selection carried by identity, not index ---
+    // --- pico-link-znb.4 / pico-link-4vb.4: selection carried by identity, not index ---
     //
-    // `a_device_arriving_mid_navigation_does_not_reset_the_devices_screens_
-    // selection` above already proves the *index* doesn't move when the
-    // App's own append-only device order (design section 9 rule 1: stable
-    // sort, first-seen order, append at bottom, never re-sort by RSSI)
-    // happens not to disturb it. These go one step further: they assert
-    // the selection resolves to the *same device address* (not just the
-    // same index -- proving the identity-key path, not an accident of
-    // append-only ordering), and cover the update-in-place and
-    // selection-vanishes cases the design also calls out. The "a new row
-    // gets inserted *before* the selected one" stress case -- which App's
-    // append-only ordering can never itself produce -- is exercised
-    // directly against `VerticalList::with_selected_identity` in
-    // `render::list::tests` instead, since that's the widget-level
-    // mechanism this all rests on and the ordering rule App builds atop it
-    // makes it unreachable at this level by design.
+    // These prove the selection resolves to the *same device address* (not
+    // just the same index), across exactly the cases the design calls out:
+    // reordering by a fresh `mru_seq` (which the old append-only scan list
+    // could never produce, since MRU sorting is new to this bead), an
+    // update-in-place rename, and a forgotten device vanishing.
 
     #[test]
-    fn selecting_a_device_survives_further_devices_arriving_identified_by_address_not_just_index() {
+    fn selecting_a_paired_device_survives_reordering_identified_by_address_not_just_index() {
         let mut app = App::new(240, 240);
-        open_devices(&mut app);
         let device_a = [1, 1, 1, 1, 1, 1];
-        app.add_device(device_a, String::from("Device A"), -50);
+        app.handle_event(upsert(device_a, "Device A", 1));
+        open_devices(&mut app);
 
-        // Devices rows: 0 = Scan, 1 = Device A. Select Device A.
-        app.handle_input(vec![NavIntent::Down]);
-        assert_eq!(app.devices_selected_index_for_test(), Some(1));
-        assert_eq!(app.model().devices[0].addr, device_a);
+        // Devices rows: 0 = Device A, 1 = "Pair new headphones" -- default
+        // selection starts at row 0, already Device A.
+        assert_eq!(app.devices_selected_index_for_test(), Some(0));
+        assert_eq!(app.model().paired[0].addr, device_a);
 
-        app.add_device([2, 2, 2, 2, 2, 2], String::from("Device B"), -60);
-        app.add_device([3, 3, 3, 3, 3, 3], String::from("Device C"), -70);
+        // Two more devices, with HIGHER mru_seq, push Device A down the list.
+        app.handle_event(upsert([2, 2, 2, 2, 2, 2], "Device B", 5));
+        app.handle_event(upsert([3, 3, 3, 3, 3, 3], "Device C", 6));
 
+        // Rows now: 0 = C (6), 1 = B (5), 2 = A (1), 3 = Pair new.
         let selected = app.devices_selected_index_for_test().expect("a device must still be selected");
-        assert_eq!(
-            app.model().devices[selected - 1].addr,
-            device_a,
-            "the selected row must still resolve to Device A's address, not merely the same index"
-        );
+        assert_eq!(selected, 2, "the selection must follow Device A's address even though it moved rows");
     }
 
     #[test]
-    fn a_late_name_for_an_already_listed_device_replaces_its_row_in_place() {
+    fn a_paired_device_upserted_for_a_known_addr_updates_its_row_in_place() {
         let mut app = App::new(240, 240);
-        open_devices(&mut app);
         let addr = [7, 7, 7, 7, 7, 7];
-        app.add_device(addr, String::new(), -55); // nameless first report
+        app.handle_event(upsert(addr, "", 1)); // nameless first report
+        open_devices(&mut app);
 
-        app.handle_input(vec![NavIntent::Down]); // select the device row
-        assert_eq!(app.devices_selected_index_for_test(), Some(1));
+        assert_eq!(app.devices_selected_index_for_test(), Some(0));
 
-        // The name resolves later, same address.
-        app.add_device(addr, String::from("Sony WH-1000XM5"), -55);
+        // The name resolves later, same address, higher mru_seq.
+        app.handle_event(upsert(addr, "Sony WH-1000XM5", 2));
 
-        assert_eq!(app.model().devices.len(), 1, "a late name must update the existing row, not append a second one");
-        assert_eq!(app.model().devices[0].name, "Sony WH-1000XM5");
-        assert_eq!(app.devices_selected_index_for_test(), Some(1), "the late name must not disturb the selection");
+        assert_eq!(app.model().paired.len(), 1, "a re-upsert for a known addr must update the existing row, not append a second one");
+        assert_eq!(app.model().paired[0].name, "Sony WH-1000XM5");
+        assert_eq!(app.devices_selected_index_for_test(), Some(0), "the update must not disturb the selection");
     }
 
     #[test]
-    fn the_selected_devices_disappearing_clamps_selection_instead_of_resetting_to_row_zero() {
+    fn forgetting_the_selected_paired_device_clamps_selection_instead_of_resetting_to_row_zero() {
         let mut app = App::new(240, 240);
+        let addr_a = [1, 1, 1, 1, 1, 1];
+        let addr_b = [2, 2, 2, 2, 2, 2];
+        app.handle_event(upsert(addr_a, "Device A", 2));
+        app.handle_event(upsert(addr_b, "Device B", 1));
         open_devices(&mut app);
-        app.add_device([1, 1, 1, 1, 1, 1], String::from("Device A"), -50);
+
+        // Rows: 0 = A, 1 = B, 2 = Pair new. Select B.
         app.handle_input(vec![NavIntent::Down]);
         assert_eq!(app.devices_selected_index_for_test(), Some(1));
 
-        // The selected device drops out of the model entirely (e.g. a
-        // future timeout/removal path -- simulated here via the one
-        // removal primitive App has today, a full clear).
-        app.clear_devices();
+        app.handle_event(Event::PairedDeviceForgotten { addr: addr_b });
 
-        // Only the Scan row and the "No devices found" placeholder remain
-        // (rows 0 and 1); the vanished key isn't found, so
-        // `with_selected_identity` falls back to clamping the previous
-        // index (1) into the new list's bounds -- landing on row 1, not
-        // snapping back past it to row 0.
+        // Only Device A and "Pair new headphones" remain (rows 0 and 1);
+        // B's key is gone, so `with_selected_identity` falls back to
+        // clamping the previous index (1) into the new list's bounds --
+        // landing on row 1, not snapping back past it to row 0.
         assert_eq!(
             app.devices_selected_index_for_test(),
             Some(1),
             "losing the selected row must clamp to the nearest surviving row, not reset to row 0"
         );
+        assert!(app.model().paired.iter().all(|d| d.addr != addr_b), "the forgotten device must be gone from the model");
+    }
+
+    // --- pico-link-4vb.4 (T5): the new Devices screen's own behaviors ---
+
+    #[test]
+    fn the_connected_row_pins_first_and_a_pushes_its_device_detail_screen() {
+        let mut app = App::new(240, 240);
+        let addr = [4, 4, 4, 4, 4, 4];
+        app.handle_event(upsert(addr, "Connected Cans", 1));
+        open_devices(&mut app);
+
+        app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        app.poll_command(); // drain PersistDevice
+        // C echoes the upsert once the persist write actually lands --
+        // this is what actually refreshes the Devices screen's pinned row
+        // (design section 7's hazard 4).
+        app.handle_event(upsert(addr, "Connected Cans", 2));
+
+        // The only paired device, now connected, pins at row 0; "Pair new
+        // headphones" is row 1.
+        assert_eq!(app.devices_selected_index_for_test(), Some(0));
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.current_screen_title(), "Connected Cans", "A on the connected row must push its device-detail screen");
+    }
+
+    #[test]
+    fn selecting_a_paired_non_connected_row_queues_connect_and_pushes_the_wizard_at_connecting() {
+        let mut app = App::new(240, 240);
+        let addr = [5, 5, 5, 5, 5, 5];
+        app.handle_event(upsert(addr, "Headphones", 1));
+        open_devices(&mut app);
+
+        app.handle_input(vec![NavIntent::Select]); // row 0: the sole paired (not-connected) device
+        assert_eq!(app.navigator_depth(), 3, "selecting a paired row must push the wizard");
+        assert!(
+            matches!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr: a, step: ConnectStep::Connecting, .. } if a == addr),
+            "the wizard must enter straight into Connecting for this device"
+        );
+        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Headphones") }));
+    }
+
+    #[test]
+    fn pair_new_headphones_opens_the_wizard_when_under_capacity() {
+        let mut app = App::new(240, 240);
+        open_devices(&mut app); // no paired devices -- the sole row is "Pair new headphones"
+
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.navigator_depth(), 3, "under capacity, Pair new headphones must open the wizard");
+        assert_eq!(app.poll_command(), Some(Command::StartScan));
+    }
+
+    #[test]
+    fn pair_new_headphones_opens_the_forget_picker_when_at_capacity() {
+        let mut app = App::new(240, 240);
+        for i in 0..8u8 {
+            app.handle_event(upsert([i; 6], "Device", u32::from(i)));
+        }
+        open_devices(&mut app);
+
+        // Rows: 8 paired devices (MRU-descending) then "Pair new
+        // headphones" at index 8 -- gated on capacity *before* any radio
+        // work (design section 4).
+        app.handle_input(vec![
+            NavIntent::Down,
+            NavIntent::Down,
+            NavIntent::Down,
+            NavIntent::Down,
+            NavIntent::Down,
+            NavIntent::Down,
+            NavIntent::Down,
+            NavIntent::Down,
+        ]);
+        assert_eq!(app.devices_selected_index_for_test(), Some(8));
+
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.navigator_depth(), 3, "at capacity, Pair new headphones must open a picker screen, not the wizard");
+        assert_eq!(app.poll_command(), None, "no StartScan should be queued when gated by capacity");
+    }
+
+    #[test]
+    fn x_on_a_paired_row_opens_forget_confirm_and_confirming_queues_forget_device() {
+        let mut app = App::new(240, 240);
+        let addr = [6, 6, 6, 6, 6, 6];
+        app.handle_event(upsert(addr, "Cans", 1));
+        open_devices(&mut app);
+
+        app.handle_input(vec![NavIntent::ShortcutX]);
+        assert_eq!(app.navigator_depth(), 3, "X on a paired row must push the forget-confirm screen");
+
+        // Cancel is the default selection (row 0, the safe default per
+        // `ConfirmView`'s own precedent) -- Forget is row 1.
+        app.handle_input(vec![NavIntent::Down]);
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.poll_command(), Some(Command::ForgetDevice { addr }));
+        assert_eq!(app.navigator_depth(), 2, "confirming must pop back to Devices");
+    }
+
+    #[test]
+    fn x_on_the_pair_new_row_does_nothing() {
+        let mut app = App::new(240, 240);
+        open_devices(&mut app); // no paired devices -- the sole row is "Pair new headphones"
+
+        app.handle_input(vec![NavIntent::ShortcutX]);
+        assert_eq!(app.navigator_depth(), 2, "X on the fixed Pair-new row must be a no-op");
+    }
+
+    #[test]
+    fn a_nameless_paired_device_renders_the_unknown_device_fallback_label() {
+        let device = PairedDevice { addr: [0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33], name: String::new(), mru_seq: 1 };
+        assert_eq!(paired_device_label(&device), "(unknown device) 11:22:33");
     }
 
     #[test]
@@ -1915,30 +2387,94 @@ mod tests {
         );
     }
 
-    // --- bead pico-link-cz0.6 (M5 persistence): StoreLoaded / PersistDevice ---
+    // --- beads pico-link-cz0.6 / pico-link-4vb.4 (T4): StoreLoaded / PersistDevice ---
 
     #[test]
-    fn store_loaded_with_a_device_queues_connect_and_records_the_status() {
+    fn store_loaded_after_paired_devices_folded_auto_reconnects_to_the_mru_max() {
+        // Reshaped by bead pico-link-4vb.4 (T4), design section 5.2:
+        // `StoreLoaded` no longer carries an address -- C's real boot
+        // sequence is `count` x `PairedDeviceUpserted` THEN `StoreLoaded` as
+        // the terminator, so this drives that same order.
         let mut app = App::new(240, 240);
-        let addr = [1, 2, 3, 4, 5, 6];
-        app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded, device_addr: Some(addr) });
+        let addr_old = [1, 2, 3, 4, 5, 6];
+        let addr_new = [9, 9, 9, 9, 9, 9];
+        app.handle_event(upsert(addr_old, "Old", 1));
+        app.handle_event(upsert(addr_new, "New", 2));
+        app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
 
         assert_eq!(app.model().store_status, Some(StoreStatus::Loaded));
         assert_eq!(
             app.poll_command(),
-            Some(Command::Connect { addr }),
-            "a loaded device record must queue the same Connect command a manual wizard selection uses"
+            Some(Command::Connect { addr: addr_new, name: String::from("New") }),
+            "auto-reconnect must target the highest mru_seq record, using the same Connect command a manual selection uses"
         );
         assert_eq!(app.poll_command(), None, "exactly one Connect, nothing else");
     }
 
     #[test]
-    fn store_loaded_with_no_device_records_status_but_queues_nothing() {
+    fn truncate_device_name_backs_off_to_a_utf8_character_boundary_instead_of_panicking() {
+        // Code review on pico-link-4vb.4: every prior test used a pure-ASCII
+        // name, so the exact bug class the design called out ("a
+        // byte-boundary truncation would panic or corrupt on any non-ASCII
+        // device name") had zero coverage. U+65E5 ("日") is 3 bytes; 11 of
+        // them is 33 bytes, one over MAX_DEVICE_NAME_BYTES (32), and byte 32
+        // lands one byte into the 11th character -- exactly the mid-character
+        // cut that a naive `&name[..32]` would panic on.
+        let name: String = "日".repeat(11);
+        assert_eq!(name.len(), 33, "fixture must actually exceed MAX_DEVICE_NAME_BYTES for this test to be meaningful");
+        assert!(!name.is_char_boundary(MAX_DEVICE_NAME_BYTES), "fixture must land mid-character at the cut point, or this test proves nothing");
+
+        let truncated = truncate_device_name(&name);
+
+        // A `String` can never hold invalid UTF-8, so the fact this line
+        // returned at all (rather than panicking inside the slice) is the
+        // real assertion; `chars().count()` re-parsing cleanly is belt and
+        // braces confirmation there's no corruption hiding in a `String`
+        // built some other way in the future.
+        assert_eq!(truncated.chars().count(), 10, "must back off a full character rather than keep a partial one");
+        assert_eq!(truncated.len(), 30, "the boundary one character back from byte 32 is byte 30");
+        assert!(truncated.len() <= MAX_DEVICE_NAME_BYTES);
+    }
+
+    #[test]
+    fn connect_wire_path_carries_a_utf8_truncated_name_for_a_multibyte_device() {
+        // Covers the same bug class as the test above but through the real
+        // `Command::Connect` wire path (auto-reconnect on `StoreLoaded`),
+        // the path `ui-ffi` copies byte-for-byte into the C struct -- so this
+        // is also the cheapest proxy for the FFI seam without touching
+        // `ui-ffi` itself.
         let mut app = App::new(240, 240);
-        app.handle_event(Event::StoreLoaded { status: StoreStatus::FirstBoot, device_addr: None });
+        let addr = [9, 9, 9, 9, 9, 9];
+        let long_name: String = "日".repeat(11);
+        app.handle_event(upsert(addr, &long_name, 1));
+        app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
+
+        let expected_name = truncate_device_name(&long_name);
+        assert_eq!(expected_name.len(), 30, "sanity: the fixture name must actually need truncating");
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::Connect { addr, name: expected_name }),
+            "the wire-path Connect command must carry the same char-boundary-truncated name, not the raw 33-byte original"
+        );
+    }
+
+    #[test]
+    fn store_loaded_with_no_paired_devices_records_status_but_queues_nothing() {
+        let mut app = App::new(240, 240);
+        app.handle_event(Event::StoreLoaded { status: StoreStatus::FirstBoot });
 
         assert_eq!(app.model().store_status, Some(StoreStatus::FirstBoot));
         assert_eq!(app.poll_command(), None, "no saved device -- nothing to auto-reconnect to");
+    }
+
+    #[test]
+    fn paired_store_full_is_folded_without_touching_the_paired_list() {
+        let mut app = App::new(240, 240);
+        app.handle_event(upsert([1; 6], "Existing", 1));
+        app.handle_event(Event::PairedStoreFull);
+
+        assert!(app.model().store_full, "PairedStoreFull must be recorded");
+        assert_eq!(app.model().paired.len(), 1, "a refused save must not touch the existing paired list");
     }
 
     #[test]

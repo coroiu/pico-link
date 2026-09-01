@@ -102,9 +102,16 @@ Rows, top to bottom:
 | `Pair new headphones` | always | — | push wizard at `Instructions` | — |
 
 - **No RSSI, no address, no availability dot.** S18: never claim availability we
-  have not verified. `Connected` or `Paired`, nothing else. The nameless case is
-  `(unknown device)` with the last three address bytes as the sublabel
-  discriminator (S13's first-class-label rule).
+  have not verified. The nameless case is `(unknown device)` with the last three
+  address bytes appended to the **label** (`(unknown device) XX:XX:XX`), not the
+  sublabel — `Connected`/`Paired` stays in the sublabel for every row, nameless
+  or not (`paired_device_label` / `build_devices_screen`, `core/src/app.rs`).
+  This deviates from the literal spec above (which put the address tail in the
+  sublabel, displacing the status word on nameless rows) and is accepted as the
+  better outcome, not a bug to "fix" back: the literal spec would have
+  sacrificed `Connected`/`Paired` on exactly the rows that are hardest to tell
+  apart, and keeping both pieces of information is strictly more useful than
+  trading one for the other.
 - **`Pair new headphones` goes last**, not first. The recurring 2-press job
   (switch) belongs under the cursor; the rare job belongs at the end. On first
   run it is the only row, so discoverability is unharmed — which is the only

@@ -163,8 +163,12 @@ impl HomeView {
         // the honest "no reason recorded" value, not a guess.
         let hero = match &model.connected_codec {
             Some(codec) => {
+                // Bead pico-link-4vb.4 (T4): reads `paired` (the remembered
+                // list), not the old `discovered` scan list -- the whole
+                // point of this bead is that a device's name must survive
+                // long after the scan that first discovered it is gone.
                 let device_name =
-                    model.devices.iter().find(|d| d.addr == codec.addr).map(|d| d.name.clone()).unwrap_or_default();
+                    model.paired.iter().find(|d| d.addr == codec.addr).map(|d| d.name.clone()).unwrap_or_default();
                 let bitrate = BitrateStatus::Kbps(codec.nominal_bitrate_bps / 1000);
                 HeroStatusView::new(
                     device_name,
