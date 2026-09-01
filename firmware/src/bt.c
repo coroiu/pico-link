@@ -535,6 +535,14 @@ typedef enum {
     PL_BT_PENDING_CANCEL_SCAN,
     PL_BT_PENDING_CONNECT,
     PL_BT_PENDING_DISCONNECT,
+    // Bead pico-link-cz0.6 (M5 persistence), code-review finding 1: reuses
+    // this exact queue/heartbeat idiom (pico-link-ouw) for persist.c's
+    // deferred flash write, rather than inventing a second mechanism --
+    // see persist.h's module doc "Reentrancy" section for why the write
+    // MUST run from this queue's IRQ-context consumer, never thread
+    // context. Carries no addr (persist.c already has the pending record
+    // staged in its own s_pending_addr).
+    PL_BT_PENDING_PERSIST_WRITE,
 } pl_bt_pending_tag_t;
 
 typedef struct {
@@ -563,6 +571,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "CONNECT";
         case PL_BT_PENDING_DISCONNECT:
             return "DISCONNECT";
+        case PL_BT_PENDING_PERSIST_WRITE:
+            return "PERSIST_WRITE";
         default:
             return "?";
     }
@@ -623,8 +633,26 @@ static void pl_bt_pending_service(void) {
             case PL_BT_PENDING_DISCONNECT:
                 pl_a2dp_disconnect();
                 break;
+            case PL_BT_PENDING_PERSIST_WRITE:
+                // Bead pico-link-cz0.6, code-review finding 1: the ONLY
+                // call site for this function -- IRQ/async_context, same
+                // serialized execution stream BTstack's own put_link_key
+                // call runs on. See persist.h's "Reentrancy" doc.
+                pl_persist_execute_pending_write();
+                break;
         }
     }
+}
+
+// Bead pico-link-cz0.6 (M5 persistence), code-review finding 1: the only
+// way persist.c ever gets its staged write actually performed -- enqueues
+// onto the pending-action queue above (thread-context-safe, same as every
+// other pl_bt_pending_push call site) so pl_persist_execute_pending_write()
+// runs from pl_bt_pending_service's IRQ/async_context, never from
+// persist.c's own thread-context caller (pl_persist_service, the
+// superloop). See persist.h's module doc for the full rationale.
+void pl_bt_enqueue_persist_write(void) {
+    pl_bt_pending_push(PL_BT_PENDING_PERSIST_WRITE, NULL);
 }
 
 // Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the

@@ -16,6 +16,7 @@
 #include "classic/btstack_link_key_db_tlv.h"
 
 #include "a2dp.h"
+#include "bt.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
 
@@ -105,10 +106,20 @@ static uint64_t s_last_write_us;
 static bool s_have_last_write;
 // Set by pl_persist_request_urgent_flush() (IRQ-context-safe: a plain
 // monotonic bool write, no read-modify-write hazard -- see that function's
-// doc comment), cleared only by pl_persist_service() after it actually
-// writes. Lets a "flush on stream stop"/"flush before arming a stream" call
-// site skip the settle/rate-limit gates without itself touching flash.
+// doc comment), cleared only by pl_persist_execute_pending_write() after it
+// actually writes. Lets a "flush on stream stop"/"flush before arming a
+// stream" call site skip the settle/rate-limit gates without itself
+// touching flash.
 static volatile bool s_urgent;
+// Code-review finding 1 (2026-09-01, on bd-pico-link-cz0.6): set the moment
+// pl_persist_service() enqueues a write request onto bt.c's pending queue,
+// cleared by pl_persist_execute_pending_write() once that write actually
+// runs (or bails). Without this, pl_persist_service() -- called every
+// superloop iteration while s_pending stays true -- would re-enqueue a
+// PL_BT_PENDING_PERSIST_WRITE entry on every single iteration until the
+// heartbeat (up to 100ms later) finally drains one, flooding bt.c's 8-slot
+// pending queue and potentially crowding out a real scan/connect request.
+static volatile bool s_write_enqueued;
 
 // Unconditional (NOT #ifndef NDEBUG-gated) firmware/storage-region collision
 // check -- replaces btstack_flash_bank.c:53-58's assert, which pico-sdk's
@@ -136,6 +147,18 @@ static void pl_persist_check_no_firmware_collision(void) {
     }
 }
 
+// Calls s_tlv_impl's get_tag/delete_tag directly (thread context -- called
+// from pl_bt_init, itself called synchronously from main() before the
+// superloop even starts) -- the ONE place in this file that's exempt from
+// pl_persist_execute_pending_write's "async_context only" rule (code-review
+// finding 1). Safe by construction, not by convention: this function's own
+// caller (pl_bt_init) calls it BEFORE hci_power_control(HCI_POWER_ON), so
+// no HCI event has fired yet and BTstack cannot have dispatched anything --
+// including a put_link_key call -- through the cyw43/BTstack background
+// async_context. There is nothing yet running on that queue for this call
+// to race with. Every write after this point (pl_persist_execute_pending_write)
+// goes through the deferred queue; this function does not, because at the
+// moment it runs there is no concurrent writer to serialize against.
 void pl_persist_init(void) {
     pl_persist_check_no_firmware_collision();
 
@@ -211,23 +234,70 @@ void pl_persist_request_save_device(const uint8_t addr[6]) {
     memcpy(s_pending_addr, addr, 6);
     s_pending = true;
     s_pending_since_us = time_us_64();
+    // Code-review finding 1: a freshly staged save supersedes whatever the
+    // heartbeat may already be about to write for a STALE prior request
+    // (e.g. a quick reconnect-to-a-different-device churn) -- the enqueued
+    // flag only gates against re-enqueueing the SAME request repeatedly,
+    // not against a genuinely new one.
+    s_write_enqueued = false;
     pl_log(
         "persist: staged save for %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
     );
 }
 
-// The actual flash write -- writes the marker (idempotent, cheap to
-// rewrite every time so a first save always leaves a consistent store even
-// if a prior boot never wrote one) and the device record. Caller
-// (pl_persist_service/pl_persist_flush_now) has already applied the
-// streaming gate; this function itself re-checks it defensively (belt and
-// suspenders -- "NO flash write while streaming, of any size" per design
-// point 4 has no exception).
-static void pl_persist_write_now(void) {
+// Code-review finding 1 (2026-09-01, on bd-pico-link-cz0.6, CONFIRMED
+// critical): persist.c and BTstack share ONE btstack_tlv_flash_bank
+// instance with NO locking of its own
+// (btstack_tlv_flash_bank_store_tag/get_tag/delete_tag are a multi-step
+// sequence over plain, non-atomic struct fields -- check space, maybe
+// migrate, write value, write header, delete old entries, THEN mutate
+// self->write_offset). Before this fix, persist.c called store_tag/get_tag
+// directly from THREAD context (pl_persist_service, the superloop) while
+// BTstack writes link keys into that SAME instance synchronously from
+// inside its own HCI event dispatch (hci.c's put_link_key), which runs on
+// the cyw43/BTstack background async_context -- a real low-priority
+// hardware IRQ, not a cooperative poll. A thread-context TLV call
+// preempted mid-sequence by that IRQ (or vice versa) corrupts write_offset
+// and the bank bookkeeping -- reachable on the exact acceptance path,
+// since pl_a2dp_connect() (a2dp.c) requests an urgent flush immediately
+// before establishing the very stream whose pairing just triggered
+// BTstack's own link-key write for the same device.
+//
+// FIX: reuse pico-link-ouw's established idiom (bt.c's pl_bt_pending_push/
+// pl_bt_pending_service -- see that bead's module doc in bt.c) rather than
+// inventing a second mechanism. This function -- the only place that
+// actually touches s_tlv_impl for a WRITE after boot -- is now called
+// EXCLUSIVELY from pl_bt_pending_service (bt.c), which itself only ever
+// runs from pl_bt_wdt_heartbeat_handler: a btstack_run_loop timer callback
+// dispatched through the SAME async_context_threadsafe_background work
+// queue that runs BTstack's own HCI event dispatch (including put_link_key).
+// That queue serializes every callback registered on it to completion
+// before starting the next -- so once both sides run through it, they
+// cannot preempt each other, closing the race by construction rather than
+// by adding a lock. pl_persist_service() (thread context, unchanged
+// responsibility: streaming/settle/rate-limit gating) now only DECIDES
+// when a write is due and enqueues a request via pl_bt_enqueue_persist_write()
+// (bt.h) -- it never touches s_tlv_impl itself.
+//
+// # Safety / calling contract
+//
+// MUST be called only from bt.c's pending-queue drain (async_context/IRQ
+// context). Calling this from thread context reintroduces exactly the race
+// this fix closes.
+void pl_persist_execute_pending_write(void) {
+    if (!s_pending) {
+        s_write_enqueued = false;
+        return;
+    }
     if (pl_usb_audio_streaming() || pl_a2dp_streaming()) {
-        // Should be unreachable (both call sites already gate on this),
-        // but never write flash on a bad assumption -- leave it pending
-        // for the next safe iteration instead.
+        // The gate could have flipped true again between
+        // pl_persist_service() enqueueing this request and the heartbeat
+        // draining it (up to ~100ms later) -- "NO flash write while
+        // streaming, of any size" has no exception, so bail and leave the
+        // request pending; pl_persist_service() will re-arm
+        // s_write_enqueued the next time it sees a safe window (it does so
+        // unconditionally on every call, see below).
+        s_write_enqueued = false;
         return;
     }
 
@@ -249,6 +319,7 @@ static void pl_persist_write_now(void) {
 
     s_pending = false;
     s_urgent = false;
+    s_write_enqueued = false;
     s_last_write_us = time_us_64();
     s_have_last_write = true;
     pl_log(
@@ -264,18 +335,25 @@ void pl_persist_service(void) {
     if (pl_usb_audio_streaming() || pl_a2dp_streaming()) {
         return;
     }
+    bool due;
     if (s_urgent) {
-        pl_persist_write_now();
+        due = true;
+    } else {
+        uint64_t now_us = time_us_64();
+        due = (now_us - s_pending_since_us >= PL_PERSIST_SETTLE_US) &&
+              (!s_have_last_write || (now_us - s_last_write_us >= PL_PERSIST_MIN_INTERVAL_US));
+    }
+    if (!due || s_write_enqueued) {
         return;
     }
-    uint64_t now_us = time_us_64();
-    if (now_us - s_pending_since_us < PL_PERSIST_SETTLE_US) {
-        return;
-    }
-    if (s_have_last_write && (now_us - s_last_write_us < PL_PERSIST_MIN_INTERVAL_US)) {
-        return;
-    }
-    pl_persist_write_now();
+    // Code-review finding 1: no direct flash access here any more -- only
+    // enqueues onto bt.c's existing pending-queue/heartbeat mechanism (see
+    // pl_persist_execute_pending_write's doc comment above for the full
+    // rationale). s_write_enqueued guards against flooding that queue on
+    // every subsequent superloop iteration before the heartbeat (up to
+    // 100ms later) actually drains this request.
+    s_write_enqueued = true;
+    pl_bt_enqueue_persist_write();
 }
 
 void pl_persist_request_urgent_flush(void) {

@@ -121,4 +121,14 @@ void pl_bt_debug_connect(const uint8_t *addr);
 void pl_bt_debug_disconnect(void);
 #endif
 
+// Bead pico-link-cz0.6 (M5 persistence), code-review finding 1: enqueues a
+// deferred flash-write request onto this file's pending-action queue
+// (pico-link-ouw's idiom), so it runs from pl_bt_pending_service's
+// IRQ/async_context consumer -- the same serialized execution stream
+// BTstack's own link-key writes run on -- rather than persist.c's own
+// thread-context caller. Called from persist.c's pl_persist_service()
+// (thread context, the superloop). See persist.h's module doc
+// ("Reentrancy") for the full rationale.
+void pl_bt_enqueue_persist_write(void);
+
 #endif // PL_BT_H

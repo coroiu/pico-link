@@ -37,12 +37,28 @@
 // pico-sdk's flash.c), and usb_audio.c's ISO-OUT re-arm has a 2ms bar with
 // exactly ONE missed re-arm being PERMANENT (audio_device.c:759-762). So
 // this module NEVER writes flash while USB audio or A2DP is streaming --
-// pl_persist_service() (called from the superloop, thread context, every
-// iteration) is the only place an actual flash write happens, and it gates
-// on both pl_usb_audio_streaming() and pl_a2dp_streaming() being false, plus
-// a 2s settle timer and a 10s global rate limit. pl_persist_flush_now()
-// (forced, same streaming gate, no settle/rate-limit) is for the "flush on
-// stream stop, flush before arming a stream" call sites (a2dp.c).
+// gated on both pl_usb_audio_streaming() and pl_a2dp_streaming() being
+// false, plus a 2s settle timer and a 10s global rate limit for an ordinary
+// save, or just the streaming gate for an urgent one (see
+// pl_persist_request_urgent_flush()).
+//
+// REENTRANCY (code-review finding 1, 2026-09-01, fixed on bd-pico-link-cz0.6):
+// this module shares its one btstack_tlv_flash_bank instance with BTstack's
+// own link-key DB, which BTstack writes to synchronously from inside its
+// own HCI event dispatch (hci.c's put_link_key) -- running on the
+// cyw43/BTstack background async_context, a real IRQ, not a poll. The TLV
+// store's own store_tag/get_tag/delete_tag have no locking of their own
+// (btstack_tlv_flash_bank.c), so ANY call into them from thread context
+// races that IRQ. The actual write therefore happens ONLY from
+// pl_persist_execute_pending_write(), which bt.c calls exclusively from ITS
+// existing pending-queue drain (the pico-link-ouw idiom) -- i.e. from the
+// same async_context BTstack's own link-key write runs on, which serializes
+// every callback on it to completion before the next starts. Thread context
+// (pl_persist_service(), the superloop, called every iteration) only
+// DECIDES when a write is due and safe, then enqueues a request via
+// pl_bt_enqueue_persist_write() (bt.h) -- it never touches flash itself.
+// pl_persist_init() is the one exception, and is safe for a structural
+// reason, not a lock -- see its own doc comment in persist.c.
 void pl_persist_init(void);
 
 // Blank vs corrupt, distinguished at this layer (design point 5 -- upstream
@@ -82,25 +98,40 @@ void pl_persist_boot_device_addr(uint8_t out_addr[6]);
 void pl_persist_request_save_device(const uint8_t addr[6]);
 
 // Called once per superloop iteration, thread context, unconditionally
-// cheap when nothing is pending (a few volatile reads) -- performs the
-// actual flash write when a save is staged AND it is safe to do so (see
-// this header's module doc for the exact gate). No-op if nothing is
-// pending.
+// cheap when nothing is pending (a few volatile reads) -- decides whether a
+// staged save is due (see this header's module doc for the exact gate) and,
+// if so, enqueues a write request via pl_bt_enqueue_persist_write() (bt.h).
+// Never touches flash directly -- see the module doc's Reentrancy section.
+// No-op if nothing is pending or a request is already enqueued and awaiting
+// the heartbeat.
 void pl_persist_service(void);
 
-// Flags any pending save as urgent -- pl_persist_service() (thread context,
-// the superloop) will then write it on its very next iteration once it is
-// actually safe to do so (not streaming), skipping the normal 2s settle /
-// 10s rate-limit gates but NOT the streaming gate ("NO flash write while
-// streaming, of any size" has no exception). This function itself does NOT
-// touch flash and is safe to call from IRQ context -- a2dp.c's call sites
-// (design point 4's "flush on stream stop" / "flush before arming a
-// stream") run in the cyw43/BTstack background IRQ (pico-link-ouw), and the
-// design's own rule is that a real flash write is "serviced from the
-// superloop in THREAD context, never a packet handler" -- so this is a
-// same-instant-cheap flag set, not the write itself. A no-op if nothing is
-// pending.
+// Flags any pending save as urgent -- the next time pl_persist_service()
+// runs (thread context, the superloop) it will enqueue the write
+// immediately once it is actually safe to do so (not streaming), skipping
+// the normal 2s settle / 10s rate-limit gates but NOT the streaming gate
+// ("NO flash write while streaming, of any size" has no exception). This
+// function itself does NOT touch flash and is safe to call from IRQ
+// context -- a2dp.c's call sites (design point 4's "flush on stream stop" /
+// "flush before arming a stream") run in the cyw43/BTstack background IRQ
+// (pico-link-ouw) -- so this is a same-instant-cheap flag set, not the
+// write itself. A no-op if nothing is pending.
 void pl_persist_request_urgent_flush(void);
+
+// Performs the actual flash write for whatever save is currently staged --
+// writes the marker and the device record, or bails (leaving the request
+// pending) if the streaming gate has flipped true again since it was
+// enqueued. See this header's module doc (Reentrancy) for the full
+// rationale.
+//
+// # Calling contract
+//
+// MUST be called ONLY from bt.c's pending-queue drain (pl_bt_pending_service,
+// itself only ever called from the cyw43/BTstack background async_context)
+// -- never from thread context, and never directly by anything other than
+// bt.c's PL_BT_PENDING_PERSIST_WRITE case. Calling this from thread context
+// reintroduces the exact race code-review finding 1 closed.
+void pl_persist_execute_pending_write(void);
 
 // Tag namespace, exposed so a future preset-store implementation (hardening,
 // not MVP -- design point 8/pico-link-ryw) reuses this exact scheme rather
