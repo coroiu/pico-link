@@ -62,8 +62,8 @@ pub mod render;
 pub mod run;
 
 pub use app::{
-    App, BtModel, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, StoreStatus,
-    WizardPhase,
+    App, BtModel, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, PairedDevice,
+    StoreStatus, WizardPhase,
 };
 pub use input::NavIntent;
 pub use panel::{Button, Edge, PanelOrientation, PANEL};

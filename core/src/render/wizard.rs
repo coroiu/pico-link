@@ -39,7 +39,7 @@ use embedded_graphics::prelude::{Point, Size};
 use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
-use crate::app::{Command, ConnectFailureReason, ConnectStep, DeviceEntry, WizardPhase};
+use crate::app::{truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, WizardPhase};
 use crate::input::NavIntent;
 
 use super::ctx::RenderCtx;
@@ -258,7 +258,9 @@ fn build_scan_list(
     VerticalList::new(items)
         .on_activate_index(move |index| {
             if let Some(device) = devices_snapshot.get(index) {
-                commands_for_activate.borrow_mut().push_back(Command::Connect { addr: device.addr });
+                commands_for_activate
+                    .borrow_mut()
+                    .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
                 *phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
             }
             Action::None
@@ -351,13 +353,21 @@ impl Widget for PairingWizardView {
             // `Command::Connect` for the same `addr` and drop straight
             // back into phase 4 at its first sub-step, exactly like
             // selecting the device fresh from the scan list would.
+            //
+            // `name` is empty here, deliberately -- `WizardPhase` carries no
+            // name of its own for `NotResponding`/`Failed` (bead
+            // pico-link-4vb.4, T4/design section 5.3's last paragraph), and
+            // C's read-modify-write persist path treats an empty name as
+            // "keep whatever name the record already has" rather than
+            // erasing it, so a retry can never regress an already-known
+            // name to nameless.
             (NavIntent::ShortcutX, WizardPhase::NotResponding { addr, .. }) => {
-                self.commands.borrow_mut().push_back(Command::Connect { addr });
+                self.commands.borrow_mut().push_back(Command::Connect { addr, name: String::new() });
                 *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
             (NavIntent::ShortcutX, WizardPhase::Failed { addr, reason }) if reason.retryable() => {
-                self.commands.borrow_mut().push_back(Command::Connect { addr });
+                self.commands.borrow_mut().push_back(Command::Connect { addr, name: String::new() });
                 *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
@@ -585,7 +595,7 @@ mod tests {
         app.handle_input(vec![NavIntent::Select]); // activate the (only) row
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::StartScan));
-        assert_eq!(app.poll_command(), Some(Command::Connect { addr }));
+        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Cans") }));
     }
 
     #[test]
@@ -701,7 +711,7 @@ mod tests {
 
         app.handle_input(vec![NavIntent::ShortcutX]);
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
-        assert_eq!(app.poll_command(), Some(Command::Connect { addr }));
+        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::new() }));
     }
 
     #[test]
@@ -788,7 +798,7 @@ mod tests {
 
         app.handle_input(vec![NavIntent::ShortcutX]);
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
-        assert_eq!(app.poll_command(), Some(Command::Connect { addr }));
+        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::new() }));
     }
 
     // --- B always aborts the whole flow, from every phase (design section 9) ---
