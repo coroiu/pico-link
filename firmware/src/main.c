@@ -498,33 +498,64 @@ int main(void) {
         // Bead pico-link-p1r.
         pl_loop_prof_record(PL_LOOP_PHASE_UI_TICK, time_us_64() - ui_tick_start_us);
 
+        // Idle-screensaver seam (pico-link-i3e): a LEVEL, read once per
+        // iteration right after pl_ui_tick and applied idempotently to the
+        // backlight GPIO -- see pl_ui_display_power's doc comment and
+        // .planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md.
+        // No blit_wait to preserve here (pico-link-3uq's split is not
+        // merged -- st7789_blit_framebuffer below is still one blocking
+        // call, not a start/wait pair), so the gate is simply: skip
+        // render+blit while blanked. If 3uq lands first, its unconditional
+        // blit_wait for the PREVIOUS frame's DMA must stay ABOVE this
+        // gate -- see the design doc's §3.3 ordering rule.
+        bool display_on = pl_ui_display_power(ui) == PL_DISPLAY_POWER_ON;
+        st7789_set_backlight(display_on);
+
         const uint16_t *px = NULL;
         uintptr_t px_len = 0;
-        uint64_t render_start_us = time_us_64();
-        pl_wdt_mark(PL_WDT_CP_UI_RENDER);
-        pl_ui_render(ui, &px, &px_len);
-        uint64_t render_end_us = time_us_64();
-        // Bead pico-link-p1r.
-        pl_loop_prof_record(PL_LOOP_PHASE_UI_RENDER, render_end_us - render_start_us);
+        // Declared at this scope (not inside the `if (display_on)` block
+        // below) because the frame_report_phase print further down
+        // references them unconditionally -- defaulted to frame_start_us
+        // so a blanked frame's report reads as zero render/blit time
+        // rather than undefined.
+        uint64_t render_start_us = frame_start_us;
+        uint64_t render_end_us = frame_start_us;
+        uint64_t blit_end_us = frame_start_us;
+        if (display_on) {
+            render_start_us = time_us_64();
+            pl_wdt_mark(PL_WDT_CP_UI_RENDER);
+            pl_ui_render(ui, &px, &px_len);
+            render_end_us = time_us_64();
+            // Bead pico-link-p1r.
+            pl_loop_prof_record(PL_LOOP_PHASE_UI_RENDER, render_end_us - render_start_us);
 
-        if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
-            // ui_tick()/pl_ui_render() must not be called again until this
-            // DMA completes (st7789_blit_framebuffer blocks until it does)
-            // -- Rust can never write while DMA reads, per the M1b design's
-            // no-tearing, no-double-buffering contract.
-            st7789_blit_framebuffer(spi1, px, (uint32_t)px_len);
+            if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
+                // ui_tick()/pl_ui_render() must not be called again until this
+                // DMA completes (st7789_blit_framebuffer blocks until it does)
+                // -- Rust can never write while DMA reads, per the M1b design's
+                // no-tearing, no-double-buffering contract.
+                st7789_blit_framebuffer(spi1, px, (uint32_t)px_len);
+            }
+            blit_end_us = time_us_64();
+            // Bead pico-link-p1r: the pico-link-3uq blit-split candidate --
+            // measured here as one blocking call, matching pico-link-14l's
+            // 38.6ms figure. Only recorded on the frame that actually blits
+            // (px non-NULL) -- a NULL-px frame does not call
+            // st7789_blit_framebuffer at all, so recording render_end..blit_end
+            // unconditionally would falsely attribute ~0us "blit" samples to
+            // frames that skipped it.
+            if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
+                pl_loop_prof_record(PL_LOOP_PHASE_BLIT, blit_end_us - render_end_us);
+            }
         }
-        uint64_t blit_end_us = time_us_64();
-        // Bead pico-link-p1r: the pico-link-3uq blit-split candidate --
-        // measured here as one blocking call, matching pico-link-14l's
-        // 38.6ms figure. Only recorded on the frame that actually blits
-        // (px non-NULL) -- a NULL-px frame does not call
-        // st7789_blit_framebuffer at all, so recording render_end..blit_end
-        // unconditionally would falsely attribute ~0us "blit" samples to
-        // frames that skipped it.
-        if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
-            pl_loop_prof_record(PL_LOOP_PHASE_BLIT, blit_end_us - render_end_us);
-        }
+        // While blanked (display_on == false): render+blit are skipped
+        // entirely, per pico-link-i3e's acceptance criterion -- this is
+        // what makes the blank actually take effect on the panel, and as a
+        // bonus removes the ~38ms blit from the idle path (see
+        // .planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md
+        // §3.3). `App::dirty()` is untouched by this gate (same contract
+        // as core's own Runner::step), so the next real wake still renders
+        // immediately.
 
 #ifndef PL_DIAG_SKIP_BT
         pl_wdt_mark(PL_WDT_CP_BT_POLL_CMDS);
