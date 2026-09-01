@@ -61,14 +61,16 @@ fn save_zoomed_png(app: &mut App, out_dir: &Path, name: &str) {
 /// failing loudly, since a `Select` is always accepted by *something*
 /// (the Home status face, then the Devices list) -- it just wasn't the
 /// wizard.
+///
+/// pico-link-4vb.2 deleted the old instructions phase 1 -- the third
+/// `Select` above now lands directly in `WizardPhase::Scanning` (and
+/// queues `Command::StartScan` itself), so there is no separate
+/// `start_scan` step any more; every call site below that used to call
+/// `start_scan(&mut app)` right after `open_wizard` had that line deleted.
 fn open_wizard(app: &mut App) {
     app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
     app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
-    app.handle_input(vec![NavIntent::Select]); // "Scan for headphones" row -> pushes the wizard
-}
-
-fn start_scan(app: &mut App) {
-    app.handle_input(vec![NavIntent::Select]); // Instructions -> Scanning
+    app.handle_input(vec![NavIntent::Select]); // "Scan for headphones" row -> pushes the wizard, straight into Scanning
 }
 
 fn select_device(app: &mut App) {
@@ -79,16 +81,10 @@ fn main() {
     let out_dir: PathBuf = env::args().nth(1).map_or_else(|| env::temp_dir().join("pico-link-wizard-screenshots"), PathBuf::from);
     std::fs::create_dir_all(&out_dir).expect("failed to create output directory");
 
-    // --- Phase 1: instructions ---
-    let mut app = App::new(240, 240);
-    open_wizard(&mut app);
-    save_zoomed_png(&mut app, &out_dir, "01_instructions");
-
     // --- Phase 2: scanning, with a late-arriving name AND a permanently
     // nameless device (design's own "DONE LOOKS LIKE" fixture ask) ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    start_scan(&mut app);
     let named_addr = [0xAA; 6];
     let nameless_addr = [0xBB; 6];
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: named_addr, name: String::new(), rssi: -45 }));
@@ -106,7 +102,6 @@ fn main() {
     // ellipsis rather than running into the disclosure caret.
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    start_scan(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry {
         addr: [0xCC; 6],
         name: String::from("Sennheiser Momentum 4 Wireless"),
@@ -126,7 +121,6 @@ fn main() {
     // level side by side.
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    start_scan(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x10; 6], name: String::from("4 bars"), rssi: -40 }));
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x11; 6], name: String::from("3 bars"), rssi: -55 }));
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [0x12; 6], name: String::from("2 bars"), rssi: -65 }));
@@ -137,7 +131,6 @@ fn main() {
     // --- Phase 3: nothing found ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    start_scan(&mut app);
     app.handle_event(Event::LinkStateChanged(pico_link_core::LinkState::Idle));
     save_zoomed_png(&mut app, &out_dir, "03_nothing_found");
 
@@ -151,7 +144,6 @@ fn main() {
     for (step, name) in steps {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        start_scan(&mut app);
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -50 }));
         select_device(&mut app);
         app.handle_event(Event::ConnectStepChanged(step));
@@ -161,7 +153,6 @@ fn main() {
     // --- Phase 5: "Still trying (2)" -- the 6s surfacing point ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    start_scan(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -50 }));
     select_device(&mut app);
     app.handle_event(Event::ConnectRetrying { attempt: 1 });
@@ -179,7 +170,6 @@ fn main() {
     for (reason, name) in failures {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        start_scan(&mut app);
         let addr = [3; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -50 }));
         select_device(&mut app);
@@ -190,7 +180,6 @@ fn main() {
     // --- Phase 6: plain success ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    start_scan(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [4; 6], name: String::from("Cans"), rssi: -50 }));
     select_device(&mut app);
     app.handle_event(Event::ConnectSucceeded { addr: [4; 6], degraded: false });
@@ -199,11 +188,10 @@ fn main() {
     // --- Phase 6: degraded success ---
     let mut app = App::new(240, 240);
     open_wizard(&mut app);
-    start_scan(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [5; 6], name: String::from("Cans"), rssi: -50 }));
     select_device(&mut app);
     app.handle_event(Event::ConnectSucceeded { addr: [5; 6], degraded: true });
     save_zoomed_png(&mut app, &out_dir, "06g_succeeded_degraded");
 
-    println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());
+    println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());
 }

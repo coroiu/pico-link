@@ -59,9 +59,11 @@ use super::widget::{Action, ChromeContribution, FocusEvent, Widget};
 pub const WIZARD_TITLE: &str = "Pair headphones";
 
 /// Builds the wizard screen at whatever phase `phase` currently holds
-/// (typically [`WizardPhase::Instructions`], since `build_devices_screen`
-/// resets it right before pushing this) -- see the module doc for why no
-/// further rebuild is needed as the phase advances.
+/// (typically [`WizardPhase::Scanning`], since `build_devices_screen`
+/// resets it right before pushing this and queues `Command::StartScan` in
+/// the same step -- pico-link-4vb.2 removed the old instructions phase 1)
+/// -- see the module doc for why no further rebuild is needed as the
+/// phase advances.
 #[must_use]
 pub fn build_wizard_screen(
     phase: Rc<RefCell<WizardPhase>>,
@@ -288,11 +290,12 @@ impl Widget for PairingWizardView {
         }
         let phase = self.phase.borrow().clone();
         match phase {
-            WizardPhase::Instructions | WizardPhase::NothingFound => {
-                // Phase 1/3 -> phase 2. Clearing `devices` proactively
-                // (rather than waiting for C's own `DevicesCleared` event)
-                // avoids a stale-row flash from a previous scan between
-                // this press and that event arriving.
+            WizardPhase::NothingFound => {
+                // Phase 3 -> phase 2 (re-scan). Clearing `devices`
+                // proactively (rather than waiting for C's own
+                // `DevicesCleared` event) avoids a stale-row flash from a
+                // previous scan between this press and that event
+                // arriving.
                 self.devices.borrow_mut().clear();
                 self.commands.borrow_mut().push_back(Command::StartScan);
                 *self.phase.borrow_mut() = WizardPhase::scanning_pending();
@@ -373,7 +376,7 @@ impl Widget for PairingWizardView {
         let phase = self.phase.borrow().clone();
         let mut contribution = ChromeContribution { y: Some(ButtonLabel::Inert), ..ChromeContribution::default() };
         match phase {
-            WizardPhase::Instructions | WizardPhase::NothingFound => {
+            WizardPhase::NothingFound => {
                 contribution.a = Some(ButtonLabel::Live(String::from("scan")));
                 contribution.x = Some(ButtonLabel::Inert);
             }
@@ -434,16 +437,6 @@ impl Widget for PairingWizardView {
     fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let phase = self.phase.borrow().clone();
         match phase {
-            WizardPhase::Instructions => {
-                // Short enough to fit one line within the wizard's content
-                // width (~206px, screen width minus the button rail) at
-                // `font::name()` size -- see `failure_text`'s doc comment
-                // for why this budget is a hard constraint, not a style
-                // choice.
-                MessageView::new("Enable pairing mode")
-                    .with_subline("Hold power ~5s until it flashes")
-                    .render(area, ctx, target)?;
-            }
             WizardPhase::NothingFound => {
                 MessageView::new("No headphones found")
                     .with_headline_color(palette::STATUS_WARNING)
@@ -543,19 +536,15 @@ mod tests {
     }
 
     #[test]
-    fn selecting_scan_opens_the_wizard_at_the_instructions_phase() {
+    fn selecting_scan_opens_the_wizard_directly_into_scanning() {
+        // pico-link-4vb.2: the old instructions phase 1 is gone -- opening
+        // the wizard now enters `WizardPhase::Scanning` immediately and
+        // queues `Command::StartScan` in the same step, with no A press
+        // required first.
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         assert_eq!(app.navigator_depth(), 3);
         assert_eq!(app.current_screen_title(), WIZARD_TITLE);
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Instructions);
-    }
-
-    #[test]
-    fn pressing_a_on_instructions_starts_the_scan_and_queues_start_scan() {
-        let mut app = App::new(240, 240);
-        open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::StartScan));
     }
@@ -564,7 +553,6 @@ mod tests {
     fn a_device_arriving_while_scanning_does_not_change_the_phase() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -40 }));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
         assert_eq!(app.navigator_depth(), 3, "the wizard must still be the top screen at Home(1)/Devices(2)/Wizard(3)");
@@ -574,7 +562,6 @@ mod tests {
     fn scan_ending_with_zero_devices_moves_to_nothing_found() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
         app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::NothingFound);
@@ -584,7 +571,6 @@ mod tests {
     fn scan_ending_with_devices_present_stays_on_scanning() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -40 }));
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
@@ -594,7 +580,6 @@ mod tests {
     fn selecting_a_device_row_queues_connect_and_enters_the_connecting_phase() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
         let addr = [3; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]); // activate the (only) row
@@ -614,7 +599,6 @@ mod tests {
         let mut app = App::new(240, 240);
         app.tick(999_000);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // Instructions -> Scanning
         assert_eq!(
             app.wizard_phase_for_test(),
             WizardPhase::Scanning { started: Instant::from_micros(999_000) },
@@ -644,7 +628,6 @@ mod tests {
         let mut app = App::new(240, 240);
         app.tick(0);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // Instructions -> Scanning
         let addr = [9; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]); // Scanning -> Connecting, started == 0
@@ -671,7 +654,6 @@ mod tests {
     fn connect_step_events_advance_the_named_sub_steps() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [4; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -686,16 +668,15 @@ mod tests {
     #[test]
     fn connect_step_changed_is_ignored_outside_the_connecting_phases() {
         let mut app = App::new(240, 240);
-        // Wizard not even open -- default phase is Instructions.
+        // Wizard not even open -- default phase is NothingFound.
         app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
-        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Instructions);
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::NothingFound);
     }
 
     #[test]
     fn retrying_surfaces_not_responding_with_an_incrementing_attempt_counter() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [5; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -711,7 +692,6 @@ mod tests {
     fn keep_trying_from_not_responding_reissues_connect_and_returns_to_connecting() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [6; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -728,7 +708,6 @@ mod tests {
     fn connect_succeeded_reaches_the_plain_success_outcome() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [7; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -738,10 +717,11 @@ mod tests {
     }
 
     #[test]
-    fn wizard_auto_dismiss_pops_back_to_devices_only_after_plain_success() {
+    fn wizard_auto_dismiss_pops_all_the_way_to_home_only_after_plain_success() {
+        // pico-link-4vb.2: Andreas wanted auto-dismiss to land on Home, not
+        // Devices, so he doesn't have to press Back a bunch of times.
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [8; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -749,14 +729,13 @@ mod tests {
         assert_eq!(app.navigator_depth(), 3);
 
         app.handle_event(Event::WizardAutoDismiss);
-        assert_eq!(app.navigator_depth(), 2, "a plain success must auto-dismiss back to Devices");
+        assert_eq!(app.navigator_depth(), 1, "a plain success must auto-dismiss all the way back to Home");
     }
 
     #[test]
     fn degraded_success_does_not_auto_dismiss() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [9; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -771,7 +750,6 @@ mod tests {
     fn connect_failed_reaches_the_failed_phase_with_its_reason() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [10; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -784,7 +762,6 @@ mod tests {
     fn retry_is_offered_only_for_retryable_failure_reasons() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [11; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -802,7 +779,6 @@ mod tests {
     fn retry_reissues_connect_for_a_retryable_failure_reason() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]);
         let addr = [12; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -829,7 +805,12 @@ mod tests {
     }
 
     #[test]
-    fn b_aborts_from_instructions() {
+    fn b_aborts_from_freshly_opened_scanning() {
+        // pico-link-4vb.2: the wizard opens straight into Scanning now (the
+        // old instructions phase 1 is gone), so this is what "B from the
+        // very first phase" means today. `b_aborts_from_scanning_and_
+        // cancels_the_scan` below covers the CancelScan side effect
+        // specifically; this one just proves the generic pop.
         assert_back_aborts_from(|_app| {});
     }
 
@@ -837,7 +818,6 @@ mod tests {
     fn b_aborts_from_scanning_and_cancels_the_scan() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
         app.poll_command(); // drain StartScan
 
         app.handle_input(vec![NavIntent::Back]);
@@ -852,7 +832,6 @@ mod tests {
     #[test]
     fn b_aborts_from_nothing_found() {
         assert_back_aborts_from(|app| {
-            app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::LinkStateChanged(LinkState::Idle));
         });
     }
@@ -861,7 +840,6 @@ mod tests {
     fn b_aborts_from_connecting_and_queues_cancel_connect() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
         let addr = [13; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
@@ -881,7 +859,6 @@ mod tests {
     fn b_aborts_from_not_responding_and_queues_cancel_connect() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
         let addr = [14; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
@@ -901,7 +878,6 @@ mod tests {
     #[test]
     fn b_aborts_from_succeeded() {
         assert_back_aborts_from(|app| {
-            app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [15; 6], name: String::new(), rssi: -40 }));
             app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::ConnectSucceeded { addr: [15; 6], degraded: true });
@@ -911,7 +887,6 @@ mod tests {
     #[test]
     fn b_aborts_from_failed() {
         assert_back_aborts_from(|app| {
-            app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [16; 6], name: String::new(), rssi: -40 }));
             app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::ConnectFailed { addr: [16; 6], reason: ConnectFailureReason::RadioError });
@@ -928,8 +903,6 @@ mod tests {
         open_wizard(&mut app);
         assert_eq!(app.navigator_depth(), 3, "Home(1)/Devices(2)/Wizard(3)");
 
-        app.handle_input(vec![NavIntent::Select]); // -> Scanning
-        assert_eq!(app.navigator_depth(), 3);
         let addr = [17; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         assert_eq!(app.navigator_depth(), 3);
@@ -942,6 +915,6 @@ mod tests {
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::WizardAutoDismiss);
-        assert_eq!(app.navigator_depth(), 2, "auto-dismiss returns to Devices (Home(1)/Devices(2))");
+        assert_eq!(app.navigator_depth(), 1, "auto-dismiss returns all the way to Home (pico-link-4vb.2: no more Back-Back-Back)");
     }
 }

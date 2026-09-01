@@ -42,17 +42,17 @@ fn dump_png_scaled(framebuffer: &FrameBuffer565, path: &str, scale: u32) {
 fn main() {
     let mut app = App::new(240, 240);
 
+    // Pins App's clock at t=0 first, so phase 2's own `started` (not under
+    // test here, but exercised along the way) is deterministic.
+    //
     // Home status face -> menu face (Bluetooth pre-selected) -> Devices
-    // ("Scan for headphones" pre-selected) -> the wizard, at phase 1
-    // (Instructions).
-    app.handle_input(vec![NavIntent::Select]);
-    app.handle_input(vec![NavIntent::Select]);
-    app.handle_input(vec![NavIntent::Select]);
-
-    // Phase 1 -> phase 2 (Scanning): pins App's clock at t=0 first, so the
-    // Scanning phase's own `started` (not under test here, but exercised
-    // along the way) is deterministic too.
+    // ("Scan for headphones" pre-selected) -> the wizard, straight into
+    // phase 2 (Scanning) -- pico-link-4vb.2 deleted the old instructions
+    // phase 1, so this third `Select` now lands directly in Scanning
+    // rather than needing a fourth one.
     app.tick(0);
+    app.handle_input(vec![NavIntent::Select]);
+    app.handle_input(vec![NavIntent::Select]);
     app.handle_input(vec![NavIntent::Select]);
 
     let addr = [0xAA; 6];

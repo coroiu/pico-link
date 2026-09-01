@@ -265,6 +265,13 @@ void pl_bt_push_link_state_connected(void) {
     pl_bt_push_link_state(PL_LINK_STATE_CONNECTED);
 }
 
+// Bead pico-link-4vb.5: the disconnected counterpart above -- see bt.h's
+// doc comment on this declaration for why SIGNALING_CONNECTION_RELEASED
+// is the right call site.
+void pl_bt_push_link_state_disconnected(void) {
+    pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+}
+
 void pl_bt_push_connect_step(uint32_t step) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
@@ -311,6 +318,18 @@ void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t nam
         event.payload.codec_changed.name_len = name_len;
     }
     memcpy(event.payload.codec_changed.name, name, name_len);
+    pl_bt_ring_push(event, NULL, 0);
+}
+
+// Bead pico-link-4vb.2 (bug 3): pushes Event::WizardAutoDismiss -- no
+// payload, same shape as pl_bt_push_devices_cleared above. Called from
+// a2dp.c's wizard-dismiss timer handler (IRQ-context producer, same ring).
+void pl_bt_push_wizard_auto_dismiss(void) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_WIZARD_AUTO_DISMISS,
+        .payload = {0},
+    };
     pl_bt_ring_push(event, NULL, 0);
 }
 

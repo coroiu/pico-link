@@ -315,24 +315,28 @@ impl ConnectStep {
 /// one field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum WizardPhase {
-    /// Phase 1: instructions, before any scanning. No timer, nothing
-    /// moving -- see the design's "the user is the one doing work" note.
-    #[default]
-    Instructions,
-    /// Phase 2: scanning (10.24s, C-timed) and/or showing whatever's
-    /// accumulated in `BtModel::devices` so far -- this phase covers both
-    /// "still actively scanning" and "scan finished, results on screen,
-    /// user is choosing one", since nothing about the rendered content
-    /// differs between them. `started` is when the scan began -- see the
-    /// frame-scoped clock ADR's "event timestamps" note: a timestamp is
-    /// domain state and belongs in the model, current time is not. Widget
-    /// code (`render::wizard`) has no clock of its own, so a freshly
-    /// entered `Scanning` phase carries [`PENDING_TIMESTAMP`] until
-    /// [`App`]'s own `now_us` backfills it -- see [`WizardPhase::
-    /// scanning_pending`].
+    /// Phase 1 (formerly "instructions", now removed -- pico-link-4vb.2:
+    /// Andreas wanted the wizard to open straight into scanning rather
+    /// than requiring an A press first). Scanning (10.24s, C-timed)
+    /// and/or showing whatever's accumulated in `BtModel::devices` so far
+    /// -- this phase covers both "still actively scanning" and "scan
+    /// finished, results on screen, user is choosing one", since nothing
+    /// about the rendered content differs between them. `started` is when
+    /// the scan began -- see the frame-scoped clock ADR's "event
+    /// timestamps" note: a timestamp is domain state and belongs in the
+    /// model, current time is not. Widget code (`render::wizard`) has no
+    /// clock of its own, so a freshly entered `Scanning` phase carries
+    /// [`PENDING_TIMESTAMP`] until [`App`]'s own `now_us` backfills it --
+    /// see [`WizardPhase::scanning_pending`].
     Scanning { started: Instant },
-    /// Phase 3: the scan ended (a C `LinkStateChanged(Idle)` event while
-    /// this phase was `Scanning`) with zero devices found.
+    /// Phase 3 (default): the scan ended (a C `LinkStateChanged(Idle)`
+    /// event while this phase was `Scanning`) with zero devices found.
+    /// Also the wizard's closed/not-yet-opened placeholder value -- see
+    /// this variant's use as `#[default]`: opening the wizard always sets
+    /// [`WizardPhase::scanning_pending`] explicitly (`build_devices_
+    /// screen`'s `on_activate_index`), so this default is never actually
+    /// rendered as "nothing found" for a fresh wizard.
+    #[default]
     NothingFound,
     /// Phase 4: connecting, at the named sub-`step` currently in
     /// progress. `addr` is carried so a subsequent retry (phase 5's "keep
@@ -552,18 +556,20 @@ pub(crate) fn build_devices_screen(
     let list = VerticalList::new(items)
         .on_activate_index(move |index| {
             if index == 0 {
-                // pico-link-znb.7 (E5): selecting "Scan" no longer queues
-                // `Command::StartScan` directly -- it opens the pairing
-                // wizard at phase 1 (instructions), which is what actually
-                // starts the scan once the user presses A there. Resetting
+                // pico-link-4vb.2: selecting "Scan" opens the pairing
+                // wizard straight into phase 2 (scanning) and queues
+                // `Command::StartScan` immediately -- the old instructions
+                // phase 1 (press A to start) is gone; the user shouldn't
+                // have to press anything before scanning begins. Resetting
                 // `wizard_phase`/`wizard_devices` here (rather than only
                 // when the wizard widget itself is constructed) covers
                 // re-opening the wizard after a previous session ended in
                 // a terminal phase (Succeeded/Failed/NothingFound) --
                 // without this the wizard would briefly flash its last
-                // outcome before the user does anything.
-                *wizard_phase_for_activate.borrow_mut() = WizardPhase::Instructions;
+                // outcome before the scan result replaces it.
+                *wizard_phase_for_activate.borrow_mut() = WizardPhase::scanning_pending();
                 wizard_devices_for_activate.borrow_mut().clear();
+                commands_for_activate.borrow_mut().push_back(Command::StartScan);
                 let phase = Rc::clone(&wizard_phase_for_activate);
                 let devices = Rc::clone(&wizard_devices_for_activate);
                 let commands = Rc::clone(&commands_for_activate);
@@ -910,17 +916,19 @@ impl App {
         }
     }
 
-    /// Folds one [`Event::WizardAutoDismiss`] -- pops the wizard back to
-    /// Devices, but **only** if it's currently showing a plain
-    /// (non-degraded) success; see that event's doc comment for why this
-    /// guard exists. `Navigator::pop` is itself a no-op if the wizard
-    /// isn't actually on the stack (e.g. this event arrived after the
-    /// user already backed out via B), so no separate "is the wizard
-    /// open" check is needed here.
+    /// Folds one [`Event::WizardAutoDismiss`] -- pops all the way back to
+    /// Home, but **only** if it's currently showing a plain (non-degraded)
+    /// success; see that event's doc comment for why this guard exists.
+    /// pico-link-4vb.2 (Andreas's ruling): landing on Devices left him
+    /// pressing Back repeatedly to get back to Home, so this now calls
+    /// [`crate::render::Navigator::pop_to_root`] instead of
+    /// [`crate::render::Navigator::pop`] -- a no-op if the wizard isn't
+    /// actually the top of the stack any more (e.g. this event arrived
+    /// after the user already backed out via B), same as `pop` was.
     fn on_wizard_auto_dismiss(&mut self) {
         let should_pop = matches!(*self.wizard_phase.borrow(), WizardPhase::Succeeded { degraded: false });
         if should_pop {
-            self.navigator.pop();
+            self.navigator.pop_to_root();
             *self.wizard_phase.borrow_mut() = WizardPhase::default();
             self.wizard_devices.borrow_mut().clear();
             self.dirty = true;
@@ -999,7 +1007,7 @@ impl App {
         // attempt just sets a phase nothing is currently rendering, which
         // is harmless and gets overwritten the next time the wizard opens
         // (`build_devices_screen`'s row-0 activation resets it to
-        // `Instructions`).
+        // `WizardPhase::scanning_pending`).
         *self.wizard_phase.borrow_mut() = WizardPhase::Failed { addr, reason };
         self.rebuild_root();
     }
@@ -1676,9 +1684,9 @@ mod tests {
 
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
         app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
-        app.handle_input(vec![NavIntent::Select]); // Scan row -> pushes the wizard (Instructions)
+        app.handle_input(vec![NavIntent::Select]); // Scan row -> pushes the wizard, straight into Scanning
         assert_eq!(app.navigator_depth(), 3);
-        assert_no_commands_queued(&mut app);
+        app.poll_command(); // drain StartScan, queued by opening the wizard
 
         app.handle_event(Event::ConnectSucceeded { addr: DGX_ADDR, degraded });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded });
@@ -1845,7 +1853,7 @@ mod tests {
         // pl_bt_debug_connect) never drives the wizard -- this is exactly
         // why Event::ConnectSucceeded carries its own `addr` (bead
         // pico-link-cz0.6) rather than requiring core to read it back off
-        // WizardPhase, which stays WizardPhase::default() (Instructions)
+        // WizardPhase, which stays WizardPhase::default() (NothingFound)
         // for the whole debug-bypass path. Persistence must still work.
         let mut app = App::new(240, 240);
         let addr = [42, 42, 42, 42, 42, 42];

@@ -57,9 +57,23 @@ void pl_bt_drain_events(struct PlUi *ui);
 
 // Pushes Event::LinkStateChanged{state: Connected} -- PL_LINK_STATE_IDLE/
 // SCANNING/CONNECTING are already reachable via bt.c's own call sites;
-// CONNECTED only becomes reachable once a2dp.c's A2DP_SUBEVENT_STREAM_STARTED
-// fires (design sec 4.3), so it is exposed here rather than duplicated.
+// CONNECTED only becomes reachable once a2dp.c's
+// A2DP_SUBEVENT_STREAM_ESTABLISHED fires (moved off STREAM_STARTED by bead
+// pico-link-4vb.2 -- see that bead's bug 2), so it is exposed here rather
+// than duplicated.
 void pl_bt_push_link_state_connected(void);
+
+// Pushes Event::LinkStateChanged{state: Idle} -- the disconnected
+// counterpart of pl_bt_push_link_state_connected above. Bead
+// pico-link-4vb.5: before this, nothing in firmware told core when a
+// connected sink went away (power-off, out of range, etc.) -- BtModel's
+// link_state stayed Connected forever and Home kept rendering a live
+// link to hardware that was no longer there. Call from
+// A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED (a2dp.c), the point BTstack
+// itself treats as the authoritative "this A2DP session is over" signal
+// -- NOT from STREAM_SUSPENDED/STREAM_RELEASED, which fire on an ordinary
+// pause and must not read as a disconnect.
+void pl_bt_push_link_state_disconnected(void);
 
 // Pushes Event::ConnectStepChanged(step). `step` is the raw wire value of
 // ui-ffi's PlConnectStep (Connecting=0, Pairing=1, SettingUpAudio=2,
@@ -95,6 +109,14 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
 // pico_link_ui.h. Call only from the signaling codec-configuration
 // handler (a2dp.c), never from the media timer path.
 void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t name_len, uint32_t nominal_bitrate_bps);
+
+// Pushes Event::WizardAutoDismiss (no payload). Bead pico-link-4vb.2 (bug
+// 3): PL_EVENT_TAG_WIZARD_AUTO_DISMISS existed in the FFI with core-side
+// handling already wired (pops the wizard back to Home, but only on a
+// plain non-degraded success) yet had NO producer anywhere in firmware.
+// Call from a2dp.c's one-shot wizard-dismiss timer, armed a couple of
+// seconds after a ConnectSucceeded push.
+void pl_bt_push_wizard_auto_dismiss(void);
 
 #ifdef PL_DEBUG_REMOTE
 // Bead pico-link-g48: debug-only direct connect to a host-supplied
