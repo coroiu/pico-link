@@ -209,6 +209,159 @@ enum PowerState {
     Asleep,
 }
 
+/// What one [`IdlePolicy::tick`] call decided, for the caller to act on.
+/// Both fields default to "do nothing" (`None`/`false`) on a tick that
+/// changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IdleDecision {
+    /// `Some(_)` only on the tick the power level actually *changed* --
+    /// e.g. crossing the idle timeout, or the wake half of the state
+    /// machine (see [`IdlePolicy::on_input`]) requesting `On`. A caller
+    /// that re-applies [`IdlePolicy::display_power`] every frame (as the
+    /// firmware's pull-based `pl_ui_display_power` does -- see
+    /// `.planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md`)
+    /// can ignore this field entirely; it exists for a caller like
+    /// [`Runner::step`] that only wants to call
+    /// `DisplaySurface::set_power` on an actual transition.
+    pub power_transition: Option<DisplayPower>,
+    /// `true` on the one tick deep sleep should fire (see
+    /// [`IdlePolicy`]'s "Deep sleep" section) -- at most once per
+    /// `IdlePolicy` instance, mirroring the old `deep_sleep_triggered`
+    /// latch.
+    pub enter_deep_sleep: bool,
+}
+
+/// The idle/wake + deep-sleep decision, extracted from [`Runner::step`] so
+/// both the emulator's `run`/`Runner` and firmware's `ui-ffi` can share
+/// **one** implementation of the tiers instead of the firmware silently
+/// having none at all -- see pico-link-i3e and
+/// `.planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md`.
+/// Deliberately `Platform`-free: this type touches no trait from
+/// `crate::platform` except the plain data types [`DisplayPower`] and
+/// [`crate::platform::Instant`], so it is usable from `ui-ffi` (which has
+/// no `Platform` impl and never will under the C-first ADR) exactly as
+/// easily as from [`Runner`].
+///
+/// Two halves, deliberately split because a caller like `ui-ffi`'s
+/// `pl_ui_input` has no clock reading available (C's clock only arrives
+/// later, via `pl_ui_tick`'s `now_us`):
+///
+/// - [`IdlePolicy::on_input`] -- call synchronously when a non-empty input
+///   batch arrives, before forwarding it anywhere. Purely a state
+///   transition (`Asleep` -> `Active`); needs no clock.
+/// - [`IdlePolicy::tick`] -- call once per frame with that frame's clock
+///   reading and whether input arrived. Updates the idle clock and
+///   evaluates both timeout tiers.
+///
+/// `last_input` is lazily initialized on the first [`IdlePolicy::tick`]
+/// call rather than seeded at construction -- `IdlePolicy::new` takes no
+/// clock reading precisely because `ui-ffi`'s `pl_ui_create` has none
+/// available; seeding a `0` baseline there would mean a UI created, say,
+/// 61 seconds after device boot blanks on its very first rendered frame.
+pub struct IdlePolicy {
+    power_state: PowerState,
+    last_input: Option<crate::platform::Instant>,
+    /// Set once deep sleep has fired, so a host test's no-op recording
+    /// stub (which, unlike real hardware, actually returns) doesn't
+    /// re-fire it every subsequent tick once eligible -- see the "Deep
+    /// sleep" section below.
+    deep_sleep_triggered: bool,
+    idle_timeout: Option<Duration>,
+    deep_sleep_timeout: Option<Duration>,
+}
+
+impl IdlePolicy {
+    /// Builds a policy starting `Active`, with `last_input` unset (see the
+    /// type doc's note on lazy initialization). `idle_timeout`/
+    /// `deep_sleep_timeout` are the same `None`-disables-the-tier seams
+    /// [`run`] always took.
+    #[must_use]
+    pub const fn new(idle_timeout: Option<Duration>, deep_sleep_timeout: Option<Duration>) -> Self {
+        Self { power_state: PowerState::Active, last_input: None, deep_sleep_triggered: false, idle_timeout, deep_sleep_timeout }
+    }
+
+    /// The wake half. Call synchronously when a non-empty input batch has
+    /// arrived, **before** forwarding it to `App`. Returns `true` if the
+    /// display was `Asleep` and this call just woke it -- the caller must
+    /// swallow this batch (never forward it to `app.handle_input`) and
+    /// mark the app dirty instead, so the just-woken display gets a fresh
+    /// flush even though nothing on screen actually changed (see the
+    /// module doc's "Idle/wake" section, which this reproduces exactly).
+    /// Returns `false` (forward normally) if already `Active`.
+    ///
+    /// Does not touch `last_input` -- that update happens in the following
+    /// [`IdlePolicy::tick`] call, which every caller is expected to make
+    /// once per frame regardless of whether input arrived.
+    pub fn on_input(&mut self) -> bool {
+        if self.power_state == PowerState::Asleep {
+            self.power_state = PowerState::Active;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The arm half. Call exactly once per frame with `now` (this frame's
+    /// clock reading), `had_input` (whether a non-empty batch arrived this
+    /// frame -- and, if so, whether [`IdlePolicy::on_input`] was already
+    /// called for it), `at_home_root` (`App::is_at_home_root()`), and
+    /// `on_external_power` (`PowerControl::on_external_power()`).
+    ///
+    /// Lazily initializes `last_input` to `now` on the very first call
+    /// (see the type doc). Any frame with `had_input == true` resets
+    /// `last_input` to `now`, mirroring the module doc's "Idle/wake"
+    /// pseudocode. A frame with no input evaluates, in order:
+    ///
+    /// - the screensaver tier: blanks (`power_transition = Some(Off)`) once
+    ///   `Active && at_home_root && now - last_input >= idle_timeout`.
+    /// - the deep-sleep tier (independent of the screensaver's own
+    ///   `PowerState`, per the module doc's "Deep sleep" section): fires
+    ///   at most once, when `!deep_sleep_triggered && now - last_input >=
+    ///   deep_sleep_timeout && !on_external_power`.
+    ///
+    /// Either tier is permanently disabled by passing `None` for its
+    /// timeout.
+    pub fn tick(&mut self, now: crate::platform::Instant, had_input: bool, at_home_root: bool, on_external_power: bool) -> IdleDecision {
+        let last_input = *self.last_input.get_or_insert(now);
+        let mut decision = IdleDecision::default();
+
+        if had_input {
+            self.last_input = Some(now);
+            return decision;
+        }
+
+        if let Some(idle_timeout) = self.idle_timeout {
+            if self.power_state == PowerState::Active && at_home_root && now.saturating_duration_since(last_input) >= idle_timeout {
+                self.power_state = PowerState::Asleep;
+                decision.power_transition = Some(DisplayPower::Off);
+            }
+        }
+
+        if let Some(deep_sleep_timeout) = self.deep_sleep_timeout {
+            let idle_elapsed = now.saturating_duration_since(last_input);
+            if !self.deep_sleep_triggered && idle_elapsed >= deep_sleep_timeout && !on_external_power {
+                self.deep_sleep_triggered = true;
+                decision.enter_deep_sleep = true;
+            }
+        }
+
+        decision
+    }
+
+    /// The current requested display power level -- `On` unless the
+    /// screensaver tier has blanked it. A **level**, not an edge: a caller
+    /// may read this every frame and re-apply it idempotently (the
+    /// firmware's `pl_ui_display_power` does exactly this) rather than
+    /// relying on catching every [`IdleDecision::power_transition`].
+    #[must_use]
+    pub fn display_power(&self) -> DisplayPower {
+        match self.power_state {
+            PowerState::Active => DisplayPower::On,
+            PowerState::Asleep => DisplayPower::Off,
+        }
+    }
+}
+
 #[cfg(feature = "frame-timing")]
 impl FrameTiming {
     const WINDOW: u32 = 30;
@@ -279,34 +432,29 @@ pub struct Runner {
     frame_timing: FrameTiming,
     flush_errors: FlushErrorTracker,
     power_errors: FlushErrorTracker,
-    power_state: PowerState,
-    last_input: crate::platform::Instant,
-    /// Set once `PowerControl::enter_deep_sleep` has fired, so a host
-    /// test's no-op recording stub (which, unlike real hardware, actually
-    /// returns) doesn't re-fire it every subsequent iteration once
-    /// eligible -- see the module doc's "Deep sleep" section.
-    deep_sleep_triggered: bool,
-    idle_timeout: Option<Duration>,
-    deep_sleep_timeout: Option<Duration>,
+    /// The idle/deep-sleep decision, extracted into a `Platform`-free unit
+    /// shared with `ui-ffi` -- see [`IdlePolicy`]'s doc comment.
+    idle: IdlePolicy,
 }
 
 impl Runner {
-    /// Builds a fresh `Runner`, starting `Active` with `last_input` set to
-    /// `now` (i.e. the idle clock starts counting from construction, not
-    /// from some earlier unknown point) -- mirroring what the pre-refactor
-    /// `run` did inline at the top of its own function body.
+    /// Builds a fresh `Runner`. `now` is accepted for API stability (a
+    /// caller with a clock reading in hand at construction time can still
+    /// pass it), but is no longer used to seed the idle clock eagerly --
+    /// [`IdlePolicy`] lazily initializes `last_input` on its first
+    /// [`IdlePolicy::tick`] call instead (see that type's doc comment).
+    /// [`run`]'s own construction site calls this immediately before its
+    /// first `step`, so the two clock readings are for all practical
+    /// purposes the same instant either way.
     #[must_use]
     pub fn new(now: crate::platform::Instant, idle_timeout: Option<Duration>, deep_sleep_timeout: Option<Duration>) -> Self {
+        let _ = now;
         Self {
             #[cfg(feature = "frame-timing")]
             frame_timing: FrameTiming::new(),
             flush_errors: FlushErrorTracker::new("DisplaySurface::flush"),
             power_errors: FlushErrorTracker::new("DisplaySurface::set_power"),
-            power_state: PowerState::Active,
-            last_input: now,
-            deep_sleep_triggered: false,
-            idle_timeout,
-            deep_sleep_timeout,
+            idle: IdlePolicy::new(idle_timeout, deep_sleep_timeout),
         }
     }
 
@@ -325,56 +473,40 @@ impl Runner {
         let frame_start = now;
         let intents = platform.input().poll();
         let mut outcome = StepOutcome::Idle;
+        let had_input = !intents.is_empty();
 
-        if intents.is_empty() {
-            if let Some(idle_timeout) = self.idle_timeout {
-                if self.power_state == PowerState::Active
-                    && app.is_at_home_root()
-                    && frame_start.saturating_duration_since(self.last_input) >= idle_timeout
-                {
-                    match platform.display().set_power(DisplayPower::Off) {
-                        Ok(()) => self.power_errors.on_ok(),
-                        Err(error) => self.power_errors.on_err(&error),
-                    }
-                    self.power_state = PowerState::Asleep;
+        if had_input {
+            if self.idle.on_input() {
+                // The wake-triggering input only wakes the display — it is
+                // deliberately never forwarded to `app.handle_input` (see
+                // the module doc). `App` never learns it was asleep;
+                // `mark_dirty` forces the fresh flush the just-woken
+                // display needs even though nothing on screen actually
+                // changed.
+                match platform.display().set_power(DisplayPower::On) {
+                    Ok(()) => self.power_errors.on_ok(),
+                    Err(error) => self.power_errors.on_err(&error),
                 }
+                app.mark_dirty();
+            } else {
+                app.handle_input(intents);
+                outcome = StepOutcome::InputHandled;
             }
+        }
 
-            // Deep sleep (see the module doc's "Deep sleep" section):
-            // independent of `power_state` above (not gated on already
-            // being `Asleep`) -- in practice `Tb` is well past `Ta` so the
-            // screen is already blanked by the time this can fire, but
-            // the check itself only cares about elapsed idle time and
-            // external power.
-            if let Some(deep_sleep_timeout) = self.deep_sleep_timeout {
-                let idle_elapsed = frame_start.saturating_duration_since(self.last_input);
-                if !self.deep_sleep_triggered && idle_elapsed >= deep_sleep_timeout && !platform.power().on_external_power() {
-                    platform.power().enter_deep_sleep();
-                    self.deep_sleep_triggered = true;
-                }
+        // `IdlePolicy::tick` updates `last_input` (if `had_input`) and
+        // evaluates both timeout tiers (if not) -- see its doc comment.
+        // Called every step regardless of `had_input`, mirroring the
+        // module doc's pseudocode.
+        let decision = self.idle.tick(frame_start, had_input, app.is_at_home_root(), platform.power().on_external_power());
+        if let Some(power) = decision.power_transition {
+            match platform.display().set_power(power) {
+                Ok(()) => self.power_errors.on_ok(),
+                Err(error) => self.power_errors.on_err(&error),
             }
-        } else {
-            self.last_input = frame_start;
-            match self.power_state {
-                PowerState::Asleep => {
-                    // The wake-triggering input only wakes the display —
-                    // it is deliberately never forwarded to
-                    // `app.handle_input` (see the module doc). `App`
-                    // never learns it was asleep; `mark_dirty` forces the
-                    // fresh flush the just-woken display needs even
-                    // though nothing on screen actually changed.
-                    match platform.display().set_power(DisplayPower::On) {
-                        Ok(()) => self.power_errors.on_ok(),
-                        Err(error) => self.power_errors.on_err(&error),
-                    }
-                    self.power_state = PowerState::Active;
-                    app.mark_dirty();
-                }
-                PowerState::Active => {
-                    app.handle_input(intents);
-                    outcome = StepOutcome::InputHandled;
-                }
-            }
+        }
+        if decision.enter_deep_sleep {
+            platform.power().enter_deep_sleep();
         }
 
         // Forwards this step's sampled clock time into the app core so
@@ -393,7 +525,7 @@ impl Runner {
         // deliberately stays untouched by this gate (not cleared, not
         // read via `render()`) — a dirty flag survives blanked frames so
         // the next real wake renders it immediately.
-        if app.dirty() && self.power_state == PowerState::Active {
+        if app.dirty() && self.idle.display_power() == DisplayPower::On {
             #[cfg(feature = "frame-timing")]
             let render_start = platform.clock().now();
 
@@ -1179,5 +1311,147 @@ mod tests {
         });
 
         assert_eq!(power.deep_sleep_call_count(), 0, "deep_sleep_timeout: None must disable the tier entirely");
+    }
+}
+
+/// Direct [`IdlePolicy`] unit tests -- no `Platform` stub needed at all,
+/// which is the entire point of pulling the decision out of `Runner::step`
+/// (see [`IdlePolicy`]'s doc comment and pico-link-i3e): these exercise the
+/// exact same tiers the `run::tests` module above already covers via the
+/// full `Runner`/`Platform` machinery, but directly against the
+/// `Platform`-free type `ui-ffi` also calls.
+#[cfg(test)]
+mod idle_policy_tests {
+    use super::{DisplayPower, IdlePolicy};
+    use crate::platform::Instant;
+    use core::time::Duration;
+
+    #[test]
+    fn starts_active_and_on() {
+        let policy = IdlePolicy::new(Some(Duration::from_secs(60)), None);
+        assert_eq!(policy.display_power(), DisplayPower::On);
+    }
+
+    #[test]
+    fn last_input_is_lazily_initialized_not_seeded_to_zero() {
+        // A tick at t=1000s with no prior `tick` call must NOT read as
+        // "already idle for 1000s" -- the first tick call establishes the
+        // baseline instead. This is the exact scenario the design doc
+        // calls out: `pl_ui_create` has no clock, so if `last_input` were
+        // seeded to 0 a UI created 61s after boot would blank on its very
+        // first frame.
+        let mut policy = IdlePolicy::new(Some(Duration::from_secs(60)), None);
+        let far_future = Instant::from_micros(1_000_000_000);
+        let decision = policy.tick(far_future, false, true, true);
+        assert_eq!(decision.power_transition, None, "the first tick must establish the baseline, not read as already-idle");
+        assert_eq!(policy.display_power(), DisplayPower::On);
+    }
+
+    #[test]
+    fn blanks_once_idle_past_the_timeout_at_home_root() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true); // establishes baseline
+
+        let still_before = policy.tick(t0 + Duration::from_secs(59), false, true, true);
+        assert_eq!(still_before.power_transition, None);
+        assert_eq!(policy.display_power(), DisplayPower::On);
+
+        let crosses = policy.tick(t0 + idle_timeout, false, true, true);
+        assert_eq!(crosses.power_transition, Some(DisplayPower::Off));
+        assert_eq!(policy.display_power(), DisplayPower::Off);
+
+        // Must not repeat the transition on a later tick while still idle.
+        let later = policy.tick(t0 + idle_timeout + Duration::from_secs(1), false, true, true);
+        assert_eq!(later.power_transition, None, "already Asleep -- no repeat transition");
+    }
+
+    #[test]
+    fn never_blanks_off_home_root_no_matter_how_long_idle() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, false, true);
+        let decision = policy.tick(t0 + Duration::from_secs(1000), false, false, true);
+        assert_eq!(decision.power_transition, None, "must never arm off Home root");
+        assert_eq!(policy.display_power(), DisplayPower::On);
+    }
+
+    #[test]
+    fn idle_timeout_none_never_blanks() {
+        let mut policy = IdlePolicy::new(None, None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true);
+        let decision = policy.tick(t0 + Duration::from_secs(10_000), false, true, true);
+        assert_eq!(decision.power_transition, None);
+        assert_eq!(policy.display_power(), DisplayPower::On);
+    }
+
+    #[test]
+    fn on_input_wakes_from_asleep_and_returns_true_only_once() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true);
+        policy.tick(t0 + idle_timeout, false, true, true);
+        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
+
+        assert!(policy.on_input(), "waking from Asleep must report true (caller must swallow this input)");
+        assert_eq!(policy.display_power(), DisplayPower::On, "on_input must flip the level immediately, before the next tick");
+
+        assert!(!policy.on_input(), "already Active -- must not report a wake a second time");
+    }
+
+    #[test]
+    fn input_while_active_resets_the_idle_clock() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true);
+
+        // Input arrives just before the timeout would have fired.
+        let just_before = t0 + Duration::from_secs(59);
+        assert!(!policy.on_input(), "already Active");
+        policy.tick(just_before, true, true, true);
+
+        // A full `idle_timeout` after the ORIGINAL baseline (t0) has now
+        // passed, but only ~1s has passed since the reset -- must not
+        // blank yet.
+        let decision = policy.tick(t0 + idle_timeout + Duration::from_millis(500), false, true, true);
+        assert_eq!(decision.power_transition, None, "the idle clock must have reset on the input at `just_before`, not stayed anchored to t0");
+    }
+
+    #[test]
+    fn deep_sleep_fires_once_past_tb_when_off_external_power() {
+        let deep_sleep_timeout = Duration::from_secs(600);
+        let mut policy = IdlePolicy::new(None, Some(deep_sleep_timeout));
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, false);
+
+        let decision = policy.tick(t0 + deep_sleep_timeout, false, true, false);
+        assert!(decision.enter_deep_sleep);
+
+        let again = policy.tick(t0 + deep_sleep_timeout + Duration::from_secs(1), false, true, false);
+        assert!(!again.enter_deep_sleep, "must fire at most once");
+    }
+
+    #[test]
+    fn deep_sleep_never_fires_on_external_power() {
+        let deep_sleep_timeout = Duration::from_secs(600);
+        let mut policy = IdlePolicy::new(None, Some(deep_sleep_timeout));
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true);
+        let decision = policy.tick(t0 + deep_sleep_timeout, false, true, true);
+        assert!(!decision.enter_deep_sleep);
+    }
+
+    #[test]
+    fn deep_sleep_timeout_none_never_fires() {
+        let mut policy = IdlePolicy::new(None, None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, false);
+        let decision = policy.tick(t0 + Duration::from_secs(100_000), false, true, false);
+        assert!(!decision.enter_deep_sleep);
     }
 }

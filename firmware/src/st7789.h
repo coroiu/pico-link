@@ -11,6 +11,7 @@
 #ifndef PICO_LINK_ST7789_H
 #define PICO_LINK_ST7789_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "hardware/spi.h"
@@ -88,5 +89,16 @@ void st7789_set_caset_offset(uint16_t x0);
 // scan direction until the window commands are reissued -- st7789_blit_
 // framebuffer's RAMWR-only fast path assumes that never needs to happen.
 void st7789_reset_window(void);
+
+// Sets the backlight GPIO (GP13) only -- `true` for on, `false` for off.
+// Deliberately NOT DISPOFF/SLPIN (the panel-controller sleep commands):
+// GP13 is a plain GPIO wired straight to the backlight driver, entirely
+// out of band from the SPI1 bus st7789_blit_framebuffer's DMA uses, so
+// toggling it can never race an in-flight blit and needs no panel
+// re-init on the next wake (see pico-link-i3e /
+// .planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md). Safe
+// to call every superloop iteration -- idempotent, just a `gpio_put`.
+// Requires st7789_init to have run first (it owns GP13's init/direction).
+void st7789_set_backlight(bool on);
 
 #endif // PICO_LINK_ST7789_H

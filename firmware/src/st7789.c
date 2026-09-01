@@ -274,3 +274,10 @@ void st7789_reset_window(void) {
     uint8_t raset_params[4] = {0x00, 0x00, (uint8_t)(y_end >> 8), (uint8_t)(y_end & 0xff)};
     st7789_command(ST7789_CMD_RASET, raset_params, sizeof(raset_params));
 }
+
+void st7789_set_backlight(bool on) {
+    // A plain gpio_put -- see st7789.h's doc comment for why this is
+    // deliberately not DISPOFF/SLPIN (out of band from SPI1, cannot race
+    // st7789_blit_framebuffer's DMA). Idempotent by construction.
+    gpio_put(ST7789_PIN_BL, on ? 1 : 0);
+}

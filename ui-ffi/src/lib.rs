@@ -52,8 +52,11 @@ use alloc::vec::Vec;
 
 #[cfg(not(test))]
 use embedded_alloc::LlffHeap as Heap;
+use pico_link_core::platform::DisplayPower;
+use pico_link_core::run::IdlePolicy;
 use pico_link_core::{
     App, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, NavIntent, StoreStatus,
+    DEFAULT_IDLE_TIMEOUT,
 };
 
 // --- critical-section implementation ---
@@ -267,6 +270,23 @@ extern "C" {
 /// (see the module doc's memory rules).
 pub struct PlUi {
     app: App,
+    /// The idle-screensaver/deep-sleep decision, shared with the
+    /// emulator's `Runner::step` via `pico_link_core::run::IdlePolicy` --
+    /// see pico-link-i3e and
+    /// `.planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md`.
+    /// Deep sleep stays unreachable here: constructed with
+    /// `deep_sleep_timeout: None` (see [`pl_ui_create`]'s doc comment),
+    /// matching `crate::power::DEEP_SLEEP_ARMED == false` today.
+    idle: IdlePolicy,
+    /// Set by [`pl_ui_input`] whenever a call carries at least one intent
+    /// (`count > 0`, valid or malformed), and consumed (reset to `false`)
+    /// by the next [`pl_ui_tick`] call. `pl_ui_input` has no clock
+    /// available -- only `pl_ui_tick`'s `now_us` does -- so this flag is
+    /// how "input arrived this frame" crosses from one FFI call to the
+    /// next, mirroring `Runner::step`'s single-call `had_input` local
+    /// (there, input poll and idle tick happen in the same call; here they
+    /// are necessarily two separate C calls per frame).
+    input_since_last_tick: bool,
     /// Count of `pl_ui_input`/`pl_ui_push_event` calls that carried a tag
     /// value with no corresponding `PlIntentTag`/`PlEventTag` variant --
     /// i.e. a malformed or garbage discriminant, most plausibly arriving via
@@ -290,6 +310,19 @@ pub struct PlUi {
 /// panic contract, but this boundary never panics across FFI -- see the
 /// module doc).
 ///
+/// Constructs its [`IdlePolicy`] with `idle_timeout: Some(DEFAULT_IDLE_TIMEOUT)`
+/// and `deep_sleep_timeout: None` -- the screensaver tier is on, matching
+/// `crate::power::IdlePowerSetting::default()`'s always-on behavior (the
+/// persisted toggle itself is not yet read from `Storage` here -- see
+/// pico-link-i3e's follow-up beads); deep sleep stays unreachable, matching
+/// `crate::power::DEEP_SLEEP_ARMED == false`. Deliberately does **not**
+/// seed `IdlePolicy`'s idle clock from any timestamp here: this function
+/// has no clock (see the FFI direction rule -- C owns the clock, only
+/// [`pl_ui_tick`]'s `now_us` ever supplies one), and `IdlePolicy` lazily
+/// initializes `last_input` on its first `tick` call for exactly this
+/// reason (see that type's doc comment) -- a UI created 61s after boot
+/// must not blank on its very first rendered frame.
+///
 /// # Safety
 ///
 /// The returned pointer must eventually be passed to exactly one
@@ -308,7 +341,12 @@ pub extern "C" fn pl_ui_create(width: u32, height: u32) -> *mut PlUi {
         return core::ptr::null_mut();
     }
 
-    let ui = PlUi { app: App::new(width, height), malformed_tag_count: 0 };
+    let ui = PlUi {
+        app: App::new(width, height),
+        idle: IdlePolicy::new(Some(DEFAULT_IDLE_TIMEOUT), None),
+        input_since_last_tick: false,
+        malformed_tag_count: 0,
+    };
     Box::into_raw(Box::new(ui))
 }
 
@@ -443,6 +481,16 @@ impl core::convert::TryFrom<PlIntent> for NavIntent {
 /// mapped to `pl_intent_t`) into the app core. A no-op if `ui` is null,
 /// `intents` is null, or `count` is zero.
 ///
+/// **Idle/wake:** if the display is currently blanked (see
+/// [`pl_ui_display_power`]), this call only wakes it -- the batch is
+/// swallowed, never forwarded to `app.handle_input`, matching
+/// `pico_link_core::run::Runner::step`'s wake contract exactly (see
+/// [`IdlePolicy::on_input`]'s doc comment: the wake-triggering input must
+/// never itself navigate). Otherwise forwarded normally. Either way, this
+/// call flags that input arrived so the following [`pl_ui_tick`] resets
+/// the idle clock -- see [`PlUi::input_since_last_tick`]'s doc comment for
+/// why that update is deferred to `pl_ui_tick` rather than done here.
+///
 /// # Safety
 ///
 /// If non-null, `intents` must point to at least `count` valid,
@@ -456,6 +504,8 @@ pub unsafe extern "C" fn pl_ui_input(ui: *mut PlUi, intents: *const PlIntent, co
     }
     // SAFETY: caller contract above.
     let ui = &mut *ui;
+    ui.input_since_last_tick = true;
+
     // SAFETY: caller contract above -- `intents` points to `count` valid,
     // initialized `PlIntent` values for the duration of this call. Reading
     // them is sound regardless of `tag`'s value because `PlIntent::tag` is a
@@ -471,6 +521,16 @@ pub unsafe extern "C" fn pl_ui_input(ui: *mut PlUi, intents: *const PlIntent, co
             Err(()) => ui.malformed_tag_count += 1,
         }
     }
+
+    if ui.idle.on_input() {
+        // Was Asleep, now woken: drop this batch entirely (even any
+        // successfully-mapped intents) and mark the app dirty instead, so
+        // the just-woken display gets a fresh flush -- see the doc comment
+        // above.
+        ui.app.mark_dirty();
+        return;
+    }
+
     if !mapped.is_empty() {
         ui.app.handle_input(mapped);
     }
@@ -484,6 +544,17 @@ pub unsafe extern "C" fn pl_ui_input(ui: *mut PlUi, intents: *const PlIntent, co
 /// link-status/liveness indicator during multi-second waits, per the
 /// approved on-device UI design). A no-op if `ui` is null.
 ///
+/// Also arms/evaluates the idle-screensaver tier for this frame (see
+/// [`IdlePolicy::tick`]): consumes [`PlUi::input_since_last_tick`] and
+/// updates the idle clock accordingly. `on_external_power` is hardcoded to
+/// `true` -- the firmware has no external-power sense yet (see the design
+/// doc's §5.2) and this instance's `deep_sleep_timeout` is always `None`
+/// (set in [`pl_ui_create`]), so the deep-sleep tier can never actually
+/// fire regardless of this value; it exists only so `IdlePolicy::tick`'s
+/// signature doesn't need a second, firmware-only variant. The resulting
+/// power level is read separately via [`pl_ui_display_power`] -- this
+/// function does not report it.
+///
 /// # Safety
 ///
 /// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
@@ -495,7 +566,57 @@ pub unsafe extern "C" fn pl_ui_tick(ui: *mut PlUi, now_us: u64) {
     }
     // SAFETY: caller contract above.
     let ui = &mut *ui;
+    let had_input = core::mem::take(&mut ui.input_since_last_tick);
+    let now = pico_link_core::platform::Instant::from_micros(now_us);
+    // `enter_deep_sleep` is deliberately ignored -- see the doc comment
+    // above for why it can never be `true` here.
+    let _decision = ui.idle.tick(now, had_input, ui.app.is_at_home_root(), true);
     ui.app.tick(now_us);
+}
+
+/// Requested panel power level, mirroring
+/// [`pico_link_core::platform::DisplayPower`] for the C side of the FFI --
+/// see [`pl_ui_display_power`]'s doc comment for the full contract. Pinned
+/// discriminants (part of the wire ABI, same rationale as
+/// [`PlLinkState`]'s).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlDisplayPower {
+    On = 0,
+    Off = 1,
+}
+
+impl From<DisplayPower> for PlDisplayPower {
+    fn from(power: DisplayPower) -> Self {
+        match power {
+            DisplayPower::On => PlDisplayPower::On,
+            DisplayPower::Off => PlDisplayPower::Off,
+        }
+    }
+}
+
+/// Current requested panel power. **A level, not an edge**: intended to be
+/// read once per superloop iteration (after [`pl_ui_tick`]) and applied
+/// idempotently to the backlight GPIO -- see
+/// `.planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md`'s §2.4
+/// for why a pull-based level was chosen over a command or a callback (a
+/// dropped edge would leave the backlight permanently wrong; a level
+/// re-applied every frame is self-healing, including across a watchdog
+/// reboot). Safe to call at any time; returns [`PlDisplayPower::On`] if
+/// `ui` is null (never leaves a null `ui` looking blanked).
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_display_power(ui: *mut PlUi) -> PlDisplayPower {
+    if ui.is_null() {
+        return PlDisplayPower::On;
+    }
+    // SAFETY: caller contract above.
+    let ui = &*ui;
+    ui.idle.display_power().into()
 }
 
 /// Renders the current screen -- unconditionally, every call, regardless of
@@ -1642,6 +1763,78 @@ mod tests {
             assert_eq!((*ui).app.dirty(), dirty_before);
             pl_ui_destroy(ui);
         }
+    }
+
+    #[test]
+    fn pl_ui_display_power_defaults_to_on_and_is_on_for_a_null_ui() {
+        let ui = new_ui();
+        assert!(unsafe { pl_ui_display_power(ui) } == PlDisplayPower::On, "a fresh PlUi must not start blanked");
+        assert!(unsafe { pl_ui_display_power(core::ptr::null_mut()) } == PlDisplayPower::On, "a null ui must read as On, never blanked");
+        unsafe { pl_ui_destroy(ui) };
+    }
+
+    #[test]
+    fn pl_ui_tick_blanks_after_the_idle_timeout_at_home_root() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe { pl_ui_tick(ui, 0) };
+        assert!(unsafe { pl_ui_display_power(ui) } == PlDisplayPower::On, "must not blank on the very first tick");
+
+        unsafe { pl_ui_tick(ui, idle_timeout_us - 1) };
+        assert!(unsafe { pl_ui_display_power(ui) } == PlDisplayPower::On, "must not blank one microsecond early");
+
+        unsafe { pl_ui_tick(ui, idle_timeout_us) };
+        assert!(unsafe { pl_ui_display_power(ui) } == PlDisplayPower::Off, "must blank once the idle timeout has elapsed at Home root");
+
+        unsafe { pl_ui_destroy(ui) };
+    }
+
+    #[test]
+    fn pl_ui_tick_baseline_is_lazily_established_not_seeded_to_zero() {
+        // Mirrors `IdlePolicy`'s own `last_input_is_lazily_initialized_not_seeded_to_zero`
+        // test, but through the real FFI entry points: a UI whose first
+        // `pl_ui_tick` call already carries a large `now_us` (i.e. created
+        // long after device boot) must not read as already-idle.
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+        let far_future_us = idle_timeout_us + 1_000_000_000;
+
+        unsafe { pl_ui_tick(ui, far_future_us) };
+        assert!(
+            unsafe { pl_ui_display_power(ui) } == PlDisplayPower::On,
+            "the first tick must establish the baseline, not read as already idle past the timeout"
+        );
+
+        unsafe { pl_ui_destroy(ui) };
+    }
+
+    #[test]
+    fn pl_ui_input_while_asleep_wakes_and_swallows_the_batch() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe { pl_ui_tick(ui, 0) };
+        unsafe { pl_ui_tick(ui, idle_timeout_us) };
+        assert!(unsafe { pl_ui_display_power(ui) } == PlDisplayPower::Off, "sanity: asleep");
+
+        // Render once to reach a clean (non-dirty) baseline, then capture
+        // the current selection state as a proxy for "was this intent
+        // forwarded to the navigator" -- same pattern as
+        // `pico_link_core::run::tests::waking_input_is_swallowed_but_the_
+        // next_input_reaches_the_app`.
+        let mut out_px = core::ptr::null();
+        let mut out_len = 0usize;
+        unsafe { pl_ui_render(ui, &mut out_px, &mut out_len) };
+        assert!(!unsafe { (*ui).app.dirty() }, "PlUi should be clean immediately after a render");
+
+        let down = [PlIntent { tag: PlIntentTag::Down as u32, jump_by: 0 }];
+        unsafe { pl_ui_input(ui, down.as_ptr(), down.len()) };
+
+        assert!(unsafe { pl_ui_display_power(ui) } == PlDisplayPower::On, "the waking input must turn the display back on immediately");
+        assert!(unsafe { (*ui).app.dirty() }, "waking must mark the app dirty so the just-woken display gets a fresh flush");
+
+        unsafe { pl_ui_destroy(ui) };
     }
 
     #[test]
