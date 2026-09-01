@@ -503,8 +503,12 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
         // hci_connection_t with no further use of any handle) on any
         // other status -- so this is the only way to see what the
         // controller actually sent on the failure path. Wire format:
-        // Status(1) BD_ADDR(6) Handle(2,LE) Link_Type(1) Encryption(1),
-        // starting at packet[2].
+        // Status(1) Handle(2,LE) BD_ADDR(6) Link_Type(1) Encryption(1),
+        // starting at packet[2] -- Handle before BD_ADDR (see BTstack's own
+        // hci_event_connection_complete_get_connection_handle/_get_bd_addr
+        // accessors in btstack_event.h, offsets 3 and 5 respectively). The
+        // code below already reads it in this order; this comment previously
+        // stated BD_ADDR before Handle.
         case HCI_EVENT_CONNECTION_COMPLETE: {
             uint8_t status = packet[2];
             bd_addr_t addr;

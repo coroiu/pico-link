@@ -268,6 +268,13 @@ typedef struct {
     btstack_timer_source_t reconnect_retry_timer;
     bool reconnect_retry_armed; // true iff reconnect_retry_timer is currently added to the run loop
     bool reconnect_retry_used;  // true once this connect() attempt has already spent its one retry
+    // Bead pico-link-cz0.6 code review: the exact status that armed the
+    // retry above, so the STREAM_ESTABLISHED cascade-suppression check
+    // (below) can confirm the cascaded failure is really the SAME failure
+    // being retried, not a genuinely different one that happens to land in
+    // the same ~1.5s window. Meaningful only while reconnect_retry_armed is
+    // true.
+    uint8_t reconnect_retry_armed_status;
 
     int max_media_payload_size;
     // Bead pico-link-85v (D1): rtp_next replaces the old rtp_timestamp --
@@ -1210,7 +1217,7 @@ static void pl_a2dp_reconnect_retry_handler(btstack_timer_source_t *ts) {
 // reconnect_retry_used so a second 0x0b (from this retry itself, or any
 // later failure before the next fresh connect()) is reported to the UI as
 // a real failure instead of retrying again.
-static void pl_a2dp_reconnect_retry_arm(void) {
+static void pl_a2dp_reconnect_retry_arm(uint8_t status) {
     s_ctx.reconnect_retry_used = true;
     pl_log(
         "a2dp: 0x0b (ACL connection already exists) -- arming single bounded retry in %ums\r\n",
@@ -1221,6 +1228,7 @@ static void pl_a2dp_reconnect_retry_arm(void) {
     btstack_run_loop_set_timer(&s_ctx.reconnect_retry_timer, PL_A2DP_RECONNECT_RETRY_DELAY_MS);
     btstack_run_loop_add_timer(&s_ctx.reconnect_retry_timer);
     s_ctx.reconnect_retry_armed = true;
+    s_ctx.reconnect_retry_armed_status = status;
 }
 
 static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -1247,7 +1255,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 // falls through to the normal failure report below, same
                 // as every other status.
                 if (status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS && !s_ctx.reconnect_retry_used) {
-                    pl_a2dp_reconnect_retry_arm();
+                    pl_a2dp_reconnect_retry_arm(status);
                     break;
                 }
                 pl_bt_push_connect_failed(s_ctx.connect_addr, pl_a2dp_failure_reason_for_status(status));
@@ -1549,8 +1557,12 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 // flash a failure screen for an attempt we're still
                 // retrying. reconnect_retry_armed is only true here in
                 // that exact window (it's cleared before this handler can
-                // run again for a genuinely new attempt).
-                if (s_ctx.reconnect_retry_armed) {
+                // run again for a genuinely new attempt). Bead pico-link-cz0.6
+                // code review: also require THIS status to match the one
+                // that armed the retry -- a genuinely different failure
+                // landing in that same ~1.5s window must still be reported,
+                // not silently absorbed into the 0x0b suppression.
+                if (s_ctx.reconnect_retry_armed && status == s_ctx.reconnect_retry_armed_status) {
                     pl_log("a2dp: suppressing UI failure push -- 0x0b retry already armed for this attempt\r\n");
                     break;
                 }

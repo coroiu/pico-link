@@ -127,7 +127,18 @@ void pl_persist_boot_device_addr(uint8_t out_addr[6]);
 // POLICY decides *when* a device is worth remembering -- on
 // Event::ConnectSucceeded -- and tells C via this command; C only stages,
 // gates and flushes, per design point 7). Does not write flash itself --
-// see this header's module doc. Thread-context only (bt.c's poll loop).
+// see this header's module doc.
+//
+// # Calling contract
+//
+// TWO valid callers, in two different contexts: bt.c's
+// PL_COMMAND_TAG_PERSIST_DEVICE handler (thread context, the superloop) and
+// pl_persist_save_device_now()'s pico-link-lmf carve-out (IRQ/async_context,
+// when USB audio is already streaming at pairing time -- see that
+// function's doc comment). The function body is wrapped in
+// save_and_disable_interrupts()/restore_interrupts() specifically so both
+// contexts can call it safely; do not add a third caller without checking
+// that guard still suffices.
 void pl_persist_request_save_device(const uint8_t addr[6]);
 
 // Called once per superloop iteration, thread context, unconditionally

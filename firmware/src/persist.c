@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "hardware/flash.h"
+#include "hardware/sync.h"
 #include "pico/btstack_flash_bank.h"
 #include "pico/time.h"
 
@@ -230,7 +231,22 @@ void pl_persist_boot_device_addr(uint8_t out_addr[6]) {
     memcpy(out_addr, s_boot_device_addr, 6);
 }
 
+// Code-review finding (bd-pico-link-cz0.6, 2026-09-01, CONFIRMED): this
+// function has TWO callers in two different contexts -- bt.c:814's
+// PL_COMMAND_TAG_PERSIST_DEVICE handler (thread context, the superloop) and
+// pl_persist_save_device_now()'s pico-link-lmf carve-out below (IRQ /
+// cyw43-BTstack background async_context, when USB audio is already
+// streaming at pairing time). The staging state it writes
+// (s_pending/s_pending_addr/s_pending_since_us/s_write_enqueued) is plain,
+// non-atomic memory with no lock of its own. On this single core, disabling
+// interrupts for the body is sufficient mutual exclusion between the two
+// contexts -- it makes the async_context caller unable to preempt a
+// thread-context write in progress (and vice versa: the write itself can't
+// be re-entered), closing the torn-MAC-address write. Same short-critical-
+// section idiom as bt.c's pl_bt_pending_push (bt.c:613) -- kept deliberately
+// tiny (plain memory writes only, no flash access) per that idiom.
 void pl_persist_request_save_device(const uint8_t addr[6]) {
+    uint32_t irq_state = save_and_disable_interrupts();
     memcpy(s_pending_addr, addr, 6);
     s_pending = true;
     s_pending_since_us = time_us_64();
@@ -240,6 +256,7 @@ void pl_persist_request_save_device(const uint8_t addr[6]) {
     // flag only gates against re-enqueueing the SAME request repeatedly,
     // not against a genuinely new one.
     s_write_enqueued = false;
+    restore_interrupts(irq_state);
     pl_log(
         "persist: staged save for %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
     );
