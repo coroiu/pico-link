@@ -18,6 +18,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::time::Duration;
 
 use crate::input::NavIntent;
 use crate::render::home::build_home_screen;
@@ -30,6 +31,45 @@ use crate::render::{Action, FrameBuffer565, Instant, ListItem, ListItemKey, Navi
 /// never collide with a real device's key (a device key's top two bytes
 /// are always `0`; this sentinel's are always `0xFF`).
 const SCAN_ROW_KEY: ListItemKey = ListItemKey::from_bytes([0xFF; 8]);
+
+/// Floor applied to [`Widget::redraw_after`]'s returned [`Duration`]
+/// before it is added to `ctx.now()` to produce [`App::next_redraw_at`]
+/// (see [`App::render`]). Guards against `Some(Duration::ZERO)` (or any
+/// sub-frame duration): unclamped, that would make `next_redraw_at`
+/// exactly equal to (or barely past) the instant just rendered, and
+/// [`App::tick`]'s due-check uses `>=`, so it would come due on the very
+/// next tick with effectively no time elapsed -- forever. That silently
+/// reinstates the always-dirty behaviour
+/// `.planning/decisions/2026-08-31-render-ctx-frame-scoped-clock.md`
+/// forbids: it costs the flush-skip on every screen and puts full-frame
+/// blits into SPI contention with audio (see pico-link-6wz). Not a live
+/// bug -- no production widget returns a sub-frame duration today -- this
+/// is a guard against a future one.
+///
+/// This is a conservative floor, not a measured frame cadence: no
+/// existing `core`-visible constant was available to reuse.
+/// `run::run`'s `frame_budget` is a runtime parameter chosen per platform
+/// (the emulator passes 33ms; firmware's superloop has no fixed period at
+/// all, see `firmware/src/main.c`'s per-frame `pl_ui_tick` call), not a
+/// compile-time constant `App` can see. `Duration::from_millis(16)`
+/// (~60Hz) is comfortably below any real frame period on this hardware,
+/// so it never meaningfully delays a widget with a genuinely short but
+/// non-pathological redraw interval -- it only rules out the
+/// exactly-or-near-zero case that re-dirties every tick.
+///
+/// Deliberately *not* gated behind `debug_assert!`/`cfg(debug_assertions)`:
+/// this project's firmware builds `NDEBUG`-on by default (pico-sdk forces
+/// `CMAKE_BUILD_TYPE=Release` when the caller sets none), which also
+/// compiles out Rust's `debug_assert!` -- so a debug_assert-only guard
+/// would protect the host test suite and emulator but not the shipped
+/// firmware, exactly the environment where this regression is costly. The
+/// clamp below is unconditional in every build and is the actual guard;
+/// there is no accompanying `debug_assert!`, deliberately -- returning a
+/// sub-floor duration is a normal, silently-handled case (see
+/// [`Widget::redraw_after`](crate::render::Widget::redraw_after)'s doc
+/// comment), not a bug to flag loudly, and this crate's own test suite
+/// exercises exactly that case.
+const MIN_REDRAW_DELAY: Duration = Duration::from_millis(16);
 
 /// The Bluetooth link's coarse lifecycle state, as reported by C over
 /// [`App::set_link_state`] (`pl_ui_set_link_state` in the FFI surface).
@@ -1190,7 +1230,9 @@ impl App {
     /// Also recomputes [`App::next_redraw_at`] from
     /// [`Navigator::redraw_after`] at this frame's `ctx` -- so a widget's
     /// "I'll look different again in N" answer is always relative to the
-    /// instant that was actually just rendered, not a stale one.
+    /// instant that was actually just rendered, not a stale one. The
+    /// returned duration is floored at [`MIN_REDRAW_DELAY`] before being
+    /// added to `ctx.now()` -- see that constant's doc comment for why.
     ///
     /// # Panics
     ///
@@ -1203,7 +1245,7 @@ impl App {
         self.navigator
             .render(&ctx, &mut self.framebuffer)
             .expect("core DrawTarget is Infallible");
-        self.next_redraw_at = self.navigator.redraw_after(&ctx).map(|duration| ctx.now() + duration);
+        self.next_redraw_at = self.navigator.redraw_after(&ctx).map(|duration| ctx.now() + duration.max(MIN_REDRAW_DELAY));
         self.dirty = false;
         &self.framebuffer
     }
@@ -1506,6 +1548,37 @@ mod tests {
 
         app.tick(150_000); // 150ms: past the 100ms mark.
         assert!(app.dirty(), "must go dirty once now_us reaches/passes the widget's requested redraw instant");
+    }
+
+    /// pico-link-6wz: a widget returning `Some(Duration::ZERO)` must not
+    /// re-dirty the app on the immediately-following tick with no time
+    /// elapsed. Unclamped, `next_redraw_at` would equal exactly
+    /// `ctx.now()`, and `tick`'s `>=` due-check would fire on the very
+    /// next call regardless of elapsed time -- reinstating always-dirty
+    /// behaviour forever. `MIN_REDRAW_DELAY` clamps this up so the app
+    /// stays clean until at least that much time has actually passed.
+    #[test]
+    fn a_widget_requesting_zero_duration_redraw_does_not_redirty_on_the_next_tick() {
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(Screen::new("T", vec![Box::new(FixedRedrawWidget(core::time::Duration::ZERO))]));
+
+        // Establishes next_redraw_at = now(0) + MIN_REDRAW_DELAY (clamped
+        // up from the widget's literal ZERO), and clears dirty.
+        app.render();
+        assert!(!app.dirty());
+
+        // Same instant, zero elapsed: with the bug (no clamp), next_redraw_at
+        // == 0 == now_us, so tick's >= check would already fire here.
+        app.tick(0);
+        assert!(!app.dirty(), "a Some(Duration::ZERO) redraw request must not fire with zero elapsed time");
+
+        // Still short of the clamp floor.
+        app.tick(1_000); // 1ms.
+        assert!(!app.dirty(), "must not go dirty before MIN_REDRAW_DELAY has actually elapsed");
+
+        // Past the clamp floor (MIN_REDRAW_DELAY == 16ms).
+        app.tick(20_000); // 20ms.
+        assert!(app.dirty(), "must go dirty once the clamped redraw instant is actually reached");
     }
 
     #[test]
