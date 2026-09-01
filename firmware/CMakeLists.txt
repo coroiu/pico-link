@@ -60,6 +60,37 @@ if(_pl_patch3_pos EQUAL -1)
         "See firmware/sdk-patches/README.md.")
 endif()
 message(STATUS "pico-link: vendored SDK patch 03 (usbd.c) is applied")
+
+# Bead pico-link-2ap.6 (EXPERIMENT): patches 04 (usbd_pvt.h/usbd.c/
+# audio_device.h/audio_device.c) and 05 (dcd_rp2040.c) -- the ISO-OUT
+# xfer_isr backport and its required RP2040 reorder fix (upstream PR
+# #3203). Missing either does not crash the build -- PL_USB_ISO_XFER_ISR
+# defaults to 0 (firmware/src/tusb_config.h) so audiod_xfer_isr() is a
+# no-op either way -- but a silent revert here would mean this bead's A/B
+# test was never actually built, so it is FATAL_ERROR like 01-03.
+set(_pl_dcd_rp2040 "${PICO_SDK_PATH}/lib/tinyusb/src/portable/raspberrypi/rp2040/dcd_rp2040.c")
+if(NOT EXISTS "${_pl_dcd_rp2040}")
+    message(FATAL_ERROR "Cannot find ${_pl_dcd_rp2040} -- is PICO_SDK_PATH right?")
+endif()
+file(READ "${_pl_usbd}" _pl_usbd_src2)
+file(READ "${_pl_dcd_rp2040}" _pl_dcd_rp2040_src)
+foreach(_pl_mark4 "audiod_xfer_isr")
+string(FIND "${_pl_usbd_src2}" "${_pl_mark4}" _pl_patch4_pos)
+if(_pl_patch4_pos EQUAL -1)
+    message(FATAL_ERROR
+        "pico-sdk is MISSING a vendored patch (marker ${_pl_mark4} in usbd.c).\n"
+        "  Run:  tools/apply-sdk-patches.sh\n"
+        "See firmware/sdk-patches/README.md (patch 04).")
+endif()
+endforeach()
+string(FIND "${_pl_dcd_rp2040_src}" "const uint16_t xferred_len = ep->xferred_len" _pl_patch5_pos)
+if(_pl_patch5_pos EQUAL -1)
+    message(FATAL_ERROR
+        "pico-sdk is MISSING a vendored patch (marker in dcd_rp2040.c).\n"
+        "  Run:  tools/apply-sdk-patches.sh\n"
+        "See firmware/sdk-patches/README.md (patch 05).")
+endif()
+message(STATUS "pico-link: vendored SDK patches 04+05 (ISO xfer_isr backport) are applied")
 # ---------------------------------------------------------------------------
 
 # Bead pico-link-cd3: debug-only NavIntent injection over the CDC console,
@@ -67,6 +98,13 @@ message(STATUS "pico-link: vendored SDK patch 03 (usbd.c) is applied")
 # OFF by default -- must never be on in a shipping build. Enable with
 # `cmake -B build -DPL_DEBUG_REMOTE=ON`. See src/debug_remote.h.
 option(PL_DEBUG_REMOTE "Enable debug NavIntent injection over the CDC console (unattended hardware testing only)" OFF)
+
+# Bead pico-link-2ap.6 (EXPERIMENT): moves ISO-OUT re-arm from tud_task()
+# context into true USB ISR context (sdk-patches/04+05, gated no-op when
+# OFF). Default OFF -- this A/B tests a candidate mechanism for the
+# pico-link-2ap halving, not a shipping behaviour change. See
+# firmware/src/tusb_config.h and firmware/sdk-patches/README.md.
+option(PL_USB_ISO_XFER_ISR "EXPERIMENTAL: re-arm ISO-OUT from true USB ISR context instead of tud_task()" OFF)
 
 # Bead pico-link-ufh: software+hardware watchdog supervisor. Armed by
 # default in EVERY build, including debug -- a watchdog only armed in
@@ -312,6 +350,16 @@ if(PL_DEBUG_REMOTE)
     # Gates main.c's call into debug_remote.c (only compiled in above when
     # PL_DEBUG_REMOTE is ON) -- see src/debug_remote.h's module doc.
     target_compile_definitions(pico_link PRIVATE PL_DEBUG_REMOTE=1)
+endif()
+
+if(PL_USB_ISO_XFER_ISR)
+    # Bead pico-link-2ap.6: overrides tusb_config.h's #ifndef-guarded
+    # default (0). pico_link compiles TinyUSB's sources itself (see the
+    # build output -- audio_device.c/usbd.c land under
+    # CMakeFiles/pico_link.dir/..., not a separate library target), so this
+    # -D reaches src/tusb_config.h for every translation unit that includes
+    # it, tinyusb's own included.
+    target_compile_definitions(pico_link PRIVATE PL_USB_ISO_XFER_ISR=1)
 endif()
 
 # Bead pico-link-ukk: PL_DIAG_* reusable diagnostics -- see the option()

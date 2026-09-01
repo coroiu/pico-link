@@ -153,6 +153,21 @@ extern "C" {
 
 #define CFG_TUD_AUDIO_FUNC_1_CTRL_BUF_SZ 64
 
+// Bead pico-link-2ap.6: EXPERIMENTAL, default OFF. When 1, sdk-patches/
+// 04-tinyusb-audio-iso-out-isr.patch wires audiod's ISO-OUT re-arm
+// (usbd_edpt_xfer on audio->ep_out) into TRUE USB ISR context via a new
+// xfer_isr class-driver hook, instead of task context via tud_task()'s
+// queued DCD_EVENT_XFER_COMPLETE (the stock 0.18.0 path, unchanged when
+// this is 0). Backports the mechanism of upstream TinyUSB PR #3150 ("Move
+// ISO transfers into xfer_isr", landed in 0.19.0) without the surrounding
+// 0.18->0.19 refactor. Motivation: our re-arm's phase within the USB frame
+// is currently set by pl_usb_pump_worker_irq's free-running 1ms timer, not
+// the bus -- a candidate mechanism for the pico-link-2ap halving. See
+// firmware/sdk-patches/README.md and bead pico-link-2ap.6.
+#ifndef PL_USB_ISO_XFER_ISR
+#define PL_USB_ISO_XFER_ISR 0
+#endif
+
 #ifdef __cplusplus
 }
 #endif
