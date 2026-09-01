@@ -104,6 +104,81 @@ is never reached, regardless of the patch itself being applied.
 
 Beads: pico-link-wbq (E2, fix 1), rides with pico-link-2ap.
 
+## 04. ISO-OUT re-arm in TRUE ISR context (EXPERIMENT, default OFF)
+
+`usbd_pvt.h`, `usbd.c`, `audio_device.h`, `audio_device.c`. Backports the
+mechanism of upstream TinyUSB PR #3150 ("audio: manage ISO transfer in ISR",
+landed 0.19.0) onto our vendored 0.18.0, WITHOUT the surrounding 0.18->0.19
+refactor (see 0.19.0's release notes for the full change list -- this patch
+takes only the `xfer_isr` class-driver hook mechanism).
+
+Stock 0.18.0's ISO-OUT re-arm (`usbd_edpt_xfer()` inside `audiod_rx_done_cb()`,
+called from `audiod_xfer_cb()`) only ever runs from **task context**: the
+completing IRQ (`dcd_rp2040.c`'s `hw_handle_buff_status()`) calls
+`dcd_event_xfer_complete()`, which unconditionally queues a
+`DCD_EVENT_XFER_COMPLETE` event that `tud_task_ext()` drains later --  on this
+firmware, from inside the pico-link-tfj 0xC0 `pl_usb_pump_worker_irq`, up to
+~1ms after the real completion, at a phase set by our own free-running 1ms
+timer rather than the USB bus. Bead pico-link-2ap's 0.500-packets-per-SOF
+halving has that phase drift as its last live candidate mechanism (see the
+bead) after ten other eliminations, all of them host-side or descriptor-side.
+
+This patch adds an OPTIONAL `xfer_isr` field to `usbd_class_driver_t`
+(`usbd_pvt.h`) and a `DCD_EVENT_XFER_COMPLETE` case in `dcd_event_handler()`
+(`usbd.c`) that, when the owning driver provides one, calls it FIRST, from
+true ISR context, before the event would otherwise be queued; the hook
+returns `true` to mean "fully handled, do not also queue" or `false` to defer
+to the existing `xfer_cb()` task-context path unchanged. `audiod_xfer_isr()`
+(`audio_device.c`) is wired into the AUDIO driver's table entry
+unconditionally (matching upstream) but is itself gated by
+`PL_USB_ISO_XFER_ISR` (`firmware/src/tusb_config.h`, default `0`, also a
+`cmake -B build -DPL_USB_ISO_XFER_ISR=ON` option) -- with the flag off it
+always returns `false` and every completion goes through the unchanged
+`audiod_xfer_cb()` path, i.e. this whole patch is a no-op. Only claims our
+ISO-OUT endpoint (`audio->ep_out`); every other endpoint, and
+`CFG_TUD_AUDIO_ENABLE_DECODING` (which this project leaves at its default 0,
+so is untested), defer to `xfer_cb()` regardless of the flag.
+
+**Patch 05 is a hard dependency of this patch, not optional** -- see below.
+
+Beads: pico-link-2ap.6 (EXPERIMENT). See bead for the A/B soak result once run.
+
+## 05. Reset transfer state BEFORE notifying the stack (upstream PR #3203)
+
+`dcd_rp2040.c`'s `hw_handle_buff_status()`. Backports upstream TinyUSB PR
+#3203 ("fix rp2 iso transfer with new audio driver"), which HiFiPhile's own
+PR #3150 needed a companion fix for on RP2040 specifically.
+
+Stock 0.18.0 (and, unpatched, 0.19.0+) calls `dcd_event_xfer_complete()`
+BEFORE `hw_endpoint_reset_transfer(ep)`. That ordering is harmless when the
+notification only ever gets queued (the stock path, and this patch set with
+`PL_USB_ISO_XFER_ISR` off) -- but patch 04 lets `dcd_event_xfer_complete()`
+call SYNCHRONOUSLY into a class driver's `xfer_isr()` from inside this same
+ISR, and that hook may re-arm the SAME endpoint via `usbd_edpt_xfer()` before
+`dcd_event_xfer_complete()` even returns. Re-arming before
+`hw_endpoint_reset_transfer()` has cleared `ep->active` and the endpoint's
+transfer bookkeeping is exactly the arm/complete disorder patches 01 and 02
+exist to survive -- except here it would be self-inflicted by this patch set,
+not a host/device race, so the correct fix is to remove the cause (reorder)
+rather than add a third counter for a symptom we created ourselves.
+
+Applied UNCONDITIONALLY, not gated by `PL_USB_ISO_XFER_ISR`: it is a pure
+reordering that does not change what gets sent to the stack (same event, same
+`xferred_len`, captured into a local before `hw_endpoint_reset_transfer()`
+clears it) when the flag is off, only when it runs relative to hw state that
+nothing else reads in between.
+
+**Not backported: upstream's separate "abort transfer if active in
+`iso_activate()`" RP2040 fix** (`hw_endpoint_abort_xfer()`, merged 2026-03-05,
+before #3150). Read during this bead's investigation and confirmed unrelated
+to `xfer_isr` correctness -- it changes `dcd_edpt_iso_activate()` (SET_INTERFACE
+handling on alt-setting change), a code path patch 04/05 do not touch, so our
+existing (unpatched) behaviour there is no worse than before this bead. Left
+out to keep the backport minimal per this bead's scope; revisit only if
+alt-setting-switch robustness becomes its own investigation.
+
+Beads: pico-link-2ap.6 (EXPERIMENT).
+
 ## Deliberately NOT patched: dcd_rp2040.c:333 `panic("Unhandled IRQ")`
 
 Assessed 2026-08-30 and left FATAL on purpose. `if (status ^ handled) panic(...)`
