@@ -492,6 +492,32 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             pl_bt_push_link_state(PL_LINK_STATE_IDLE);
             break;
 
+        // Bead pico-link-648 diagnostic: raw HCI_EVENT_CONNECTION_COMPLETE
+        // bytes, to answer -- with a measurement, not an assumption --
+        // whether the CYW43439 controller populates a usable connection
+        // handle in the Connection_Complete event when status is
+        // ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS (0x0b). hci.c's own
+        // internal handler (hci.c:3837-3881) only reads the handle field
+        // inside the `status == 0` branch and calls
+        // hci_handle_connection_failed() (which frees the local
+        // hci_connection_t with no further use of any handle) on any
+        // other status -- so this is the only way to see what the
+        // controller actually sent on the failure path. Wire format:
+        // Status(1) BD_ADDR(6) Handle(2,LE) Link_Type(1) Encryption(1),
+        // starting at packet[2].
+        case HCI_EVENT_CONNECTION_COMPLETE: {
+            uint8_t status = packet[2];
+            bd_addr_t addr;
+            reverse_bd_addr(&packet[5], addr);
+            uint16_t handle = little_endian_read_16(packet, 3);
+            pl_log(
+                "BT: HCI_EVENT_CONNECTION_COMPLETE status=0x%02x addr=%02x:%02x:%02x:%02x:%02x:%02x handle=0x%04x "
+                "link_type=%u encryption=%u\r\n",
+                status, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], handle, packet[11], packet[12]
+            );
+            break;
+        }
+
         default:
             break;
     }

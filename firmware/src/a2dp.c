@@ -1094,6 +1094,42 @@ static void pl_a2dp_media_timer_arm(void) {
     s_ctx.timer_armed = true;
 }
 
+// Bead pico-link-648: maps a raw HCI status byte from
+// A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED's failure case to the
+// closest-justified ConnectFailureReason -- previously every non-SUCCESS
+// status was collapsed into PL_FAILURE_REASON_REJECTED, throwing away
+// information ConnectFailureReason already models. Only maps codes with an
+// unambiguous match to an existing category; everything else stays
+// REJECTED rather than inventing a new one (explicit instruction: "do not
+// invent categories for codes you cannot justify").
+static uint32_t pl_a2dp_failure_reason_for_status(uint8_t status) {
+    switch (status) {
+        case ERROR_CODE_PAGE_TIMEOUT:
+        case ERROR_CODE_CONNECTION_TIMEOUT:
+            // No response within the connection window -- exactly
+            // PL_FAILURE_REASON_TIMEOUT's own definition.
+            return PL_FAILURE_REASON_TIMEOUT;
+        case ERROR_CODE_PIN_OR_KEY_MISSING:
+            // The remote has no link key on record for us (or vice versa)
+            // -- a fresh SSP/pairing dialog is needed, which this product
+            // cannot drive without on-screen text entry. Matches
+            // PL_FAILURE_REASON_NEEDS_PIN's own non-retryable semantics.
+            return PL_FAILURE_REASON_NEEDS_PIN;
+        case ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS:
+            // NOT a remote rejection -- this is BTstack's/the controller's
+            // OWN local HCI-level bookkeeping reporting a conflict (see
+            // persist.c's pico-link-648 investigation notes and hci.c's
+            // own hci_handle_connection_failed, which discards our local
+            // connection tracking with no recovery path). Matches
+            // PL_FAILURE_REASON_RADIO_ERROR's own definition: "The
+            // radio/HCI layer itself reported an error (not a per-device
+            // remote-side rejection)".
+            return PL_FAILURE_REASON_RADIO_ERROR;
+        default:
+            return PL_FAILURE_REASON_REJECTED;
+    }
+}
+
 static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -1111,7 +1147,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             if (status != ERROR_CODE_SUCCESS) {
                 pl_log("a2dp: signaling connection FAILED status=0x%02x\r\n", status);
                 s_ctx.a2dp_cid = 0;
-                pl_bt_push_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_REJECTED);
+                pl_bt_push_connect_failed(s_ctx.connect_addr, pl_a2dp_failure_reason_for_status(status));
                 break;
             }
             s_ctx.a2dp_cid = cid;
