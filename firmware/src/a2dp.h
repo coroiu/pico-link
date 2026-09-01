@@ -58,6 +58,15 @@ void pl_a2dp_connect(const uint8_t *addr);
 // of scope here.
 void pl_a2dp_disconnect(void);
 
+// Bead pico-link-cz0.6 (M5 persistence): true whenever the media pipeline is
+// PRIMING or STREAMING (i.e. not IDLE) -- part of persist.c's "NO flash
+// write while streaming" gate alongside pl_usb_audio_streaming(). PRIMING is
+// included deliberately, not just STREAMING: it is the run-up to a stream
+// actually starting, and a flash blackout during it risks the same missed
+// ISO-OUT re-arm STREAMING itself must avoid. Thread-context safe to call
+// (reads one enum field, no BTstack call).
+bool pl_a2dp_streaming(void);
+
 // Once-per-second instrumentation snapshot -- design sec 7's
 // "a2dp: codec=... bitrate=... fill=... ovr_frames=... und=... enc_max_us=...
 // pkt_sent=... pkt_fail=... misaligned=..." report line. Call from the

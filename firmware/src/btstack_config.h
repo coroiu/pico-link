@@ -57,9 +57,13 @@
 
 // pico_btstack_classic links btstack_link_key_db_tlv.c unconditionally
 // (flash-backed link key storage), which hard-errors at compile time
-// without this -- one link key is all this project needs (one paired sink
-// at a time, no multi-device bonding yet).
-#define NVM_NUM_LINK_KEYS 1
+// without this. Bead pico-link-cz0.6 (M5 persistence) raised this from 1 to
+// 8: the TLV store's own per-record shape (design point 1) makes extra link
+// key slots free (no format migration either way), and it matches this
+// bead's device record store's own future slot count (design point 2 -- 8
+// per-device records, though only slot 0 is used by this bead's MVP
+// slice).
+#define NVM_NUM_LINK_KEYS 8
 
 // --- M4 additions: AVDTP/A2DP/AVRCP/SDP (design sec 9) ---
 //

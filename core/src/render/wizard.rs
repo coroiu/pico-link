@@ -733,7 +733,7 @@ mod tests {
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
 
-        app.handle_event(Event::ConnectSucceeded { degraded: false });
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded: false });
     }
 
@@ -745,7 +745,7 @@ mod tests {
         let addr = [8; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
-        app.handle_event(Event::ConnectSucceeded { degraded: false });
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         assert_eq!(app.navigator_depth(), 3);
 
         app.handle_event(Event::WizardAutoDismiss);
@@ -760,7 +760,7 @@ mod tests {
         let addr = [9; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40 }));
         app.handle_input(vec![NavIntent::Select]);
-        app.handle_event(Event::ConnectSucceeded { degraded: true });
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: true });
 
         app.handle_event(Event::WizardAutoDismiss);
         assert_eq!(app.navigator_depth(), 3, "degraded success must require acknowledgement, never auto-dismiss");
@@ -904,7 +904,7 @@ mod tests {
             app.handle_input(vec![NavIntent::Select]);
             app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [15; 6], name: String::new(), rssi: -40 }));
             app.handle_input(vec![NavIntent::Select]);
-            app.handle_event(Event::ConnectSucceeded { degraded: true });
+            app.handle_event(Event::ConnectSucceeded { addr: [15; 6], degraded: true });
         });
     }
 
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::ConnectRetrying { attempt: 1 });
         assert_eq!(app.navigator_depth(), 3);
-        app.handle_event(Event::ConnectSucceeded { degraded: false });
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::WizardAutoDismiss);
         assert_eq!(app.navigator_depth(), 2, "auto-dismiss returns to Devices (Home(1)/Devices(2))");

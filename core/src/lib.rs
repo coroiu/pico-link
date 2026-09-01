@@ -62,7 +62,7 @@ pub mod render;
 pub mod run;
 
 pub use app::{
-    App, BtModel, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState,
+    App, BtModel, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, StoreStatus,
     WizardPhase,
 };
 pub use input::NavIntent;
