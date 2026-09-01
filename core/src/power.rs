@@ -28,9 +28,13 @@ use core::time::Duration;
 use crate::platform::Storage;
 
 /// How long the display stays on with no input before `run`'s
-/// idle-screensaver tier blanks it (`Ta`). 120 seconds, matching the
-/// design's "~2min" target.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// idle-screensaver tier blanks it (`Ta`). 60 seconds -- Andreas's
+/// 2026-09-01 ruling on bead pico-link-4vb.3 ("For now 1 minute hardcoded"),
+/// superseding the earlier design's "~2min" target. Only takes effect while
+/// `App::is_at_home_root()` (see `crate::run::Runner::step`); armed
+/// anywhere else (Devices, Settings, the pairing wizard) would read as a
+/// crash.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long the device stays idle (from the same last-input clock as
 /// [`DEFAULT_IDLE_TIMEOUT`], not from when the screen blanked) before
