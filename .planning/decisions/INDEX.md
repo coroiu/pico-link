@@ -7,6 +7,7 @@ Superseded entries are marked Deprecated, never deleted.
 
 | Date | Decision | Status |
 |------|----------|--------|
+| 2026-08-11 | [UI framework: fixed chrome regions + linear stacks, not a general layout engine](2026-08-11-ui-framework-reuse-vs-rewrite.md) | Accepted (written retroactively 2026-09-01, bead pico-link-3i8 — see its provenance note) |
 | 2026-08-26 | [Rust owns the firmware binary; C libraries are linked in, not forked](2026-08-26-rust-owns-the-binary-no-usbpods-fork.md) | **Superseded** by 2026-08-27 (C-first) |
 | 2026-08-27 | [TinyUSB owns the USB device controller; the embassy-usb CDC console is unwound](2026-08-27-usb-device-stack-returns-to-tinyusb.md) | Accepted |
 | 2026-08-27 | [C-first: pico-sdk owns `main()`; the Rust core becomes a staticlib called over FFI](2026-08-27-c-first-pico-sdk-owns-main.md) | Accepted |

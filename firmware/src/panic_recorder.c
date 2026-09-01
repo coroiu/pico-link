@@ -247,11 +247,22 @@ void __attribute__((noreturn)) __printflike(1, 0) pl_panic_c_hook(const char *fm
 // calls _exit(1), which (PICO_ENTER_USB_BOOT_ON_EXIT is not defined in this
 // project) spins forever in a bare __breakpoint() loop with NO watchdog
 // ever armed -- the exact silent-hang failure mode this file exists to
-// close. NDEBUG is not defined anywhere in firmware/CMakeLists.txt, so
-// assert() is live in the shipped build and reachable from our own code
-// and from anything inside linked pico-sdk/BTstack/TinyUSB that calls raw
-// assert(). Signature must match newlib's exactly (see <assert.h>) or this
-// override does not link against the weak symbol's call sites. ---
+// close.
+//
+// CORRECTION (2026-09-01, bead pico-link-at3): this comment used to claim
+// NDEBUG is not defined anywhere in firmware/CMakeLists.txt and that
+// assert() is therefore live in the shipped (default) build. THAT IS
+// WRONG -- verified 2026-08-29 by rebuilding bare and reading flags.make.
+// firmware/CMakeLists.txt sets no CMAKE_BUILD_TYPE, and pico-sdk's
+// pico_pre_load_toolchain.cmake:5-11 forces CMAKE_BUILD_TYPE=Release
+// whenever the caller leaves it unset. A Release build defines NDEBUG, so
+// assert() IS ELIDED PROJECT-WIDE in the default build -- ours,
+// pico-sdk's, BTstack's and TinyUSB's alike -- and this override is DEAD
+// CODE there. The override still matters: it is what protects a Debug
+// build (`cmake -DCMAKE_BUILD_TYPE=Debug`), which is the one you reach for
+// when debugging on device and where assert() is genuinely reachable.
+// Signature must match newlib's exactly (see <assert.h>) or this override
+// does not link against the weak symbol's call sites. ---
 void __attribute__((noreturn)) __assert_func(const char *file, int line, const char *func, const char *failedexpr) {
     // Step 1 -- FIRST statement, before file/func/failedexpr are touched at
     // all: arm the watchdog. Same reasoning as pl_panic_c_hook above --
