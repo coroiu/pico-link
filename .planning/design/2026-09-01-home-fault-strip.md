@@ -205,47 +205,62 @@ Amber is already the banner colour, but the shapes are unmistakably different
 
 ## 7. Vertical budget
 
+> **AMENDED 2026-09-01 by `.planning/design/2026-09-01-home-alignment-grid.md`
+> (bead `pico-link-nvj`).** The table below was computed against `hero.rs`'s
+> old accumulating `cursor_y` rhythm, in which showing the banner moved the
+> stat strip down 28px. That rhythm is replaced by a fixed grid; the hero
+> composite's bands are now at constant y in every state. **The fault strip's
+> own geometry is unchanged** — this amendment only restates what sits above
+> it, and improves the guarantee.
+
 Content area is **206 x 224** (240 minus the 34px rail, minus the 16px title
-bar). The hero composite's existing rhythm consumes, measured from `hero.rs`'s
-constants:
+bar). The hero composite's rhythm, per the alignment grid:
 
-| Element | Ends at y= |
-|---|---|
-| name (8 pad + ~13) | 21 |
-| hero slot (+8 gap, 32) | 61 |
-| bitrate (+4 gap, ~13) | 78 |
-| gap to next (10) | 88 |
-| banner, when shown (20 + 8) | 116 |
-| stat strip (~10) | **98** no banner / **126** with banner |
+| Element | y band | Fixed? |
+|---|---|---|
+| device name | 28..43 | yes |
+| hero slot | 56..87 | yes |
+| bitrate | 92..108 | yes |
+| banner, when shown | 116..135 | yes — fixed slot, not cursor-derived |
+| stat strip | 144..154 | yes — same rows with or without a banner |
 
-The strip is **bottom-anchored**, not stacked after the stat line:
+The strip is **bottom-anchored**, unchanged:
 
 - bottom padding 6 -> strip bottom edge at **y = 218**
 - row slot **12px** (8px ink + 4px leading)
 - cap **4 rows** = 48px, plus a 1px `DIVIDER` rule and 5px of air above = **54px**
 - strip top at **y = 164**
 
-Clearance to the stat line: 66px (no banner) / 38px (banner). Comfortable in
-both.
+**Clearance from the stat strip to the strip's divider is a constant 9px, in
+every combination of banner/no-banner and stream/no-stream.** This replaces the
+old "66px no banner / 38px with banner" — the number is smaller but it is now
+*invariant*, which is what the strip actually needed.
 
 **The cap of 4 is a legibility choice, not a space constraint** — the geometry
-would take 6 rows (top at y=140, still clearing the banner case). It is capped
-at 4 because once more than four distinct kinds of fault are live
-simultaneously, the individual identity has stopped being the useful
-information; "a lot is wrong" is. At overflow, show the 3 most-recently-active
-rows plus:
+would take 6 rows. It is capped at 4 because once more than four distinct kinds
+of fault are live simultaneously, the individual identity has stopped being the
+useful information; "a lot is wrong" is. At overflow, show the 3 most-recently-
+active rows plus:
 
 ```
 | +3 MORE - SETTINGS > ABOUT           |
 ```
 
+**Row alignment:** the stage tag is left-aligned to the shared left rule
+**`L = 12`**; the value slot is right-aligned to the shared right rule
+**`R = 194`**, the same rule the bitrate uses. Fault rows are on the page grid,
+not a private one.
+
 **Contention priority, stated once so nobody has to negotiate it later:**
 
 > hero word > banner > fault strip > stat line.
 
-If the fallback banner and four live fault rows collide, **the stat line is
-dropped.** `USB 48K 24-BIT` is the least valuable line on the screen at the
-exact moment something is broken.
+> **STRUCK by the alignment amendment:** the old rule "if the fallback banner
+> and four live fault rows collide, the stat line is dropped" is now
+> unreachable. With fixed slots the banner, the stat strip and a full four-row
+> strip coexist with clearance to spare, so nothing ever collides and there is
+> no drop behaviour to implement. The priority ordering above is retained only
+> as a tiebreaker of record for any *future* element that wants space on Home.
 
 ## 8. Input, motion and cost
 
