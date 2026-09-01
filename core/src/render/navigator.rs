@@ -84,6 +84,19 @@ impl Navigator {
         }
     }
 
+    /// Pops every screen above the root, leaving only `stack[0]` --
+    /// e.g. Home(1)/Devices(2)/Wizard(3) collapses straight to Home(1).
+    /// Unlike repeated [`Navigator::pop`] calls this is one atomic
+    /// operation with no intermediate `Screen`s ever observed rendered.
+    ///
+    /// Used by [`crate::app::App`]'s wizard-auto-dismiss handling
+    /// (pico-link-4vb.2: Andreas wants a successful pairing to land back
+    /// on Home, not require several manual `B` presses back through
+    /// Devices). A no-op if the stack is already at depth 1.
+    pub fn pop_to_root(&mut self) {
+        self.stack.truncate(1);
+    }
+
     /// The root screen's (`stack[0]`'s) own focused widget's selection
     /// index, if any — see `Screen::selected_index`. Read by a caller
     /// about to call [`Navigator::replace_root`], so the freshly built

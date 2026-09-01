@@ -140,6 +140,12 @@
 // spend.
 #define PL_A2DP_RECONNECT_RETRY_DELAY_MS 1500
 
+// Bead pico-link-4vb.2 (bug 3): how long the wizard's plain-success screen
+// stays up before auto-dismissing to Home. "A couple of seconds" per the
+// investigation -- long enough to register as a real confirmation, short
+// enough that Andreas isn't left waiting on a screen he's done with.
+#define PL_A2DP_WIZARD_DISMISS_DELAY_MS 2000
+
 // Bead pico-link-pbv: PL_A2DP_MAX_FRAMES_PER_TICK (a fixed constant, 5) is
 // GONE. Round 1 replaced it with s_ctx.frames_per_tick_cap, a per-stream
 // FRAME-COUNT cap computed from the negotiated payload size and the
@@ -275,6 +281,24 @@ typedef struct {
     // the same ~1.5s window. Meaningful only while reconnect_retry_armed is
     // true.
     uint8_t reconnect_retry_armed_status;
+
+    // Bead pico-link-4vb.2 (bug 2): true once ConnectSucceeded/
+    // LinkState(Connected) has been pushed for the CURRENT stream --
+    // guards against A2DP_SUBEVENT_STREAM_STARTED (which no longer pushes
+    // anything itself) somehow firing twice, and is the natural place to
+    // hang "has this stream already announced success" for any future
+    // caller. Reset false at A2DP_SUBEVENT_SIGNALING_CONNECTION_
+    // ESTABLISHED (a fresh discovery pass, same reset point as
+    // s_ctx.discovered above).
+    bool connect_succeeded_pushed;
+
+    // Bead pico-link-4vb.2 (bug 3): PL_EVENT_TAG_WIZARD_AUTO_DISMISS had no
+    // producer anywhere in firmware -- this one-shot timer is armed right
+    // after a ConnectSucceeded push (STREAM_ESTABLISHED above) and fires
+    // pl_bt_push_wizard_auto_dismiss() a couple of seconds later. Same
+    // armed-flag idiom as reconnect_retry_armed above.
+    btstack_timer_source_t wizard_dismiss_timer;
+    bool wizard_dismiss_armed;
 
     int max_media_payload_size;
     // Bead pico-link-85v (D1): rtp_next replaces the old rtp_timestamp --
@@ -1231,6 +1255,42 @@ static void pl_a2dp_reconnect_retry_arm(uint8_t status) {
     s_ctx.reconnect_retry_armed_status = status;
 }
 
+// Bead pico-link-4vb.2 (bug 3): cancels the wizard-dismiss timer if it's
+// currently armed -- same idiom as pl_a2dp_reconnect_retry_cancel above
+// (safe to call unconditionally; a no-op when nothing is armed). Called on
+// every path that tears down or restarts the session before the timer's
+// own delay elapses, so a stale dismiss can never fire into a screen it no
+// longer applies to: SIGNALING_CONNECTION_RELEASED/STREAM_RELEASED (bug
+// 3.5's disconnect handling), and a fresh connect() attempt superseding
+// whatever came before it.
+static void pl_a2dp_wizard_dismiss_timer_cancel(void) {
+    if (!s_ctx.wizard_dismiss_armed) {
+        return;
+    }
+    btstack_run_loop_remove_timer(&s_ctx.wizard_dismiss_timer);
+    s_ctx.wizard_dismiss_armed = false;
+}
+
+static void pl_a2dp_wizard_dismiss_timer_handler(btstack_timer_source_t *ts) {
+    (void)ts;
+    s_ctx.wizard_dismiss_armed = false;
+    pl_bt_push_wizard_auto_dismiss();
+}
+
+// Arms the one-shot PL_A2DP_WIZARD_DISMISS_DELAY_MS timer -- see this
+// field's doc comment on pl_a2dp_ctx_t. Called right after a
+// ConnectSucceeded push (STREAM_ESTABLISHED below); core's own guard on
+// Event::WizardAutoDismiss (only acts on a plain, non-degraded success)
+// makes it safe to arm this unconditionally rather than branching on
+// `degraded` here too.
+static void pl_a2dp_wizard_dismiss_timer_arm(void) {
+    btstack_run_loop_remove_timer(&s_ctx.wizard_dismiss_timer); // safe even if not currently added
+    btstack_run_loop_set_timer_handler(&s_ctx.wizard_dismiss_timer, pl_a2dp_wizard_dismiss_timer_handler);
+    btstack_run_loop_set_timer(&s_ctx.wizard_dismiss_timer, PL_A2DP_WIZARD_DISMISS_DELAY_MS);
+    btstack_run_loop_add_timer(&s_ctx.wizard_dismiss_timer);
+    s_ctx.wizard_dismiss_armed = true;
+}
+
 static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -1267,6 +1327,11 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // is exactly the "cannot fire into a live session" case this
             // bead's acceptance criteria calls out).
             pl_a2dp_reconnect_retry_cancel();
+            // Bead pico-link-4vb.2: a fresh connect() attempt supersedes
+            // whatever the previous session left armed/pushed -- same
+            // reasoning as the reconnect-retry cancel just above.
+            pl_a2dp_wizard_dismiss_timer_cancel();
+            s_ctx.connect_succeeded_pushed = false;
             s_ctx.a2dp_cid = cid;
             // Fresh discovery pass starting -- clear any capability bits
             // left over from a previous connection attempt.
@@ -1708,6 +1773,39 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // ruling exists to bypass.
             pl_persist_save_device_now(s_ctx.connect_addr);
 
+            // Bead pico-link-4vb.2 (bug 2): the link is fully up here --
+            // codec configured, AVDTP media channel open -- so this, not
+            // A2DP_SUBEVENT_STREAM_STARTED below, is where
+            // ConnectSucceeded/LinkState(Connected) belong. STREAM_STARTED
+            // requires the HOST to begin streaming audio (it fires from
+            // TinyUSB's own alt-setting activation, entirely outside our
+            // control), so gating success on it left the wizard stuck on
+            // "Negotiating codec" until Andreas pressed play on the host.
+            // s_ctx.codec is guaranteed non-NULL here: it's set by
+            // pl_a2dp_finish_codec_negotiation during the codec
+            // configuration subevent(s), which BTstack always delivers
+            // before STREAM_ESTABLISHED. connect_succeeded_pushed guards
+            // against a double push both if STREAM_ESTABLISHED itself
+            // somehow re-fires for the same stream and if STREAM_STARTED
+            // later arrives (see that case below, which no longer pushes
+            // at all) -- reset to false only at the next fresh
+            // SIGNALING_CONNECTION_ESTABLISHED (a genuinely new attempt).
+            if (!s_ctx.connect_succeeded_pushed) {
+                s_ctx.connect_succeeded_pushed = true;
+                pl_bt_push_link_state_connected();
+                pl_bt_push_connect_succeeded(s_ctx.connect_addr, PL_CODEC_COUNT > 0 && s_ctx.codec != PL_CODECS[0]);
+
+                // Bead pico-link-4vb.2 (bug 3): PL_EVENT_TAG_WIZARD_AUTO_DISMISS
+                // had no producer anywhere in firmware -- core already
+                // handles the event (pops the wizard back to Home on a
+                // plain, non-degraded success) but nothing ever sent it.
+                // Arm a couple-second one-shot timer here; degraded
+                // success also gets this timer armed (harmless -- core's
+                // own guard on Event::WizardAutoDismiss ignores it unless
+                // the wizard is showing a plain success).
+                pl_a2dp_wizard_dismiss_timer_arm();
+            }
+
             // design sec 3.5 case 3: prime before starting -- see this
             // file's PL_A2DP_MEDIA_PRIMING doc comment.
             s_ctx.state = PL_A2DP_MEDIA_PRIMING;
@@ -1774,17 +1872,15 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // fill_min -- see pl_usb_audio_fb_reset's doc comment.
             pl_usb_audio_fb_reset();
             pl_log("a2dp: stream started\r\n");
-            pl_bt_push_link_state_connected();
-            // Bead pico-link-cz0.5.6: computed for real now that a second
-            // row exists (design sec 4.3) -- degraded means the negotiated
-            // codec (s_ctx.codec) was NOT PL_CODECS' own most-preferred
-            // row, i.e. some higher-preference row (LDAC) was tried first
-            // and refused/fell through, so the connection settled for a
-            // lower one (SBC). PL_CODECS[0] is that most-preferred row by
-            // construction (codec_table.c's own array-order-is-preference
-            // rule); s_ctx.codec is always non-NULL here (STREAM_STARTED
-            // cannot be reached without a prior successful codec init).
-            pl_bt_push_connect_succeeded(s_ctx.connect_addr, PL_CODEC_COUNT > 0 && s_ctx.codec != PL_CODECS[0]);
+            // Bead pico-link-4vb.2 (bug 2): ConnectSucceeded/LinkState
+            // (Connected) moved to A2DP_SUBEVENT_STREAM_ESTABLISHED above
+            // -- the link is fully up well before the host actually
+            // starts streaming audio, and gating success on THIS event
+            // left the wizard stuck on "Negotiating codec" until the host
+            // played something. Nothing to push here any more;
+            // connect_succeeded_pushed (set at STREAM_ESTABLISHED) is what
+            // stops a stray second push if this event fires for the same
+            // stream.
             break;
 
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
@@ -1836,6 +1932,25 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // still armed when the signaling connection went away some
             // other way, don't let it fire into whatever comes next.
             pl_a2dp_reconnect_retry_cancel();
+            // Bead pico-link-4vb.2 (bug 3): a stale dismiss timer must
+            // never fire after the session it belonged to is gone.
+            pl_a2dp_wizard_dismiss_timer_cancel();
+            // Bead pico-link-4vb.5 (Andreas: "it doesn't seem like the
+            // home page detects when I turn off my headphones"):
+            // PL_LINK_STATE_IDLE had no producer for a real disconnect --
+            // BtModel.link_state stayed Connected forever and Home kept
+            // showing a live link to hardware that was switched off. This
+            // is the authoritative "the A2DP session is over" point
+            // (unlike STREAM_SUSPENDED/STREAM_RELEASED, which also fire on
+            // an ordinary pause/auto-resume and must NOT read as a
+            // disconnect -- see the STREAM_RELEASED case above, left
+            // untouched deliberately). pl_bt_push_link_state_disconnected
+            // also clears BtModel::connected_codec on the core side (see
+            // App::set_link_state's doc comment) the same way the
+            // existing non-Connected handling already does, so no
+            // separate codec-clear push is needed here.
+            pl_bt_push_link_state_disconnected();
+            s_ctx.connect_succeeded_pushed = false;
             s_ctx.a2dp_cid = 0;
             s_ctx.codec = NULL;
             s_ctx.state = PL_A2DP_MEDIA_IDLE;
