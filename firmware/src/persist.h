@@ -113,21 +113,52 @@ typedef enum {
     PL_PERSIST_STATUS_VERSION_MISMATCH = 3,
 } pl_persist_status_t;
 
-// Set by pl_persist_init() to the last-loaded device's address; only
-// meaningful when pl_persist_init()'s own return-by-out-param `has_device`
-// (see below) is true. Kept as file-scope query functions rather than
-// threading a struct through bt.c, matching this codebase's existing
-// pl_usb_audio_streaming()-style small-getter convention.
-pl_persist_status_t pl_persist_boot_status(void);
-bool pl_persist_boot_has_device(void);
-void pl_persist_boot_device_addr(uint8_t out_addr[6]);
+// Result of an actual (attempted) flash write -- bead pico-link-4vb.6 (T1),
+// widening the store from 1 slot to PL_PERSIST_DEVICE_SLOTS with NO eviction
+// (design `.planning/design/2026-09-01-remembered-devices.md` section 6):
+// once every slot is occupied by a DIFFERENT address than the one being
+// saved, the write is refused outright rather than evicting anything. This
+// return value is how that refusal is signalled up to a caller -- today
+// `pl_persist_execute_pending_write`/`pl_persist_save_device_now` are that
+// caller and both bt.c and a2dp.c currently discard it (their call sites are
+// bare statements, which still compiles fine against a non-void return); the
+// deferred T3 bt.c wiring is what will actually inspect this and push
+// `PlEventTag::PairedStoreFull` to core. Until then a STORE_FULL result is
+// only observable via the `pl_log` line `pl_persist_do_write` emits.
+typedef enum {
+    PL_PERSIST_WRITE_OK = 0,
+    PL_PERSIST_WRITE_STORE_FULL = 1,
+} pl_persist_write_result_t;
 
-// Stages `addr` to be persisted as the last-used device -- called from
-// bt.c's PL_COMMAND_TAG_PERSIST_DEVICE handler (Rust's auto-reconnect
-// POLICY decides *when* a device is worth remembering -- on
-// Event::ConnectSucceeded -- and tells C via this command; C only stages,
-// gates and flushes, per design point 7). Does not write flash itself --
-// see this header's module doc.
+pl_persist_status_t pl_persist_boot_status(void);
+
+// Bead pico-link-4vb.7 (T3), design section 5.2/8: replaces the old
+// single-device `pl_persist_boot_has_device()`/`pl_persist_boot_device_addr()`
+// pair (deleted -- they were a SINGLE-DEVICE view that made "auto-reconnect
+// target" C's decision; that policy now belongs to `core`, computed as
+// `paired.iter().max_by_key(|d| d.mru_seq)` once every loaded record has
+// been folded into `core`'s `paired` list). bt.c's boot sequence
+// (`pl_bt_init`'s `BTSTACK_EVENT_STATE`/`HCI_STATE_WORKING` case) calls
+// these to push one `PairedDeviceUpserted` per surviving record, THEN
+// `StoreLoaded{status, count}` as the terminator -- see
+// `pl_persist_init()`'s doc comment for where this snapshot is populated.
+uint8_t pl_persist_boot_device_count(void);
+void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq);
+
+// Stages `addr` (and, optionally, `name`/`name_len`) to be persisted as the
+// last-used device -- called from bt.c's PL_COMMAND_TAG_PERSIST_DEVICE
+// handler (Rust's auto-reconnect POLICY decides *when* a device is worth
+// remembering -- on Event::ConnectSucceeded -- and tells C via this
+// command; C only stages, gates and flushes, per design point 7). Does not
+// write flash itself -- see this header's module doc.
+//
+// `name`/`name_len` added by bead pico-link-4vb.7 (T3) so the
+// pico-link-lmf carve-out in `pl_persist_save_device_now()` below doesn't
+// lose the in-flight connect target's name when it falls back to this
+// staged path -- `name_len == 0` means "no name to contribute, leave
+// whatever is already on record" (same RMW convention as
+// `pl_persist_do_write`). bt.c's own PL_COMMAND_TAG_PERSIST_DEVICE handler
+// (the MRU-bump-only caller, design section 7 hazard 3) passes NULL/0.
 //
 // # Calling contract
 //
@@ -139,7 +170,7 @@ void pl_persist_boot_device_addr(uint8_t out_addr[6]);
 // save_and_disable_interrupts()/restore_interrupts() specifically so both
 // contexts can call it safely; do not add a third caller without checking
 // that guard still suffices.
-void pl_persist_request_save_device(const uint8_t addr[6]);
+void pl_persist_request_save_device(const uint8_t addr[6], const uint8_t *name, uint8_t name_len);
 
 // Called once per superloop iteration, thread context, unconditionally
 // cheap when nothing is pending (a few volatile reads) -- decides whether a
@@ -175,7 +206,19 @@ void pl_persist_request_urgent_flush(void);
 // -- never from thread context, and never directly by anything other than
 // bt.c's PL_BT_PENDING_PERSIST_WRITE case. Calling this from thread context
 // reintroduces the exact race code-review finding 1 closed.
-void pl_persist_execute_pending_write(void);
+//
+// Returns PL_PERSIST_WRITE_OK both when a write actually happened and when
+// this call was a no-op (nothing pending, or the streaming gate bounced the
+// request back to pending) -- PL_PERSIST_WRITE_STORE_FULL is returned only
+// when a write was actually attempted and every slot was occupied by a
+// different address.
+//
+// Bead pico-link-4vb.7 (T3): on an actual write, pushes
+// PlEventTag::PairedDeviceUpserted (via bt.h's pl_bt_push_paired_device_upserted);
+// on PL_PERSIST_WRITE_STORE_FULL, pushes PlEventTag::PairedStoreFull instead
+// -- see pl_persist_do_write's doc comment in persist.c for where this is
+// centralized.
+pl_persist_write_result_t pl_persist_execute_pending_write(void);
 
 // Andreas's ruling, 2026-09-01: writes the device record SYNCHRONOUSLY, as
 // part of establishing the connection -- see this header's module doc
@@ -193,7 +236,47 @@ void pl_persist_execute_pending_write(void);
 // A2DP_SUBEVENT_STREAM_ESTABLISHED case, BEFORE the stream state advances
 // to PRIMING. Calling this from thread context reintroduces the exact race
 // code-review finding 1 closed.
-void pl_persist_save_device_now(const uint8_t addr[6]);
+//
+// Returns PL_PERSIST_WRITE_STORE_FULL if every slot is occupied by an
+// address other than `addr` (a2dp.c does not yet inspect this); returns
+// PL_PERSIST_WRITE_OK both when the write actually happened and when it was
+// deferred to the staged/pending path instead (the pico-link-lmf carve-out
+// below).
+//
+// Bead pico-link-4vb.7 (T3): reads the device's name from bt.c's in-flight
+// connect-target cache (`pl_bt_get_connect_target_name`, bt.h) before
+// writing -- this is the whole reason a record could never have a name
+// before this bead: at the moment this function runs, C has an address and
+// (until now) nothing else. On an actual write, pushes
+// PlEventTag::PairedDeviceUpserted; on STORE_FULL, pushes
+// PlEventTag::PairedStoreFull -- see pl_persist_do_write's doc comment in
+// persist.c.
+pl_persist_write_result_t pl_persist_save_device_now(const uint8_t addr[6]);
+
+// Forgets a remembered device (bead pico-link-4vb.6 / T1, design section 6's
+// "Forget" bullet): deletes its PL:D:<slot> tag AND its BTstack link key
+// (S18 -- "forgetting removes the link key too"; a record without its key is
+// a row that says Paired but cannot connect without re-pairing). Returns
+// false, doing nothing, if no slot in the store currently holds `addr`. On
+// success, pushes PlEventTag::PairedDeviceForgotten (bead pico-link-4vb.7,
+// T3).
+//
+// Wired into bt.c's pending queue via PL_BT_PENDING_FORGET_DEVICE (bead
+// pico-link-4vb.7, T3) -- bt.c's PL_COMMAND_TAG_FORGET_DEVICE handler
+// enqueues onto that entry, and pl_bt_pending_service's IRQ/async_context
+// drain calls this.
+//
+// # Calling contract
+//
+// MUST be called ONLY from the cyw43/BTstack background async_context, for
+// the exact same reason as pl_persist_execute_pending_write /
+// pl_persist_save_device_now above -- this touches the shared
+// btstack_tlv_flash_bank instance directly (delete_tag), and
+// gap_drop_link_key_for_bd_addr touches BTstack's own link-key DB, which
+// shares that same instance (see this header's module doc). Calling this
+// from thread context reintroduces the exact race code-review finding 1
+// closed.
+bool pl_persist_forget_device(const uint8_t addr[6]);
 
 // Tag namespace, exposed so a future preset-store implementation (hardening,
 // not MVP -- design point 8/pico-link-ryw) reuses this exact scheme rather
@@ -201,5 +284,12 @@ void pl_persist_save_device_now(const uint8_t addr[6]);
 #define PL_PERSIST_KIND_MARKER 0x4Du // 'M'
 #define PL_PERSIST_KIND_DEVICE 0x44u // 'D'
 #define PL_PERSIST_KIND_PRESET 0x50u // 'P' -- reserved, not yet implemented
+
+// Number of PL:D:<i> device slots the store holds, i in [0, PL_PERSIST_DEVICE_SLOTS).
+// Widened from a single slot (index 0 only) to 8 by bead pico-link-4vb.6
+// (T1), per design section 6 -- "PL:D:0 .. PL:D:7". PL_PERSIST_SCHEMA_VERSION
+// stays 1: an existing single-slot (v1) store's slot-0 record loads cleanly
+// under the new 8-slot reader (slots 1-7 simply read as absent/unoccupied).
+#define PL_PERSIST_DEVICE_SLOTS 8u
 
 #endif // PL_PERSIST_H

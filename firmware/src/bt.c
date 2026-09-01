@@ -256,6 +256,57 @@ static void pl_bt_push_device_discovered(const uint8_t *addr, const uint8_t *nam
     pl_bt_ring_push(event, name, name_len);
 }
 
+// --- pico-link-4vb.7 (T3): in-flight connect-target name cache ---
+//
+// design section 5.3's "Why the name rides on Connect": PlConnectPayload now
+// carries name/name_len, but the record is only actually written later, at
+// a2dp.c's A2DP_SUBEVENT_STREAM_ESTABLISHED (pl_persist_save_device_now) --
+// by then all C has is the addr. So PL_COMMAND_TAG_CONNECT's handler below
+// (and pl_bt_debug_connect, the PL_DEBUG_REMOTE bypass, which has no name
+// and caches name_len = 0) stash the name here; persist.c reads it back via
+// pl_bt_get_connect_target_name.
+//
+// Contexts: written from thread context only (both callers -- the CONNECT
+// command handler and pl_bt_debug_connect -- run from the main.c superloop).
+// Read from the cyw43/BTstack background async_context (persist.c's
+// pl_persist_save_device_now, which a2dp.c calls from its own IRQ-context
+// packet handler). In practice these never overlap in time (the write
+// happens when the user picks a device; the read happens only after BTstack
+// has actually established a stream for that same connect attempt, well
+// after), but this struct is >32 bytes and not atomically readable/writable
+// as a unit, so both sides still take the same short critical-section
+// approach as bt.c's other cross-context statics (pl_bt_pending_push,
+// pl_persist_request_save_device) rather than relying on that timing.
+static uint8_t s_connect_target_addr[6];
+static uint8_t s_connect_target_name[32];
+static uint8_t s_connect_target_name_len;
+static bool s_connect_target_valid;
+
+static void pl_bt_set_connect_target(const uint8_t addr[6], const uint8_t *name, uint8_t name_len) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    memcpy(s_connect_target_addr, addr, 6);
+    if (name != NULL && name_len > 0) {
+        uint8_t copy_len = name_len > (uint8_t)sizeof(s_connect_target_name) ? (uint8_t)sizeof(s_connect_target_name) : name_len;
+        memcpy(s_connect_target_name, name, copy_len);
+        s_connect_target_name_len = copy_len;
+    } else {
+        s_connect_target_name_len = 0;
+    }
+    s_connect_target_valid = true;
+    restore_interrupts(irq_state);
+}
+
+void pl_bt_get_connect_target_name(const uint8_t addr[6], uint8_t out_name[32], uint8_t *out_name_len) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    if (s_connect_target_valid && memcmp(s_connect_target_addr, addr, 6) == 0) {
+        memcpy(out_name, s_connect_target_name, sizeof(s_connect_target_name));
+        *out_name_len = s_connect_target_name_len;
+    } else {
+        *out_name_len = 0;
+    }
+    restore_interrupts(irq_state);
+}
+
 // --- M4 S1 additions (bead pico-link-cz0.5.2): exported so a2dp.c can push
 // through this same ring -- see bt.h's doc comment on why that's the right
 // seam (a2dp.c's A2DP/AVRCP packet handler is another IRQ-context producer,
@@ -333,26 +384,63 @@ void pl_bt_push_wizard_auto_dismiss(void) {
     pl_bt_ring_push(event, NULL, 0);
 }
 
-// Bead pico-link-cz0.6 (M5 persistence): pushes Event::StoreLoaded{status,
-// device_addr}. Called exactly once, from pl_bt_init below (thread
-// context -- main() calls it directly, before the superloop even starts),
-// right after pl_persist_init() has read the flash store. `status` is the
-// raw wire value of ui-ffi's PlStoreStatus (see ui-ffi/src/lib.rs);
-// `has_device`/`addr` carry the last-used device, if any, so core's
-// auto-reconnect POLICY (Rust, per design point 7) can queue
-// Command::Connect for it -- C only loaded, staged and (later) flushes,
-// never decides whether to reconnect.
-static void pl_bt_push_store_loaded(uint32_t status, bool has_device, const uint8_t *addr) {
+// Bead pico-link-4vb.7 (T3), reshaping bead pico-link-cz0.6's original:
+// pushes Event::StoreLoaded{status, count}. Called exactly once, from
+// pl_bt_init below (thread context -- main() calls it directly, before the
+// superloop even starts), right after pl_persist_init() has read the flash
+// store AND after `count` x PairedDeviceUpserted have already been pushed
+// for every surviving record (this call is the TERMINATOR of that
+// sequence, design section 5.2) -- see pl_bt_init's BTSTACK_EVENT_STATE
+// case below. `status` is the raw wire value of ui-ffi's PlStoreStatus.
+// No longer carries a device address: the auto-reconnect POLICY (which
+// device, if any, to reconnect to) now lives entirely in `core`, computed
+// from the `paired` list this event's preceding PairedDeviceUpserted
+// pushes just built (design point 7 / section 5.2) -- C only loads, stages
+// and (later) flushes, never decides.
+static void pl_bt_push_store_loaded(uint32_t status, uint8_t count) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_STORE_LOADED,
-        .payload = {.store_loaded = {.status = (uint8_t)status, .has_device = has_device ? 1 : 0}},
+        .payload = {.store_loaded = {.status = (uint8_t)status, .count = count}},
     };
-    if (has_device) {
-        memcpy(event.payload.store_loaded.addr, addr, 6);
-    } else {
-        memset(event.payload.store_loaded.addr, 0, 6);
-    }
+    pl_bt_ring_push(event, NULL, 0);
+}
+
+// Bead pico-link-4vb.7 (T3), design section 5.1: pushes
+// Event::PairedDeviceUpserted{addr, name, name_len, mru_seq}. See bt.h's
+// doc comment for the two call sites (persist.c's write path, and this
+// file's own boot sequence).
+void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_PAIRED_DEVICE_UPSERTED,
+        .payload = {.paired_device_upserted = {.name_len = name_len, .mru_seq = mru_seq}},
+    };
+    memcpy(event.payload.paired_device_upserted.addr, addr, 6);
+    memcpy(event.payload.paired_device_upserted.name, name, sizeof(event.payload.paired_device_upserted.name));
+    pl_bt_ring_push(event, NULL, 0);
+}
+
+// Bead pico-link-4vb.7 (T3), design section 5.1: pushes
+// Event::PairedDeviceForgotten{addr}.
+void pl_bt_push_paired_device_forgotten(const uint8_t addr[6]) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_PAIRED_DEVICE_FORGOTTEN,
+        .payload = {.paired_device_forgotten = {0}},
+    };
+    memcpy(event.payload.paired_device_forgotten.addr, addr, 6);
+    pl_bt_ring_push(event, NULL, 0);
+}
+
+// Bead pico-link-4vb.7 (T3), design section 5.1: pushes
+// Event::PairedStoreFull -- no payload, like DevicesCleared/WizardAutoDismiss.
+void pl_bt_push_paired_store_full(void) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_PAIRED_STORE_FULL,
+        .payload = {0},
+    };
     pl_bt_ring_push(event, NULL, 0);
 }
 
@@ -469,20 +557,29 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                 pl_log("BT: HCI_STATE_WORKING -- radio up\r\n");
                 hci_send_cmd(&hci_read_local_version_information);
 
-                // Bead pico-link-cz0.6 (M5 persistence): NOW it's safe to
-                // let core's auto-reconnect policy queue a Connect command
-                // (radio is fully up) -- pushed before pl_bt_start_scan()
-                // below so the queued Connect, once drained, lands ahead of
-                // a fresh inquiry in the deferred pending queue. Reads
-                // straight from persist.c's boot-time getters -- no
-                // re-read of flash, pl_persist_init() already did that in
-                // pl_bt_init above.
-                uint8_t boot_device_addr[6] = {0};
-                bool boot_has_device = pl_persist_boot_has_device();
-                if (boot_has_device) {
-                    pl_persist_boot_device_addr(boot_device_addr);
+                // Bead pico-link-4vb.7 (T3), design section 5.2: NOW it's
+                // safe to push the boot-loaded device records (radio is
+                // fully up) -- pushed before pl_bt_start_scan() below so
+                // core has folded every record into its `paired` list, and
+                // computed its own MRU-max auto-reconnect target, before
+                // any scan-driven UI change lands. One PairedDeviceUpserted
+                // per surviving record, THEN StoreLoaded{status, count} as
+                // the terminator -- core no longer needs an address on
+                // StoreLoaded itself (that was C deciding the reconnect
+                // target; now core does, from the `paired` list this
+                // sequence just built). Reads straight from persist.c's
+                // boot-time snapshot -- no re-read of flash,
+                // pl_persist_init() already did that in pl_bt_init above.
+                uint8_t boot_device_count = pl_persist_boot_device_count();
+                for (uint8_t i = 0; i < boot_device_count; i++) {
+                    uint8_t boot_addr[6];
+                    uint8_t boot_name[32];
+                    uint8_t boot_name_len;
+                    uint32_t boot_mru_seq;
+                    pl_persist_boot_device_at(i, boot_addr, boot_name, &boot_name_len, &boot_mru_seq);
+                    pl_bt_push_paired_device_upserted(boot_addr, boot_name, boot_name_len, boot_mru_seq);
                 }
-                pl_bt_push_store_loaded((uint32_t)pl_persist_boot_status(), boot_has_device, boot_device_addr);
+                pl_bt_push_store_loaded((uint32_t)pl_persist_boot_status(), boot_device_count);
 
                 pl_bt_start_scan();
             }
@@ -592,11 +689,19 @@ typedef enum {
     // context. Carries no addr (persist.c already has the pending record
     // staged in its own s_pending_addr).
     PL_BT_PENDING_PERSIST_WRITE,
+    // Bead pico-link-4vb.7 (T3), design section 5.1/6: reuses this exact
+    // queue/heartbeat idiom for persist.c's forget-device flash write, for
+    // the same reason PL_BT_PENDING_PERSIST_WRITE does --
+    // pl_persist_forget_device touches the shared btstack_tlv_flash_bank
+    // instance directly and MUST run on the cyw43/BTstack background
+    // async_context (persist.h's Reentrancy doc). Carries the target addr,
+    // same as PL_BT_PENDING_CONNECT.
+    PL_BT_PENDING_FORGET_DEVICE,
 } pl_bt_pending_tag_t;
 
 typedef struct {
     pl_bt_pending_tag_t tag;
-    bd_addr_t addr; // meaningful only for PL_BT_PENDING_CONNECT
+    bd_addr_t addr; // meaningful for PL_BT_PENDING_CONNECT and PL_BT_PENDING_FORGET_DEVICE
 } pl_bt_pending_entry_t;
 
 static pl_bt_pending_entry_t s_bt_pending[PL_BT_PENDING_CAPACITY];
@@ -622,6 +727,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "DISCONNECT";
         case PL_BT_PENDING_PERSIST_WRITE:
             return "PERSIST_WRITE";
+        case PL_BT_PENDING_FORGET_DEVICE:
+            return "FORGET_DEVICE";
         default:
             return "?";
     }
@@ -643,7 +750,7 @@ static void pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
         return;
     }
     s_bt_pending[head].tag = tag;
-    if (tag == PL_BT_PENDING_CONNECT) {
+    if (tag == PL_BT_PENDING_CONNECT || tag == PL_BT_PENDING_FORGET_DEVICE) {
         memcpy(s_bt_pending[head].addr, addr, sizeof(bd_addr_t));
     }
     s_bt_pending_head = next_head;
@@ -688,6 +795,14 @@ static void pl_bt_pending_service(void) {
                 // serialized execution stream BTstack's own put_link_key
                 // call runs on. See persist.h's "Reentrancy" doc.
                 pl_persist_execute_pending_write();
+                break;
+            case PL_BT_PENDING_FORGET_DEVICE:
+                // Bead pico-link-4vb.7 (T3): same reentrancy contract as
+                // PL_BT_PENDING_PERSIST_WRITE above -- pl_persist_forget_device
+                // touches the shared flash TLV instance directly and must
+                // run only from here. Pushes PairedDeviceForgotten itself
+                // on success (persist.c).
+                pl_persist_forget_device(entry.addr);
                 break;
         }
     }
@@ -814,6 +929,12 @@ void pl_bt_poll_commands(struct PlUi *ui) {
                 "BT: PL_CMD_CONNECT %02x:%02x:%02x:%02x:%02x:%02x\r\n",
                 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
             );
+            // Bead pico-link-4vb.7 (T3), design section 5.3: cache the
+            // name that rode along with this Connect command -- the record
+            // isn't actually written until a2dp.c's STREAM_ESTABLISHED,
+            // long after this call returns, and that's the only place C
+            // ever learns the name at all.
+            pl_bt_set_connect_target(addr, command.payload.connect.name, command.payload.connect.name_len);
             pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
             pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_A2DP);
             pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
@@ -829,12 +950,23 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             // (thread context, but still subject to the same streaming
             // gate persist.c's own service loop applies -- staging itself
             // is cheap and safe regardless).
-            const uint8_t *addr = command.payload.connect.addr;
+            //
+            // Bead pico-link-4vb.7 (T3), design section 7 hazard 3: this
+            // command's meaning has drifted since Andreas's
+            // write-at-pairing-time ruling -- the synchronous
+            // pl_persist_save_device_now() path (a2dp.c) already remembers
+            // the device (and its name) at STREAM_ESTABLISHED, so by the
+            // time core queues this, the record normally already exists.
+            // What's left for this handler is the MRU bump (and, later,
+            // per-device settings flushes) -- no name to contribute here,
+            // hence NULL/0 (persist.c's RMW convention leaves the existing
+            // name untouched).
+            const uint8_t *addr = command.payload.addr.addr;
             pl_log(
                 "BT: PL_CMD_PERSIST_DEVICE %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4],
                 addr[5]
             );
-            pl_persist_request_save_device(addr);
+            pl_persist_request_save_device(addr, NULL, 0);
             break;
         }
 
@@ -846,6 +978,23 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             pl_bt_pending_push(PL_BT_PENDING_CANCEL_SCAN, NULL);
             pl_wdt_mark(PL_WDT_CP_CMD_CANCEL_SCAN_RET);
             break;
+
+        case PL_COMMAND_TAG_FORGET_DEVICE: {
+            // Bead pico-link-4vb.7 (T3), design section 5.1/6: user-initiated
+            // "forget this remembered device" (Devices screen's X action, or
+            // the pick-one-to-forget flow when the store is full). Deferred
+            // onto the pending queue -- pl_persist_forget_device touches the
+            // shared flash TLV instance directly and must run on the
+            // cyw43/BTstack background async_context, same as every other
+            // flash write in this file.
+            const uint8_t *addr = command.payload.addr.addr;
+            pl_log(
+                "BT: PL_CMD_FORGET_DEVICE %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4],
+                addr[5]
+            );
+            pl_bt_pending_push(PL_BT_PENDING_FORGET_DEVICE, addr);
+            break;
+        }
 
         case PL_COMMAND_TAG_NONE:
             pl_wdt_mark(PL_WDT_CP_CMD_NONE);
@@ -873,6 +1022,11 @@ void pl_bt_debug_connect(const uint8_t *addr) {
         "BT: debug-remote CONNECT %02x:%02x:%02x:%02x:%02x:%02x (bypassing inquiry)\r\n",
         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
     );
+    // Bead pico-link-4vb.7 (T3): no name available here (this bypasses
+    // inquiry entirely) -- name_len = 0 caches "no name", which
+    // persist.c's RMW convention turns into "keep whatever name is
+    // already on record" when the write actually happens.
+    pl_bt_set_connect_target(addr, NULL, 0);
     pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
     pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
 }

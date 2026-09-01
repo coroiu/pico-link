@@ -905,16 +905,90 @@ impl From<PlStoreStatus> for StoreStatus {
 /// [`PlStoreStatus`] -- same reason as every other union-member
 /// tag/state/reason field in this module (see
 /// [`PlLinkStateChangedPayload::state`]'s doc comment); convert via
-/// [`PlStoreStatus::try_from`], never by transmuting. `addr` is only
-/// meaningful when `has_device != 0` -- mirrors
-/// [`PlConnectSucceededPayload::degraded`]'s "any nonzero value is true"
-/// convention for the same reason (no validity invariant to violate on a
-/// plain `u8`).
+/// [`PlStoreStatus::try_from`], never by transmuting.
+///
+/// Reshaped by bead pico-link-4vb.6 (T2), design section 5.2 -- `has_device`
+/// and `addr` are REMOVED; `count` is new. This is the load-bearing seam
+/// call in that design: `has_device`/`addr` were C DECIDING which device to
+/// auto-reconnect to (`pl_persist_boot_has_device`/`pl_persist_boot_device_addr`,
+/// "the one slot" -- not a policy with one slot, but a real one with eight).
+/// That policy belongs on `core`'s side of the seam (design point 7), so
+/// this event no longer carries an opinion about it: C's boot sequence is
+/// now `count` x [`PlEventTag::PairedDeviceUpserted`] (one per surviving
+/// record), THEN this event as the terminator -- `core` computes the
+/// reconnect target itself (`paired.iter().max_by_key(|d| d.mru_seq)`,
+/// design section 5.2) once it has folded every upserted record into its
+/// own model.
+///
+/// **`count` is not yet populated by any real producer.** `firmware/src/bt.c`
+/// still calls `pl_persist_boot_has_device`/`pl_persist_boot_device_addr`
+/// and constructs the OLD `{status, has_device, addr}` shape this struct no
+/// longer has (T3, deferred out of this bead's scope -- see
+/// `persist.h`'s doc comment on those two getters). Until T3 lands and bt.c
+/// is updated to push `count` x `PairedDeviceUpserted` instead, this event
+/// arriving with any `count` means nothing has actually been folded into
+/// `core`'s `paired` list yet (that list doesn't even exist in `core` until
+/// T4) -- `pl_ui_push_event`'s `StoreLoaded` arm below always queues
+/// `device_addr: None`, deliberately NOT reading `count` to synthesize a
+/// reconnect target, exactly because there is no way to sound-ly derive one
+/// from a bare count.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlStoreLoadedPayload {
     pub status: u8,
-    pub has_device: u8,
+    /// How many [`PlEventTag::PairedDeviceUpserted`] events preceded this
+    /// one in C's boot push sequence (design section 5.2). See this
+    /// struct's doc comment for why nothing reads this yet.
+    pub count: u8,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::PairedDeviceUpserted`
+/// (bead pico-link-4vb.6, T2, design section 5.1). One remembered (paired)
+/// device the flash store holds, pushed either at boot (C's `count` x this
+/// event, design section 5.2) or after a device is newly persisted /
+/// updated.
+///
+/// `name` is an inline fixed buffer copied by value, following
+/// [`PlCodecChangedPayload::name`]'s convention -- NOT
+/// [`PlDeviceDiscoveredPayload::name`]'s borrowed-pointer style -- so every
+/// [`PlEventPayload`] member stays `Copy` with no lifetime (design section
+/// 5.1's explicit "inline fixed buffer copied by value" call-out).
+///
+/// **Not yet producible from C.** `firmware/src/bt.c` does not push this
+/// tag yet -- that's T3 (deferred out of this bead's scope, see
+/// `PlStoreLoadedPayload`'s doc comment). This tag/payload shape exists now,
+/// purely additive, so the header and the rest of T2's surface land
+/// together; `pl_ui_push_event` accepts it (counts as legal, not malformed)
+/// but does not yet fold it into `core`'s model -- `pico_link_core::Event`
+/// has no matching variant yet (T4, also deferred). See this tag's arm in
+/// [`pl_ui_push_event`] for the explicit "accepted, not yet wired" handling.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlPairedDeviceUpsertedPayload {
+    pub addr: [u8; 6],
+    /// Fixed at 32 bytes, matching `firmware/src/persist.c`'s
+    /// `pl_persist_device_record_t::name` on-flash field exactly (bead
+    /// pico-link-cz0.6, M5 persistence) -- a literal, not a named const, for
+    /// the same cbindgen-array-size reason as
+    /// [`PlDeviceDiscoveredPayload::addr`]'s bare `6` (see that field's doc
+    /// comment).
+    pub name: [u8; 32],
+    /// `> 32` is treated as an empty name, same convention as
+    /// [`PlCodecChangedPayload::name_len`].
+    pub name_len: u8,
+    /// Monotonic use-sequence (design section 3's [`PairedDevice::mru_seq`]
+    /// doc comment in `core` -- never a wall clock, this board has no RTC).
+    /// Ordering key for the eventual Devices screen (design section 4).
+    pub mru_seq: u32,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::PairedDeviceForgotten`
+/// (bead pico-link-4vb.6, T2, design section 5.1). Not yet producible from
+/// C -- see [`PlPairedDeviceUpsertedPayload`]'s doc comment for the same
+/// "accepted, not yet wired" story (T3/T4, both deferred).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlPairedDeviceForgottenPayload {
     pub addr: [u8; 6],
 }
 
@@ -945,8 +1019,31 @@ pub enum PlEventTag {
     WizardAutoDismiss = 7,
     CodecChanged = 8,
     /// Bead pico-link-cz0.6 (M5 persistence). Purely additive like the rest
-    /// of this enum -- [`PL_EVENT_ABI_VERSION`] is unchanged.
+    /// of this enum -- [`PL_EVENT_ABI_VERSION`] was unchanged by this tag's
+    /// own addition (it moved 1->2 the same bead for an unrelated,
+    /// non-additive reason -- see that constant's doc comment); its own
+    /// *payload shape* was later reshaped non-additively by bead
+    /// pico-link-4vb.6 (see [`PlStoreLoadedPayload`]'s doc comment), which
+    /// is what bumped [`PL_EVENT_ABI_VERSION`] to 3.
     StoreLoaded = 9,
+    /// Bead pico-link-4vb.6 (T2), design section 5.1. Purely additive --
+    /// see [`PlPairedDeviceUpsertedPayload`]'s doc comment for the payload
+    /// shape and its "not yet producible from C" status.
+    PairedDeviceUpserted = 10,
+    /// Bead pico-link-4vb.6 (T2), design section 5.1. Purely additive --
+    /// see [`PlPairedDeviceForgottenPayload`]'s doc comment.
+    PairedDeviceForgotten = 11,
+    /// Bead pico-link-4vb.6 (T2), design section 5.1: the store refused a
+    /// save because every slot was occupied by a different address (no
+    /// eviction, ever -- design section 3's "must never silently evict").
+    /// Carries no payload -- like
+    /// [`DevicesCleared`](Self::DevicesCleared)/[`WizardAutoDismiss`](Self::WizardAutoDismiss),
+    /// the union simply isn't read for this tag. Purely additive. Not yet
+    /// producible from C (T3, deferred) -- `firmware/src/persist.c`'s
+    /// `pl_persist_do_write` already returns a distinguishable
+    /// `PL_PERSIST_WRITE_STORE_FULL` result for this (bead pico-link-4vb.6's
+    /// T1), but nothing in `bt.c` reads that result and pushes this tag yet.
+    PairedStoreFull = 12,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -967,6 +1064,9 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             7 => Ok(PlEventTag::WizardAutoDismiss),
             8 => Ok(PlEventTag::CodecChanged),
             9 => Ok(PlEventTag::StoreLoaded),
+            10 => Ok(PlEventTag::PairedDeviceUpserted),
+            11 => Ok(PlEventTag::PairedDeviceForgotten),
+            12 => Ok(PlEventTag::PairedStoreFull),
             _ => Err(()),
         }
     }
@@ -990,6 +1090,15 @@ pub union PlEventPayload {
     pub connect_succeeded: PlConnectSucceededPayload,
     pub codec_changed: PlCodecChangedPayload,
     pub store_loaded: PlStoreLoadedPayload,
+    /// Bead pico-link-4vb.6 (T2). See [`PlPairedDeviceUpsertedPayload`]'s
+    /// doc comment.
+    pub paired_device_upserted: PlPairedDeviceUpsertedPayload,
+    /// Bead pico-link-4vb.6 (T2). See [`PlPairedDeviceForgottenPayload`]'s
+    /// doc comment.
+    pub paired_device_forgotten: PlPairedDeviceForgottenPayload,
+    // PlEventTag::PairedStoreFull has no payload of its own -- like
+    // DevicesCleared/WizardAutoDismiss above, the union simply isn't read
+    // for that tag, so no placeholder member is needed.
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -1002,7 +1111,14 @@ pub union PlEventPayload {
 // an existing tag's payload (see that struct's doc comment) -- so every
 // producer/consumer in this one coordinated build picks up the new field
 // together; nothing outside this repo speaks this ABI.
-pub const PL_EVENT_ABI_VERSION: u32 = 2;
+//
+// Bead pico-link-4vb.6 (T2), design section 5.2: bumped 2 -> 3.
+// PlStoreLoadedPayload dropped `has_device`/`addr` and gained `count` -- a
+// non-additive shape change to an existing tag's payload, same class of
+// bump as the 1->2 one above (see that struct's doc comment for the full
+// rationale -- moving the auto-reconnect policy decision to `core`'s side
+// of the seam).
+pub const PL_EVENT_ABI_VERSION: u32 = 3;
 
 /// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
@@ -1163,9 +1279,45 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                     return;
                 }
             };
-            let device_addr = if payload.has_device != 0 { Some(payload.addr) } else { None };
-            Event::StoreLoaded { status: status.into(), device_addr }
+            // Bead pico-link-4vb.6 (T2): `PlStoreLoadedPayload` no longer
+            // carries an address -- see that struct's doc comment for why
+            // (the auto-reconnect policy moved to `core`'s side of the
+            // seam, design section 5.2). `device_addr` is always `None`
+            // here; `payload.count` is deliberately NOT read to synthesize
+            // one -- there is no sound way to derive a specific address
+            // from a bare count, and the real mechanism (folding `count` x
+            // `PairedDeviceUpserted` into `core`'s own `paired` list, then
+            // computing `paired.iter().max_by_key(|d| d.mru_seq)`) is T4,
+            // deferred out of this bead's scope.
+            Event::StoreLoaded { status: status.into(), device_addr: None }
         }
+        // Bead pico-link-4vb.6 (T2): these three tags are ACCEPTED as
+        // legal (not counted as malformed -- they are real, defined tags,
+        // just not yet wired to a model) and then this function returns
+        // without calling `ui.app.handle_event` at all, because
+        // `pico_link_core::Event` has no matching variant for any of them
+        // yet -- that's T4 (bead pico-link-4vb.4), deferred out of this
+        // bead's scope pending `pico-link-4vb.2`'s `core/src/app.rs`
+        // changes landing first. See each payload struct's own doc comment
+        // ("not yet producible from C" / "not yet wired") for the full
+        // story. Once T4 lands, these three arms gain a real `Event::*`
+        // variant to construct and rejoin the rest of this match's
+        // single-`handle_event`-call shape.
+        PlEventTag::PairedDeviceUpserted => {
+            // SAFETY: `tag` says this union currently holds
+            // `paired_device_upserted`. Reading it is sound regardless of
+            // field values -- every field is a plain integer/byte-array
+            // type with no validity invariant to violate (see
+            // `PlPairedDeviceUpsertedPayload`'s doc comment).
+            let _payload = unsafe { event.payload.paired_device_upserted };
+            return;
+        }
+        PlEventTag::PairedDeviceForgotten => {
+            // SAFETY: same as the `PairedDeviceUpserted` arm above.
+            let _payload = unsafe { event.payload.paired_device_forgotten };
+            return;
+        }
+        PlEventTag::PairedStoreFull => return,
     };
     ui.app.handle_event(core_event);
 }
@@ -1208,15 +1360,72 @@ pub enum PlCommandTag {
     CancelConnect = 4,
     /// Bead pico-link-cz0.6 (M5 persistence), design point 7: `core`'s
     /// auto-reconnect/remember-this-device POLICY output. Carries the
-    /// target `addr` via the same `connect` payload member `Connect`/
-    /// `CancelConnect` use -- see [`PlCommandPayload`]'s doc comment.
+    /// target `addr` via the [`PlAddrPayload`] union member (bead
+    /// pico-link-4vb.6 moved this and [`CancelConnect`](Self::CancelConnect)
+    /// off `.connect` onto `.addr` -- see [`PlCommandPayload`]'s doc
+    /// comment; a *source*-only change, no wire byte moves for either).
     PersistDevice = 5,
+    /// Bead pico-link-4vb.6 (T2), design
+    /// `.planning/design/2026-09-01-remembered-devices.md` section 5.3:
+    /// user-initiated "forget this remembered device" (the Devices screen's
+    /// X action, or the pick-one-to-forget flow when the store is full).
+    /// Carries the target `addr` via [`PlAddrPayload`], same as
+    /// [`CancelConnect`](Self::CancelConnect)/[`PersistDevice`](Self::PersistDevice).
+    ///
+    /// **Not yet producible from `core`** -- `pico_link_core::Command` has
+    /// no `ForgetDevice` variant yet (that's T4/T5, bead pico-link-4vb.4,
+    /// which depends on `core/src/app.rs` changes deliberately deferred out
+    /// of this bead's scope). This tag and its wire shape exist now so the
+    /// C-side header (`firmware/include/pico_link_ui.h`) and the ABI
+    /// version bump land together with the rest of T2's additive surface,
+    /// per the same "define the shape now, wire the producer later"
+    /// precedent [`CancelConnect`](Self::CancelConnect) itself set
+    /// (pico-link-znb.7's completion report). [`pl_command_from`] has no
+    /// match arm for it yet -- unreachable until T4 lands.
+    ForgetDevice = 6,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
+///
+/// `name`/`name_len` added by bead pico-link-4vb.6 (T2), design section
+/// 5.3's "Why the name rides on `Connect`" (alternative A, chosen over a
+/// separate `SetDeviceName` command -- seeing that alternative's cost
+/// analysis is the point: an unenforceable "send this first" ordering rule
+/// whose failure mode is a silently nameless record, exactly the defect
+/// class this whole line of work exists to kill). Fixed inline buffer
+/// copied by value, following [`PlCodecChangedPayload::name`]'s convention
+/// -- `core` is expected to have already truncated on a UTF-8 *character*
+/// boundary before setting `name_len` (design section 5.3, "Rust owns
+/// text; C owns bytes"); this crate does not re-validate that here since
+/// `core` is the only producer of `PlCommand` values.
+///
+/// **`name`/`name_len` are not yet populated by any real caller** --
+/// `pico_link_core::Command::Connect` doesn't carry a name yet (T4,
+/// deferred out of this bead's scope, per the same reasoning as
+/// [`PlCommandTag::ForgetDevice`]'s doc comment); [`pl_command_from`]
+/// zero-fills both today. Added now so the wire shape and the
+/// [`PL_COMMAND_ABI_VERSION`] bump land together with the rest of T2.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectPayload {
+    pub addr: [u8; 6],
+    pub name: [u8; 32],
+    pub name_len: u8,
+}
+
+/// [`PlCommand`]'s payload for every tag that carries nothing but a target
+/// address -- [`PlCommandTag::CancelConnect`], [`PlCommandTag::PersistDevice`]
+/// and [`PlCommandTag::ForgetDevice`] (bead pico-link-4vb.6, T2, design
+/// section 5.3). Introduced as its own type, rather than continuing to
+/// reuse [`PlConnectPayload`] the way those first two tags did before this
+/// bead, because `PlConnectPayload` now also carries `name`/`name_len` --
+/// fields meaningless for a cancel/persist/forget command. Both structs
+/// still start with `addr: [u8; 6]` at the same offset, so this is a
+/// *source*-only change for the two pre-existing tags: no wire byte moves
+/// for either (see [`PlCommandPayload`]'s doc comment).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlAddrPayload {
     pub addr: [u8; 6],
 }
 
@@ -1233,6 +1442,8 @@ pub struct PlConnectPayload {
 #[derive(Clone, Copy)]
 pub union PlCommandPayload {
     pub connect: PlConnectPayload,
+    /// See [`PlAddrPayload`]'s doc comment. Bead pico-link-4vb.6 (T2).
+    pub addr: PlAddrPayload,
 }
 
 /// ABI version [`PlCommand`] consumers (C call sites, i.e. `bt.c`'s poll
@@ -1241,7 +1452,13 @@ pub union PlCommandPayload {
 /// sets this correctly; the check exists on the C side as the same
 /// defensive belt-and-suspenders guard [`PL_EVENT_ABI_VERSION`] is for
 /// events -- see the module section doc.
-pub const PL_COMMAND_ABI_VERSION: u32 = 1;
+// Bead pico-link-4vb.6 (T2): bumped 1 -> 2. `PlConnectPayload` gained
+// `name`/`name_len` -- a non-additive shape change to an existing tag's
+// payload (same class of change `PL_EVENT_ABI_VERSION`'s 1->2 bump was for
+// `PlConnectSucceededPayload` gaining `addr`, bead pico-link-cz0.6) -- so
+// every producer/consumer in this one coordinated build picks up the new
+// field together.
+pub const PL_COMMAND_ABI_VERSION: u32 = 2;
 
 /// One user-initiated command, Rust -> C. See [`PlCommandPayload`]'s doc
 /// comment for the extensibility rationale and [`PL_COMMAND_ABI_VERSION`]
@@ -1258,7 +1475,11 @@ pub struct PlCommand {
 /// correctly -- the "nothing queued" value returned by [`pl_ui_poll_command`]
 /// in every case that isn't `Some(Command::{StartScan,Connect})`.
 fn pl_command_none() -> PlCommand {
-    PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::None, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
+    PlCommand {
+        version: PL_COMMAND_ABI_VERSION,
+        tag: PlCommandTag::None,
+        payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+    }
 }
 
 /// Pops the oldest user-initiated command queued by the devices screen
@@ -1271,21 +1492,42 @@ fn pl_command_none() -> PlCommand {
 /// wizard screen in pico-link-znb.7 adds one).
 fn pl_command_from(command: Command) -> PlCommand {
     match command {
-        Command::StartScan => {
-            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::StartScan, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
-        }
-        Command::Connect { addr } => {
-            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::Connect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
-        }
-        Command::CancelScan => {
-            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::CancelScan, payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6] } } }
-        }
-        Command::CancelConnect { addr } => {
-            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::CancelConnect, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
-        }
-        Command::PersistDevice { addr } => {
-            PlCommand { version: PL_COMMAND_ABI_VERSION, tag: PlCommandTag::PersistDevice, payload: PlCommandPayload { connect: PlConnectPayload { addr } } }
-        }
+        Command::StartScan => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::StartScan,
+            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+        },
+        Command::Connect { addr } => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::Connect,
+            // `name`/`name_len` zero-filled: `pico_link_core::Command::Connect`
+            // doesn't carry a name yet -- see `PlConnectPayload`'s doc
+            // comment (T4, deferred out of this bead's scope).
+            payload: PlCommandPayload { connect: PlConnectPayload { addr, name: [0; 32], name_len: 0 } },
+        },
+        Command::CancelScan => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::CancelScan,
+            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+        },
+        // Bead pico-link-4vb.6 (T2): moved off `.connect` onto `.addr`
+        // (`PlAddrPayload`) -- see that struct's doc comment. Source-only
+        // change: both payload shapes start with `addr: [u8; 6]` at offset
+        // 0, so no wire byte moves.
+        Command::CancelConnect { addr } => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::CancelConnect,
+            payload: PlCommandPayload { addr: PlAddrPayload { addr } },
+        },
+        Command::PersistDevice { addr } => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::PersistDevice,
+            payload: PlCommandPayload { addr: PlAddrPayload { addr } },
+        },
+        // `Command::ForgetDevice` does not exist yet on `pico_link_core`'s
+        // side (T4, deferred) -- no arm needed here until it does;
+        // `PlCommandTag::ForgetDevice`'s wire shape is defined and ready
+        // (see that variant's doc comment).
     }
 }
 
@@ -1408,7 +1650,11 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            tag: 10, // one past StoreLoaded = 9, the highest legal PlEventTag
+            // One past PairedStoreFull = 12, the highest legal PlEventTag
+            // as of bead pico-link-4vb.6 (T2) -- moved from 10 (one past
+            // the old highest, StoreLoaded = 9) when this bead added tags
+            // 10-12.
+            tag: 13,
             payload: bogus_payload,
         };
         unsafe {
@@ -1554,19 +1800,22 @@ mod tests {
     }
 
     #[test]
-    fn pl_ui_push_event_store_loaded_with_a_device_queues_connect() {
-        // Bead pico-link-cz0.6 (M5 persistence): round-trips
-        // PlEventTag::StoreLoaded with has_device=1 all the way through to
-        // core's Command::Connect queue, and asserts the model's
-        // store_status was recorded -- the actual gap this event exists to
-        // close (design point 5's "never renders identically to a new
-        // one"), not just "doesn't panic".
+    fn pl_ui_push_event_store_loaded_records_status_but_does_not_yet_auto_reconnect() {
+        // Bead pico-link-4vb.6 (T2) reshaped PlStoreLoadedPayload -- it no
+        // longer carries an address (see that struct's doc comment), so
+        // StoreLoaded alone can no longer queue a Command::Connect the way
+        // it did pre-reshape (bead pico-link-cz0.6's original test this one
+        // replaces). The auto-reconnect policy moves to core computing
+        // `paired.iter().max_by_key(mru_seq)` once PairedDeviceUpserted
+        // folding lands (T4, deferred) -- until then, `count` alone must
+        // NOT synthesize a phantom Connect command. `store_status` is still
+        // recorded either way -- that part of the original gap (design
+        // point 5's "never renders identically to a new one") still holds.
         let ui = new_ui();
-        let addr = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::StoreLoaded as u32,
-            payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: PlStoreStatus::Loaded as u8, has_device: 1, addr } },
+            payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: PlStoreStatus::Loaded as u8, count: 2 } },
         };
         unsafe {
             pl_ui_push_event(ui, event);
@@ -1574,22 +1823,18 @@ mod tests {
             assert_eq!((*ui).app.model().store_status, Some(pico_link_core::StoreStatus::Loaded));
 
             let cmd = pl_ui_poll_command(ui);
-            assert_eq!(cmd.version, PL_COMMAND_ABI_VERSION);
-            assert!(matches!(cmd.tag, PlCommandTag::Connect));
-            assert_eq!(cmd.payload.connect.addr, addr);
+            assert!(matches!(cmd.tag, PlCommandTag::None), "count alone must not synthesize a Connect target (T4 not landed yet)");
             pl_ui_destroy(ui);
         }
     }
 
     #[test]
-    fn pl_ui_push_event_store_loaded_with_no_device_queues_nothing() {
+    fn pl_ui_push_event_store_loaded_with_zero_count_queues_nothing() {
         let ui = new_ui();
         let event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::StoreLoaded as u32,
-            payload: PlEventPayload {
-                store_loaded: PlStoreLoadedPayload { status: PlStoreStatus::FirstBoot as u8, has_device: 0, addr: [0; 6] },
-            },
+            payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: PlStoreStatus::FirstBoot as u8, count: 0 } },
         };
         unsafe {
             pl_ui_push_event(ui, event);
@@ -1608,11 +1853,51 @@ mod tests {
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::StoreLoaded as u32,
-            payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: 99, has_device: 0, addr: [0; 6] } },
+            payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: 99, count: 0 } },
         };
         unsafe {
             pl_ui_push_event(ui, bad_event);
             assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range nested store status should be counted, not matched-on");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_accepts_the_new_paired_device_tags_without_folding_into_the_model() {
+        // Bead pico-link-4vb.6 (T2): PairedDeviceUpserted/PairedDeviceForgotten/
+        // PairedStoreFull are legal, real tags -- accepted (not counted as
+        // malformed) -- but `pico_link_core::Event` has no matching variant
+        // for any of them yet (T4, deferred), so `pl_ui_push_event` must
+        // return without calling `App::handle_event` for any of the three.
+        // Proven here via `link_state`, which nothing in this test's event
+        // sequence should be able to touch.
+        let ui = new_ui();
+        let addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let mut name = [0u8; 32];
+        name[..2].copy_from_slice(b"XM");
+        let events = [
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::PairedDeviceUpserted as u32,
+                payload: PlEventPayload { paired_device_upserted: PlPairedDeviceUpsertedPayload { addr, name, name_len: 2, mru_seq: 7 } },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::PairedDeviceForgotten as u32,
+                payload: PlEventPayload { paired_device_forgotten: PlPairedDeviceForgottenPayload { addr } },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::PairedStoreFull as u32,
+                payload: PlEventPayload { paired_device_forgotten: PlPairedDeviceForgottenPayload { addr: [0; 6] } },
+            },
+        ];
+        unsafe {
+            for event in events {
+                pl_ui_push_event(ui, event);
+            }
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "all three tags are legal -- none should be counted as malformed");
+            assert_eq!((*ui).app.model().link_state, LinkState::Idle, "none of these tags should have reached App::handle_event yet");
             pl_ui_destroy(ui);
         }
     }
@@ -1678,11 +1963,14 @@ mod tests {
             PlEventTag::WizardAutoDismiss,
             PlEventTag::CodecChanged,
             PlEventTag::StoreLoaded,
+            PlEventTag::PairedDeviceUpserted,
+            PlEventTag::PairedDeviceForgotten,
+            PlEventTag::PairedStoreFull,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        assert!(PlEventTag::try_from(10u32).is_err());
+        assert!(PlEventTag::try_from(13u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
@@ -1833,12 +2121,30 @@ mod tests {
         // silently leaving the abandoned attempt running in C. Plumbed
         // through the FFI surface by this bead; left unhandled C-side
         // (see `PlCommandTag::CancelConnect`'s doc comment).
+        //
+        // Bead pico-link-4vb.6 (T2): reads `.addr.addr` now, not
+        // `.connect.addr` -- `pl_command_from` moved this tag onto
+        // `PlAddrPayload` (see that struct's doc comment). Source-only
+        // change: both members start with `addr: [u8; 6]` at offset 0.
         let addr = [0xAA; 6];
         let wire = pl_command_from(Command::CancelConnect { addr });
         assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
         assert_eq!(wire.tag as u32, PlCommandTag::CancelConnect as u32);
-        // SAFETY: `wire.tag` above confirms the union currently holds `connect`.
-        assert_eq!(unsafe { wire.payload.connect.addr }, addr);
+        // SAFETY: `wire.tag` above confirms the union currently holds `addr`.
+        assert_eq!(unsafe { wire.payload.addr.addr }, addr);
+    }
+
+    #[test]
+    fn persist_device_command_maps_to_the_persist_device_tag_and_carries_the_addr() {
+        // Bead pico-link-4vb.6 (T2): same `.connect` -> `.addr` move as
+        // `CancelConnect` above, covering `PersistDevice` too -- not
+        // previously covered by its own dedicated test.
+        let addr = [0x55; 6];
+        let wire = pl_command_from(Command::PersistDevice { addr });
+        assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
+        assert_eq!(wire.tag as u32, PlCommandTag::PersistDevice as u32);
+        // SAFETY: `wire.tag` above confirms the union currently holds `addr`.
+        assert_eq!(unsafe { wire.payload.addr.addr }, addr);
     }
 
     #[test]
@@ -1852,6 +2158,26 @@ mod tests {
         let addr = [1, 2, 3, 4, 5, 6];
         let connect = pl_command_from(Command::Connect { addr });
         assert_eq!(connect.tag as u32, PlCommandTag::Connect as u32);
-        assert_eq!(unsafe { connect.payload.connect.addr }, addr);
+        // SAFETY: `connect.tag` above confirms the union currently holds `connect`.
+        let payload = unsafe { connect.payload.connect };
+        assert_eq!(payload.addr, addr);
+        // Bead pico-link-4vb.6 (T2): `name`/`name_len` are zero-filled --
+        // `pico_link_core::Command::Connect` doesn't carry a name yet (T4,
+        // deferred). See `PlConnectPayload`'s doc comment.
+        assert_eq!(payload.name_len, 0);
+        assert_eq!(payload.name, [0u8; 32]);
+    }
+
+    #[test]
+    fn forget_device_tag_and_addr_payload_have_the_expected_wire_shape() {
+        // Bead pico-link-4vb.6 (T2): `PlCommandTag::ForgetDevice` is not
+        // yet producible from `pl_command_from` (no `Command::ForgetDevice`
+        // in `core` until T4) -- this pins the tag's discriminant and the
+        // `PlAddrPayload` shape it will use, so a future T4 change that
+        // adds the real mapping has something to round-trip against.
+        assert_eq!(PlCommandTag::ForgetDevice as u32, 6);
+        let addr = [0x77; 6];
+        let payload = PlAddrPayload { addr };
+        assert_eq!(payload.addr, addr);
     }
 }

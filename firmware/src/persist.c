@@ -37,11 +37,12 @@
 #define PL_PERSIST_SETTLE_US (2ull * 1000ull * 1000ull)
 #define PL_PERSIST_MIN_INTERVAL_US (10ull * 1000ull * 1000ull)
 
-// MVP: exactly one device slot (index 0). The record shape already carries
-// mru_seq so a future bead can add slots 1..7 (design point 2's "8
-// per-device records") purely by widening the loop this module's load/save
-// use -- no format change needed.
-#define PL_PERSIST_DEVICE_SLOT 0u
+// PL_PERSIST_DEVICE_SLOTS (persist.h) is the slot count -- widened from a
+// single slot (index 0 only) to 8 by bead pico-link-4vb.6 (T1), per design
+// `.planning/design/2026-09-01-remembered-devices.md` section 6. The record
+// shape (pl_persist_device_record_t below) is unchanged -- it already
+// carried every field this needed; only how many slots get used, and which
+// fields a write actually populates, changed.
 
 static inline uint32_t pl_persist_tag(uint8_t kind, uint8_t index) {
     return ((uint32_t)'P' << 24) | ((uint32_t)'L' << 16) | ((uint32_t)kind << 8) | (uint32_t)index;
@@ -92,16 +93,54 @@ static btstack_tlv_flash_bank_t s_tlv_context;
 static const btstack_tlv_t *s_tlv_impl;
 
 static pl_persist_status_t s_boot_status = PL_PERSIST_STATUS_FIRST_BOOT;
-static bool s_boot_has_device;
-static uint8_t s_boot_device_addr[6];
+
+// Bead pico-link-4vb.7 (T3): every surviving record loaded at boot, in slot
+// order (not MRU order -- bt.c pushes one PairedDeviceUpserted per entry and
+// `core` folds them into its own `paired` list, so ordering here doesn't
+// matter). Replaces the old single-device s_boot_has_device/s_boot_device_addr
+// pair, which made "which device to reconnect to" C's decision -- that
+// policy now belongs to `core` (design section 5.2). Populated by
+// pl_persist_init()'s load loop; read only via pl_persist_boot_device_count()/
+// pl_persist_boot_device_at() below.
+typedef struct {
+    uint8_t addr[6];
+    uint8_t name[32];
+    uint8_t name_len;
+    uint32_t mru_seq;
+} pl_persist_boot_device_t;
+static pl_persist_boot_device_t s_boot_devices[PL_PERSIST_DEVICE_SLOTS];
+static uint8_t s_boot_device_count;
 // Next mru_seq to stamp on a save -- seeded from whatever was loaded at
 // boot (if anything) so a fresh save's mru_seq is monotonic across a
-// reflash, not just within one power-on session.
+// reflash, not just within one power-on session. Bead pico-link-4vb.6 (T1):
+// now the max mru_seq loaded across ALL PL_PERSIST_DEVICE_SLOTS slots, plus
+// one (design section 6) -- not just slot 0's.
 static uint32_t s_next_mru_seq = 1;
+
+// In-RAM mirror of "which slots are occupied, and by which address" --
+// populated by pl_persist_init()'s load loop and kept in sync by every
+// write/forget after that. Exists purely to avoid re-reading flash (up to
+// 8 get_tag calls) on every slot-selection decision in pl_persist_do_write/
+// pl_persist_forget_device -- bead pico-link-4vb.6 (T1). Never itself
+// written to flash; reconstructed fresh from the real on-flash records
+// every boot in pl_persist_init(), so it can never drift from what's
+// actually stored (a stale cache can only cause a spurious "occupied" read,
+// self-correcting the moment get_tag itself is consulted inside
+// pl_persist_do_write's own read-modify-write).
+static bool s_slot_occupied[PL_PERSIST_DEVICE_SLOTS];
+static uint8_t s_slot_addr[PL_PERSIST_DEVICE_SLOTS][6];
 
 // Staged-save state (design point 4's "staged, gated, flushed" split).
 static bool s_pending;
 static uint8_t s_pending_addr[6];
+// Bead pico-link-4vb.7 (T3): optional name for the staged save, threaded
+// through so the pico-link-lmf carve-out in pl_persist_save_device_now
+// doesn't lose the in-flight connect target's name when it falls back to
+// this staged path. s_pending_name_len == 0 means "no name staged, leave
+// whatever is on record" -- same RMW convention pl_persist_do_write already
+// uses for its own name/name_len parameters.
+static uint8_t s_pending_name[32];
+static uint8_t s_pending_name_len;
 static uint64_t s_pending_since_us;
 static uint64_t s_last_write_us;
 static bool s_have_last_write;
@@ -186,49 +225,94 @@ void pl_persist_init(void) {
             "dropping our records, link keys untouched\r\n",
             marker_len, marker_len == (int)sizeof(marker) ? marker.schema_version : 0xFFu, PL_PERSIST_SCHEMA_VERSION
         );
-        s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, PL_PERSIST_DEVICE_SLOT));
+        for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
+            s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, i));
+        }
         s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_MARKER, 0));
         s_boot_status = PL_PERSIST_STATUS_VERSION_MISMATCH;
         return;
     }
 
-    // --- Device record: CRC-verified, drop only this record on failure ---
-    pl_persist_device_record_t rec;
-    int rec_len =
-        s_tlv_impl->get_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, PL_PERSIST_DEVICE_SLOT), (uint8_t *)&rec, sizeof(rec));
-    if (rec_len != (int)sizeof(rec)) {
-        pl_log("persist: marker present but no device record (rec_len=%d) -- valid store, no device yet\r\n", rec_len);
-        s_boot_status = PL_PERSIST_STATUS_LOADED;
-        return;
-    }
-    uint16_t crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
-    if (crc != rec.crc16) {
-        pl_log("persist: device record CRC mismatch (got 0x%04x, computed 0x%04x) -- dropping this record only\r\n", rec.crc16, crc);
-        s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, PL_PERSIST_DEVICE_SLOT));
-        s_boot_status = PL_PERSIST_STATUS_RECORD_CORRUPT;
-        return;
+    // --- Device records: loop every slot, CRC-verified independently, drop
+    // only the bad ones (design section 6's per-record isolation -- one
+    // corrupt slot must not affect the others). Bead pico-link-4vb.6 (T1):
+    // widened from slot 0 only to all PL_PERSIST_DEVICE_SLOTS slots.
+    // PL_PERSIST_SCHEMA_VERSION stays 1, so an old single-slot store's slot 0
+    // record loads here exactly as it always did -- slots 1..7 simply read
+    // back "absent" (rec_len != sizeof(rec)), same as a slot that was never
+    // written.
+    bool any_loaded = false;
+    bool any_corrupt = false;
+    uint32_t max_mru_seq = 0;
+    for (uint8_t slot = 0; slot < PL_PERSIST_DEVICE_SLOTS; slot++) {
+        pl_persist_device_record_t rec;
+        int rec_len = s_tlv_impl->get_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, slot), (uint8_t *)&rec, sizeof(rec));
+        if (rec_len != (int)sizeof(rec)) {
+            // Slot never written -- not an error, just unoccupied.
+            continue;
+        }
+        uint16_t crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
+        if (crc != rec.crc16) {
+            pl_log(
+                "persist: device record CRC mismatch in slot %u (got 0x%04x, computed 0x%04x) -- dropping this "
+                "record only\r\n",
+                slot, rec.crc16, crc
+            );
+            s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, slot));
+            any_corrupt = true;
+            continue;
+        }
+
+        s_slot_occupied[slot] = true;
+        memcpy(s_slot_addr[slot], rec.addr, 6);
+        any_loaded = true;
+        if (rec.mru_seq > max_mru_seq) {
+            max_mru_seq = rec.mru_seq;
+        }
+        // Bead pico-link-4vb.7 (T3): snapshot every surviving record so
+        // bt.c can push one PairedDeviceUpserted per entry -- see
+        // s_boot_devices's doc comment above. s_boot_device_count can never
+        // exceed PL_PERSIST_DEVICE_SLOTS (the array's own size), since this
+        // loop runs at most once per slot.
+        pl_persist_boot_device_t *boot_dev = &s_boot_devices[s_boot_device_count++];
+        memcpy(boot_dev->addr, rec.addr, 6);
+        memcpy(boot_dev->name, rec.name, sizeof(boot_dev->name));
+        boot_dev->name_len = rec.name_len;
+        boot_dev->mru_seq = rec.mru_seq;
+        pl_log(
+            "persist: loaded device slot=%u %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u)\r\n", slot, rec.addr[0], rec.addr[1],
+            rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len
+        );
     }
 
-    memcpy(s_boot_device_addr, rec.addr, 6);
-    s_boot_has_device = true;
-    s_next_mru_seq = rec.mru_seq + 1;
-    s_boot_status = PL_PERSIST_STATUS_LOADED;
-    pl_log(
-        "persist: loaded device %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu)\r\n", rec.addr[0], rec.addr[1], rec.addr[2], rec.addr[3],
-        rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq
-    );
+    s_next_mru_seq = max_mru_seq + 1;
+    s_boot_status = any_corrupt ? PL_PERSIST_STATUS_RECORD_CORRUPT : PL_PERSIST_STATUS_LOADED;
+    if (!any_loaded) {
+        pl_log("persist: marker present but no device records -- valid store, no device yet\r\n");
+    }
 }
 
 pl_persist_status_t pl_persist_boot_status(void) {
     return s_boot_status;
 }
 
-bool pl_persist_boot_has_device(void) {
-    return s_boot_has_device;
+uint8_t pl_persist_boot_device_count(void) {
+    return s_boot_device_count;
 }
 
-void pl_persist_boot_device_addr(uint8_t out_addr[6]) {
-    memcpy(out_addr, s_boot_device_addr, 6);
+void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq) {
+    if (index >= s_boot_device_count) {
+        memset(out_addr, 0, 6);
+        memset(out_name, 0, 32);
+        *out_name_len = 0;
+        *out_mru_seq = 0;
+        return;
+    }
+    const pl_persist_boot_device_t *boot_dev = &s_boot_devices[index];
+    memcpy(out_addr, boot_dev->addr, 6);
+    memcpy(out_name, boot_dev->name, 32);
+    *out_name_len = boot_dev->name_len;
+    *out_mru_seq = boot_dev->mru_seq;
 }
 
 // Code-review finding (bd-pico-link-cz0.6, 2026-09-01, CONFIRMED): this
@@ -245,9 +329,16 @@ void pl_persist_boot_device_addr(uint8_t out_addr[6]) {
 // be re-entered), closing the torn-MAC-address write. Same short-critical-
 // section idiom as bt.c's pl_bt_pending_push (bt.c:613) -- kept deliberately
 // tiny (plain memory writes only, no flash access) per that idiom.
-void pl_persist_request_save_device(const uint8_t addr[6]) {
+void pl_persist_request_save_device(const uint8_t addr[6], const uint8_t *name, uint8_t name_len) {
     uint32_t irq_state = save_and_disable_interrupts();
     memcpy(s_pending_addr, addr, 6);
+    if (name != NULL && name_len > 0) {
+        uint8_t copy_len = name_len > (uint8_t)sizeof(s_pending_name) ? (uint8_t)sizeof(s_pending_name) : name_len;
+        memcpy(s_pending_name, name, copy_len);
+        s_pending_name_len = copy_len;
+    } else {
+        s_pending_name_len = 0;
+    }
     s_pending = true;
     s_pending_since_us = time_us_64();
     // Code-review finding 1: a freshly staged save supersedes whatever the
@@ -287,29 +378,136 @@ void pl_persist_request_save_device(const uint8_t addr[6]) {
 // bumps) and pl_persist_save_device_now() (a2dp.c's STREAM_ESTABLISHED
 // handler, called directly and synchronously -- see that function's own
 // doc comment for why a queue+wait round-trip isn't needed there).
-static void pl_persist_do_write(const uint8_t addr[6]) {
+// Finds which slot currently holds `addr`, if any -- returns the slot index
+// or -1. Consults the in-RAM `s_slot_occupied`/`s_slot_addr` cache, not
+// flash (see that cache's doc comment).
+static int pl_persist_find_slot_for_addr(const uint8_t addr[6]) {
+    for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
+        if (s_slot_occupied[i] && memcmp(s_slot_addr[i], addr, 6) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Finds the first unoccupied slot, or -1 if every slot is in use. Bead
+// pico-link-4vb.6 (T1) / design section 6: NO eviction -- this is the only
+// fallback pl_persist_do_write tries after a same-address match fails; if
+// this also returns -1, the write is refused outright
+// (PL_PERSIST_WRITE_STORE_FULL).
+static int pl_persist_find_free_slot(void) {
+    for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
+        if (!s_slot_occupied[i]) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Bead pico-link-4vb.6 (T1) -- THE MOST IMPORTANT CHANGE IN THIS SECTION,
+// per the design doc: this is now READ-MODIFY-WRITE, not
+// construct-from-scratch. Previously this memset a fresh record and filled
+// only addr/mru_seq/crc16, so EVERY OTHER FIELD (name, codec_id,
+// ldac_quality, volume, flags, preset_id) was silently zeroed on every save
+// -- a bug that was invisible while nothing but addr/mru_seq was ever
+// populated, and would have become a real, hard-to-diagnose defect ("looks
+// like flash corruption") the moment a per-device-setting write landed on
+// top of this. Fix: if the target slot already holds a valid record, start
+// from IT (not a zeroed one); only overwrite the fields THIS call actually
+// carries. Today only `addr` and (optionally) `name`/`name_len` are
+// call-supplied -- `name_len == 0` means "this caller has no name to
+// contribute, leave whatever is already stored." `codec_id`/
+// `ldac_quality`/`volume`/`flags`/`preset_id` are never touched by this
+// function at all (no caller populates them yet -- those are Tier 2 work,
+// design section 2 point 5) and so ride through RMW unchanged for free.
+// `mru_seq` is ALWAYS bumped -- every write, by construction, means "this
+// device was just used."
+//
+// `name`/`name_len` are NULL/0 from every call site in this bead (T3,
+// deferred, is what will thread a real name through
+// PlCommandTag::Connect's payload -> bt.c's in-flight connect-target cache
+// -> here) -- the parameters exist now so T3 only has to change call
+// sites, not this function's RMW logic.
+//
+// Slot selection (design section 6): match by `addr` against an existing
+// slot (a re-pairing of an already-remembered device updates that same
+// slot rather than consuming a new one) -- else the first free slot -- else
+// NO EVICTION, refuse the write and return PL_PERSIST_WRITE_STORE_FULL.
+static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], const uint8_t *name, uint8_t name_len) {
+    int slot = pl_persist_find_slot_for_addr(addr);
+    if (slot < 0) {
+        slot = pl_persist_find_free_slot();
+    }
+    if (slot < 0) {
+        pl_log(
+            "persist: store full (%u/%u slots used) -- refusing to write %02x:%02x:%02x:%02x:%02x:%02x, no "
+            "eviction\r\n",
+            (unsigned)PL_PERSIST_DEVICE_SLOTS, (unsigned)PL_PERSIST_DEVICE_SLOTS, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+        );
+        // Bead pico-link-4vb.7 (T3): S18 -- "must never silently evict", so
+        // the UI must hear about a refused write too.
+        pl_bt_push_paired_store_full();
+        return PL_PERSIST_WRITE_STORE_FULL;
+    }
+
     pl_persist_marker_t marker = {.schema_version = PL_PERSIST_SCHEMA_VERSION};
     s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_MARKER, 0), (const uint8_t *)&marker, sizeof(marker));
 
+    // Read-modify-write: start from the slot's existing record if it has
+    // one and it's valid; otherwise (brand new slot, or a corrupt existing
+    // record we're about to overwrite anyway) start from zeroed fields --
+    // same fresh-record shape the old construct-from-scratch code always
+    // produced, just no longer the ONLY path.
     pl_persist_device_record_t rec;
     memset(&rec, 0, sizeof(rec));
+    int existing_len = s_tlv_impl->get_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, (uint8_t)slot), (uint8_t *)&rec, sizeof(rec));
+    if (existing_len == (int)sizeof(rec)) {
+        uint16_t existing_crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
+        if (existing_crc != rec.crc16) {
+            // Corrupt existing record in this slot -- don't propagate
+            // garbage fields forward, start clean instead.
+            memset(&rec, 0, sizeof(rec));
+        }
+    } else {
+        memset(&rec, 0, sizeof(rec));
+    }
+
     memcpy(rec.addr, addr, 6);
+    if (name != NULL && name_len > 0) {
+        uint8_t copy_len = name_len > (uint8_t)sizeof(rec.name) ? (uint8_t)sizeof(rec.name) : name_len;
+        memcpy(rec.name, name, copy_len);
+        if (copy_len < (uint8_t)sizeof(rec.name)) {
+            memset(rec.name + copy_len, 0, sizeof(rec.name) - copy_len);
+        }
+        rec.name_len = copy_len;
+    }
+    // else: leave rec.name/rec.name_len exactly as read (or zeroed, for a
+    // brand new slot) -- this call has no name to contribute.
     rec.mru_seq = s_next_mru_seq++;
-    // name/codec_id/ldac_quality/volume/flags/preset_id: left zeroed for
-    // this MVP slice (design's explicit scope: "MVP slice = marker + one
-    // device record + the link key"). A follow-up bead threading the
-    // discovered name and negotiated codec through PlCommandTag::PersistDevice's
-    // payload can populate these without a format change.
+    // codec_id/ldac_quality/volume/flags/preset_id: untouched above --
+    // whatever was in `rec` (from the existing record, or zeroed for a new
+    // slot) rides through unchanged. No call site populates these yet
+    // (Tier 2, design section 2 point 5).
     rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
 
-    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, PL_PERSIST_DEVICE_SLOT), (const uint8_t *)&rec, sizeof(rec));
+    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, (uint8_t)slot), (const uint8_t *)&rec, sizeof(rec));
+
+    s_slot_occupied[(uint8_t)slot] = true;
+    memcpy(s_slot_addr[(uint8_t)slot], addr, 6);
 
     s_last_write_us = time_us_64();
     s_have_last_write = true;
     pl_log(
-        "persist: wrote device record %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu)\r\n", rec.addr[0], rec.addr[1], rec.addr[2],
-        rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq
+        "persist: wrote device record slot=%d %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u)\r\n", slot, rec.addr[0], rec.addr[1],
+        rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len
     );
+    // Bead pico-link-4vb.7 (T3): echo the write that actually landed --
+    // design section 3's single-writer rule ("no echo means no row") means
+    // this is the ONLY place PlEventTag::PairedDeviceUpserted is pushed for
+    // a save (both pl_persist_execute_pending_write and
+    // pl_persist_save_device_now funnel through this one function).
+    pl_bt_push_paired_device_upserted(rec.addr, rec.name, rec.name_len, rec.mru_seq);
+    return PL_PERSIST_WRITE_OK;
 }
 
 // Called EXCLUSIVELY from pl_bt_pending_service (bt.c), which itself only
@@ -326,10 +524,10 @@ static void pl_persist_do_write(const uint8_t addr[6]) {
 // MUST be called only from bt.c's pending-queue drain (async_context/IRQ
 // context). Calling this from thread context reintroduces exactly the race
 // pl_persist_do_write's doc comment describes.
-void pl_persist_execute_pending_write(void) {
+pl_persist_write_result_t pl_persist_execute_pending_write(void) {
     if (!s_pending) {
         s_write_enqueued = false;
-        return;
+        return PL_PERSIST_WRITE_OK;
     }
     if (pl_usb_audio_streaming() || pl_a2dp_streaming()) {
         // The gate could have flipped true again between
@@ -340,14 +538,15 @@ void pl_persist_execute_pending_write(void) {
         // s_write_enqueued the next time it sees a safe window (it does so
         // unconditionally on every call, see below).
         s_write_enqueued = false;
-        return;
+        return PL_PERSIST_WRITE_OK;
     }
 
-    pl_persist_do_write(s_pending_addr);
+    pl_persist_write_result_t result = pl_persist_do_write(s_pending_addr, s_pending_name_len > 0 ? s_pending_name : NULL, s_pending_name_len);
 
     s_pending = false;
     s_urgent = false;
     s_write_enqueued = false;
+    return result;
 }
 
 // Andreas's ruling, 2026-09-01 (follow-up to code-review finding 1's fix):
@@ -391,29 +590,81 @@ void pl_persist_execute_pending_write(void) {
 // today that means exclusively from a2dp.c's A2DP_SUBEVENT_STREAM_ESTABLISHED
 // case. Calling this from thread context reintroduces the exact race
 // code-review finding 1 closed.
-void pl_persist_save_device_now(const uint8_t addr[6]) {
+pl_persist_write_result_t pl_persist_save_device_now(const uint8_t addr[6]) {
+    // Bead pico-link-4vb.7 (T3): read the in-flight connect target's name
+    // from bt.c's cache -- this is the whole reason a record could never
+    // have a name before this bead: at the moment this function runs, C has
+    // an address and (until now) nothing else. name_len == 0 (no cached
+    // target matching this addr, or the debug-connect bypass which never
+    // caches a name) means "leave whatever name is already on record" --
+    // pl_persist_do_write's own RMW convention.
+    uint8_t name[32];
+    uint8_t name_len;
+    pl_bt_get_connect_target_name(addr, name, &name_len);
+
     if (pl_usb_audio_streaming()) {
         pl_log(
             "persist: USB audio already live at pairing time -- staging %02x:%02x:%02x:%02x:%02x:%02x instead of "
             "writing now (pico-link-lmf carve-out)\r\n",
             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
         );
-        pl_persist_request_save_device(addr);
-        return;
+        pl_persist_request_save_device(addr, name_len > 0 ? name : NULL, name_len);
+        // Not a real result -- deferred to the staged path, which does not
+        // yet know whether the store will turn out to be full when it
+        // finally writes. Bead pico-link-4vb.6 (T1) widens the store to 8
+        // slots but doesn't change this carve-out's own behaviour
+        // (pico-link-lmf, still open) -- see this function's doc comment.
+        return PL_PERSIST_WRITE_OK;
     }
 
     pl_log(
         "persist: writing device record synchronously at pairing time for %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0],
         addr[1], addr[2], addr[3], addr[4], addr[5]
     );
-    pl_persist_do_write(addr);
+    pl_persist_write_result_t result = pl_persist_do_write(addr, name_len > 0 ? name : NULL, name_len);
 
-    // The record is now durably on flash -- clear any stale staged
-    // request for the same (or a different, e.g. a fast device-switch)
-    // address so pl_persist_service() doesn't redundantly re-enqueue it.
+    // The write attempt is now resolved (written, or refused as store-full)
+    // -- clear any stale staged request for the same (or a different, e.g.
+    // a fast device-switch) address so pl_persist_service() doesn't
+    // redundantly re-enqueue it either way.
     s_pending = false;
     s_urgent = false;
     s_write_enqueued = false;
+    return result;
+}
+
+// Bead pico-link-4vb.6 (T1). See persist.h's doc comment for the full
+// contract (async_context-only, not yet wired into bt.c's pending queue --
+// T3, deferred).
+bool pl_persist_forget_device(const uint8_t addr[6]) {
+    int slot = pl_persist_find_slot_for_addr(addr);
+    if (slot < 0) {
+        pl_log(
+            "persist: forget requested for %02x:%02x:%02x:%02x:%02x:%02x but no slot holds it -- no-op\r\n", addr[0], addr[1], addr[2],
+            addr[3], addr[4], addr[5]
+        );
+        return false;
+    }
+
+    s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, (uint8_t)slot));
+    s_slot_occupied[(uint8_t)slot] = false;
+    memset(s_slot_addr[(uint8_t)slot], 0, 6);
+
+    // S18: forgetting removes the link key too -- a PL:D record without its
+    // key is a row that says "Paired" but can't connect without re-pairing.
+    // Shares the same btstack_tlv_flash_bank instance as our own PL:* tags
+    // (persist.h's module doc), so this MUST run on the same async_context
+    // as every other write in this file -- see this function's calling
+    // contract in persist.h.
+    gap_drop_link_key_for_bd_addr((uint8_t *)addr);
+
+    pl_log(
+        "persist: forgot device slot=%d %02x:%02x:%02x:%02x:%02x:%02x (link key dropped too)\r\n", slot, addr[0], addr[1], addr[2], addr[3],
+        addr[4], addr[5]
+    );
+    // Bead pico-link-4vb.7 (T3).
+    pl_bt_push_paired_device_forgotten(addr);
+    return true;
 }
 
 void pl_persist_service(void) {
