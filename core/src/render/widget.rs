@@ -128,11 +128,6 @@ pub struct ChromeContribution {
     /// A right-aligned position readout (e.g. `"2 / 5"`), if this widget
     /// has a meaningful position/count to report.
     pub readout: Option<String>,
-    /// Overrides the screen's static A-button rail label, if set. See the
-    /// three-state table on [`ChromeContribution::button`]'s doc comment:
-    /// `None` here is "no opinion, defer to the screen", not "inert" —
-    /// that distinction is `Some(ButtonLabel::Inert)`.
-    pub a: Option<ButtonLabel>,
     /// Overrides the screen's static B-button rail label, if set. **B's
     /// text is always the constant "back"** — only `Navigator` (via
     /// `Screen::render`'s `can_go_back` parameter) decides B's
@@ -175,21 +170,75 @@ impl ChromeContribution {
     /// physical [`crate::panel::PanelOrientation::slot_order`] to resolve
     /// each slot.
     ///
-    /// Returns `None` when this contribution has no opinion (defer to the
-    /// screen's static label) — that is a distinct third state from
-    /// `Some(&ButtonLabel::Inert)` (actively dead on this widget's watch).
-    /// See the field doc comments above: flattening this to
-    /// `Option<String>` would lose that distinction.
+    /// **Never called for `Button::A`** — A has no field on this struct at
+    /// all (design rule 4, `.planning/design/2026-09-02-a-button-label-
+    /// rule.md`): its liveness and label come from [`Widget::activation`]
+    /// alone, read directly by `Screen::activate_focused`/
+    /// `Screen::resolve_a`, never through a `ChromeContribution`. Always
+    /// returns `None` for `Button::A`; kept as a match arm rather than a
+    /// panic so a caller that (incorrectly) asks doesn't crash, just gets
+    /// "no opinion".
+    ///
+    /// For B/X/Y: returns `None` when this contribution has no opinion
+    /// (defer to the screen's static label) — that is a distinct third
+    /// state from `Some(&ButtonLabel::Inert)` (actively dead on this
+    /// widget's watch). See the field doc comments above: flattening this
+    /// to `Option<String>` would lose that distinction.
     #[must_use]
     pub fn button(&self, button: Button) -> Option<&ButtonLabel> {
         match button {
-            Button::A => self.a.as_ref(),
+            Button::A => None,
             Button::B => self.b.as_ref(),
             Button::X => self.x.as_ref(),
             Button::Y => self.y.as_ref(),
         }
     }
 }
+
+/// The fixed vocabulary for the A button's rail word — see
+/// `.planning/design/2026-09-02-a-button-label-rule.md` §4. Every word is
+/// <= 6 chars, the measured budget for a 34px rail slot in
+/// `font::hint()`. Returned by [`Widget::activation`], which is also what
+/// gates whether A does anything at all — see that method's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    /// Pushes a deeper screen about the focused row. Nothing changes.
+    Open,
+    /// Commits the focused row's choice on this screen.
+    Select,
+    /// Begins pairing with the focused device.
+    Pair,
+    /// (Re)starts discovery. Used where the screen has no focused row.
+    Scan,
+    /// The one sanctioned escape hatch, with exactly one use today: Home's
+    /// status face shows `devs` (design section 4's rail table, inside
+    /// the already-declared Home exception — this adds zero new Home
+    /// exceptions). `grep -rn 'Verb::Exception' core/` audits every
+    /// exception in the app in one command. **Adding a second is a UX
+    /// decision, not an implementation one** — bring it to Uma. Must be
+    /// <= 6 chars.
+    Exception(&'static str),
+}
+
+impl Verb {
+    /// The literal rail text this verb renders as — always <= 6
+    /// characters (the measured budget; see this type's doc comment).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Verb::Open => "open",
+            Verb::Select => "select",
+            Verb::Pair => "pair",
+            Verb::Scan => "scan",
+            Verb::Exception(word) => word,
+        }
+    }
+}
+
+const _: () = assert!(Verb::Open.as_str().len() <= 6);
+const _: () = assert!(Verb::Select.as_str().len() <= 6);
+const _: () = assert!(Verb::Pair.as_str().len() <= 6);
+const _: () = assert!(Verb::Scan.as_str().len() <= 6);
 
 /// A retained-mode UI element. Implementors own their own state (selection
 /// index, scroll offset, ...) and are told their assigned screen-space
@@ -257,6 +306,43 @@ pub trait Widget {
     /// to implement this.
     fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
         None
+    }
+
+    /// The word this widget's A button should show, and — identically —
+    /// whether A does anything at all. `None` (the default) means BOTH "A
+    /// is dim" and "activating me is a guaranteed no-op": the two cannot
+    /// disagree, because `Screen` reads this same method for both purposes
+    /// (see `Screen::activate_focused` and `Screen::resolve_a`). See
+    /// `.planning/design/2026-09-02-a-button-label-rule.md` (rule 4) for
+    /// the design of record this closes.
+    ///
+    /// **A widget that wraps another widget must forward this** — exactly
+    /// like `redraw_after`/`scroll_top`/`selected_key` (pico-link-vxc,
+    /// D2). Unlike those, forgetting is loud: A visibly stops working
+    /// instead of silently drifting stale.
+    ///
+    /// The verb must not depend on time — only on this widget's own state
+    /// and its selected row. Chrome is NOT covered by `Screen::
+    /// redraw_after`'s fold (see that method's doc comment, D3), so a
+    /// time-varying verb would go stale under the `pl_ui_dirty()` blit
+    /// gate.
+    fn activation(&self) -> Option<Verb> {
+        None
+    }
+
+    /// Whether this widget wants B to be treated as live even when the
+    /// navigator has nowhere to pop to (stack depth 1) — e.g. Home's menu
+    /// face, which uses B to fold back to the status face rather than a
+    /// navigator pop. Defaults to `false`: B's ordinary liveness (`stack
+    /// depth > 1`) already covers every widget that doesn't have an
+    /// internal "back" of its own. See `Screen::resolve_button`'s B arm.
+    ///
+    /// Unlike `activation`, forgetting this the other way (returning
+    /// `true` when there's nothing to fold back to) is caught by design
+    /// review, not the compiler — see pico-link-4a2, where Home's status
+    /// face rendered a live B that did nothing.
+    fn handles_back(&self) -> bool {
+        false
     }
 
     /// How much longer, from `ctx.now()`, this widget's next render call

@@ -51,7 +51,7 @@ use super::message::MessageView;
 use super::rail::ButtonLabel;
 use super::screen::Screen;
 use super::theme::{font, palette};
-use super::widget::{Action, ChromeContribution, FocusEvent, Widget};
+use super::widget::{Action, ChromeContribution, FocusEvent, Verb, Widget};
 
 /// The wizard screen's fixed title -- also doubles as this crate's only
 /// (pragmatic, not general) way to tell "is the top of the navigator
@@ -295,14 +295,18 @@ fn build_scan_list(
     // finishes anyway -- see this bead's zoomed fixture screenshot. A short
     // count-only readout is honest about what's actually on screen.
     if total_audio > MAX_SCAN_LIST_ITEMS {
-        items.push(ListItem::new(format!("Showing {capped_len} of {total_audio}")));
+        // `.inert()`: this row is not a device -- activating it is a
+        // no-op (see the comment above), so it must report no `Verb`
+        // rather than inheriting the list's default `Verb::Pair`, or A
+        // would render live on a row that does nothing (design rule 4).
+        items.push(ListItem::new(format!("Showing {capped_len} of {total_audio}")).inert());
     }
 
     let devices_snapshot: Vec<DeviceEntry> = capped;
     let phase_for_activate = Rc::clone(phase);
     let commands_for_activate = Rc::clone(commands);
     VerticalList::new(items)
-        .on_activate_index(move |index| {
+        .on_activate_index(Verb::Pair, move |index| {
             if let Some(device) = devices_snapshot.get(index) {
                 commands_for_activate
                     .borrow_mut()
@@ -442,24 +446,21 @@ impl Widget for PairingWizardView {
         let phase = self.phase.borrow().clone();
         let mut contribution = ChromeContribution { y: Some(ButtonLabel::Inert), ..ChromeContribution::default() };
         match phase {
-            WizardPhase::NothingFound => {
-                contribution.a = Some(ButtonLabel::Live(String::from("scan")));
-                contribution.x = Some(ButtonLabel::Inert);
-            }
-            WizardPhase::Scanning { .. } => {
-                // No A-rail label of its own -- matches the devices
-                // screen's own list, which likewise leaves A unlabelled
-                // (Select still activates the focused row regardless).
-                contribution.x = Some(ButtonLabel::Inert);
-            }
-            WizardPhase::Connecting { .. } => {
+            WizardPhase::NothingFound | WizardPhase::Scanning { .. } | WizardPhase::Connecting { .. } => {
                 contribution.x = Some(ButtonLabel::Inert);
             }
             WizardPhase::NotResponding { .. } => {
                 contribution.x = Some(ButtonLabel::Live(String::from("keep")));
             }
-            WizardPhase::Succeeded { degraded } => {
-                contribution.x = Some(if degraded { ButtonLabel::Live(String::from("codec")) } else { ButtonLabel::Inert });
+            WizardPhase::Succeeded { degraded: _ } => {
+                // pico-link-qdc: the codec picker (E11) doesn't exist yet,
+                // so X must render Inert here regardless of `degraded` --
+                // a live "codec" label with nowhere to go is exactly the
+                // labelled-but-dead violation design rule 2 forbids.
+                // Restore this to `Live("codec")` only alongside E11
+                // actually landing (see `on_intent`'s `ShortcutX` comment,
+                // which already treats this as a deliberate no-op).
+                contribution.x = Some(ButtonLabel::Inert);
             }
             WizardPhase::Failed { reason, .. } => {
                 contribution.x =
@@ -467,6 +468,25 @@ impl Widget for PairingWizardView {
             }
         }
         Some(contribution)
+    }
+
+    /// A's liveness and label, per design rule 4 -- see
+    /// `.planning/design/2026-09-02-a-button-label-rule.md` §4's
+    /// assignment table. `Scanning` delegates to the wrapped `list`
+    /// (`Verb::Pair` for a real device row, `None` for the non-device
+    /// backstop readout row -- see `build_scan_list`'s `.inert()` call).
+    fn activation(&self) -> Option<Verb> {
+        match &*self.phase.borrow() {
+            WizardPhase::NothingFound => Some(Verb::Scan),
+            WizardPhase::Scanning { .. } => {
+                self.sync_list();
+                self.list.borrow().activation()
+            }
+            WizardPhase::Connecting { .. }
+            | WizardPhase::NotResponding { .. }
+            | WizardPhase::Succeeded { .. }
+            | WizardPhase::Failed { .. } => None,
+        }
     }
 
     /// Requests a periodic redraw while phase 4 (Connecting) is showing,

@@ -331,6 +331,7 @@ impl Navigator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::widget::Verb;
     use crate::platform::Instant;
     use crate::render::list::{ListItem, VerticalList};
     use embedded_graphics::prelude::{OriginDimensions, Point, Size};
@@ -396,7 +397,7 @@ mod tests {
     #[test]
     fn pushing_a_screen_via_action_from_a_widget_callback_works() {
         let items = vec![ListItem::new("open detail")];
-        let list = VerticalList::new(items).on_activate(|_item| {
+        let list = VerticalList::new(items).on_activate(Verb::Open, |_item| {
             Action::PushView(Box::new(|| {
                 Screen::new("detail", vec![Box::new(VerticalList::new(vec![ListItem::new("x")]))])
             }))

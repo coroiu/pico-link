@@ -30,7 +30,7 @@ use crate::render::theme::palette;
 use crate::render::wizard::build_wizard_screen;
 use crate::render::{
     Action, ButtonLabel, ChromeContribution, ConfirmView, FocusEvent, FrameBuffer565, Instant, ListItem, ListItemKey, MenuItem,
-    Navigator, RenderCtx, Screen, VerticalList, Widget,
+    Navigator, RenderCtx, Screen, Verb, VerticalList, Widget,
 };
 
 /// The devices screen's "Pair new headphones" row's identity key (bead
@@ -883,10 +883,20 @@ pub(crate) fn build_devices_screen(
         .iter()
         .map(|device| {
             let sublabel = if Some(device.addr) == model.connected_addr { "Connected" } else { "Paired" };
-            ListItem::new(paired_device_label(device)).with_sublabel(sublabel).with_key(ListItemKey::from(device.addr))
+            // `Verb::Open`: every paired row pushes a deeper screen --
+            // device detail for the connected row, the wizard's
+            // `Connecting` phase for any other (design rule 4's
+            // assignment table treats both as "a paired device").
+            ListItem::new(paired_device_label(device))
+                .with_sublabel(sublabel)
+                .with_key(ListItemKey::from(device.addr))
+                .with_verb(Verb::Open)
         })
         .collect();
-    items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY));
+    // `Verb::Pair`: begins pairing -- including at the 8-device cap, where
+    // the forget-picker is the app making room, not a different intent
+    // (design rule 4's assignment table).
+    items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY).with_verb(Verb::Pair));
 
     let paired_len = model.paired.len();
     let connected_addr = model.connected_addr;
@@ -896,7 +906,10 @@ pub(crate) fn build_devices_screen(
     let wizard_phase_for_activate = Rc::clone(wizard_phase);
     let wizard_devices_for_activate = Rc::clone(wizard_devices);
     let list = VerticalList::new(items)
-        .on_activate_index(move |index| {
+        // The `Verb::Open` here is only the list's fallback default; every
+        // row above carries its own override, so this value is never
+        // actually read.
+        .on_activate_index(Verb::Open, move |index| {
             if let Some(device) = ordered_for_activate.get(index) {
                 if Some(device.addr) == connected_addr {
                     // A on the connected row: no reconnect to do -- push
@@ -969,6 +982,13 @@ impl Widget for DevicesListView {
         self.list.is_focusable()
     }
 
+    /// Forwards `list`'s own answer -- see `Widget::activation`'s doc
+    /// comment on why a wrapper must forward this rather than let the
+    /// default `None` silently swallow it.
+    fn activation(&self) -> Option<Verb> {
+        self.list.activation()
+    }
+
     fn on_focus(&mut self, event: FocusEvent) -> Action {
         self.list.on_focus(event)
     }
@@ -1039,7 +1059,7 @@ fn build_forget_picker_screen(paired: Vec<PairedDevice>, commands: Rc<RefCell<Ve
     let items: Vec<ListItem> =
         paired.iter().map(|device| ListItem::new(paired_device_label(device)).with_key(ListItemKey::from(device.addr))).collect();
     let paired_for_activate = paired;
-    let list = VerticalList::new(items).on_activate_index(move |index| {
+    let list = VerticalList::new(items).on_activate_index(Verb::Select, move |index| {
         if let Some(device) = paired_for_activate.get(index) {
             let addr = device.addr;
             let label = paired_device_label(device);
@@ -1063,7 +1083,7 @@ const FORGET_CONFIRM_TITLE: &str = "Forget device?";
 fn build_forget_confirm_screen(addr: DeviceAddr, label: &str, commands: Rc<RefCell<VecDeque<Command>>>) -> Screen {
     let headline = format!("Forget {label}?");
     let rows = vec![MenuItem::new("Cancel"), MenuItem::new("Forget").with_label_color(palette::STATUS_ERROR)];
-    let view = ConfirmView::new(headline, rows).on_activate_index(move |index| {
+    let view = ConfirmView::new(headline, rows).on_activate_index(Verb::Select, move |index| {
         if index == 1 {
             commands.borrow_mut().push_back(Command::ForgetDevice { addr });
         }

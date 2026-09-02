@@ -43,7 +43,7 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::menu::{MenuItem, MenuList};
 use super::theme::{font, palette};
-use super::widget::{Action, FocusEvent, Widget};
+use super::widget::{Action, FocusEvent, Verb, Widget};
 
 /// Top padding (px) before the headline's first line. A local constant,
 /// not a reuse of `message.rs`'s private `MESSAGE_TOP_PADDING` — see
@@ -89,11 +89,11 @@ impl ConfirmView {
         self
     }
 
-    /// Registers the wrapped [`MenuList`]'s activation callback — see
-    /// [`MenuList::on_activate_index`].
+    /// Registers the wrapped [`MenuList`]'s activation callback and A-rail
+    /// verb — see [`MenuList::on_activate_index`].
     #[must_use]
-    pub fn on_activate_index(mut self, callback: impl Fn(usize) -> Action + 'static) -> Self {
-        self.list = self.list.on_activate_index(callback);
+    pub fn on_activate_index(mut self, verb: Verb, callback: impl Fn(usize) -> Action + 'static) -> Self {
+        self.list = self.list.on_activate_index(verb, callback);
         self
     }
 
@@ -116,6 +116,13 @@ impl Widget for ConfirmView {
 
     fn is_focusable(&self) -> bool {
         self.list.is_focusable()
+    }
+
+    /// Forwards the wrapped `MenuList`'s answer -- see `Widget::
+    /// activation`'s doc comment on why a wrapper must forward this
+    /// rather than let the default `None` silently swallow it.
+    fn activation(&self) -> Option<Verb> {
+        self.list.activation()
     }
 
     fn on_focus(&mut self, event: FocusEvent) -> Action {
@@ -193,7 +200,7 @@ mod tests {
 
     #[test]
     fn activation_routes_to_the_wrapped_lists_callback_with_the_selected_index() {
-        let mut view = ConfirmView::new("Clear all 3 items?", rows()).on_activate_index(|index| {
+        let mut view = ConfirmView::new("Clear all 3 items?", rows()).on_activate_index(Verb::Select, |index| {
             assert_eq!(index, 1, "activation must report the selected row's index");
             Action::PopView
         });
@@ -207,7 +214,7 @@ mod tests {
         // Uma's design: Cancel must be default-focused (the safe row) —
         // proven the same way `MenuList`'s own tests prove default
         // selection: activating with no prior `Down`/`Up` reports index 0.
-        let mut view = ConfirmView::new("Clear all 3 items?", rows()).on_activate_index(|index| {
+        let mut view = ConfirmView::new("Clear all 3 items?", rows()).on_activate_index(Verb::Select, |index| {
             assert_eq!(index, 0, "Cancel (row 0) must be selected by default, with no navigation");
             Action::PopView
         });
