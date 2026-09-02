@@ -930,6 +930,14 @@ impl Widget for DevicesListView {
     fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         self.list.render(area, ctx, target)
     }
+
+    /// Forwards `list`'s own answer (pico-link-vxc, D2) -- without this the
+    /// default (`None`) would swallow it. `VerticalList` has no time-driven
+    /// content today, but the wrapper must not be the thing that silently
+    /// drops a future one under the dirty gate.
+    fn redraw_after(&self, ctx: &RenderCtx) -> Option<core::time::Duration> {
+        self.list.redraw_after(ctx)
+    }
 }
 
 /// The pick-one-to-forget screen (design section 4): reached only when
@@ -1332,6 +1340,7 @@ impl App {
             let name = truncate_device_name(&device.name);
             self.commands.borrow_mut().push_back(Command::Connect { addr, name });
         }
+        self.rebuild_root();
     }
 
     /// Folds one [`Event::PairedDeviceUpserted`] into [`BtModel::paired`] --
@@ -1676,6 +1685,243 @@ mod tests {
     fn open_devices(app: &mut App) {
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
         app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+    }
+
+    /// Home(1) -> Devices(2) -> Wizard(3) -- see `open_devices` above; one
+    /// further `Select` activates the fixed "Pair new headphones" row
+    /// (there being no other paired devices at this point), pushing the
+    /// wizard straight into `WizardPhase::Scanning`. Local copy of
+    /// `render::wizard`'s own test-only helper of the same name -- that
+    /// one is private to its module's test mod, and this crate has no
+    /// shared test-support module to hoist it into.
+    fn open_wizard(app: &mut App) {
+        open_devices(app);
+        app.handle_input(vec![NavIntent::Select]); // "Pair new headphones" row -> pushes the wizard
+    }
+
+    // --- pico-link-vxc, design doc §6.1: the freshness invariant ---
+    //
+    // This is the acceptance mechanism for the FFI dirty gate
+    // (`pl_ui_dirty`, `ui-ffi/src/lib.rs`): C is now allowed to skip
+    // render+blit whenever `App::dirty()` is false, so every screen the
+    // product can build must be provably safe to leave unrendered for an
+    // arbitrary stretch of wall-clock time unless it has explicitly opted
+    // into a `Widget::redraw_after` request. This table is what proves it,
+    // and is exactly the test Ada's audit (see the design doc) says would
+    // have caught D2 (a composite widget silently swallowing a child's
+    // `redraw_after`) had that bug shipped instead of being fixed in the
+    // same change.
+    //
+    // ADD YOUR NEW SCREEN BUILDER TO `freshness_cases()` BELOW whenever you
+    // add one -- see that function's doc comment.
+
+    /// A ten-minute span, deliberately far longer than any real idle gap
+    /// this device would ever sit unattended for -- if a screen is going
+    /// to leak a missing `redraw_after`, this window makes it unmistakable
+    /// rather than a maybe-it-was-close flake.
+    const FRESHNESS_TEN_MINUTES_US: u64 = 10 * 60 * 1_000_000;
+
+    /// What a screen builder in [`freshness_cases`] promises about its own
+    /// staleness.
+    enum Freshness {
+        /// Nothing about this screen can change without an event or
+        /// input -- rendering it now and rendering it again after
+        /// [`FRESHNESS_TEN_MINUTES_US`] of untouched wall-clock time must
+        /// produce byte-identical pixels.
+        Static,
+        /// This screen has a genuinely time-driven element that requests
+        /// its own redraw after the first `Duration` -- rendering it now
+        /// and again after the *second* `Duration` must produce
+        /// *different* pixels (proving the request isn't spurious). The
+        /// two durations can differ: the wizard's elapsed-seconds readout
+        /// requests a redraw every 250ms but only actually changes on a
+        /// whole-second boundary (§8's "minor, non-blocking" risk note),
+        /// so its assertion window is 2s, matching the exact scenario
+        /// `wizard.rs`'s own
+        /// `connecting_phase_liveness_end_to_end_tick_alone_marks_dirty_and_the_elapsed_readout_changes`
+        /// test already proves -- folded in here per the design doc's
+        /// §6.1 instruction, not duplicated.
+        Live { redraw_after: Duration, assert_differs_after: Duration },
+    }
+
+    /// Every screen builder the product has, paired with its
+    /// [`Freshness`] promise. **Add every new screen builder here** --
+    /// this table is the single place pico-link-vxc's freshness-invariant
+    /// test (`dirty_gate_freshness_invariant_holds_for_every_screen`)
+    /// draws its cases from, and an entry missing here is an entry the
+    /// dirty gate has no proof about.
+    /// One row of [`freshness_cases`]'s table: a case name, a builder that
+    /// constructs the `App` already navigated to the screen under test,
+    /// and that screen's [`Freshness`] promise.
+    type FreshnessCase = (&'static str, fn() -> App, Freshness);
+
+    #[allow(clippy::too_many_lines)] // one function per screen builder is the point -- see freshness_cases's own doc comment
+    fn freshness_cases() -> Vec<FreshnessCase> {
+        fn home_status_face() -> App {
+            App::new(240, 240)
+        }
+        fn home_menu_face() -> App {
+            let mut app = App::new(240, 240);
+            app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+            app
+        }
+        fn devices_list() -> App {
+            let mut app = App::new(240, 240);
+            open_devices(&mut app);
+            app
+        }
+        fn wizard_scanning() -> App {
+            let mut app = App::new(240, 240);
+            open_wizard(&mut app);
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+                addr: [1; 6],
+                name: String::from("Cans"),
+                rssi: -40,
+                class_of_device: 0x24_04_04,
+            }));
+            app
+        }
+        fn wizard_nothing_found() -> App {
+            let mut app = App::new(240, 240);
+            open_wizard(&mut app);
+            app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+            app
+        }
+        fn wizard_connecting() -> App {
+            let mut app = App::new(240, 240);
+            open_wizard(&mut app);
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+                addr: [2; 6],
+                name: String::from("Cans"),
+                rssi: -40,
+                class_of_device: 0x24_04_04,
+            }));
+            app.handle_input(vec![NavIntent::Select]); // Scanning -> Connecting
+            app
+        }
+        fn wizard_not_responding() -> App {
+            let mut app = wizard_connecting();
+            app.handle_event(Event::ConnectRetrying { attempt: 1 });
+            app
+        }
+        fn wizard_succeeded() -> App {
+            let mut app = App::new(240, 240);
+            open_wizard(&mut app);
+            app.handle_event(Event::ConnectSucceeded { addr: [3; 6], degraded: false });
+            app
+        }
+        fn wizard_failed() -> App {
+            let mut app = App::new(240, 240);
+            open_wizard(&mut app);
+            app.handle_event(Event::ConnectFailed { addr: [4; 6], reason: ConnectFailureReason::Timeout });
+            app
+        }
+        fn forget_picker() -> App {
+            let mut app = App::new(240, 240);
+            let max = u8::try_from(MAX_PAIRED_DEVICES).expect("MAX_PAIRED_DEVICES is a small constant, fits in u8");
+            for i in 0..max {
+                app.handle_event(upsert([i; 6], "Cans", u32::from(i)));
+            }
+            open_devices(&mut app);
+            // Overshoots on purpose -- VerticalList::on_intent's JumpBy
+            // clamps at the last row ("Pair new headphones") regardless of
+            // exactly how many paired rows precede it.
+            app.handle_input(vec![NavIntent::JumpBy(i16::from(max) + 1)]);
+            app.handle_input(vec![NavIntent::Select]); // at the cap -> forget picker, not the wizard
+            app
+        }
+        fn forget_confirm() -> App {
+            let mut app = App::new(240, 240);
+            app.handle_event(upsert([5; 6], "Cans", 1));
+            open_devices(&mut app);
+            app.handle_input(vec![NavIntent::ShortcutX]); // the one paired row -> forget confirm
+            app
+        }
+        fn device_detail() -> App {
+            let mut app = App::new(240, 240);
+            let addr = [6; 6];
+            // `ConnectSucceeded` before `upsert` deliberately: the former
+            // sets `connected_addr` but does not itself `rebuild_root`
+            // (see `on_connect_succeeded`'s doc comment), so `HomeView`'s
+            // captured `model` snapshot would otherwise still read
+            // `connected_addr: None` when `open_devices` pushes the
+            // Devices screen off of it, and `on_activate_index` would take
+            // the reconnect-to-a-non-connected-row branch (pushing the
+            // wizard's Connecting phase) instead of device detail. Ordered
+            // this way, the `upsert` event's own `rebuild_root` is the one
+            // that captures the fresh, already-connected model.
+            app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+            app.handle_event(upsert(addr, "Cans", 1));
+            open_devices(&mut app);
+            app.handle_input(vec![NavIntent::Select]); // the connected (pinned-first) row -> device detail
+            app
+        }
+        fn settings() -> App {
+            let mut app = App::new(240, 240);
+            app.handle_input(vec![NavIntent::ShortcutY]); // Home status face -> Settings
+            app
+        }
+
+        vec![
+            ("home, status face", home_status_face, Freshness::Static),
+            ("home, menu face", home_menu_face, Freshness::Static),
+            ("devices list", devices_list, Freshness::Static),
+            ("wizard: scanning", wizard_scanning, Freshness::Static),
+            ("wizard: nothing found", wizard_nothing_found, Freshness::Static),
+            (
+                "wizard: connecting",
+                wizard_connecting,
+                Freshness::Live {
+                    redraw_after: crate::render::wizard::ELAPSED_REDRAW_INTERVAL,
+                    assert_differs_after: Duration::from_secs(2),
+                },
+            ),
+            ("wizard: not responding", wizard_not_responding, Freshness::Static),
+            ("wizard: succeeded", wizard_succeeded, Freshness::Static),
+            ("wizard: failed", wizard_failed, Freshness::Static),
+            ("forget picker", forget_picker, Freshness::Static),
+            ("forget confirm", forget_confirm, Freshness::Static),
+            ("device detail", device_detail, Freshness::Static),
+            ("settings", settings, Freshness::Static),
+        ]
+    }
+
+    /// The test itself: see the block comment above `freshness_cases` for
+    /// what this is proving and why. Table-driven so a missing case is a
+    /// missing table row, not a missing hand-written test function.
+    #[test]
+    fn dirty_gate_freshness_invariant_holds_for_every_screen() {
+        for (name, build, freshness) in freshness_cases() {
+            let mut app = build();
+            app.tick(0);
+            let t0: Vec<_> = app.render().pixels().collect();
+            match freshness {
+                Freshness::Static => {
+                    app.tick(FRESHNESS_TEN_MINUTES_US);
+                    let t1: Vec<_> = app.render().pixels().collect();
+                    assert_eq!(
+                        t0, t1,
+                        "{name}: pixels changed after 10 minutes with no input/event -- a widget is reading the \
+                         clock without a matching Widget::redraw_after (pico-link-vxc D1/D2)"
+                    );
+                }
+                Freshness::Live { redraw_after, assert_differs_after } => {
+                    assert!(
+                        assert_differs_after >= redraw_after,
+                        "{name}: table error -- assert_differs_after ({assert_differs_after:?}) must be at least the \
+                         claimed redraw_after ({redraw_after:?}), or this isn't actually proving the request fires"
+                    );
+                    app.tick(
+                        u64::try_from(assert_differs_after.as_micros()).expect("test-only duration fits in u64 micros"),
+                    );
+                    let t1: Vec<_> = app.render().pixels().collect();
+                    assert_ne!(
+                        t0, t1,
+                        "{name}: pixels are unchanged at t+{assert_differs_after:?} -- the redraw_after request is spurious"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -378,6 +378,24 @@ if(PL_DIAG_SKIP_BT)
     target_compile_definitions(pico_link PRIVATE PL_DIAG_SKIP_BT=1)
 endif()
 
+# Bead pico-link-vxc: the dirty-gate backstop. `pl_ui_dirty()` lets main.c
+# skip a render+blit when nothing changed, but the dirty flag cannot see
+# panel-side corruption (an SPI fault, a truncated DMA, a brownout) -- the
+# unconditional blit it replaces has been silently self-healing that within
+# 33ms for weeks. This bounds any such miss to at most this many
+# milliseconds instead, forcing a repaint on a timer regardless of the
+# dirty flag. 0 disables the backstop entirely (never force-repaint) -- see
+# .planning/design/2026-09-02-dirty-gate-across-the-ffi-seam.md §5 for why
+# 1000ms and why this lives in C, not core (it defends the ST7789's GRAM,
+# a platform artifact core cannot know about and the emulator does not
+# have).
+# Not a boolean `option()` like the flags above -- a tunable period, so a
+# plain cache variable (settable via `-DPL_FORCED_REPAINT_MS=0` the same
+# way the booleans above take `-DPL_x=ON/OFF`) rather than `option()`,
+# which CMake reserves for ON/OFF switches.
+set(PL_FORCED_REPAINT_MS "1000" CACHE STRING "Repaint the panel at least this often, 0 = never")
+target_compile_definitions(pico_link PRIVATE PL_FORCED_REPAINT_MS=${PL_FORCED_REPAINT_MS})
+
 target_link_libraries(pico_link
     pico_stdlib
     hardware_spi

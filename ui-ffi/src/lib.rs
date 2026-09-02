@@ -619,15 +619,59 @@ pub unsafe extern "C" fn pl_ui_display_power(ui: *mut PlUi) -> PlDisplayPower {
     ui.idle.display_power().into()
 }
 
+/// Whether [`pl_ui_render`] would currently draw something different from
+/// the last time it was called -- `pico_link_core::app::App::dirty()`
+/// exposed across the seam (pico-link-vxc). **A level, not an edge**, read
+/// once per superloop iteration and, like [`pl_ui_display_power`],
+/// deliberately after [`pl_ui_tick`] -- `tick` is what turns a due
+/// `Widget::redraw_after` into a dirty flag, so reading this before the
+/// tick would delay every time-driven repaint by one frame.
+///
+/// **Cleared only by [`pl_ui_render`].** If C decides to skip a render this
+/// iteration, the flag simply persists to the next one -- there is no other
+/// way to clear it, so a skipped render can never be silently lost.
+///
+/// Returns `true` if `ui` is null -- every degenerate case here fails
+/// toward *painting*, never toward a screen that looks clean when it is
+/// actually just unobserved. Same self-healing polarity as
+/// [`pl_ui_display_power`] returning `On` for a null `ui`.
+///
+/// This is a pure query: it does not consume, latch, or reset any state,
+/// which is why it takes `*const` rather than `*mut`.
+///
+/// C is expected to gate the render+blit on `display_on && pl_ui_dirty(ui)`,
+/// in that order -- the dirty check must sit *inside* the display-power
+/// gate, never beside it, because calling [`pl_ui_render`] while the panel
+/// is blanked would clear the dirty flag for a frame nobody saw. See
+/// `.planning/design/2026-09-02-dirty-gate-across-the-ffi-seam.md` §3.3.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_dirty(ui: *const PlUi) -> bool {
+    if ui.is_null() {
+        return true;
+    }
+    // SAFETY: caller contract above.
+    let ui = &*ui;
+    ui.app.dirty()
+}
+
 /// Renders the current screen -- unconditionally, every call, regardless of
 /// `App::dirty()` (unlike `pico_link_core::run::Runner::step`'s dirty gate,
 /// which this FFI surface does NOT mirror: `App::render` itself has no
 /// dirty check, only `Runner`/`run` do, and neither is in the M1 FFI
 /// surface). Idempotent -- calling it twice with no intervening
 /// `pl_ui_input`/`pl_ui_tick` produces the identical frame both times -- but
-/// C should not assume a cheap early-out here; skipping a redundant blit
-/// when nothing changed is C's own call to make, not something this
-/// function does for it. Hands back a borrowed pointer to the raw RGB565
+/// C should not assume a cheap early-out here; skipping a redundant render
+/// (and the blit that would follow it) when nothing changed is C's own call
+/// to make, not something this function does for it -- see [`pl_ui_dirty`],
+/// added for exactly that call (pico-link-vxc). This function is what
+/// clears the dirty flag [`pl_ui_dirty`] reports, so C must not call this
+/// while the panel is blanked (it would clear dirty for a frame nobody
+/// saw). Hands back a borrowed pointer to the raw RGB565
 /// pixel data plus its length in pixels
 /// (not bytes). Native CPU (little-endian) `u16` values, one per pixel, row
 /// major -- **not** the panel's big-endian wire format; C's DMA blit is

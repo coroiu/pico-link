@@ -437,6 +437,14 @@ int main(void) {
     // nothing.
     uint64_t prev_frame_start_us = 0;
 
+    // Bead pico-link-vxc: the last wall-clock time a blit actually
+    // happened, for the PL_FORCED_REPAINT_MS backstop below. 0 means "no
+    // blit yet" -- with `now - 0` always >= any positive
+    // PL_FORCED_REPAINT_MS, this makes the very first iteration force a
+    // paint, harmlessly redundant with App::new's dirty:true (core/src/
+    // app.rs) but correct even if that ever changed.
+    uint64_t last_blit_us = 0;
+
     while (true) {
         pl_wdt_mark(PL_WDT_CP_LOOP_TOP);
         uint64_t frame_start_us = time_us_64();
@@ -511,17 +519,39 @@ int main(void) {
         bool display_on = pl_ui_display_power(ui) == PL_DISPLAY_POWER_ON;
         st7789_set_backlight(display_on);
 
+        // Bead pico-link-vxc: the dirty gate. `pl_ui_dirty` is read AFTER
+        // pl_ui_tick (above), since tick is what turns a due
+        // Widget::redraw_after into a dirty flag -- reading it before the
+        // tick would delay every time-driven repaint by one frame.
+        // PL_FORCED_REPAINT_MS is the backstop for panel-side corruption
+        // the dirty flag cannot see (see the CMakeLists.txt option's own
+        // comment and .planning/design/2026-09-02-dirty-gate-across-the-
+        // ffi-seam.md §5); 0 disables it.
+        uint64_t dirty_gate_now_us = time_us_64();
+        bool forced_repaint_due =
+            PL_FORCED_REPAINT_MS != 0 && (dirty_gate_now_us - last_blit_us) >= (uint64_t)PL_FORCED_REPAINT_MS * 1000;
+        bool needs_paint = pl_ui_dirty(ui) || forced_repaint_due;
+
         const uint16_t *px = NULL;
         uintptr_t px_len = 0;
-        // Declared at this scope (not inside the `if (display_on)` block
-        // below) because the frame_report_phase print further down
-        // references them unconditionally -- defaulted to frame_start_us
-        // so a blanked frame's report reads as zero render/blit time
-        // rather than undefined.
+        // Declared at this scope (not inside the `if (display_on &&
+        // needs_paint)` block below) because the frame_report_phase print
+        // further down references them unconditionally -- defaulted to
+        // frame_start_us so a skipped frame's report reads as zero
+        // render/blit time rather than undefined.
         uint64_t render_start_us = frame_start_us;
         uint64_t render_end_us = frame_start_us;
         uint64_t blit_end_us = frame_start_us;
-        if (display_on) {
+        // The dirty gate sits INSIDE the display-power gate, never beside
+        // it (`display_on && needs_paint`, in that order): while blanked
+        // we must skip render regardless of dirty, and critically must NOT
+        // call pl_ui_render, because that would clear the dirty flag for a
+        // frame nobody saw. This is the identical contract core's own
+        // Runner::step already encodes (run.rs) -- see the design doc's
+        // §3.3 for the full ordering rationale, including why this
+        // composes with pico-link-3uq's (unmerged) blit_wait/blit_start
+        // split without needing any change there.
+        if (display_on && needs_paint) {
             render_start_us = time_us_64();
             pl_wdt_mark(PL_WDT_CP_UI_RENDER);
             pl_ui_render(ui, &px, &px_len);
@@ -535,6 +565,7 @@ int main(void) {
                 // -- Rust can never write while DMA reads, per the M1b design's
                 // no-tearing, no-double-buffering contract.
                 st7789_blit_framebuffer(spi1, px, (uint32_t)px_len);
+                last_blit_us = time_us_64();
             }
             blit_end_us = time_us_64();
             // Bead pico-link-p1r: the pico-link-3uq blit-split candidate --
@@ -548,14 +579,16 @@ int main(void) {
                 pl_loop_prof_record(PL_LOOP_PHASE_BLIT, blit_end_us - render_end_us);
             }
         }
-        // While blanked (display_on == false): render+blit are skipped
-        // entirely, per pico-link-i3e's acceptance criterion -- this is
-        // what makes the blank actually take effect on the panel, and as a
-        // bonus removes the ~38ms blit from the idle path (see
-        // .planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md
-        // §3.3). `App::dirty()` is untouched by this gate (same contract
-        // as core's own Runner::step), so the next real wake still renders
-        // immediately.
+        // While blanked (display_on == false) or clean (needs_paint ==
+        // false): render+blit are skipped entirely. The blanked case is
+        // pico-link-i3e's acceptance criterion -- this is what makes the
+        // blank actually take effect on the panel. The clean case is this
+        // bead (pico-link-vxc) -- the ~38.6ms blit (pico-link-14l) is paid
+        // only when something could actually have changed, per
+        // .planning/design/2026-09-02-dirty-gate-across-the-ffi-seam.md.
+        // `App::dirty()` is untouched by either half of this gate (same
+        // contract as core's own Runner::step), so the next real wake or
+        // state change still renders immediately.
 
 #ifndef PL_DIAG_SKIP_BT
         pl_wdt_mark(PL_WDT_CP_BT_POLL_CMDS);
@@ -690,13 +723,6 @@ int main(void) {
         // Bead pico-link-p1r.
         pl_loop_prof_record(PL_LOOP_PHASE_WDT_SERVICE, time_us_64() - wdt_service_start_us);
 
-        // No dirty-gate here: pl_ui_render (unlike core's own Runner::step)
-        // re-renders unconditionally every call -- see its doc comment in
-        // pico_link_ui.h. Blitting every iteration regardless is simple and
-        // correct, if not maximally efficient -- a later milestone can add
-        // a "was this frame actually new" signal to the FFI surface if the
-        // redundant-blit cost turns out to matter.
-        //
         // Bead pico-link-tfj: replaced the old unconditional sleep_ms(16)
         // with a deadline measured from frame_start_us -- the body above
         // (blit alone: 38.6ms as of pico-link-14l) already exceeds the
