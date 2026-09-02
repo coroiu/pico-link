@@ -1006,6 +1006,18 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             break;
         }
 
+        case PL_COMMAND_TAG_DISCONNECT:
+            // Bead pico-link-44w: FFI surface only -- no screen queues this
+            // yet (design-of-record rule 2 forbids a labelled-but-dead
+            // affordance, so the manage-connected-device screen is deferred
+            // to a follow-up bead). Body is identical to
+            // pl_bt_debug_disconnect's existing debug-only path below: no
+            // address, since a2dp.c tracks at most one active connection
+            // (s_ctx.a2dp_cid) -- reuse the same PL_BT_PENDING_DISCONNECT
+            // pending-queue entry pico-link-nb6 already added.
+            pl_bt_pending_push(PL_BT_PENDING_DISCONNECT, NULL);
+            break;
+
         case PL_COMMAND_TAG_NONE:
             pl_wdt_mark(PL_WDT_CP_CMD_NONE);
             break;

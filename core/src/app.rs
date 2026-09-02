@@ -258,6 +258,19 @@ pub enum Command {
     /// echoed back once C's delete (record + link key, design section 6)
     /// actually lands.
     ForgetDevice { addr: [u8; 6] },
+    /// User-initiated "drop the current Bluetooth link" (bead
+    /// pico-link-44w, FFI surface only -- no screen wires this yet; the
+    /// design-of-record's manage-connected-device screen is the eventual
+    /// caller, design section 21 Tier constraint rule 2 forbidding a
+    /// labelled-but-dead affordance is why this stays unreachable from any
+    /// screen for now). Carries no address: `firmware/src/a2dp.c` tracks at
+    /// most one active connection at a time (`s_ctx.a2dp_cid`), and the C
+    /// side's existing debug-only disconnect path
+    /// (`pl_bt_debug_disconnect`, bead pico-link-nb6) already queues
+    /// `PL_BT_PENDING_DISCONNECT` with a null address for the same reason
+    /// -- this reuses that assumption rather than inventing a
+    /// currently-meaningless target parameter.
+    Disconnect,
 }
 
 /// Why a connect attempt failed, as reported by C over
@@ -2411,6 +2424,21 @@ mod tests {
 
         app.push_command_for_test(Command::CancelScan);
         assert_eq!(app.poll_command(), Some(Command::CancelScan));
+        assert_eq!(app.poll_command(), None, "the queue drains -- one poll per queued command");
+    }
+
+    #[test]
+    fn disconnect_command_round_trips_through_poll_command() {
+        // Bead pico-link-44w: FFI surface only -- no screen queues this
+        // yet (design-of-record rule 2 forbids a labelled-but-dead
+        // affordance), so this exercises the enqueue/drain path directly
+        // via the test-only helper, same shape as `CancelScan` above
+        // before its wizard binding existed.
+        let mut app = App::new(240, 240);
+        assert_eq!(app.poll_command(), None, "no command queued yet");
+
+        app.push_command_for_test(Command::Disconnect);
+        assert_eq!(app.poll_command(), Some(Command::Disconnect));
         assert_eq!(app.poll_command(), None, "the queue drains -- one poll per queued command");
     }
 
