@@ -48,11 +48,12 @@
 //! physical A does exactly what centre does -- opens the menu face,
 //! landing on its pre-selected "Bluetooth" row (which is where "devs"
 //! ultimately leads, one more `Select` away) -- rather than jumping to
-//! Devices directly. [`HomeView::chrome_contribution`] still labels the A
-//! slot "devs" (the design's literal text), which now overpromises by one
-//! hop; that label mismatch is real but is a separate, low-priority,
-//! already-filed follow-up, not this bead's to fix -- the toggle-first
-//! behavior itself is exactly what the design's own global rule requires.
+//! Devices directly. [`HomeView::activation`] still labels the A slot
+//! "devs" (the design's literal text, `Verb::Exception("devs")`), which
+//! now overpromises by one hop; that label mismatch is real but is a
+//! separate, low-priority, already-filed follow-up, not this bead's to
+//! fix -- the toggle-first behavior itself is exactly what the design's
+//! own global rule requires.
 //!
 //! # X is left inert on both faces
 //!
@@ -87,7 +88,7 @@ use super::hero::{BitrateStatus, CodecStatus, HeroStatusView, OutLevelDisplay};
 use super::menu::{MenuItem, MenuList};
 use super::rail::ButtonLabel;
 use super::screen::Screen;
-use super::widget::{Action, ChromeContribution, FocusEvent, Widget};
+use super::widget::{Action, ChromeContribution, FocusEvent, Verb, Widget};
 
 /// Home's fixed title -- the "Pico Link" brand mark, now that Home (not
 /// Devices) is the navigator root (design section 5's screen inventory).
@@ -113,16 +114,11 @@ pub fn build_home_screen(
     wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
 ) -> Screen {
     let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices);
-    // `handles_back(true)`: Home's B slot should render live even at
-    // navigator depth 1 (`can_go_back` false, nothing behind the root to
-    // pop to) whenever there's a face for B to back out of -- see
-    // `Screen::handles_back`'s doc comment, which names this exact
-    // scenario. Kept unconditionally true (not toggled per-face) since
-    // `Screen`'s `handles_back` flag is fixed at construction time and
-    // this screen is rebuilt on model changes, not on face toggles --
-    // see the module doc's `Rc<RefCell<_>>` rationale. B on the status
-    // face is a harmless no-op, same as any other screen's B at the root.
-    Screen::new(HOME_TITLE, vec![Box::new(view)]).handles_back(true)
+    // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
+    // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
+    // this replaced, which rendered B live on the status face too even
+    // though there was nothing there to back out of.
+    Screen::new(HOME_TITLE, vec![Box::new(view)])
 }
 
 /// Home's sole top-level content widget -- one composite `Widget` owning
@@ -203,6 +199,12 @@ impl HomeView {
         let wizard_phase_for_bluetooth = Rc::clone(wizard_phase);
         let wizard_devices_for_bluetooth = Rc::clone(wizard_devices);
         let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Settings")]).on_activate_index(
+            // `Verb::Open`: both rows push a deeper screen and draw a
+            // caret (design section 4's assignment table -- Home menu's A
+            // word changed from "select" to "open" as part of the rule 4
+            // ruling, deliberate consistency work, not a typo to "fix"
+            // back).
+            Verb::Open,
             move |index| match index {
                 MENU_ROW_BLUETOOTH => {
                     let model = model.clone();
@@ -321,32 +323,40 @@ impl Widget for HomeView {
         match self.face() {
             HomeFace::Status => {
                 let mut contribution = self.hero.chrome_contribution(ctx).unwrap_or_default();
-                // "devs" is the design's literal label (section 4's rail
-                // table) -- see the module doc for why the actual
-                // immediate action is "open the menu face", not a direct
-                // jump to Devices.
-                contribution.a = Some(ButtonLabel::Live(String::from("devs")));
                 contribution.y = Some(ButtonLabel::Live(String::from("set")));
                 contribution.link = Some(self.link_state);
                 Some(contribution)
             }
-            HomeFace::Menu => {
-                // A must not render dim here: unlike X/Y (design section
-                // 4 rule 2's "unlabelled means inert" exemption is
-                // granted only to X and Y), A's global meaning --
-                // "activate the focused thing" -- is unconditional, and
-                // the menu face plainly has a focused thing
-                // (`HomeView::on_focus`'s `Activated` arm delegates
-                // straight to `self.menu`, which pushes Devices/Settings
-                // on the selected row). Leaving this `None` would fall
-                // back to `ButtonLabels::default()` (all four slots
-                // `Inert`), rendering A dim while it still silently
-                // navigates on press -- exactly the "mispress on a dim
-                // button is not free" violation `rail.rs`'s own
-                // `ButtonLabel::Inert` doc comment promises can't happen.
-                Some(ChromeContribution { a: Some(ButtonLabel::Live(String::from("select"))), ..Default::default() })
-            }
+            // A's word is entirely `activation()`'s job now (design rule
+            // 4) -- nothing left for this face to contribute to chrome.
+            HomeFace::Menu => None,
         }
+    }
+
+    /// A's liveness and label, per design rule 4 -- see
+    /// `.planning/design/2026-09-02-a-button-label-rule.md` §4's
+    /// assignment table. The status face keeps the one named exception
+    /// (`devs`, design section 4's rail table); the menu face reports
+    /// `open` since both rows push a deeper screen and draw a caret
+    /// (`HomeView::on_focus`'s `Activated` arm delegates straight to
+    /// `self.menu`, which pushes Devices/Settings on the selected row --
+    /// A is never dim here, unlike X/Y, whose "unlabelled means inert"
+    /// exemption A does not share).
+    fn activation(&self) -> Option<Verb> {
+        Some(match self.face() {
+            HomeFace::Status => Verb::Exception("devs"),
+            HomeFace::Menu => Verb::Open,
+        })
+    }
+
+    /// B is live on the menu face (folds back to the status face) but
+    /// genuinely dead on the status face -- Home is the navigator root, so
+    /// at depth 1 with the status face showing there is nothing to back
+    /// out of (pico-link-4a2: B previously rendered live there
+    /// unconditionally, via `Screen::handles_back(true)`, and did nothing
+    /// on press).
+    fn handles_back(&self) -> bool {
+        self.face() == HomeFace::Menu
     }
 
     fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
@@ -391,25 +401,23 @@ mod tests {
         HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
     }
 
-    /// Regression test for the review finding on this bead: `chrome_
-    /// contribution` returning `None` for `HomeFace::Menu` fell back to
-    /// `ButtonLabels::default()` (all four slots `Inert`), rendering A dim
-    /// while `HomeView::on_focus`'s `Activated` arm still delegates
-    /// straight to the wrapped `MenuList` -- so A silently navigated on
-    /// press despite looking inert. `rail.rs`'s own `ButtonLabel::Inert`
-    /// doc comment promises "a mispress on a dim button is always free";
-    /// a labelled-but-dim A on the menu face broke that promise on the
-    /// product's own root screen.
+    /// Regression test for the review finding on this bead: a `None`
+    /// activation for `HomeFace::Menu` would render A dim while
+    /// `HomeView::on_focus`'s `Activated` arm still delegates straight to
+    /// the wrapped `MenuList` -- so A would silently navigate on press
+    /// despite looking inert. Design rule 4 makes this unrepresentable
+    /// (`Screen::activate_focused` refuses to dispatch when `activation()`
+    /// is `None`), but this widget-level test pins the actual value down.
     #[test]
     fn a_is_live_on_the_menu_face_since_it_actually_activates_the_selected_row() {
         let mut view = fresh_home_view();
         view.on_focus(FocusEvent::Activated); // status -> menu
         assert_eq!(view.face(), HomeFace::Menu);
 
-        let contribution = view.chrome_contribution(&test_ctx()).expect("the menu face must have a chrome opinion");
-        assert!(
-            matches!(contribution.a, Some(ButtonLabel::Live(_))),
-            "A must render live on the menu face -- it activates the selected row, not a no-op"
+        assert_eq!(
+            view.activation(),
+            Some(Verb::Open),
+            "A must render live (\"open\") on the menu face -- it activates the selected row, not a no-op"
         );
     }
 
@@ -418,7 +426,23 @@ mod tests {
         let view = fresh_home_view();
         assert_eq!(view.face(), HomeFace::Status);
 
-        let contribution = view.chrome_contribution(&test_ctx()).expect("the status face must have a chrome opinion");
-        assert!(matches!(contribution.a, Some(ButtonLabel::Live(_))), "A must render live on the status face too (it toggles the face)");
+        assert_eq!(
+            view.activation(),
+            Some(Verb::Exception("devs")),
+            "A must render live on the status face too (it toggles the face)"
+        );
+    }
+
+    #[test]
+    fn b_is_inert_on_the_status_face_but_live_on_the_menu_face() {
+        // pico-link-4a2: the status face is Home's root state -- there is
+        // nothing to fold back to, so B must not claim otherwise.
+        let mut view = fresh_home_view();
+        assert_eq!(view.face(), HomeFace::Status);
+        assert!(!view.handles_back(), "B must be inert on the status face -- there is nothing to back out of");
+
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.face(), HomeFace::Menu);
+        assert!(view.handles_back(), "B must be live on the menu face -- it folds back to the status face");
     }
 }

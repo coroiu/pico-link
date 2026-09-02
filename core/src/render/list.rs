@@ -29,7 +29,7 @@ use crate::input::NavIntent;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::theme::{self, font, icon, palette};
-use super::widget::{Action, FocusEvent, Widget};
+use super::widget::{Action, FocusEvent, Verb, Widget};
 
 /// An opaque row-identity key, supplied by the call site — e.g. a
 /// Bluetooth device's 6-byte address. `Copy`/allocation-free by design:
@@ -105,6 +105,18 @@ pub struct ListItem {
     /// keep falling back to index-based selection carry-forward, see
     /// [`VerticalList::with_selected_identity`].
     pub key: Option<ListItemKey>,
+    /// Overrides the list's default `Verb` (set on [`VerticalList::
+    /// on_activate`]/[`VerticalList::on_activate_index`]) for this row
+    /// specifically — e.g. Devices' paired-device rows say `open` while
+    /// its "Pair new headphones" row says `pair` (design rule 4 §5(c)).
+    /// `None` (the default) means "use the list's default verb".
+    verb: Option<super::widget::Verb>,
+    /// Forces this row's `Widget::activation()` to `None` regardless of
+    /// `verb`/the list's default — for a row that is present in the list
+    /// but is not actually activatable (e.g. the wizard scan list's
+    /// "Showing N of M" backstop readout row). `true` (activatable) by
+    /// default, so every existing caller is unaffected. See [`Self::inert`].
+    activatable: bool,
 }
 
 impl ListItem {
@@ -116,6 +128,8 @@ impl ListItem {
             icon: None,
             signal_bars: None,
             key: None,
+            verb: None,
+            activatable: true,
         }
     }
 
@@ -147,6 +161,26 @@ impl ListItem {
     #[must_use]
     pub fn with_key(mut self, key: ListItemKey) -> Self {
         self.key = Some(key);
+        self
+    }
+
+    /// Overrides the list's default A-rail verb for this row specifically
+    /// — see [`Self::verb`]'s doc comment.
+    #[must_use]
+    pub fn with_verb(mut self, verb: super::widget::Verb) -> Self {
+        self.verb = Some(verb);
+        self
+    }
+
+    /// Marks this row as never activatable, regardless of the list's
+    /// default verb or any per-row [`Self::with_verb`] override — see
+    /// [`Self::activatable`]'s doc comment. A `VerticalList`'s rows are
+    /// normally uniform in kind (unlike `FieldList`'s `Action`/`Readonly`
+    /// split), so this exists only for the rare non-device backstop row
+    /// mixed into an otherwise-activatable list.
+    #[must_use]
+    pub fn inert(mut self) -> Self {
+        self.activatable = false;
         self
     }
 }
@@ -624,6 +658,13 @@ pub struct VerticalList {
     focused: bool,
     on_activate: Option<OnActivate>,
     on_activate_index: Option<OnActivateIndex>,
+    /// The A-rail verb reported for a selected row that has no per-row
+    /// [`ListItem::with_verb`] override -- set alongside whichever
+    /// activation callback is registered (design rule 4 §5(c): "you
+    /// cannot install a handler without naming it"). `None` iff no
+    /// callback is registered, which is also when [`Widget::activation`]
+    /// must report `None` (an unactivatable list has no verb to report).
+    default_verb: Option<Verb>,
 }
 
 impl VerticalList {
@@ -636,14 +677,20 @@ impl VerticalList {
             focused: false,
             on_activate: None,
             on_activate_index: None,
+            default_verb: None,
         }
     }
 
     /// Registers a callback invoked with the selected `ListItem` when the
     /// list is activated (joystick press, button A / `NavIntent::Select`)
-    /// while focused. Typically used to return `Action::PushView(...)`.
+    /// while focused, and the A-rail verb to show while this list is
+    /// focused (overridable per row via [`ListItem::with_verb`]) —
+    /// design rule 4 §5(c): the builder that installs a handler must also
+    /// name what A does, so the two can never drift apart. Typically used
+    /// to return `Action::PushView(...)`.
     #[must_use]
-    pub fn on_activate(mut self, callback: impl Fn(&ListItem) -> Action + 'static) -> Self {
+    pub fn on_activate(mut self, verb: Verb, callback: impl Fn(&ListItem) -> Action + 'static) -> Self {
+        self.default_verb = Some(verb);
         self.on_activate = Some(Box::new(callback));
         self
     }
@@ -665,7 +712,8 @@ impl VerticalList {
     /// Takes precedence over `on_activate` if both happen to be set —
     /// activation only ever fires one callback, never both.
     #[must_use]
-    pub fn on_activate_index(mut self, callback: impl Fn(usize) -> Action + 'static) -> Self {
+    pub fn on_activate_index(mut self, verb: Verb, callback: impl Fn(usize) -> Action + 'static) -> Self {
+        self.default_verb = Some(verb);
         self.on_activate_index = Some(Box::new(callback));
         self
     }
@@ -788,6 +836,22 @@ impl Widget for VerticalList {
 
     fn is_focusable(&self) -> bool {
         !self.items.is_empty()
+    }
+
+    /// The selected row's verb (per-row [`ListItem::with_verb`] override,
+    /// else the list's own [`Self::on_activate`]/[`Self::on_activate_index`]
+    /// default), or `None` if either no activation callback was ever
+    /// registered or the selected row was explicitly marked
+    /// [`ListItem::inert`] -- design rule 4.
+    fn activation(&self) -> Option<Verb> {
+        if self.on_activate.is_none() && self.on_activate_index.is_none() {
+            return None;
+        }
+        let item = self.items.get(self.selected)?;
+        if !item.activatable {
+            return None;
+        }
+        item.verb.or(self.default_verb)
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -966,7 +1030,7 @@ mod tests {
 
     #[test]
     fn activate_with_callback_invokes_it_with_the_selected_item() {
-        let mut list = VerticalList::new(items(3)).on_activate(|item| {
+        let mut list = VerticalList::new(items(3)).on_activate(Verb::Open, |item| {
             assert_eq!(item.label, "item-1");
             Action::PopView
         });
@@ -982,7 +1046,7 @@ mod tests {
         // here by using labels ("item-0"/"item-1"/"item-2") that carry no
         // hint of index 1 being special, only the callback's own assertion
         // on the numeric index does.
-        let mut list = VerticalList::new(items(3)).on_activate_index(|index| {
+        let mut list = VerticalList::new(items(3)).on_activate_index(Verb::Open, |index| {
             assert_eq!(index, 1, "the callback must receive the selected row's index");
             Action::PopView
         });
@@ -994,8 +1058,8 @@ mod tests {
     #[test]
     fn on_activate_index_takes_precedence_when_both_callbacks_are_registered() {
         let mut list = VerticalList::new(items(3))
-            .on_activate(|_item| Action::PopView)
-            .on_activate_index(|index| {
+            .on_activate(Verb::Open, |_item| Action::PopView)
+            .on_activate_index(Verb::Open, |index| {
                 assert_eq!(index, 0);
                 Action::Back
             });

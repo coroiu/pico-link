@@ -37,9 +37,8 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::{reconcile_top_index, ListItemKey};
 use super::menu::{draw_row, row_height, RowStyle, RowTrailing, RowValue};
-use super::rail::ButtonLabel;
 use super::theme::{font, palette};
-use super::widget::{Action, ChromeContribution, FocusEvent, Widget};
+use super::widget::{Action, FocusEvent, Verb, Widget};
 
 /// A field row's kind — TWO, not three, and collapsing Uma's `Info` and
 /// `Disabled` kinds into one variant IS the finding the field-list ruling
@@ -100,9 +99,11 @@ pub struct FieldRow {
     value_color: Rgb565,
     value_font: ValueFont,
     leading: Option<char>,
-    /// The A-rail word for this row when it's an [`FieldKind::Action`]
-    /// row and focused (e.g. `"pick"`, `"forget"`). Defaults to `"open"`.
-    activate_label: Option<String>,
+    /// The A-rail verb for this row when it's a [`FieldKind::Action`]
+    /// row and focused (e.g. `Verb::Pair`, or an exception word for
+    /// "forget"). `None` defaults to [`Verb::Open`] -- see
+    /// [`FieldList::activation`].
+    verb: Option<Verb>,
     key: Option<ListItemKey>,
 }
 
@@ -116,7 +117,7 @@ impl FieldRow {
             value_color: palette::TEXT_PRIMARY,
             value_font: ValueFont::Normal,
             leading: None,
-            activate_label: None,
+            verb: None,
             key: None,
         }
     }
@@ -169,12 +170,12 @@ impl FieldRow {
         self
     }
 
-    /// Sets this row's A-rail word (e.g. `"pick"`) — used only while this
-    /// row is focused and is an [`FieldKind::Action`] row. Defaults to
-    /// `"open"` (see [`FieldList::chrome_contribution`]).
+    /// Sets this row's A-rail verb — used only while this row is focused
+    /// and is an [`FieldKind::Action`] row. Defaults to [`Verb::Open`] (see
+    /// [`FieldList::activation`]).
     #[must_use]
-    pub fn with_activate_label(mut self, word: impl Into<String>) -> Self {
-        self.activate_label = Some(word.into());
+    pub fn with_verb(mut self, verb: Verb) -> Self {
+        self.verb = Some(verb);
         self
     }
 
@@ -354,18 +355,17 @@ impl Widget for FieldList {
         Action::None
     }
 
-    /// Returns **only** `a`: `Action` row -> `Live(activate_label or
-    /// "open")`, `Readonly` row -> `Inert`. This makes "an unlabelled A
-    /// does nothing, so a mispress is always free" structural rather than
-    /// remembered -- a page wrapper that also wants `title`/`x` merges
-    /// its own fields over this one's result (field-list ruling §4.4).
-    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
+    /// `Action` row -> `Some(verb or Verb::Open)`, `Readonly` row -> `None`.
+    /// This makes "an unlabelled A does nothing, so a mispress is always
+    /// free" structural rather than remembered (design rule 4) -- the
+    /// canonical example the rule generalizes from (field-list ruling
+    /// §4.4).
+    fn activation(&self) -> Option<Verb> {
         let row = self.rows.get(self.selected)?;
-        let a = match row.kind {
-            FieldKind::Action => ButtonLabel::Live(row.activate_label.clone().unwrap_or_else(|| String::from("open"))),
-            FieldKind::Readonly => ButtonLabel::Inert,
-        };
-        Some(ChromeContribution { a: Some(a), ..ChromeContribution::default() })
+        match row.kind {
+            FieldKind::Action => Some(row.verb.unwrap_or(Verb::Open)),
+            FieldKind::Readonly => None,
+        }
     }
 
     // `redraw_after` is deliberately NOT overridden here -- the default
@@ -536,12 +536,11 @@ mod tests {
         // Readonly, focused: never a caret -- render must not panic and
         // this is exercised by the freshness/behaviour tests above via
         // `is_focusable`/`on_focus`; here we additionally confirm
-        // `chrome_contribution` reports Inert, the structural half of
-        // "never a caret".
+        // `activation()` reports `None`, the structural half of "never a
+        // caret".
         let mut readonly_list = FieldList::new(vec![FieldRow::readonly("SAMPLE RATE").with_value("48 kHz", palette::TEXT_SECONDARY)]);
         readonly_list.on_focus(FocusEvent::Gained);
-        let contribution = readonly_list.chrome_contribution(&test_ctx()).expect("a focused row must have a chrome opinion");
-        assert_eq!(contribution.a, Some(ButtonLabel::Inert));
+        assert_eq!(readonly_list.activation(), None);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::rail::{draw_rail, ButtonLabel, ButtonLabels};
 use super::theme::{font, icon, palette};
-use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Widget};
+use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Verb, Widget};
 
 /// Margin (px) from the title bar's left/right edges to its content —
 /// now the same left rule `L = 12` the body content uses (design doc
@@ -109,11 +109,6 @@ pub struct Screen {
     /// its slot's presence/absence-of-override matters, and even that is
     /// moot since B's liveness comes from `Navigator`, not `Screen`.
     pub buttons: ButtonLabels,
-    /// Whether this screen handles `NavIntent::Back` internally (e.g. a
-    /// menu/status face toggle) rather than deferring to the navigator's
-    /// stack-depth pop. ORs into the B slot's liveness passed to
-    /// [`Screen::render`] — see `can_go_back`.
-    handles_back: bool,
     widgets: Vec<Box<dyn Widget>>,
     focused_index: Option<usize>,
 }
@@ -124,31 +119,22 @@ impl Screen {
         Self {
             title: title.into(),
             buttons: ButtonLabels::default(),
-            handles_back: false,
             widgets,
             focused_index: None,
         }
     }
 
-    /// Sets this screen's static A/X/Y rail labels. B is deliberately not
-    /// a parameter here: its text is always [`BACK_LABEL`] and its
-    /// liveness is a navigator fact (stack depth), not a screen fact — see
-    /// the design's rule that B must not be per-screen overridable, and
-    /// [`Screen::handles_back`] for the one thing a screen *can* say about
-    /// B (that it wants to be treated as live even at depth 1).
+    /// Sets this screen's static X/Y rail labels. Neither A nor B is a
+    /// parameter here: **A never has a screen-level static label**
+    /// (design rule 4 — A's liveness and label are always the focused
+    /// widget's own [`Widget::activation`], because "activate the focused
+    /// thing" is meaningless without a focused thing), and B's text is
+    /// always [`BACK_LABEL`] with its liveness a navigator fact (stack
+    /// depth) OR'd with the focused widget's own [`Widget::handles_back`]
+    /// — see [`Screen::resolve_button`].
     #[must_use]
-    pub fn with_button_labels(mut self, a: ButtonLabel, x: ButtonLabel, y: ButtonLabel) -> Self {
-        self.buttons = ButtonLabels { a, b: ButtonLabel::Inert, x, y };
-        self
-    }
-
-    /// Declares that this screen handles `NavIntent::Back` internally
-    /// (e.g. Home's menu<->status face toggle) — its B slot should read as
-    /// live even at navigator depth 1, where there is otherwise nothing to
-    /// pop back to.
-    #[must_use]
-    pub fn handles_back(mut self, handles: bool) -> Self {
-        self.handles_back = handles;
+    pub fn with_button_labels(mut self, x: ButtonLabel, y: ButtonLabel) -> Self {
+        self.buttons = ButtonLabels { a: ButtonLabel::Inert, b: ButtonLabel::Inert, x, y };
         self
     }
 
@@ -289,23 +275,72 @@ impl Screen {
     }
 
     /// Activates the currently focused widget (`NavIntent::Select`).
+    ///
+    /// Refuses to dispatch when the focused widget's [`Widget::activation`]
+    /// is `None` — design rule 4: "A's liveness and A's label are the same
+    /// fact." [`Screen::resolve_a`] reads this exact same accessor to
+    /// decide what the rail *shows*, so the two cannot disagree; "A acts
+    /// but renders dim" is a state this program has no way to represent.
     pub(super) fn activate_focused(&mut self) -> Action {
         match self.focused_index {
-            Some(index) => self.widgets[index].on_focus(FocusEvent::Activated),
-            None => Action::None,
+            Some(index) if self.widgets[index].activation().is_some() => self.widgets[index].on_focus(FocusEvent::Activated),
+            _ => Action::None,
         }
     }
 
-    /// Resolves one button's rail label: the focused widget's
+    /// Resolves A's rail label from the focused widget's own
+    /// [`Widget::activation`] — the one and only source of A's liveness
+    /// and text (design rule 4). A never falls back to a screen-level
+    /// static label (see [`Screen::with_button_labels`]) and never reads
+    /// [`ChromeContribution`] — see [`Screen::activate_focused`] for the
+    /// matching gate this must never disagree with.
+    ///
+    /// `pub(crate)`, not private: this is also the accessor
+    /// `app::tests::a_rail_liveness_matches_activation_for_every_screen`
+    /// reads to observe what the rail actually renders, independently of
+    /// [`Screen::focused_activation`] — see that method's doc comment for
+    /// why the two are kept as separate call sites in the test even though
+    /// they are, today, one expression apart.
+    pub(crate) fn resolve_a(&self) -> ButtonLabel {
+        let verb = self.focused_activation();
+        match verb {
+            Some(verb) => ButtonLabel::Live(String::from(verb.as_str())),
+            None => ButtonLabel::Inert,
+        }
+    }
+
+    /// The focused widget's [`Widget::activation`], or `None` if nothing is
+    /// focused — the same expression [`Screen::activate_focused`] gates
+    /// dispatch on and [`Screen::resolve_a`] renders from (design rule 4:
+    /// "A's liveness and A's label are the same fact"). `pub(crate)` so
+    /// `app`'s central regression test
+    /// (`a_rail_liveness_matches_activation_for_every_screen`) can assert
+    /// the invariant from outside this module, as a tripwire on the
+    /// mechanism rather than a proof of per-screen correctness — see the
+    /// design doc §5(d)'s "what is NOT enforceable" note.
+    pub(crate) fn focused_activation(&self) -> Option<Verb> {
+        self.focused_index.and_then(|index| self.widgets[index].activation())
+    }
+
+    /// Whether the focused widget wants B treated as live even at
+    /// navigator depth 1 (nothing to pop to) — see
+    /// [`Widget::handles_back`]'s doc comment (e.g. Home's menu face
+    /// folding back to its status face).
+    fn widget_handles_back(&self) -> bool {
+        self.focused_index.is_some_and(|index| self.widgets[index].handles_back())
+    }
+
+    /// Resolves one of B/X/Y's rail label: the focused widget's
     /// [`ChromeContribution`] wins when it has an opinion (`Some(_)`,
     /// including `Some(Inert)`), otherwise this screen's static
-    /// [`Screen::buttons`] label is used. B is special-cased: its text is
-    /// always [`BACK_LABEL`] and its liveness is `can_go_back` (already
-    /// `OR`ed with [`Screen::handles_back`] by the caller) rather than
-    /// anything either the widget or the screen authored for it.
+    /// [`Screen::buttons`] label is used. **Never called for A** — see
+    /// [`Screen::resolve_a`]. B is further special-cased: its text is
+    /// always [`BACK_LABEL`] and its liveness is `can_go_back` OR'd with
+    /// [`Screen::widget_handles_back`] rather than anything either the
+    /// widget or the screen authored for it.
     fn resolve_button(&self, button: Button, contribution: Option<&ChromeContribution>, can_go_back: bool) -> ButtonLabel {
         if button == Button::B {
-            return if can_go_back || self.handles_back { ButtonLabel::Live(String::from(BACK_LABEL)) } else { ButtonLabel::Inert };
+            return if can_go_back || self.widget_handles_back() { ButtonLabel::Live(String::from(BACK_LABEL)) } else { ButtonLabel::Inert };
         }
         match contribution.and_then(|c| c.button(button)) {
             Some(label) => label.clone(),
@@ -444,7 +479,7 @@ impl Screen {
 
         if chrome.rail.size.width > 0 {
             let labels = ButtonLabels {
-                a: self.resolve_button(Button::A, contribution.as_ref(), can_go_back),
+                a: self.resolve_a(),
                 b: self.resolve_button(Button::B, contribution.as_ref(), can_go_back),
                 x: self.resolve_button(Button::X, contribution.as_ref(), can_go_back),
                 y: self.resolve_button(Button::Y, contribution.as_ref(), can_go_back),
@@ -459,6 +494,7 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::widget::Verb;
     use crate::platform::Instant;
     use crate::render::list::{ListItem, VerticalList};
 
@@ -600,10 +636,13 @@ mod tests {
     use crate::panel::{Button, PanelOrientation};
 
     /// A single-purpose focusable widget whose only job is reporting a
-    /// caller-fixed set of `ChromeContribution` button overrides -- same
-    /// shape as `LinkOnlyWidget` above, one field per rail slot.
+    /// caller-fixed set of button overrides -- same shape as `LinkOnlyWidget`
+    /// above, one field per rail slot. `a` is a [`Verb`] (routed through
+    /// [`Widget::activation`], the only source of A's label since design
+    /// rule 4), not a `ButtonLabel` like the other three (still routed
+    /// through [`ChromeContribution`]).
     struct ButtonsOnlyWidget {
-        a: Option<ButtonLabel>,
+        a: Option<Verb>,
         b: Option<ButtonLabel>,
         x: Option<ButtonLabel>,
         y: Option<ButtonLabel>,
@@ -619,9 +658,11 @@ mod tests {
         fn is_focusable(&self) -> bool {
             true
         }
+        fn activation(&self) -> Option<Verb> {
+            self.a
+        }
         fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
             Some(ChromeContribution {
-                a: self.a.clone(),
                 b: self.b.clone(),
                 x: self.x.clone(),
                 y: self.y.clone(),
@@ -669,7 +710,7 @@ mod tests {
     fn mirroring_the_orientation_moves_both_the_edge_and_the_slot_order() {
         for orientation in [PanelOrientation::ButtonsRight, PanelOrientation::ButtonsLeft] {
             let widget = ButtonsOnlyWidget {
-                a: Some(ButtonLabel::Live(String::from("devs"))),
+                a: Some(Verb::Exception("devs")),
                 b: Some(ButtonLabel::Inert),
                 x: Some(ButtonLabel::Inert),
                 y: Some(ButtonLabel::Inert),
@@ -732,7 +773,6 @@ mod tests {
         // the screen's label wins and its text paints.
         let widget = ButtonsOnlyWidget { a: None, b: None, x: None, y: None };
         let mut screen = Screen::new("T", vec![Box::new(widget)]).with_button_labels(
-            ButtonLabel::Inert,
             ButtonLabel::Live(String::from("link")),
             ButtonLabel::Inert,
         );
@@ -756,7 +796,6 @@ mod tests {
         // test would still be there.
         let widget = ButtonsOnlyWidget { a: None, b: None, x: Some(ButtonLabel::Inert), y: None };
         let mut screen = Screen::new("T", vec![Box::new(widget)]).with_button_labels(
-            ButtonLabel::Inert,
             ButtonLabel::Live(String::from("link")),
             ButtonLabel::Inert,
         );
@@ -779,7 +818,7 @@ mod tests {
     #[test]
     fn a_16_character_label_never_paints_left_of_the_rails_own_left_edge() {
         let widget = ButtonsOnlyWidget {
-            a: Some(ButtonLabel::Live(String::from("abcdefghijklmnop"))),
+            a: Some(Verb::Exception("abcdefghijklmnop")),
             b: Some(ButtonLabel::Inert),
             x: Some(ButtonLabel::Inert),
             y: Some(ButtonLabel::Inert),

@@ -30,7 +30,7 @@ use crate::render::theme::palette;
 use crate::render::wizard::build_wizard_screen;
 use crate::render::{
     Action, ButtonLabel, ChromeContribution, ConfirmView, FocusEvent, FrameBuffer565, Instant, ListItem, ListItemKey, MenuItem,
-    Navigator, RenderCtx, Screen, VerticalList, Widget,
+    Navigator, RenderCtx, Screen, Verb, VerticalList, Widget,
 };
 
 /// The devices screen's "Pair new headphones" row's identity key (bead
@@ -883,10 +883,20 @@ pub(crate) fn build_devices_screen(
         .iter()
         .map(|device| {
             let sublabel = if Some(device.addr) == model.connected_addr { "Connected" } else { "Paired" };
-            ListItem::new(paired_device_label(device)).with_sublabel(sublabel).with_key(ListItemKey::from(device.addr))
+            // `Verb::Open`: every paired row pushes a deeper screen --
+            // device detail for the connected row, the wizard's
+            // `Connecting` phase for any other (design rule 4's
+            // assignment table treats both as "a paired device").
+            ListItem::new(paired_device_label(device))
+                .with_sublabel(sublabel)
+                .with_key(ListItemKey::from(device.addr))
+                .with_verb(Verb::Open)
         })
         .collect();
-    items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY));
+    // `Verb::Pair`: begins pairing -- including at the 8-device cap, where
+    // the forget-picker is the app making room, not a different intent
+    // (design rule 4's assignment table).
+    items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY).with_verb(Verb::Pair));
 
     let paired_len = model.paired.len();
     let connected_addr = model.connected_addr;
@@ -896,7 +906,10 @@ pub(crate) fn build_devices_screen(
     let wizard_phase_for_activate = Rc::clone(wizard_phase);
     let wizard_devices_for_activate = Rc::clone(wizard_devices);
     let list = VerticalList::new(items)
-        .on_activate_index(move |index| {
+        // The `Verb::Open` here is only the list's fallback default; every
+        // row above carries its own override, so this value is never
+        // actually read.
+        .on_activate_index(Verb::Open, move |index| {
             if let Some(device) = ordered_for_activate.get(index) {
                 if Some(device.addr) == connected_addr {
                     // A on the connected row: no reconnect to do -- push
@@ -969,6 +982,13 @@ impl Widget for DevicesListView {
         self.list.is_focusable()
     }
 
+    /// Forwards `list`'s own answer -- see `Widget::activation`'s doc
+    /// comment on why a wrapper must forward this rather than let the
+    /// default `None` silently swallow it.
+    fn activation(&self) -> Option<Verb> {
+        self.list.activation()
+    }
+
     fn on_focus(&mut self, event: FocusEvent) -> Action {
         self.list.on_focus(event)
     }
@@ -1039,7 +1059,7 @@ fn build_forget_picker_screen(paired: Vec<PairedDevice>, commands: Rc<RefCell<Ve
     let items: Vec<ListItem> =
         paired.iter().map(|device| ListItem::new(paired_device_label(device)).with_key(ListItemKey::from(device.addr))).collect();
     let paired_for_activate = paired;
-    let list = VerticalList::new(items).on_activate_index(move |index| {
+    let list = VerticalList::new(items).on_activate_index(Verb::Select, move |index| {
         if let Some(device) = paired_for_activate.get(index) {
             let addr = device.addr;
             let label = paired_device_label(device);
@@ -1063,7 +1083,7 @@ const FORGET_CONFIRM_TITLE: &str = "Forget device?";
 fn build_forget_confirm_screen(addr: DeviceAddr, label: &str, commands: Rc<RefCell<VecDeque<Command>>>) -> Screen {
     let headline = format!("Forget {label}?");
     let rows = vec![MenuItem::new("Cancel"), MenuItem::new("Forget").with_label_color(palette::STATUS_ERROR)];
-    let view = ConfirmView::new(headline, rows).on_activate_index(move |index| {
+    let view = ConfirmView::new(headline, rows).on_activate_index(Verb::Select, move |index| {
         if index == 1 {
             commands.borrow_mut().push_back(Command::ForgetDevice { addr });
         }
@@ -2114,6 +2134,104 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Design rule 4 (`.planning/design/2026-09-02-a-button-label-rule.md`
+    /// §5(d)): "A's liveness and A's label are the same fact." This is the
+    /// **one central test**, not one per screen -- a per-screen assertion
+    /// is the exact scatter that caused the bug this rule fixes.
+    ///
+    /// Two things are checked per screen state, both against
+    /// [`Screen::focused_activation`] as the single source of truth:
+    ///
+    /// 1. `Screen::resolve_a` (what the rail actually renders) agrees with
+    ///    `focused_activation().is_some()`. This is a regression tripwire
+    ///    on the *mechanism*: today the two are one call apart by
+    ///    construction (`screen.rs`'s `activate_focused`/`resolve_a` both
+    ///    read `focused_activation`), so this cannot fail without someone
+    ///    reintroducing a second channel for A -- see the design doc's "what
+    ///    is NOT enforceable" note on `Box<dyn Widget>` wrapper forwarding,
+    ///    which is exactly the gap this line stands guard over.
+    /// 2. The rendered word matches Uma's assignment table (design doc §4)
+    ///    verbatim, which *is* capable of failing on an ordinary per-screen
+    ///    regression (wrong verb, or a screen silently losing its verb).
+    ///
+    /// Reuses [`freshness_cases`]'s table of screen-state builders rather
+    /// than hand-rolling a second one -- one table of "every production
+    /// screen state", not two that can drift apart.
+    #[test]
+    fn a_rail_liveness_matches_activation_for_every_screen() {
+        fn store_corrupt_boot_devices() -> App {
+            let mut app = App::new(240, 240);
+            app.handle_event(Event::StoreLoaded { status: StoreStatus::RecordCorrupt });
+            open_devices(&mut app);
+            app
+        }
+
+        // A paired device row focused on Devices -- design section 4's
+        // `open` row (row 3 of the audit table), distinct from
+        // `devices_list`'s empty-store "Pair new headphones" row.
+        fn devices_list_paired_row_focused() -> App {
+            let mut app = App::new(240, 240);
+            app.handle_event(upsert([9; 6], "Cans", 1));
+            open_devices(&mut app);
+            app
+        }
+
+        type ActivationCase = (&'static str, fn() -> App, Option<Verb>);
+
+        let mut cases: Vec<ActivationCase> = freshness_cases()
+            .into_iter()
+            .map(|(name, build, _)| {
+                let expected = match name {
+                    "home, status face" | "home, status face, connected with live out level" => Some(Verb::Exception("devs")),
+                    "home, menu face" => Some(Verb::Open),
+                    // `devices_list`'s builder (see `freshness_cases`) has
+                    // no paired devices, so the only row is "Pair new
+                    // headphones" -- design doc section 4's `pair` row, not
+                    // its `open` row. `devices_list_paired_row_focused`
+                    // below covers the `open` case with an actual device
+                    // row focused.
+                    "devices list" => Some(Verb::Pair),
+                    "forget picker" => Some(Verb::Select),
+                    "forget confirm" => Some(Verb::Select),
+                    "device detail" | "settings" => None,
+                    "wizard: scanning" => Some(Verb::Pair),
+                    "wizard: nothing found" => Some(Verb::Scan),
+                    "wizard: connecting" | "wizard: not responding" | "wizard: failed" | "wizard: succeeded" => None,
+                    other => panic!(
+                        "{other}: no expected A-verb entry in this test -- add one from design doc \
+                         .planning/design/2026-09-02-a-button-label-rule.md section 4's assignment table, don't skip it"
+                    ),
+                };
+                (name, build, expected)
+            })
+            .collect();
+        // No devices survive a corrupt store, so (like `devices_list`) the
+        // only row is "Pair new headphones" -- `pair`, not `open`. This
+        // case exists to cover design row 14 (same defect class as row 3,
+        // a Devices screen with A silent), not to exercise a different
+        // verb.
+        cases.push(("store-corrupt boot, devices", store_corrupt_boot_devices, Some(Verb::Pair)));
+        cases.push(("devices list, paired row focused", devices_list_paired_row_focused, Some(Verb::Open)));
+
+        for (name, build, expected) in cases {
+            let app = build();
+            let screen = app.navigator.current();
+            let rendered_live = matches!(screen.resolve_a(), ButtonLabel::Live(_));
+            let activation = screen.focused_activation();
+
+            assert_eq!(
+                rendered_live,
+                activation.is_some(),
+                "{name}: rail A liveness ({rendered_live}) disagrees with focused_activation \
+                 ({activation:?}) -- design rule 4 says these are the same fact"
+            );
+            assert_eq!(
+                activation, expected,
+                "{name}: A's verb is {activation:?}, expected {expected:?} per design doc section 4's assignment table"
+            );
         }
     }
 

@@ -97,5 +97,5 @@ pub use message::MessageView;
 pub use navigator::Navigator;
 pub use rail::{Button, ButtonLabel, ButtonLabels};
 pub use screen::Screen;
-pub use widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Widget};
+pub use widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Verb, Widget};
 pub use wizard::{build_wizard_screen, WIZARD_TITLE};

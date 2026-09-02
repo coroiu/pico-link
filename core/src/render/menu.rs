@@ -47,7 +47,7 @@ use crate::input::NavIntent;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::theme::{self, font, icon, palette};
-use super::widget::{Action, FocusEvent, Widget};
+use super::widget::{Action, FocusEvent, Verb, Widget};
 
 /// Row metrics — one per **list**, not per row: a list whose rows use
 /// different margins is not a list. Threaded through [`draw_row`] so
@@ -381,18 +381,25 @@ pub struct MenuList {
     selected: usize,
     focused: bool,
     on_activate_index: Option<OnActivateIndex>,
+    /// The A-rail verb reported while this menu is focused -- set
+    /// alongside the activation callback (design rule 4 §5(c)). `None`
+    /// iff no callback is registered.
+    verb: Option<Verb>,
 }
 
 impl MenuList {
     #[must_use]
     pub fn new(items: Vec<MenuItem>) -> Self {
-        Self { items, selected: 0, focused: false, on_activate_index: None }
+        Self { items, selected: 0, focused: false, on_activate_index: None, verb: None }
     }
 
     /// Registers a callback invoked with the selected row's index when the
-    /// menu is activated while focused.
+    /// menu is activated while focused, and the A-rail verb to show while
+    /// this menu is focused (design rule 4 §5(c): the builder that installs
+    /// a handler must also name what A does).
     #[must_use]
-    pub fn on_activate_index(mut self, callback: impl Fn(usize) -> Action + 'static) -> Self {
+    pub fn on_activate_index(mut self, verb: Verb, callback: impl Fn(usize) -> Action + 'static) -> Self {
+        self.verb = Some(verb);
         self.on_activate_index = Some(Box::new(callback));
         self
     }
@@ -438,6 +445,13 @@ impl Widget for MenuList {
 
     fn is_focusable(&self) -> bool {
         !self.items.is_empty()
+    }
+
+    /// The verb registered on [`Self::on_activate_index`], or `None` if no
+    /// callback (and therefore no verb) was ever registered -- design
+    /// rule 4.
+    fn activation(&self) -> Option<Verb> {
+        self.on_activate_index.is_some().then_some(self.verb).flatten()
     }
 
     fn on_focus(&mut self, event: FocusEvent) -> Action {
@@ -546,7 +560,7 @@ mod tests {
 
     #[test]
     fn activate_invokes_the_callback_with_the_selected_rows_index() {
-        let mut menu = MenuList::new(items(3)).on_activate_index(|index| {
+        let mut menu = MenuList::new(items(3)).on_activate_index(Verb::Open, |index| {
             assert_eq!(index, 1);
             Action::PopView
         });
@@ -588,7 +602,7 @@ mod tests {
 
     #[test]
     fn render_focused_row_shows_the_shared_selection_fill() {
-        let mut menu = MenuList::new(items(2)).on_activate_index(|_| Action::None);
+        let mut menu = MenuList::new(items(2)).on_activate_index(Verb::Open, |_| Action::None);
         menu.on_focus(FocusEvent::Gained);
         let mut fb = FrameBuffer565::new(200, 100);
         let area = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
