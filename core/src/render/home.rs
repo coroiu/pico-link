@@ -256,6 +256,14 @@ impl Widget for HomeView {
                 if self.face() == HomeFace::Menu {
                     *self.home_face.borrow_mut() = HomeFace::Status;
                 }
+                // pico-link-l4d POLICY: this is the only place a manual B
+                // ever changes `home_face`, and it's a local toggle, not a
+                // pop. "B from Devices back to Home" (`Navigator`'s plain
+                // pop) deliberately does NOT also reset the face -- see
+                // `wizard.rs`'s `(Back, Succeeded)` fallthrough for the
+                // full policy statement: automatic dismiss chooses the
+                // destination (always the status hero); manual B retraces
+                // the user's own steps one screen at a time.
                 Action::None
             }
             NavIntent::Up | NavIntent::Down | NavIntent::JumpBy(_) => match self.face() {
