@@ -337,4 +337,28 @@ pub trait Widget {
     fn selected_key(&self) -> Option<ListItemKey> {
         None
     }
+
+    /// This widget's scroll-top row index, if it scrolls. `None` for
+    /// widgets with no scrolling concept (the default): static labels,
+    /// `MenuList` (deliberately never scrolls — see `menu::MenuList`'s
+    /// doc comment), and any widget short enough to fit its viewport.
+    ///
+    /// Exists for the same reason [`Self::selected_index`]/
+    /// [`Self::selected_key`] do: a caller that rebuilds a screen from
+    /// live model state on every event must carry the user's *viewport*
+    /// forward, not just their cursor — otherwise a scrolled list snaps
+    /// back to `top_index == 0` on the next unrelated event and
+    /// `list::reconcile_top_index` re-lands the selected row at the
+    /// viewport's bottom edge. Latent on today's Devices screen (4 rows
+    /// fit, nothing scrolls in practice); not latent on a longer list
+    /// rebuilt on every live event — see
+    /// `.planning/design/2026-09-02-field-list-widget-ruling.md` §4.7.
+    ///
+    /// **A widget that wraps another scrolling widget must forward
+    /// this** — same failure mode as [`Self::redraw_after`]'s "a wrapper
+    /// that doesn't forward silently looks like `None` instead of
+    /// forgotten" hazard (pico-link-vxc, D2).
+    fn scroll_top(&self) -> Option<usize> {
+        None
+    }
 }

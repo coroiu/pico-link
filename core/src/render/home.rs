@@ -190,7 +190,7 @@ impl HomeView {
                     let commands = Rc::clone(&commands_for_bluetooth);
                     let wizard_phase = Rc::clone(&wizard_phase_for_bluetooth);
                     let wizard_devices = Rc::clone(&wizard_devices_for_bluetooth);
-                    Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, &commands, &wizard_phase, &wizard_devices)))
+                    Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, None, &commands, &wizard_phase, &wizard_devices)))
                 }
                 MENU_ROW_SETTINGS => Action::PushView(Box::new(build_settings_screen)),
                 _ => Action::None,

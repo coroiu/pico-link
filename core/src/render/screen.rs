@@ -181,6 +181,15 @@ impl Screen {
         self.focused_index.and_then(|index| self.widgets[index].selected_key())
     }
 
+    /// The focused widget's own scroll-top row index, if any — see
+    /// `Widget::scroll_top`'s doc comment. The scroll-position
+    /// counterpart to [`Screen::selected_index`]/[`Screen::selected_key`],
+    /// for the same "carry live-rebuilt state forward" purpose.
+    #[must_use]
+    pub fn scroll_top(&self) -> Option<usize> {
+        self.focused_index.and_then(|index| self.widgets[index].scroll_top())
+    }
+
     /// The currently focused widget's [`ChromeContribution`], if any.
     /// Consulting *only* the focused widget (not e.g. merging every
     /// widget's contribution) is deliberate: on every screen this bead

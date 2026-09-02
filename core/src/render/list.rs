@@ -742,6 +742,22 @@ impl VerticalList {
         self
     }
 
+    /// Sets the initial scroll-top row index — the scroll-position
+    /// counterpart to [`Self::with_selected`]/[`Self::with_selected_identity`].
+    /// A caller that rebuilds a fresh `VerticalList` from live data on
+    /// every render call reads back the outgoing widget's
+    /// [`Widget::scroll_top`] and carries it forward here, so an
+    /// unrelated model event doesn't snap a scrolled list back to the
+    /// top (see `Widget::scroll_top`'s doc comment for the failure mode
+    /// this closes). `render`'s own `reconcile_top_index` call still
+    /// clamps this to the current item count/viewport on the very next
+    /// render, so an out-of-range value here is harmless.
+    #[must_use]
+    pub fn with_scroll_top(self, top: usize) -> Self {
+        self.top_index.set(top);
+        self
+    }
+
     #[must_use]
     pub fn selected_index(&self) -> usize {
         self.selected
@@ -780,6 +796,10 @@ impl Widget for VerticalList {
 
     fn selected_key(&self) -> Option<ListItemKey> {
         VerticalList::selected_key(self)
+    }
+
+    fn scroll_top(&self) -> Option<usize> {
+        Some(self.top_index.get())
     }
 
     fn on_focus(&mut self, event: FocusEvent) -> Action {

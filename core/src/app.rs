@@ -798,6 +798,7 @@ pub(crate) fn build_devices_screen(
     model: &BtModel,
     prev_key: Option<ListItemKey>,
     prev_index: usize,
+    prev_scroll_top: Option<usize>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     wizard_phase: &Rc<RefCell<WizardPhase>>,
     wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
@@ -871,6 +872,7 @@ pub(crate) fn build_devices_screen(
             }
         })
         .with_selected_identity(prev_key, prev_index);
+    let list = if let Some(top) = prev_scroll_top { list.with_scroll_top(top) } else { list };
 
     let view = DevicesListView { list, row_devices: ordered, commands: Rc::clone(commands) };
     Screen::new(DEVICES_TITLE, vec![Box::new(view)])
@@ -938,6 +940,14 @@ impl Widget for DevicesListView {
 
     fn selected_key(&self) -> Option<ListItemKey> {
         self.list.selected_key()
+    }
+
+    /// Forwards `list`'s own answer — see `Widget::scroll_top`'s doc
+    /// comment on why a wrapper must forward this rather than let the
+    /// default `None` silently swallow it (the same pico-link-vxc D2
+    /// hazard `redraw_after` below already guards against).
+    fn scroll_top(&self) -> Option<usize> {
+        self.list.scroll_top()
     }
 
     fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
@@ -1180,12 +1190,14 @@ impl App {
         if self.navigator.title_at(1) == Some(DEVICES_TITLE) {
             let devices_prev_key = self.navigator.selected_key_at(1);
             let devices_prev_index = self.navigator.selected_index_at(1).unwrap_or(0);
+            let devices_prev_scroll_top = self.navigator.scroll_top_at(1);
             self.navigator.replace_at(
                 1,
                 build_devices_screen(
                     &self.model,
                     devices_prev_key,
                     devices_prev_index,
+                    devices_prev_scroll_top,
                     &self.commands,
                     &self.wizard_phase,
                     &self.wizard_devices,
@@ -1578,6 +1590,17 @@ impl App {
     #[cfg(test)]
     pub(crate) fn devices_selected_index_for_test(&self) -> Option<usize> {
         self.navigator.selected_index_at(1)
+    }
+
+    /// Test-only: the Devices screen's own scroll-top row index, if it's
+    /// currently on the navigator stack at index 1 -- the scroll-position
+    /// counterpart to [`App::devices_selected_index_for_test`], proving
+    /// [`App::rebuild_root`] carries the user's viewport forward across
+    /// an unrelated model event (`.planning/design/2026-09-02-field-list-
+    /// widget-ruling.md` §4.7). Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn devices_scroll_top_for_test(&self) -> Option<usize> {
+        self.navigator.scroll_top_at(1)
     }
 
     /// Test-only: pushes an arbitrary screen onto the navigator stack, so
@@ -2102,6 +2125,41 @@ mod tests {
         // Same for a link-state change while browsing.
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
         assert_eq!(app.devices_selected_index_for_test(), Some(1), "a link-state change must not reset the user's selection");
+    }
+
+    /// Field-list widget ruling §4.7's defect fix: `App::rebuild_root`
+    /// carried the *selection* forward across a live-model rebuild but not
+    /// `top_index`, so a scrolled Devices list snapped back to the top on
+    /// any unrelated event and `reconcile_top_index` then re-landed the
+    /// selected row at the viewport's BOTTOM edge -- latent while only 4
+    /// rows fit, not latent once a page scrolls. `MAX_PAIRED_DEVICES` (8)
+    /// paired rows + the fixed "Pair new headphones" row is 9, comfortably
+    /// past this screen's ~5-row viewport (206px content / 40px rows).
+    #[test]
+    fn an_unrelated_event_does_not_snap_a_scrolled_devices_list_back_to_the_top() {
+        let mut app = App::new(240, 240);
+        let max = u8::try_from(MAX_PAIRED_DEVICES).expect("MAX_PAIRED_DEVICES is a small constant, fits in u8");
+        for i in 0..max {
+            app.handle_event(upsert([i; 6], "Cans", u32::from(i)));
+        }
+        open_devices(&mut app);
+        // Jump to the last row ("Pair new headphones") and render once so
+        // `VerticalList::render`'s `reconcile_top_index` call actually
+        // scrolls the viewport (scrolling is computed at render time, not
+        // on `on_intent` -- see that function's doc comment).
+        app.handle_input(vec![NavIntent::JumpBy(i16::from(max) + 1)]);
+        app.render();
+        let scroll_top_before = app.devices_scroll_top_for_test().expect("a scrolled Devices list must report a scroll-top row");
+        assert!(scroll_top_before > 0, "jumping to the last of 9 rows on a ~5-row viewport must have actually scrolled");
+
+        // An unrelated event rebuilds the Devices screen from scratch.
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        app.render();
+        assert_eq!(
+            app.devices_scroll_top_for_test(),
+            Some(scroll_top_before),
+            "an unrelated model event must not snap the scrolled list back to the top"
+        );
     }
 
     // --- pico-link-znb.4 / pico-link-4vb.4: selection carried by identity, not index ---

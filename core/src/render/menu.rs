@@ -9,12 +9,14 @@
 //! mode onto `VerticalList` (which would let `VerticalList`'s other,
 //! unrelated list-style consumers accidentally end up chip-less too).
 //!
-//! [`draw_row`] (the shared row-drawing primitive, `pub(crate)`) is
-//! written to also be reusable directly by a call site that wants a
-//! bolder, more prominent single-line action row (e.g. a detail view's
-//! own default action) sharing the same chip-less/single-line/
-//! vertically-centered visual language as the menu it complements, just
-//! with a caller-supplied bolder label font instead of the menu's own.
+//! [`draw_row`] (the shared row-drawing primitive, `pub(crate)`) is the
+//! **one row-drawing path** shared by [`MenuList`] and
+//! `super::fields::FieldList` (`.planning/design/2026-09-02-field-list-
+//! widget-ruling.md` is the design of record — read it before touching
+//! this module). [`RowStyle`] parameterizes margins/padding/gutter so
+//! each caller gets its own visual rhythm without a second,
+//! independently-drawn row implementation drifting from this one on
+//! selection fill, divider, or caret.
 
 // Identical allow (and rationale) as `list.rs`:
 // this module does the same `embedded-graphics` `Point`(i32)/`Size`(u32)
@@ -47,32 +49,96 @@ use super::framebuffer::FrameBuffer565;
 use super::theme::{self, font, icon, palette};
 use super::widget::{Action, FocusEvent, Widget};
 
-/// A menu row's right-aligned trailing content — the disclosure caret
-/// (the original, sole behavior), a state label (e.g. a toggle row's
-/// "On"/"Off"), or nothing at all. Threaded through [`draw_row`] so the
-/// "what goes on the right edge" decision lives in one place instead of
-/// every caller reimplementing its own right-edge layout math.
-///
-/// Unlike [`Trailing::Caret`] (which only appears while the row is
-/// `selected`, since it's a "you can press this" affordance only
-/// relevant to the focused row), [`Trailing::Label`] is drawn regardless
-/// of `selected`: a toggle row's current state (e.g. a settings screen's
-/// toggle row) must stay visible even when focus has moved elsewhere.
+/// Row metrics — one per **list**, not per row: a list whose rows use
+/// different margins is not a list. Threaded through [`draw_row`] so
+/// every caller's own visual rhythm (left margin, trailing margins, an
+/// optional leading glyph gutter, vertical padding) lives in one place
+/// instead of being re-derived per call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Trailing<'a> {
-    /// The pre-existing disclosure-caret behavior: shown only while the
-    /// row is `selected`.
-    Caret,
-    /// A state label, drawn in `color`, shown unconditionally.
-    Label(&'a str, Rgb565),
-    /// No trailing content.
-    None,
+pub(crate) struct RowStyle {
+    /// x inset from the row's left edge to the leading gutter (or, when
+    /// `leading_gutter == 0`, to the label itself).
+    pub left_margin: i32,
+    /// x inset from the row's RIGHT edge to the trailing value's right
+    /// edge.
+    pub value_right_margin: i32,
+    /// x inset from the row's RIGHT edge to the caret's right edge. Must
+    /// be `<= value_right_margin`. When it is strictly less, the caret
+    /// occupies the gutter to the RIGHT of the value column, so gaining
+    /// focus never moves the value — see `fields.rs`'s module doc for
+    /// why that matters on the field list.
+    pub caret_right_margin: i32,
+    /// Reserved width (px) of the leading glyph gutter, applied to EVERY
+    /// row whether or not that row carries a glyph, so labels align
+    /// whether checked or not. `0` = no gutter.
+    pub leading_gutter: i32,
+    /// Padding above and below the single text line. Drives
+    /// [`row_height`].
+    pub vertical_padding: i32,
 }
 
-/// [`MenuItem`]'s owned counterpart to [`Trailing`] — a borrowed
-/// `Trailing<'a>` can't be stored on a long-lived `MenuItem`, so this owns
-/// whatever text a `Trailing::Label` needs and hands out a borrowed
-/// [`Trailing`] view via [`MenuItem::trailing`] at render time.
+impl RowStyle {
+    /// `MenuList`'s shipped metrics, reproduced exactly (legacy: the
+    /// original `TEXT_LEFT_MARGIN`/`CARET_RIGHT_MARGIN`/`ROW_PADDING`
+    /// values, pre-alignment-grid — see
+    /// `.planning/design/2026-09-02-field-list-widget-ruling.md` §7.2/7.3
+    /// for why the numbers stay put here while the false "matches a
+    /// detail view" rationale they used to carry does not). Do not
+    /// change these numbers as part of porting `MenuList` onto
+    /// [`draw_row`] — see [`MenuList`]'s module-level acceptance test.
+    pub const MENU: Self =
+        Self { left_margin: 8, value_right_margin: 6, caret_right_margin: 6, leading_gutter: 0, vertical_padding: 10 };
+    /// The field list: the alignment grid's 12/12
+    /// (`.planning/design/2026-09-01-home-alignment-grid.md`), a compact
+    /// row, and a caret that lives right of the value column so gaining
+    /// focus never moves the value.
+    pub const FIELD: Self =
+        Self { left_margin: 12, value_right_margin: 12, caret_right_margin: 4, leading_gutter: 0, vertical_padding: 6 };
+    /// [`Self::FIELD`] plus the pickers' current-choice check gutter.
+    pub const FIELD_GUTTERED: Self = Self { leading_gutter: CHECK_GUTTER_WIDTH, ..Self::FIELD };
+}
+
+/// Width (px) of the leading glyph gutter: an `icon_1x` glyph (~8px)
+/// plus a 4px gap before the label.
+pub(crate) const CHECK_GUTTER_WIDTH: i32 = 12;
+
+/// Compile-time enforcement of "the caret never moves the value"
+/// (field-list ruling §4.2/§5 test 5): `RowStyle::FIELD`'s caret must sit
+/// strictly right of the value column's right edge, in its own gutter, so
+/// gaining focus can never move the value. A `const` assertion catches a
+/// future edit to either margin immediately, at compile time, rather than
+/// only when the test suite happens to run.
+const _: () = assert!(RowStyle::FIELD.caret_right_margin < RowStyle::FIELD.value_right_margin);
+
+/// Gap (px) between a clipped label's right edge and the trailing value
+/// column's left edge — see [`draw_row`]'s label-clipping step.
+const LABEL_VALUE_GAP: i32 = 8;
+
+/// A row's right-aligned trailing value text — drawn REGARDLESS of
+/// `selected` (today's `Trailing::Label` semantics, unchanged and still
+/// the point: `menu.rs`'s original doc comment on that variant).
+pub(crate) struct RowValue<'a> {
+    pub text: &'a str,
+    pub color: Rgb565,
+    pub font: &'a FontRenderer,
+}
+
+/// A row's trailing content. A STRUCT, not an enum: the value and the
+/// caret are independent — `CODEC` must show `LDAC` unconditionally and
+/// grow a caret only while focused, which the old `Trailing` enum's
+/// Label-xor-Caret exclusivity could not express (see the field-list
+/// ruling §3.2/§7.4 for why that enum is retired rather than extended).
+pub(crate) struct RowTrailing<'a> {
+    pub value: Option<RowValue<'a>>,
+    /// Whether this row draws a disclosure caret WHILE SELECTED.
+    /// Unchanged `Trailing::Caret` semantics.
+    pub caret: bool,
+}
+
+/// [`MenuItem`]'s owned counterpart to [`RowTrailing`] — a borrowed
+/// `RowTrailing<'a>` can't be stored on a long-lived `MenuItem`, so this
+/// owns whatever text a labelled trailing needs and hands out a borrowed
+/// [`RowTrailing`] view via [`MenuItem::trailing`] at render time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedTrailing {
     Caret,
@@ -127,27 +193,24 @@ impl MenuItem {
         self
     }
 
-    fn trailing(&self) -> Trailing<'_> {
+    /// Lowers this row's owned trailing state into a borrowed
+    /// [`RowTrailing`] for [`draw_row`]. `value_font` is the caller's
+    /// single trailing-value font (every `MenuList` row shares one) —
+    /// borrowed rather than constructed here so the returned
+    /// `RowTrailing<'a>`'s lifetime ties to a `FontRenderer` that
+    /// outlives the [`draw_row`] call it feeds, not a temporary dropped
+    /// at the end of this method.
+    fn trailing<'a>(&'a self, value_font: &'a FontRenderer) -> RowTrailing<'a> {
         match &self.trailing {
-            OwnedTrailing::Caret => Trailing::Caret,
-            OwnedTrailing::Label(text, color) => Trailing::Label(text, *color),
-            OwnedTrailing::None => Trailing::None,
+            OwnedTrailing::Caret => RowTrailing { value: None, caret: true },
+            OwnedTrailing::Label(text, color) => {
+                RowTrailing { value: Some(RowValue { text, color: *color, font: value_font }), caret: false }
+            }
+            OwnedTrailing::None => RowTrailing { value: None, caret: false },
         }
     }
 }
 
-/// Left margin (px) from a row's left edge to its label text — matches
-/// a detail view's field-row left margin, so a menu row's text lines up
-/// with the detail view's own field-row text directly above it (the
-/// screen a menu is always pushed from).
-const TEXT_LEFT_MARGIN: i32 = 8;
-/// Right margin (px) reserved for the focused row's disclosure caret —
-/// matches `list.rs`'s `CARET_RIGHT_MARGIN`.
-const CARET_RIGHT_MARGIN: i32 = 6;
-/// Vertical padding (px) above/below a row's single centered text line.
-/// Deliberately its own constant, not `list::ROW_PADDING` (tuned for a
-/// two-line block) — see [`row_height`]'s doc comment.
-const ROW_PADDING: i32 = 10;
 /// Fallback line height (px): only used if a font's metrics are somehow
 /// unavailable.
 const FALLBACK_LINE_HEIGHT: i32 = 16;
@@ -163,43 +226,51 @@ fn line_height(font: &FontRenderer) -> i32 {
         .map_or(FALLBACK_LINE_HEIGHT, |bbox| bbox.size.height as i32)
 }
 
-/// Pixel height of one chip-less action row: `ROW_PADDING` above and below
-/// a single [`font::value`]-sized text line. Deliberately shorter than
-/// `list::ROW_HEIGHT` (`list.rs`'s two-line name+username+padding block) —
-/// per design review's explicit ask, this style is a one-line footprint,
-/// not `ROW_HEIGHT`.
+/// A single line's rendered pixel width in `font` — duplicated from
+/// `list.rs`'s private `text_width` for the same "small private helper,
+/// no other reason to depend on that module" rationale [`line_height`]
+/// already states.
+fn text_width(font: &FontRenderer, text: &str) -> i32 {
+    font.get_rendered_dimensions_aligned(text, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
+        .unwrap_or(None)
+        .map_or(0, |bbox| bbox.size.width as i32)
+}
+
+/// Pixel height of one chip-less action row: `style.vertical_padding`
+/// above and below a single line rendered in `font`. Style-and-font
+/// derived (not hardcoded to [`font::value`]) — see the field-list
+/// ruling §3.4/§7.6 for why the caller's own trailing/label font drives
+/// this rather than a font the caller may not even be using.
 #[must_use]
-pub(crate) fn row_height() -> u32 {
-    (ROW_PADDING * 2 + line_height(&font::value())) as u32
+pub(crate) fn row_height(style: &RowStyle, font: &FontRenderer) -> u32 {
+    (style.vertical_padding * 2 + line_height(font)) as u32
 }
 
 /// Draws one chip-less action row: the shared selection fill + left accent
 /// bar (via [`theme::draw_selection`]) when `selected`, else a plain
-/// bottom hairline divider; `label` (in `label_color`) vertically centered
-/// in `font` at the row's left margin; and, per `trailing`, either the
-/// shared right-edge disclosure
-/// caret (shown only while `selected`), a state label (shown regardless of
-/// `selected`), or nothing — the same visual vocabulary
-/// [`super::list::draw_row`] uses for its own selection/divider/caret,
-/// just without a chip or a second (sublabel) line. `font` is
-/// caller-supplied (not hardcoded to [`font::value`]) so [`MenuList`]'s
-/// plain action rows and another call site's bolder, more prominent
-/// single-line action row can share this one drawing routine without
-/// visually drifting apart on everything BUT weight — see the module doc.
+/// bottom hairline divider; an optional leading glyph in `style`'s gutter;
+/// `label` (in `label_color`) vertically centered in `label_font`,
+/// clipped before it would run under the trailing value column; and, per
+/// `trailing`, a right-aligned value (drawn regardless of `selected`)
+/// and/or the shared disclosure caret (drawn only while `selected`), per
+/// [`RowStyle::caret_right_margin`]'s placement rule.
 ///
 /// # Errors
 ///
 /// Returns `Infallible`'s uninhabited variant in practice — see
 /// [`super::widget::Widget::render`]'s doc comment for why the `Result`
 /// return exists at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_row<D>(
     target: &mut D,
     row_rect: Rectangle,
+    style: &RowStyle,
     label: &str,
     label_color: Rgb565,
-    font: &FontRenderer,
+    label_font: &FontRenderer,
+    leading: Option<char>,
+    trailing: &RowTrailing<'_>,
     selected: bool,
-    trailing: Trailing<'_>,
 ) -> Result<(), Infallible>
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
@@ -214,47 +285,76 @@ where
         divider.into_styled(PrimitiveStyle::with_fill(palette::DIVIDER)).draw(target)?;
     }
 
-    let text_x = row_rect.top_left.x + TEXT_LEFT_MARGIN;
-    let text_y = row_rect.top_left.y + row_rect.size.height as i32 / 2;
-    let _ = font.render_aligned(
+    let row_center_y = row_rect.top_left.y + row_rect.size.height as i32 / 2;
+    let gutter_x = row_rect.top_left.x + style.left_margin;
+    let label_x = gutter_x + style.leading_gutter;
+
+    // The leading glyph gutter is reserved whether or not THIS row
+    // carries a glyph -- see `RowStyle::leading_gutter`'s doc comment --
+    // so only the draw call, not the label's start x, is conditional on
+    // `leading`.
+    if style.leading_gutter > 0 {
+        if let Some(glyph) = leading {
+            let mut buf = [0_u8; 4];
+            let glyph_str: &str = glyph.encode_utf8(&mut buf);
+            let _ = font::icon_1x().render_aligned(
+                glyph_str,
+                Point::new(gutter_x, row_center_y),
+                VerticalPosition::Center,
+                HorizontalAlignment::Left,
+                FontColor::Transparent(label_color),
+                target,
+            );
+        }
+    }
+
+    let value_right_edge = row_rect.top_left.x + row_rect.size.width as i32 - style.value_right_margin;
+    let caret_right_edge = row_rect.top_left.x + row_rect.size.width as i32 - style.caret_right_margin;
+
+    // Measure the value first (§4.6 of the field-list ruling): the label
+    // is clipped -- not ellipsised, which would need a measure-per-prefix
+    // loop this render core has already retired one character-walking
+    // text hack for -- at the value column's left edge, so a long label
+    // never runs underneath a right-aligned value.
+    let label_clip_right = trailing.value.as_ref().map_or(
+        row_rect.top_left.x + row_rect.size.width as i32,
+        |value| value_right_edge - text_width(value.font, value.text) - LABEL_VALUE_GAP,
+    );
+    let label_clip_width = (label_clip_right - label_x).max(0) as u32;
+    let label_rect =
+        Rectangle::new(Point::new(label_x, row_rect.top_left.y), Size::new(label_clip_width, row_rect.size.height));
+    let mut label_target = target.clipped(&label_rect);
+    let _ = label_font.render_aligned(
         label,
-        Point::new(text_x, text_y),
+        Point::new(label_x, row_center_y),
         VerticalPosition::Center,
         HorizontalAlignment::Left,
         FontColor::Transparent(label_color),
-        target,
+        &mut label_target,
     );
 
-    match trailing {
-        Trailing::Caret if selected => {
-            let mut buf = [0_u8; 4];
-            let caret: &str = icon::CARET_RIGHT.encode_utf8(&mut buf);
-            let caret_x = row_rect.top_left.x + row_rect.size.width as i32 - CARET_RIGHT_MARGIN;
-            let caret_y = row_rect.top_left.y + row_rect.size.height as i32 / 2;
-            let _ = font::icon_1x().render_aligned(
-                caret,
-                Point::new(caret_x, caret_y),
-                VerticalPosition::Center,
-                HorizontalAlignment::Right,
-                FontColor::Transparent(palette::TEXT_PRIMARY),
-                target,
-            );
-        }
-        Trailing::Label(text, color) => {
-            let label_x = row_rect.top_left.x + row_rect.size.width as i32 - CARET_RIGHT_MARGIN;
-            let label_y = row_rect.top_left.y + row_rect.size.height as i32 / 2;
-            let _ = font::value().render_aligned(
-                text,
-                Point::new(label_x, label_y),
-                VerticalPosition::Center,
-                HorizontalAlignment::Right,
-                FontColor::Transparent(color),
-                target,
-            );
-        }
-        // `Trailing::Caret` while unselected, and `Trailing::None`
-        // unconditionally: nothing to draw.
-        Trailing::Caret | Trailing::None => {}
+    if let Some(value) = &trailing.value {
+        let _ = value.font.render_aligned(
+            value.text,
+            Point::new(value_right_edge, row_center_y),
+            VerticalPosition::Center,
+            HorizontalAlignment::Right,
+            FontColor::Transparent(value.color),
+            target,
+        );
+    }
+
+    if trailing.caret && selected {
+        let mut buf = [0_u8; 4];
+        let caret: &str = icon::CARET_RIGHT.encode_utf8(&mut buf);
+        let _ = font::icon_1x().render_aligned(
+            caret,
+            Point::new(caret_right_edge, row_center_y),
+            VerticalPosition::Center,
+            HorizontalAlignment::Right,
+            FontColor::Transparent(palette::TEXT_PRIMARY),
+            target,
+        );
     }
 
     Ok(())
@@ -268,13 +368,14 @@ where
 type OnActivateIndex = Box<dyn Fn(usize) -> Action>;
 
 /// A focusable, chip-less vertical menu of [`MenuItem`]s — the restyled
-/// field action menu style. No scrolling: every current caller has at
-/// most two rows, well within any content area this app renders into, so
+/// field action menu style, drawn via the shared [`draw_row`] primitive
+/// at [`RowStyle::MENU`]. No scrolling: every current caller has at most
+/// two rows, well within any content area this app renders into, so
 /// `list::reconcile_top_index`'s viewport-edge scrolling isn't needed
-/// here (unlike `VerticalList`, which does need it for arbitrarily long
-/// lists). A row beyond the
-/// viewport is simply not drawn, the same as a `VerticalList` row would be
-/// once clipped — see [`Widget::render`]'s early `break`.
+/// here (unlike `VerticalList`, or `super::fields::FieldList`, which do
+/// need it for arbitrarily long lists). A row beyond the viewport is
+/// simply not drawn, the same as a `VerticalList` row would be once
+/// clipped — see [`Widget::render`]'s early `break`.
 pub struct MenuList {
     items: Vec<MenuItem>,
     selected: usize,
@@ -371,7 +472,8 @@ impl Widget for MenuList {
 
     fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
-        let height = row_height();
+        let value_font = font::value();
+        let height = row_height(&RowStyle::MENU, &value_font);
 
         for (index, item) in self.items.iter().enumerate() {
             let row_top = area.top_left.y + (index as u32 * height) as i32;
@@ -380,7 +482,18 @@ impl Widget for MenuList {
             }
             let row_rect = Rectangle::new(Point::new(area.top_left.x, row_top), Size::new(area.size.width, height));
             let selected = self.focused && index == self.selected;
-            draw_row(&mut clipped, row_rect, &item.label, item.label_color, &font::value(), selected, item.trailing())?;
+            let trailing = item.trailing(&value_font);
+            draw_row(
+                &mut clipped,
+                row_rect,
+                &RowStyle::MENU,
+                &item.label,
+                item.label_color,
+                &value_font,
+                None,
+                &trailing,
+                selected,
+            )?;
         }
 
         Ok(())
@@ -445,8 +558,18 @@ mod tests {
     #[test]
     fn row_height_is_shorter_than_the_two_line_list_row_height() {
         assert!(
-            row_height() < crate::render::ROW_HEIGHT,
+            row_height(&RowStyle::MENU, &font::value()) < crate::render::ROW_HEIGHT,
             "a chip-less single-line row must be shorter than the two-line list row"
+        );
+    }
+
+    #[test]
+    fn field_row_is_shorter_than_the_menu_row() {
+        // Field-list ruling §5 test 2: FIELD's tighter vertical_padding
+        // must actually produce a shorter row than MENU's.
+        assert!(
+            row_height(&RowStyle::FIELD, &font::value()) < row_height(&RowStyle::MENU, &font::value()),
+            "RowStyle::FIELD must be shorter than RowStyle::MENU"
         );
     }
 
@@ -480,9 +603,9 @@ mod tests {
     #[test]
     fn a_trailing_label_is_drawn_even_when_the_row_is_not_selected() {
         let menu = MenuList::new(vec![MenuItem::new("Screen sleep").with_trailing_label("On", palette::STATUS_SUCCESS)]);
-        // Not focused, so nothing is selected -- a `Trailing::Caret` row
-        // would draw nothing on the right edge here; a `Trailing::Label`
-        // row must draw its state label regardless.
+        // Not focused, so nothing is selected -- a caret-only row would
+        // draw nothing on the right edge here; a labelled trailing row
+        // must draw its state label regardless.
         let mut fb = FrameBuffer565::new(200, 100);
         let area = Rectangle::new(Point::new(0, 0), Size::new(200, 100));
         menu.render(area, &test_ctx(), &mut fb).unwrap();
