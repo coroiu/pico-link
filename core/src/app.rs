@@ -463,6 +463,25 @@ pub enum Event {
     /// other), not the primary way fullness is discovered. Bead
     /// pico-link-4vb.4 (T4).
     PairedStoreFull,
+    /// One ~4Hz reading of the live A2DP output PCM level, per channel
+    /// (bead pico-link-du0, design section 21 E17/C8) -- computed cheaply
+    /// off the real-time encode path in `firmware/src/a2dp.c` (a running
+    /// peak/sum-of-squares accumulator updated per PCM block, reduced to
+    /// one reading roughly every `PL_A2DP_LEVEL_PUSH_INTERVAL_MS` and
+    /// pushed through the same `bt.c` MPSC ring every other Bluetooth-
+    /// domain event uses -- never a direct Rust call from IRQ context,
+    /// pico-link-6o2). `peak_l`/`peak_r`/`rms_l`/`rms_r` are linear 0-255
+    /// scale (255 == full-scale PCM, i.e. clipping). Folds into
+    /// [`BtModel::out_level`], which [`App::set_link_state`] clears
+    /// alongside `connected_codec`/`connected_addr` on any disconnect --
+    /// see that field's doc comment for the "absent, never frozen" rule
+    /// (design section 15) this whole event exists to satisfy.
+    LevelsChanged {
+        peak_l: u8,
+        peak_r: u8,
+        rms_l: u8,
+        rms_r: u8,
+    },
 }
 
 /// Phase 4's four named connect sub-steps (design section 9): naming the
@@ -583,6 +602,13 @@ pub enum WizardPhase {
 /// from) must never be confused with "not yet stamped".
 const PENDING_TIMESTAMP: Instant = Instant::from_micros(u64::MAX);
 
+/// How long a channel's OUT-meter peak-hold cap stays pinned at its
+/// highest recent reading before a lower peak is allowed to replace it
+/// (bead pico-link-du0, design section 21 E17's "peak-hold cap"). 1.5s is
+/// the conventional VU-meter hold time -- long enough to actually read a
+/// transient peak at a glance, short enough not to look stuck.
+const OUT_LEVEL_HOLD_DURATION: Duration = Duration::from_millis(1500);
+
 impl WizardPhase {
     /// Constructs a fresh `Scanning` phase with a not-yet-stamped
     /// `started` -- see [`PENDING_TIMESTAMP`]'s doc comment.
@@ -691,6 +717,45 @@ pub struct BtModel {
     /// `last_connect_failure`/`store_status`'s own precedent above. Bead
     /// pico-link-4vb.4 (T4).
     pub store_full: bool,
+    /// The most recent live [`Event::LevelsChanged`] reading, if any --
+    /// `None` whenever there is no PCM to measure (design section 15:
+    /// absent, never frozen or faked -- see [`OutLevelSample`]'s doc
+    /// comment for how staleness on top of a live value is handled, since
+    /// "no *new* reading has arrived" and "there is no PCM" are the same
+    /// observable fact from `core`'s side once C stops streaming).
+    /// Populated by [`App::on_levels_changed`], cleared by
+    /// [`App::set_link_state`] on the same lifecycle as `connected_codec`.
+    /// Bead pico-link-du0.
+    pub out_level: Option<OutLevelSample>,
+}
+
+/// One [`Event::LevelsChanged`] reading, timestamped and peak-held at the
+/// moment it folded into [`BtModel`] (bead pico-link-du0, design section
+/// 21 E17). `core` never derives "is the meter live" from a boolean flag
+/// C sends -- there isn't one -- but from comparing `received_at` against
+/// [`crate::render::hero::HeroStatusView`]'s own render-time clock
+/// (`RenderCtx::now`): once too much time has passed since the last
+/// reading, the meter stops drawing rather than showing a frozen last
+/// value (design section 15's rule, applied here for the same reason the
+/// hero word and bitrate line already apply it).
+///
+/// `hold_l`/`hold_r`/`hold_l_at`/`hold_r_at` implement the design's
+/// "peak-hold cap" (section 6, section 21 E17): the highest peak seen
+/// within the last hold window, decided once per incoming reading (not
+/// re-decayed every render frame, which would need a render-time mutation
+/// this `&self`-rendered widget tree has no way to make) -- see
+/// [`App::on_levels_changed`] for the hold-update rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutLevelSample {
+    pub peak_l: u8,
+    pub peak_r: u8,
+    pub rms_l: u8,
+    pub rms_r: u8,
+    pub hold_l: u8,
+    pub hold_r: u8,
+    hold_l_at: Instant,
+    hold_r_at: Instant,
+    pub received_at: Instant,
 }
 
 /// A Bluetooth device address, aliased for readability at call sites that
@@ -1233,6 +1298,7 @@ impl App {
             Event::PairedDeviceUpserted(device) => self.on_paired_device_upserted(device),
             Event::PairedDeviceForgotten { addr } => self.on_paired_device_forgotten(addr),
             Event::PairedStoreFull => self.on_paired_store_full(),
+            Event::LevelsChanged { peak_l, peak_r, rms_l, rms_r } => self.on_levels_changed(peak_l, peak_r, rms_l, rms_r),
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -1450,6 +1516,10 @@ impl App {
             // same lifecycle as `connected_codec`, for the same reason --
             // see `BtModel::connected_addr`'s doc comment.
             self.model.connected_addr = None;
+            // `out_level` (bead pico-link-du0) follows the exact same
+            // lifecycle for the exact same reason -- see
+            // `BtModel::out_level`'s doc comment.
+            self.model.out_level = None;
         }
         self.rebuild_root();
     }
@@ -1461,6 +1531,41 @@ impl App {
     /// data rather than deriving them from codec identity itself.
     pub fn set_connected_codec(&mut self, codec: ConnectedCodec) {
         self.model.connected_codec = Some(codec);
+        self.rebuild_root();
+    }
+
+    /// Folds one [`Event::LevelsChanged`] reading into
+    /// [`BtModel::out_level`] and refreshes the Home hero widget's meter
+    /// (bead pico-link-du0). Also updates the per-channel peak-hold cap:
+    /// a channel's hold value tracks the highest peak seen, and only
+    /// drops back down once [`OUT_LEVEL_HOLD_DURATION`] has passed since
+    /// it was last set to a new maximum -- the conventional VU-meter
+    /// "peak stays pinned briefly, then releases" behaviour, decided once
+    /// here (at fold time, using `self.now_us`) rather than re-computed
+    /// every render frame (see [`OutLevelSample`]'s doc comment for why
+    /// render-time decay isn't an option for a `&self`-rendered widget).
+    // `l`/`r` channel-suffixed bindings are the domain vocabulary this
+    // whole feature uses (matches `OutLevelSample`'s own field names) --
+    // clippy::similar_names' false positive on stereo L/R naming.
+    #[allow(clippy::similar_names)]
+    pub fn on_levels_changed(&mut self, peak_l: u8, peak_r: u8, rms_l: u8, rms_r: u8) {
+        let now = Instant::from_micros(self.now_us);
+        let (prev_hold_l, prev_hold_l_at, prev_hold_r, prev_hold_r_at) = match &self.model.out_level {
+            Some(sample) => (sample.hold_l, sample.hold_l_at, sample.hold_r, sample.hold_r_at),
+            None => (0, now, 0, now),
+        };
+        let (hold_l, hold_l_at) = if peak_l >= prev_hold_l || now.saturating_duration_since(prev_hold_l_at) >= OUT_LEVEL_HOLD_DURATION {
+            (peak_l, now)
+        } else {
+            (prev_hold_l, prev_hold_l_at)
+        };
+        let (hold_r, hold_r_at) = if peak_r >= prev_hold_r || now.saturating_duration_since(prev_hold_r_at) >= OUT_LEVEL_HOLD_DURATION {
+            (peak_r, now)
+        } else {
+            (prev_hold_r, prev_hold_r_at)
+        };
+        self.model.out_level =
+            Some(OutLevelSample { peak_l, peak_r, rms_l, rms_r, hold_l, hold_r, hold_l_at, hold_r_at, received_at: now });
         self.rebuild_root();
     }
 
@@ -1919,6 +2024,24 @@ mod tests {
             app.handle_input(vec![NavIntent::ShortcutY]); // Home status face -> Settings
             app
         }
+        /// Bead pico-link-du0: Home's status face, connected, with a live
+        /// OUT-meter reading. Deliberately `tick`s to a nonzero `now_us`
+        /// *before* the `LevelsChanged` event so `OutLevelSample::
+        /// received_at` isn't `Instant::from_micros(0)` -- otherwise this
+        /// case couldn't be told apart from "app never ticked at all",
+        /// and `dirty_gate_freshness_invariant_holds_for_every_screen`'s
+        /// own `app.tick(0)` at the top of the test would already be
+        /// t0 == received_at, not a meaningfully "just arrived" reading.
+        fn home_connected_with_out_level() -> App {
+            let mut app = App::new(240, 240);
+            let addr = [7; 6];
+            app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+            app.handle_event(upsert(addr, "Cans", 1));
+            app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+            app.tick(1);
+            app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
+            app
+        }
 
         vec![
             ("home, status face", home_status_face, Freshness::Static),
@@ -1941,6 +2064,18 @@ mod tests {
             ("forget confirm", forget_confirm, Freshness::Static),
             ("device detail", device_detail, Freshness::Static),
             ("settings", settings, Freshness::Static),
+            (
+                "home, status face, connected with live out level",
+                home_connected_with_out_level,
+                Freshness::Live {
+                    redraw_after: crate::render::hero::OUT_LEVEL_REFRESH_INTERVAL,
+                    // Past `OUT_LEVEL_STALE_AFTER` (600ms) so the meter
+                    // has gone from drawn to absent by t1 -- proving the
+                    // "absent, never frozen" rule (design section 15)
+                    // actually fires via `redraw_after` with no new event.
+                    assert_differs_after: Duration::from_millis(700),
+                },
+            ),
         ]
     }
 

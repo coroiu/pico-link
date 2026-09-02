@@ -133,6 +133,16 @@
 // A2DP media stream -- matches a2dp_source_demo.c's own AUDIO_TIMEOUT_MS.
 #define PL_A2DP_AUDIO_TIMEOUT_MS 10
 
+// Bead pico-link-du0, design section 21 E17/C8: how often the OUT-meter
+// peak/RMS accumulator below is reduced to one Event::LevelsChanged push.
+// ~4Hz, matching the design's own "capped at 4Hz" motion rule (section 6)
+// -- named here (not a magic literal) because `core`'s own render-side
+// staleness window (`OUT_LEVEL_STALE_AFTER`, `core/src/render/hero.rs`)
+// is derived from this exact cadence and must not silently drift from it.
+// Andreas's 2026-09-02 override on this bead: ship at this rate, do not
+// run a framerate sweep to tune it.
+#define PL_A2DP_LEVEL_PUSH_INTERVAL_MS 250
+
 // Bead pico-link-648: delay before the single bounded 0x0b retry. Measured
 // on hardware (bead comments, 2026-09-01): the stale ACL cleared itself
 // about 1s after the 0x0b failure. Rounded up for margin, still well
@@ -551,6 +561,112 @@ static uint8_t s_sdp_device_id_buf[100];
 // needing more would need this to grow, guarded below.
 static int16_t s_pcm_scratch[256 * 2];
 
+// Bead pico-link-du0 (design section 21 E17/C8): the OUT-meter accumulator.
+// Updated cheaply (integer only, no sqrt/float) inside pl_a2dp_fill's
+// per-unit loop, right where the PCM already sits in s_pcm_scratch for
+// encoding -- "sampled cheaply where the PCM already is", never a
+// separate read of its own. Reduced to one Event::LevelsChanged push
+// every PL_A2DP_LEVEL_PUSH_INTERVAL_MS by pl_a2dp_maybe_push_levels,
+// called once per pl_a2dp_fill call (IRQ context, media timer handler) --
+// this whole struct is therefore only ever touched from that one IRQ
+// context, no lock needed (same single-writer shape s_ctx itself has).
+typedef struct {
+    uint32_t peak_l; // running max abs sample this window (0..32768)
+    uint32_t peak_r;
+    uint64_t sum_sq_l; // running sum of squared samples this window, for RMS
+    uint64_t sum_sq_r;
+    uint32_t sample_count; // stereo frames accumulated this window
+    uint64_t last_push_us; // time_us_64() at the last push (0 == never pushed)
+} pl_a2dp_level_accum_t;
+
+static pl_a2dp_level_accum_t s_level_accum;
+
+// Folds `frame_count` stereo PCM frames (interleaved L/R int16, exactly
+// s_pcm_scratch's own layout) into s_level_accum. Integer-only: an abs
+// and a compare for peak, one 16x16->32-bit multiply-accumulate for the
+// RMS sum-of-squares -- negligible next to the encode call this sits
+// beside (dwell_max_us tracks THAT cost, not this one, deliberately kept
+// separate so this addition is visible if it ever isn't negligible).
+static inline void pl_a2dp_accumulate_levels(const int16_t *pcm, uint16_t frame_count) {
+    for (uint16_t i = 0; i < frame_count; i++) {
+        int32_t l = pcm[2 * i];
+        int32_t r = pcm[2 * i + 1];
+        uint32_t abs_l = (uint32_t)(l < 0 ? -l : l);
+        uint32_t abs_r = (uint32_t)(r < 0 ? -r : r);
+        if (abs_l > s_level_accum.peak_l) {
+            s_level_accum.peak_l = abs_l;
+        }
+        if (abs_r > s_level_accum.peak_r) {
+            s_level_accum.peak_r = abs_r;
+        }
+        s_level_accum.sum_sq_l += (uint64_t)((int64_t)l * (int64_t)l);
+        s_level_accum.sum_sq_r += (uint64_t)((int64_t)r * (int64_t)r);
+    }
+    s_level_accum.sample_count += frame_count;
+}
+
+// Integer square root (Newton's method, a handful of iterations) -- no
+// libm dependency for the once-per-push RMS reduction below. `value` is
+// at most a uint32_t's worth of mean-square (see the call site), so this
+// converges in well under 32 iterations; capped defensively anyway.
+static uint32_t pl_a2dp_isqrt(uint64_t value) {
+    if (value == 0) {
+        return 0;
+    }
+    uint64_t x = value;
+    uint64_t y = (x + 1) / 2;
+    for (int i = 0; i < 32 && y < x; i++) {
+        x = y;
+        y = (x + value / x) / 2;
+    }
+    return (uint32_t)x;
+}
+
+// Reduces s_level_accum to one Event::LevelsChanged push, if
+// PL_A2DP_LEVEL_PUSH_INTERVAL_MS has elapsed since the last one AND at
+// least one sample was accumulated this window (an empty window -- the
+// ring genuinely starved, design's "silent, not zero-but-live" case --
+// pushes nothing rather than a misleading all-zero reading; the Home
+// hero's own staleness window then correctly shows the meter as absent
+// once PL_A2DP_LEVEL_PUSH_INTERVAL_MS's worth of silence has passed. See
+// core/src/render/hero.rs's OUT_LEVEL_STALE_AFTER doc comment). Called
+// once per pl_a2dp_fill invocation, IRQ context.
+//
+// peak_l/peak_r/rms_l/rms_r are linear 0-255 (matching
+// PlLevelsChangedPayload's scale, 255 == full-scale/clipping): a 16-bit
+// PCM sample's magnitude tops out at 32768, so `>> 7` maps that range
+// onto 0-255 (32768 >> 7 == 256, clamped to 255 below for the exact
+// full-scale sample).
+static void pl_a2dp_maybe_push_levels(void) {
+    if (s_level_accum.sample_count == 0) {
+        return;
+    }
+    uint64_t now = time_us_64();
+    if (s_level_accum.last_push_us != 0 &&
+        now - s_level_accum.last_push_us < (uint64_t)PL_A2DP_LEVEL_PUSH_INTERVAL_MS * 1000) {
+        return;
+    }
+
+    uint32_t mean_sq_l = (uint32_t)(s_level_accum.sum_sq_l / s_level_accum.sample_count);
+    uint32_t mean_sq_r = (uint32_t)(s_level_accum.sum_sq_r / s_level_accum.sample_count);
+    uint32_t rms_l = pl_a2dp_isqrt(mean_sq_l);
+    uint32_t rms_r = pl_a2dp_isqrt(mean_sq_r);
+
+    uint8_t peak_l_u8 = (uint8_t)(s_level_accum.peak_l >> 7 > 255 ? 255 : s_level_accum.peak_l >> 7);
+    uint8_t peak_r_u8 = (uint8_t)(s_level_accum.peak_r >> 7 > 255 ? 255 : s_level_accum.peak_r >> 7);
+    uint8_t rms_l_u8 = (uint8_t)(rms_l >> 7 > 255 ? 255 : rms_l >> 7);
+    uint8_t rms_r_u8 = (uint8_t)(rms_r >> 7 > 255 ? 255 : rms_r >> 7);
+
+    pl_bt_push_levels_changed(peak_l_u8, peak_r_u8, rms_l_u8, rms_r_u8);
+
+    s_level_accum.peak_l = 0;
+    s_level_accum.peak_r = 0;
+    s_level_accum.sum_sq_l = 0;
+    s_level_accum.sum_sq_r = 0;
+    s_level_accum.sample_count = 0;
+    s_level_accum.last_push_us = now;
+}
+
 static void pl_a2dp_avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -828,6 +944,12 @@ static void pl_a2dp_fill(void) {
             break;
         }
 
+        // Bead pico-link-du0: fold this unit's PCM into the OUT-meter
+        // accumulator right where it's already sitting for encoding --
+        // before the encode call below, so this addition is never mixed
+        // into dwell_us/enc_max_us's own encode-cost accounting.
+        pl_a2dp_accumulate_levels(s_pcm_scratch, pcm_frame_count);
+
         uint64_t t0 = time_us_64();
         pl_codec_encode_result_t result = s_ctx.codec->encode(
             s_ctx.codec->state, s_pcm_scratch, &head->data[head->len], (uint16_t)(sizeof(head->data) - head->len)
@@ -883,6 +1005,12 @@ static void pl_a2dp_fill(void) {
     } else {
         s_ctx.silent_ticks = 0;
     }
+
+    // Bead pico-link-du0: reduce/push the OUT-meter accumulator, once per
+    // fill call regardless of how many units this tick encoded -- keeps
+    // the once-per-window isqrt/ring-push cost off the per-unit hot path
+    // above.
+    pl_a2dp_maybe_push_levels();
 }
 
 // Bead pico-link-85v (D1/D6): sends the slot at tx_tail as one AVDTP media

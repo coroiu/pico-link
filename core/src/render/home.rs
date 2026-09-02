@@ -83,7 +83,7 @@ use crate::input::NavIntent;
 
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
-use super::hero::{BitrateStatus, CodecStatus, HeroStatusView};
+use super::hero::{BitrateStatus, CodecStatus, HeroStatusView, OutLevelDisplay};
 use super::menu::{MenuItem, MenuList};
 use super::rail::ButtonLabel;
 use super::screen::Screen;
@@ -170,10 +170,29 @@ impl HomeView {
                 let device_name =
                     model.paired.iter().find(|d| d.addr == codec.addr).map(|d| d.name.clone()).unwrap_or_default();
                 let bitrate = BitrateStatus::Kbps(codec.nominal_bitrate_bps / 1000);
+                // Bead pico-link-du0 (design section 21 E17/C8): the
+                // stereo OUT level meter -- a straight field-for-field
+                // translation from `BtModel::out_level`'s own
+                // `OutLevelSample` into the hero widget's decoupled
+                // `OutLevelDisplay` vocabulary (see that type's doc
+                // comment for why the translation lives here). `None`
+                // when there's no live reading yet, which the hero widget
+                // already renders as "no meter" -- no extra Idle/absent
+                // branching needed on this side of the seam.
+                let out_level = model.out_level.map(|level| OutLevelDisplay {
+                    peak_l: level.peak_l,
+                    peak_r: level.peak_r,
+                    rms_l: level.rms_l,
+                    rms_r: level.rms_r,
+                    hold_l: level.hold_l,
+                    hold_r: level.hold_r,
+                    received_at: level.received_at,
+                });
                 HeroStatusView::new(
                     device_name,
                     CodecStatus::Connected { word: codec.word.clone(), fallback: None, bitrate },
                 )
+                .with_out_level(out_level)
             }
             None => HeroStatusView::new("", CodecStatus::NoLink),
         };

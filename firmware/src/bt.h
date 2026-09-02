@@ -110,6 +110,16 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
 // handler (a2dp.c), never from the media timer path.
 void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t name_len, uint32_t nominal_bitrate_bps);
 
+// Pushes Event::LevelsChanged{peak_l, peak_r, rms_l, rms_r} (bead
+// pico-link-du0, design section 21 E17/C8: the Home hero's stereo OUT
+// level meter). All four fields are linear 0-255 (255 == full-scale PCM /
+// clipping). Call only from a2dp.c's media timer handler (where the PCM
+// this reduces is already being read for encoding, design C8's "sampled
+// cheaply where the PCM already is") -- like every other producer on this
+// ring, this queues into it rather than calling into Rust directly, so
+// it's still safe to call from IRQ context (pico-link-6o2).
+void pl_bt_push_levels_changed(uint8_t peak_l, uint8_t peak_r, uint8_t rms_l, uint8_t rms_r);
+
 // Pushes Event::WizardAutoDismiss (no payload). Bead pico-link-4vb.2 (bug
 // 3): PL_EVENT_TAG_WIZARD_AUTO_DISMISS existed in the FFI with core-side
 // handling already wired (pops the wizard back to Home, but only on a

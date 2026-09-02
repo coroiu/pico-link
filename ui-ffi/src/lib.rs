@@ -1040,6 +1040,29 @@ pub struct PlCodecChangedPayload {
     pub nominal_bitrate_bps: u32,
 }
 
+/// [`PlEvent`]'s payload when `tag == PlEventTag::LevelsChanged`. Bead
+/// pico-link-du0, design section 21 E17/C8: one ~4Hz stereo OUT-meter
+/// reading, sampled cheaply off the real-time encode path in
+/// `firmware/src/a2dp.c` (a running peak/sum-of-squares accumulator,
+/// reduced once per push interval) and pushed through the same `bt.c`
+/// MPSC ring every other Bluetooth-domain event uses (`pl_bt_push_levels_
+/// changed`, `bt.c`) -- never a direct call into this crate from IRQ
+/// context (pico-link-6o2).
+///
+/// Every field is a plain `u8`, linear 0-255 (255 == full-scale PCM /
+/// clipping) -- no validity invariant to violate, so
+/// [`pl_ui_push_event`]'s `LevelsChanged` arm reads this union member
+/// unconditionally once `tag` says it's live, same as
+/// [`PlConnectRetryingPayload`]'s `attempt`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlLevelsChangedPayload {
+    pub peak_l: u8,
+    pub peak_r: u8,
+    pub rms_l: u8,
+    pub rms_r: u8,
+}
+
 /// Mirrors [`pico_link_core::StoreStatus`]'s four variants 1:1 (bead
 /// pico-link-cz0.6, M5 persistence). Explicit discriminants pinned for the
 /// same reason as [`PlLinkState`]'s -- see [`PlStoreLoadedPayload::status`]'s
@@ -1228,6 +1251,11 @@ pub enum PlEventTag {
     /// `PL_PERSIST_WRITE_STORE_FULL` result for this (bead pico-link-4vb.6's
     /// T1), but nothing in `bt.c` reads that result and pushes this tag yet.
     PairedStoreFull = 12,
+    /// Bead pico-link-du0, design section 21 E17/C8: one ~4Hz stereo
+    /// OUT-meter reading. Purely additive -- see [`PlLevelsChangedPayload`]'s
+    /// doc comment; [`PL_EVENT_ABI_VERSION`] is unchanged by this tag's
+    /// addition, same as [`Self::CodecChanged`]'s own addition was.
+    LevelsChanged = 13,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1251,6 +1279,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             10 => Ok(PlEventTag::PairedDeviceUpserted),
             11 => Ok(PlEventTag::PairedDeviceForgotten),
             12 => Ok(PlEventTag::PairedStoreFull),
+            13 => Ok(PlEventTag::LevelsChanged),
             _ => Err(()),
         }
     }
@@ -1283,6 +1312,8 @@ pub union PlEventPayload {
     // PlEventTag::PairedStoreFull has no payload of its own -- like
     // DevicesCleared/WizardAutoDismiss above, the union simply isn't read
     // for that tag, so no placeholder member is needed.
+    /// Bead pico-link-du0. See [`PlLevelsChangedPayload`]'s doc comment.
+    pub levels_changed: PlLevelsChangedPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -1502,6 +1533,20 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             Event::PairedDeviceForgotten { addr: payload.addr }
         }
         PlEventTag::PairedStoreFull => Event::PairedStoreFull,
+        PlEventTag::LevelsChanged => {
+            // SAFETY: `tag` says this union currently holds
+            // `levels_changed`. Reading it is sound regardless of field
+            // values -- every field is a plain `u8` with no validity
+            // invariant to violate (see `PlLevelsChangedPayload`'s doc
+            // comment).
+            let payload = unsafe { event.payload.levels_changed };
+            Event::LevelsChanged {
+                peak_l: payload.peak_l,
+                peak_r: payload.peak_r,
+                rms_l: payload.rms_l,
+                rms_r: payload.rms_r,
+            }
+        }
     };
     ui.app.handle_event(core_event);
 }
@@ -1945,11 +1990,10 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past PairedStoreFull = 12, the highest legal PlEventTag
-            // as of bead pico-link-4vb.6 (T2) -- moved from 10 (one past
-            // the old highest, StoreLoaded = 9) when this bead added tags
-            // 10-12.
-            tag: 13,
+            // One past LevelsChanged = 13, the highest legal PlEventTag as
+            // of bead pico-link-du0 -- moved from 13 (one past the old
+            // highest, PairedStoreFull = 12) when this bead added tag 13.
+            tag: 14,
             payload: bogus_payload,
         };
         unsafe {
@@ -2089,6 +2133,49 @@ mod tests {
             assert!(
                 (*ui).app.model().connected_codec.is_none(),
                 "disconnecting must clear the codec, never leave it stale (design section 15)"
+            );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_levels_changed_populates_out_level_and_clears_on_disconnect() {
+        // Bead pico-link-du0: a `LevelsChanged` event's four `u8` fields
+        // round-trip into `BtModel::out_level`, and a later non-`Connected`
+        // `LinkStateChanged` clears it back to `None` -- same lifecycle
+        // `pl_ui_push_event_codec_changed_populates_connected_codec` above
+        // already proves for `connected_codec` (see that test and
+        // `pico_link_core::App::set_link_state`'s doc comment for why).
+        let ui = new_ui();
+        let link_connected = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected as u32 } },
+        };
+        let levels_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LevelsChanged as u32,
+            payload: PlEventPayload { levels_changed: PlLevelsChangedPayload { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 } },
+        };
+        let link_idle = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, link_connected);
+            pl_ui_push_event(ui, levels_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+            let level = (*ui).app.model().out_level.expect("out_level should be populated");
+            assert_eq!(level.peak_l, 200);
+            assert_eq!(level.peak_r, 180);
+            assert_eq!(level.rms_l, 120);
+            assert_eq!(level.rms_r, 100);
+
+            pl_ui_push_event(ui, link_idle);
+            assert!(
+                (*ui).app.model().out_level.is_none(),
+                "disconnecting must clear the OUT level, never leave it stale (design section 15)"
             );
             pl_ui_destroy(ui);
         }
@@ -2314,11 +2401,14 @@ mod tests {
             PlEventTag::PairedDeviceUpserted,
             PlEventTag::PairedDeviceForgotten,
             PlEventTag::PairedStoreFull,
+            PlEventTag::LevelsChanged,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        assert!(PlEventTag::try_from(13u32).is_err());
+        // 14 -- one past LevelsChanged = 13, the highest legal PlEventTag
+        // as of bead pico-link-du0.
+        assert!(PlEventTag::try_from(14u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
