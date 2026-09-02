@@ -288,6 +288,20 @@ pub trait Widget {
     /// forbids. See `pico_link_core::app::MIN_REDRAW_DELAY`'s doc comment
     /// (pico-link-6wz). No production widget relies on this today; treat
     /// it as a guard, not a feature to depend on for a near-instant redraw.
+    ///
+    /// **A widget that wraps other widgets must forward this** -- see
+    /// `HomeView`, `DevicesListView` and `PairingWizardView` for the `min`-
+    /// over-children pattern (pico-link-vxc, D2 fix); the default `None`
+    /// here would otherwise silently swallow a child's time-driven request
+    /// under the FFI dirty gate (`pl_ui_dirty`), freezing the screen.
+    ///
+    /// **Not covered by this fold: the chrome/button rail** (pico-link-vxc,
+    /// D3, noted not fixed). `Screen::redraw_after` only folds over
+    /// `self.widgets`; chrome is rendered separately from the focused
+    /// widget's `chrome_contribution` and has no clock of its own today. If
+    /// the rail ever grows time-driven content (a blinking or timing-out
+    /// label), it will need its own hook into the gate -- do not assume
+    /// `Screen::redraw_after` already covers it.
     fn redraw_after(&self, _ctx: &RenderCtx) -> Option<core::time::Duration> {
         None
     }

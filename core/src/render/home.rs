@@ -328,6 +328,21 @@ impl Widget for HomeView {
             HomeFace::Menu => self.menu.render(area, ctx, target),
         }
     }
+
+    /// The `min` over `hero` and `menu`'s own answers (pico-link-vxc, D2) --
+    /// matching [`Screen::redraw_after`]'s fold over multiple widgets.
+    /// Without this override the default (`None`) would silently swallow
+    /// either child's time-driven request the moment one exists (neither
+    /// does today), freezing Home under the dirty gate. Folded over both
+    /// children regardless of which face is showing, same as `render`
+    /// only draws the active one but `chrome_contribution` only asks the
+    /// focused widget -- `redraw_after` intentionally does neither: a
+    /// hidden face isn't rendered so it can't go stale, but computing the
+    /// `min` unconditionally is simpler than face-gating it and costs
+    /// nothing since both children default to `None` today.
+    fn redraw_after(&self, ctx: &RenderCtx) -> Option<core::time::Duration> {
+        [self.hero.redraw_after(ctx), self.menu.redraw_after(ctx)].into_iter().flatten().min()
+    }
 }
 
 #[cfg(test)]

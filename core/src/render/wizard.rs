@@ -137,8 +137,10 @@ const ELAPSED_GAP: i32 = 12;
 /// Refresh cadence for phase 4's elapsed-time readout -- see
 /// [`PairingWizardView::redraw_after`]. Coarse on purpose: the readout
 /// itself only has one-second resolution, so anything finer would just be
-/// extra renders of pixels that didn't change.
-const ELAPSED_REDRAW_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
+/// extra renders of pixels that didn't change. `pub(crate)` so the
+/// pico-link-vxc freshness-invariant table test (`crate::app`'s test
+/// module) can assert against the real value instead of duplicating it.
+pub(crate) const ELAPSED_REDRAW_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
 
 /// Draws phase 4 (connecting): all four named sub-steps
 /// ([`ConnectStep::all`]'s fixed order), each colored by whether it's
@@ -464,12 +466,19 @@ impl Widget for PairingWizardView {
     /// has nothing time-driven to show, so this returns `None` -- see the
     /// frame-scoped clock ADR's "hacks to retire" section for why this
     /// stays scoped rather than becoming an unconditional per-tick redraw.
-    fn redraw_after(&self, _ctx: &RenderCtx) -> Option<core::time::Duration> {
-        if matches!(*self.phase.borrow(), WizardPhase::Connecting { .. }) {
+    ///
+    /// Folded with the wrapped `list`'s own answer (pico-link-vxc, D2),
+    /// `min`-of-children matching [`Screen::redraw_after`]'s fold over
+    /// multiple widgets -- `VerticalList` has no time-driven content
+    /// today, but the wrapper must not be the thing that silently drops a
+    /// future one under the dirty gate.
+    fn redraw_after(&self, ctx: &RenderCtx) -> Option<core::time::Duration> {
+        let own = if matches!(*self.phase.borrow(), WizardPhase::Connecting { .. }) {
             Some(ELAPSED_REDRAW_INTERVAL)
         } else {
             None
-        }
+        };
+        [own, self.list.borrow().redraw_after(ctx)].into_iter().flatten().min()
     }
 
     fn selected_index(&self) -> Option<usize> {
