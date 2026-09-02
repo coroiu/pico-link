@@ -46,8 +46,10 @@ use super::widget::{ChromeContribution, Widget};
 /// the title bar's `TITLE_SIDE_MARGIN` (`screen.rs`).
 const LEFT_MARGIN: i32 = 12;
 /// Right rule `R` (px, area-relative) — the device-name truncation budget
-/// and the bitrate slot's right edge both end here. Same design doc,
-/// section 3: symmetric with `LEFT_MARGIN` on the 206px content measure.
+/// ends here. Same design doc, section 3: symmetric with `LEFT_MARGIN` on
+/// the 206px content measure. The bitrate slot no longer anchors to this
+/// rule — see `BITRATE_SLOT_WIDTH`'s doc comment: Andreas overruled the
+/// right-aligned bitrate on 2026-09-02.
 const RIGHT_MARGIN: i32 = 12;
 /// Top padding (px) before the device-name line's first pixel — part of
 /// the uniform 12px frame (design doc section 4).
@@ -71,13 +73,17 @@ const HERO_SLOT_HEIGHT: i32 = 32;
 /// deliberately tight: hero + bitrate read as one unit (design doc
 /// section 4).
 const GAP_HERO_TO_BITRATE: i32 = 4;
-/// Width (px) of the bitrate's fixed, `BACKGROUND`-cleared slot — see the
-/// design's numeric rule ("every number is right-aligned into a fixed
-/// slot cleared to `BACKGROUND` first"), which exists so a digit-count
-/// change (e.g. "660 kbps" -> "90 kbps") never shifts other digits'
-/// positions or leaves stale ink behind. Unchanged; only the slot's x
-/// moves (now ends at `RIGHT_MARGIN` instead of a centered invisible
-/// slot).
+/// Width (px) of the bitrate's fixed, `BACKGROUND`-cleared slot. The
+/// original design rule right-aligned every number into a slot like this
+/// one specifically so a digit-count change (e.g. "660 kbps" -> "90 kbps")
+/// never shifted other digits' positions or left stale ink behind — see
+/// `.planning/design/2026-09-01-home-alignment-grid.md` section 3.1.
+/// **Superseded 2026-09-02**: Andreas ruled the bitrate line should be
+/// left-aligned instead ("Yes, put it left, it's not like it changes a
+/// lot."), so the slot now sits at `LEFT_MARGIN` and the anti-jitter
+/// clearing (still real — the slot is still `BACKGROUND`-cleared before
+/// each draw) is the only surviving reason for a fixed-width slot instead
+/// of measuring the text.
 const BITRATE_SLOT_WIDTH: u32 = 120;
 /// Height (px) of the persistent banner bar, when shown.
 const BANNER_HEIGHT: i32 = 20;
@@ -344,9 +350,11 @@ impl Widget for HeroStatusView {
             &mut clipped,
         );
 
-        // --- Bitrate line: fixed slot, cleared to BACKGROUND, right-
-        // aligned to `RIGHT_MARGIN` (design's numeric rule) — absent
-        // entirely for NoLink, never a faked/frozen number. ---
+        // --- Bitrate line: fixed slot, cleared to BACKGROUND, left-
+        // aligned to `LEFT_MARGIN` (Andreas's ruling, 2026-09-02, overrides
+        // the design doc's original right-aligned/anti-jitter rule — see
+        // .planning/design/2026-09-01-home-alignment-grid.md section 3) —
+        // absent entirely for NoLink, never a faked/frozen number. ---
         let value_font = font::value();
         let value_line_h = line_height(&value_font);
         let bitrate_y = hero_y + HERO_SLOT_HEIGHT + GAP_HERO_TO_BITRATE;
@@ -355,17 +363,16 @@ impl Widget for HeroStatusView {
                 BitrateStatus::Idle => String::from("idle"),
                 BitrateStatus::Kbps(kbps) => format!("{kbps} kbps"),
             };
-            let slot_right_x = area.top_left.x + area.size.width as i32 - RIGHT_MARGIN;
             let slot_rect = Rectangle::new(
-                Point::new(slot_right_x - BITRATE_SLOT_WIDTH as i32, bitrate_y),
+                Point::new(area.top_left.x + LEFT_MARGIN, bitrate_y),
                 Size::new(BITRATE_SLOT_WIDTH, value_line_h as u32),
             );
             slot_rect.into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND)).draw(&mut clipped)?;
             let _ = value_font.render_aligned(
                 bitrate_text.as_str(),
-                Point::new(slot_rect.top_left.x + slot_rect.size.width as i32, bitrate_y),
+                Point::new(slot_rect.top_left.x, bitrate_y),
                 VerticalPosition::Top,
-                HorizontalAlignment::Right,
+                HorizontalAlignment::Left,
                 FontColor::Transparent(palette::TEXT_PRIMARY),
                 &mut clipped,
             );

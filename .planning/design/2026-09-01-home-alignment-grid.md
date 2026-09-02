@@ -92,7 +92,7 @@ Content region is `x 0..205` (206 wide), `y 16..239` (224 tall) — 240 minus th
 | Title-bar right cluster (BT glyph, status dot) | panel right − 12 = **228** | right |
 | Device name | `L = 12` | left, max width `R − L = 182` |
 | **Hero codec word** | `L = 12` | **left** (was: centred) |
-| Bitrate | `R = 194` | right, inside the existing 120px cleared slot (now x 74..194) |
+| **Bitrate** | `L = 12` | **left**, inside the existing 120px cleared slot (now x 12..132) — **superseded 2026-09-02, see section 3.2** |
 | Banner bar | full content width | text inset to `L = 12` |
 | Stat strip | `L = 12` | left |
 | Fault-strip rows (`h62`) | tag at `L = 12`, value right at `R = 194` | |
@@ -125,6 +125,38 @@ This is the one judgement call in the document, so here is the whole argument.
 
 The right-aligned bitrate is then the *only* right-aligned element in the
 content area — and it earns it, because it is the only number.
+
+### 3.2 Superseded 2026-09-02: Andreas ruled the bitrate left, not right
+
+Andreas was walked through the right-alignment rationale above (anti-jitter:
+`Uma`'s grid right-aligns numeric values to `R = 194` so digits don't shift as
+the number's width changes). His ruling, verbatim:
+
+> "Yes, put it left, it's not like it changes a lot."
+
+That overrides section 3's bitrate row and 3.1 point 4. The bitrate now sits at
+`L = 12`, left-aligned, in the same fixed 120px `BACKGROUND`-cleared slot
+(now spanning content-x `12..132` instead of `74..194`) — the slot still gets
+cleared before every draw, so a digit-count change still can't leave stale
+ink behind, but the anti-jitter *positioning* argument (keeping the number's
+edge visually stationary) is explicitly given up: the number's left edge is
+now stationary and its right edge moves instead, which is the opposite
+tradeoff from what section 3.1 point 4 argued for. Andreas judged that
+tradeoff acceptable because the bitrate doesn't change often enough for the
+jitter to matter in practice.
+
+**Consequence for section 3's closing claim** ("the bitrate stays right-aligned
+... the only right-aligned element in the content area") — no longer true.
+As of this ruling there is no right-aligned element in Home's content area at
+all. Implemented in `core/src/render/hero.rs` (bead `pico-link-4e6`).
+
+**Open question this ruling raises, not yet settled:** section 8's fault-strip
+value column was specified to "right-align to `R = 194`, the same rule as the
+bitrate" — that rule's justification no longer exists once the bitrate itself
+is left-aligned. The fault strip is not yet implemented (`h62`), so nothing in
+shipped code is currently inconsistent, but whoever builds the fault strip
+should revisit section 8's value-column alignment against this ruling before
+copying the old rule forward unexamined.
 
 ---
 
@@ -249,6 +281,12 @@ Left rule `|` at x=12, right rule `|` at x=194.
 ```
 
 Every text run in both sketches begins at `L` or ends at `R`. Nothing floats.
+
+**Sketches not redrawn after section 3.2:** the bitrate line shown here
+right-aligned (`990 kbps`, `328 kbps`) is superseded — as of 2026-09-02 it is
+left-aligned at `L`, same as every other line in these sketches. The sketches
+are kept as originally drawn rather than re-rendered for one line; read
+section 3.2 as the correction.
 
 ---
 
