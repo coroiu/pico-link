@@ -98,6 +98,7 @@
 #include "codec_ldac.h"
 #include "codec_sbc.h"
 #include "codec_table.h"
+#include "hardware/sync.h" // __dmb() -- tx ring cross-core barriers, see s_ctx.tx doc comment
 #include "media_keys.h"
 #include "pcm_ring.h"
 #include "persist.h"
@@ -128,7 +129,18 @@
 // worst_case_encode_us -- see that handler for the loud WARNING if the
 // live derivation would exceed this compile-time count (pico-link-r44
 // lesson: a silent clamp is worse than a loud one).
-#define PL_A2DP_TX_QUEUE_SLOTS 5
+//
+// Bead pico-link-nli.3 (G2, `.planning/decisions/2026-09-03-ldac-encoder-on-
+// core1.md` sec 3.2): 5 -> 8. Raised to a POWER OF TWO so tx_count's
+// derived-count subtraction below can mask instead of modulo, and to add
+// headroom now that a filled slot may sit unsent across a cross-core
+// handoff rather than just across one tick.
+#define PL_A2DP_TX_QUEUE_SLOTS 8
+_Static_assert(
+    (PL_A2DP_TX_QUEUE_SLOTS & (PL_A2DP_TX_QUEUE_SLOTS - 1)) == 0,
+    "PL_A2DP_TX_QUEUE_SLOTS must be a power of two for the tx_head - tx_tail mask derivation"
+);
+#define PL_A2DP_TX_QUEUE_MASK (PL_A2DP_TX_QUEUE_SLOTS - 1u)
 
 // design sec 1: our own crystal, via btstack_run_loop timers, paces the
 // A2DP media stream -- matches a2dp_source_demo.c's own AUDIO_TIMEOUT_MS.
@@ -322,26 +334,40 @@ typedef struct {
 
     // Bead pico-link-85v (D1): the tx ring. Replaces sbc_storage/
     // sbc_storage_count/sbc_ready_to_send. tx_head is the slot currently
-    // being filled; tx_tail is the next slot to send; tx_count is the
-    // number of SEALED, unsent slots. send_requested mirrors whether we
-    // currently have an outstanding request_can_send_now with BTstack.
+    // being filled/sealed (producer side); tx_tail is the next slot to
+    // send (consumer side). send_requested mirrors whether we currently
+    // have an outstanding request_can_send_now with BTstack.
     //
-    // CONCURRENCY: none. The media timer handler (producer, fills/seals)
-    // and the A2DP packet handler's CAN_SEND_MEDIA_PACKET_NOW case
-    // (consumer, sends) both run in the BTstack run loop on the same 0xFF
-    // background IRQ context, and BTstack does not re-enter its own run
-    // loop -- see this file's module doc for the IRQ-context contract.
-    // tx_head/tx_tail/tx_count are therefore PLAIN, NON-VOLATILE fields,
-    // not cross-context shared state like pcm_ring.h's ring (which IS
-    // genuinely producer/consumer across contexts and needs its
-    // discipline). Do NOT add atomics, memory barriers, or volatile here
-    // -- the visual similarity to pcm_ring invites "hardening" that would
-    // be pure cost with no correctness benefit, because there is no second
-    // context to race against.
+    // CONCURRENCY, REWRITTEN for bead pico-link-nli.3 (G2). This used to
+    // say "none", correctly, because both the fill/seal side and the send
+    // side ran in the same 0xFF background IRQ context on one core and an
+    // IRQ-nesting argument covered it. As of the `pico-link-nli` epic
+    // (`.planning/decisions/2026-09-03-ldac-encoder-on-core1.md` sec 3.2)
+    // that stops being true: G3 moves the fill/seal side to core1 thread
+    // context while the send side stays core0 0xFF. Two cores execute
+    // simultaneously, so an IRQ-nesting argument protects nothing here --
+    // a stale "no second context" comment sitting above genuinely
+    // concurrent code is worse than no comment. This bead (G2) makes the
+    // ring ready for that split WHILE STILL SINGLE-CORE, so any regression
+    // it causes is attributable to the ring change alone:
+    //
+    // - tx_head/tx_tail are `volatile uint32_t`. Each side writes only its
+    //   own index (producer writes tx_head, consumer writes tx_tail),
+    //   same discipline pcm_ring.h already has.
+    // - There is no stored tx_count. It was a read-modify-write touched by
+    //   BOTH sides (incremented at seal, decremented at send) -- exactly
+    //   the shape that is a lost update once the two sides are on
+    //   different cores. The count is DERIVED as
+    //   `(tx_head - tx_tail) & PL_A2DP_TX_QUEUE_MASK` by pl_a2dp_tx_count()
+    //   below. PL_A2DP_TX_QUEUE_SLOTS is a power of two (8) precisely so
+    //   this mask is exact without a modulo.
+    // - `__dmb()` brackets each side's publish: the producer orders its
+    //   slot writes before publishing tx_head; the consumer orders its
+    //   read of tx_head before it reads that slot's data. See
+    //   pl_a2dp_seal_head() and pl_a2dp_send_media_packet() below.
     pl_a2dp_slot_t tx[PL_A2DP_TX_QUEUE_SLOTS];
-    uint8_t tx_head;
-    uint8_t tx_tail;
-    uint8_t tx_count;
+    volatile uint32_t tx_head;
+    volatile uint32_t tx_tail;
     bool send_requested;
 
     uint32_t silent_ticks;
@@ -478,10 +504,13 @@ typedef struct {
     volatile uint32_t stop_dwell;
     // Bead pico-link-85v (D7): the new ceiling tripwire, inheriting
     // stop_packet_full_hot's job. Incremented when the fill loop cannot
-    // seal because every slot is full (tx_count == PL_A2DP_TX_QUEUE_SLOTS)
-    // -- the only remaining loop-stop condition besides dwell/credit/
-    // ring-empty. Predicted 0 for SBC (acceptance item 1); nonzero means
-    // the SEND side, not fill, is the limiter -- read grants/s.
+    // seal because every slot is full (pl_a2dp_tx_count() >=
+    // PL_A2DP_TX_QUEUE_SLOTS - 1 -- see pl_a2dp_tx_count()'s doc comment
+    // for why the usable ceiling is SLOTS-1, not SLOTS, as of bead
+    // pico-link-nli.3) -- the only remaining loop-stop condition besides
+    // dwell/credit/ring-empty. Predicted 0 for SBC (acceptance item 1);
+    // nonzero means the SEND side, not fill, is the limiter -- read
+    // grants/s.
     volatile uint32_t stop_queue_full;
 
     // Bead pico-link-85v (D7): payloads_sealed's rate vs pkt_sent's rate is
@@ -490,10 +519,12 @@ typedef struct {
     // (a full slot handed off to the tx ring), replacing stop_packet_full's
     // old (and, post-D1, incorrect) role of standing in for this event.
     volatile uint32_t payloads_sealed;
-    // High-water of tx_count, reset at STREAM_STARTED (pico-link-r44
-    // lesson: a high-water mark that never resets poisons later
-    // derivations). tx_depth_max == PL_A2DP_TX_QUEUE_SLOTS - 1 means D2's
-    // depth is marginal.
+    // High-water of pl_a2dp_tx_count(), reset at STREAM_STARTED
+    // (pico-link-r44 lesson: a high-water mark that never resets poisons
+    // later derivations). tx_depth_max == PL_A2DP_TX_QUEUE_SLOTS - 1
+    // means D2's depth is AT the usable ceiling (see pl_a2dp_tx_count()),
+    // i.e. maximally marginal, not merely close to it as it was when
+    // tx_count was a true stored counter that could reach SLOTS itself.
     volatile uint32_t tx_depth_max;
     // CAN_SEND_MEDIA_PACKET_NOW events. grants/s vs pkt_sent/s separates
     // "grants are slow" (ACL-credit-bound, expected) from "we did not ask"
@@ -803,6 +834,40 @@ static inline uint32_t pl_a2dp_usable_payload(int max_media_payload_size, uint8_
     return max_media_payload_size > (int)header_bytes ? (uint32_t)(max_media_payload_size - (int)header_bytes) : 0u;
 }
 
+// Bead pico-link-nli.3 (G2): the tx ring's depth, DERIVED rather than
+// stored. The old stored `tx_count` was a read-modify-write touched by
+// both the seal side (++) and the send side (--); that is a lost update
+// the instant the two sides are on different cores (`pico-link-nli`
+// epic, G3). tx_head/tx_tail are each written by only one side, so
+// `(tx_head - tx_tail) & PL_A2DP_TX_QUEUE_MASK` needs no lock -- but the
+// mask means this ring uses the SAME one-slot-reserved discipline
+// pcm_ring.h's "capacity-1 usable" comment documents, and for the same
+// reason: with tx_head/tx_tail each reduced mod PL_A2DP_TX_QUEUE_SLOTS
+// (as they always have been, just via `%` before this bead and via `&`
+// now), a masked subtraction cannot tell "0 sealed" from "SLOTS sealed"
+// apart -- both give tx_head == tx_tail. Reserving one slot -- i.e.
+// treating PL_A2DP_TX_QUEUE_SLOTS - 1 (7 of 8) as the real usable depth
+// and never letting a caller seal past it -- removes the ambiguity: the
+// count can now only ever read [0, SLOTS-1], so SLOTS-1 unambiguously
+// means "at capacity" and is never confused with "empty" (0). This is
+// WHY every full-check below now compares against
+// `PL_A2DP_TX_QUEUE_SLOTS - 1`, not `PL_A2DP_TX_QUEUE_SLOTS` as the old
+// stored counter's checks did -- that counter could legitimately reach
+// SLOTS itself (all slots holding sealed data) because it was a true
+// count, not a masked index distance. The new usable ceiling (7) is
+// still strictly more headroom than the old hard ceiling (5), so this is
+// not a capacity regression.
+//
+// Wraparound: unsigned subtraction of two uint32_t is defined to wrap
+// modulo 2^32, so `tx_head - tx_tail` yields the true forward distance
+// even across a 2^32 rollover (not reachable in any uptime that
+// matters, but the arithmetic needs no special case for it), and the
+// subsequent `& PL_A2DP_TX_QUEUE_MASK` reduces that distance into
+// [0, SLOTS) exactly as it does for any non-wrapped difference.
+static inline uint32_t pl_a2dp_tx_count(void) {
+    return (s_ctx.tx_head - s_ctx.tx_tail) & PL_A2DP_TX_QUEUE_MASK;
+}
+
 // Bead pico-link-85v (D6): resets the tx ring to empty -- called at every
 // point that already calls pl_pcm_reset() (STREAM_ESTABLISHED/SUSPENDED/
 // RELEASED) plus SIGNALING_CONNECTION_RELEASED, which flushed nothing
@@ -816,16 +881,26 @@ static inline uint32_t pl_a2dp_usable_payload(int max_media_payload_size, uint8_
 // the fixed-size capacity-full seal (SBC, unchanged behaviour) and the
 // codec-reported payload_complete seal (LDAC, self-packetising). Both
 // mean the same thing operationally: hand the head slot to the tx ring and
-// arm a send. Caller is responsible for the tx_count < PL_A2DP_TX_QUEUE_SLOTS
-// guard (stop_queue_full) BEFORE calling -- this function does not check it.
+// arm a send. Caller is responsible for the
+// `pl_a2dp_tx_count() < PL_A2DP_TX_QUEUE_SLOTS - 1` guard (stop_queue_full)
+// BEFORE calling -- this function does not check it.
+//
+// Bead pico-link-nli.3 (G2): this is the tx ring's PRODUCER side, and as
+// of the `pico-link-nli` epic (G3) it is the side that moves to core1.
+// The `__dmb()` below is publish-after-write: it orders every store into
+// *head (the RTP timestamp, and -- already done by the caller -- the
+// slot's encoded payload bytes) BEFORE the tx_head update that hands the
+// slot to core0's send side. Without it a core0 consumer could observe
+// the new tx_head and read a still-in-flight/torn slot.
 static void pl_a2dp_seal_head(void) {
     pl_a2dp_slot_t *head = &s_ctx.tx[s_ctx.tx_head];
     head->rtp_ts = s_ctx.rtp_next;
     s_ctx.rtp_next += (uint32_t)head->frames * s_ctx.frame.pcm_frames_per_encoded_frame;
-    s_ctx.tx_head = (uint8_t)((s_ctx.tx_head + 1) % PL_A2DP_TX_QUEUE_SLOTS);
-    s_ctx.tx_count++;
-    if (s_ctx.tx_count > s_ctx.tx_depth_max) {
-        s_ctx.tx_depth_max = s_ctx.tx_count;
+    __dmb(); // publish-after-write: slot contents visible before tx_head advances
+    s_ctx.tx_head = (s_ctx.tx_head + 1u) & PL_A2DP_TX_QUEUE_MASK;
+    uint32_t depth = pl_a2dp_tx_count();
+    if (depth > s_ctx.tx_depth_max) {
+        s_ctx.tx_depth_max = depth;
     }
     s_ctx.payloads_sealed++;
     if (!s_ctx.send_requested) {
@@ -834,6 +909,12 @@ static void pl_a2dp_seal_head(void) {
     }
 }
 
+// Bead pico-link-nli.3 (G2): still core0-only today, and per the
+// `pico-link-nli` epic design (sec 4.2) it stays that way after G3 too --
+// every call site (STREAM_ESTABLISHED/SUSPENDED/RELEASED,
+// SIGNALING_CONNECTION_RELEASED) runs on core0 while core1 is quiesced by
+// the state-machine handshake, so this never races the producer side. No
+// barrier needed here for that reason; do not add one speculatively.
 static void pl_a2dp_tx_flush(void) {
     for (uint8_t i = 0; i < PL_A2DP_TX_QUEUE_SLOTS; i++) {
         s_ctx.tx[i].len = 0;
@@ -841,7 +922,6 @@ static void pl_a2dp_tx_flush(void) {
     }
     s_ctx.tx_head = 0;
     s_ctx.tx_tail = 0;
-    s_ctx.tx_count = 0;
     s_ctx.send_requested = false;
 }
 
@@ -940,11 +1020,12 @@ static void pl_a2dp_fill(void) {
         // 1b. Queue-full, checked BEFORE touching the head slot.
         //
         // This looks redundant with the queue-full check inside the
-        // payload-full branch below, and today it IS: when tx_count ==
-        // SLOTS the head slot aliases tx_tail's sealed-unsent payload,
-        // but every seal happens BECAUSE the slot could not take another
-        // frame, so that stale head always re-trips payload-full and
-        // breaks there before anything is written into it.
+        // payload-full branch below, and today it IS: when the queue is
+        // at its usable ceiling the head slot aliases tx_tail's
+        // sealed-unsent payload, but every seal happens BECAUSE the slot
+        // could not take another frame, so that stale head always
+        // re-trips payload-full and breaks there before anything is
+        // written into it.
         //
         // That safety is EMERGENT, not structural -- it rests on the
         // invariant "every sealed slot is full". pico-link-cz0.5.6 breaks
@@ -956,7 +1037,12 @@ static void pl_a2dp_fill(void) {
         //
         // So make the invariant explicit here rather than leaving the
         // next codec row to discover it as an audio-corruption bug.
-        if (s_ctx.tx_count >= PL_A2DP_TX_QUEUE_SLOTS) {
+        //
+        // Bead pico-link-nli.3 (G2): the comparison is `SLOTS - 1`, not
+        // `SLOTS` -- see pl_a2dp_tx_count()'s doc comment for why a
+        // derived, masked count needs a reserved slot to disambiguate
+        // full from empty.
+        if (pl_a2dp_tx_count() >= PL_A2DP_TX_QUEUE_SLOTS - 1u) {
             s_ctx.stop_queue_full++;
             break;
         }
@@ -989,7 +1075,7 @@ static void pl_a2dp_fill(void) {
         // (codec_table.h's own encoded_frame_bytes==0 convention, S1's
         // design), not a codec-identity branch -- see codec_table.h:4-11.
         if (frame_bytes > 0 && data_bytes_so_far + frame_bytes > usable_payload) {
-            if (s_ctx.tx_count >= PL_A2DP_TX_QUEUE_SLOTS) {
+            if (pl_a2dp_tx_count() >= PL_A2DP_TX_QUEUE_SLOTS - 1u) {
                 s_ctx.stop_queue_full++;
                 break;
             }
@@ -1058,7 +1144,7 @@ static void pl_a2dp_fill(void) {
         // behaviour change to it). The tx_count guard mirrors the
         // fixed-size seal's own stop_queue_full check above.
         if (result.payload_complete) {
-            if (s_ctx.tx_count >= PL_A2DP_TX_QUEUE_SLOTS) {
+            if (pl_a2dp_tx_count() >= PL_A2DP_TX_QUEUE_SLOTS - 1u) {
                 s_ctx.stop_queue_full++;
                 break;
             }
@@ -1104,14 +1190,33 @@ static void pl_a2dp_fill(void) {
 // BTstack. The tx_count==0 guard below is the fix: previously this
 // function checked neither state nor storage count and sent an
 // unsolicited 1-byte payload with num_frames=0.
+//
+// Bead pico-link-nli.3 (G2): this is the tx ring's CONSUMER side, and
+// stays on core0 (0xFF, this file's IRQ-context contract) even after the
+// `pico-link-nli` epic moves the producer (pl_a2dp_seal_head) to core1.
+// Two `__dmb()`s bracket the cross-core-sensitive part:
+// - read-after-acquire, AFTER the tx_count()==0 check and BEFORE touching
+//   `slot`: orders the read of tx_head/tx_tail (via pl_a2dp_tx_count()
+//   above) before the reads of slot->frames/rtp_ts/data/len, mirroring
+//   pl_a2dp_seal_head()'s publish-after-write on the other side --
+//   without it this core could observe a just-sealed tx_head and still
+//   read stale/torn slot bytes. It must sit after the tx_count() load
+//   (an early return has nothing to order) and before the slot reads
+//   (the actual dependency it protects), not before the tx_count() load
+//   itself.
+// - publish-after-read, before advancing tx_tail: orders every read of
+//   `slot` above it before the tx_tail update that tells core1 the slot
+//   is free to reuse. Without it core1 could start overwriting the slot
+//   while this function is still mid-read of it.
 static void pl_a2dp_send_media_packet(void) {
     s_ctx.grants++;
 
-    if (s_ctx.tx_count == 0) {
+    if (pl_a2dp_tx_count() == 0) {
         s_ctx.spurious_grants++;
         s_ctx.send_requested = false;
         return;
     }
+    __dmb(); // read-after-acquire: order the tx_count() read above before the slot reads that follow
 
     pl_a2dp_slot_t *slot = &s_ctx.tx[s_ctx.tx_tail];
     // Bead pico-link-cz0.5.6: byte 0 is the num_frames header content for
@@ -1135,10 +1240,10 @@ static void pl_a2dp_send_media_packet(void) {
     // is this slot's "fresh" sentinel for pl_a2dp_fill's next use of it.
     slot->len = 0;
     slot->frames = 0;
-    s_ctx.tx_tail = (uint8_t)((s_ctx.tx_tail + 1) % PL_A2DP_TX_QUEUE_SLOTS);
-    s_ctx.tx_count--;
+    __dmb(); // publish-after-read: slot reads above complete before tx_tail frees the slot for core1 to reuse
+    s_ctx.tx_tail = (s_ctx.tx_tail + 1u) & PL_A2DP_TX_QUEUE_MASK;
 
-    if (s_ctx.tx_count > 0) {
+    if (pl_a2dp_tx_count() > 0) {
         a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
     } else {
         s_ctx.send_requested = false;
@@ -1878,11 +1983,20 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 uint32_t denom = s_ctx.frame.worst_case_encode_us * s_ctx.frames_per_packet;
                 uint32_t b_tick = (PL_A2DP_MAX_ENCODE_DWELL_US + denom - 1) / denom; // ceil
                 uint32_t required_slots = 1u + 2u * b_tick;
-                if (required_slots > PL_A2DP_TX_QUEUE_SLOTS) {
+                // Bead pico-link-nli.3 (G2): the usable ceiling is
+                // SLOTS - 1, not SLOTS -- one slot is permanently
+                // reserved so pl_a2dp_tx_count()'s masked head-tail
+                // derivation can disambiguate empty from full (see
+                // pcm_ring.c's byte-ring discipline, applied here to
+                // the slot ring). Comparing against the raw SLOTS
+                // count would silently pass a queue that is actually
+                // one slot too small.
+                if (required_slots > PL_A2DP_TX_QUEUE_SLOTS - 1u) {
                     pl_log(
-                        "a2dp: WARNING tx queue depth %u required but only %u compiled in "
+                        "a2dp: WARNING tx queue depth %u required but only %u usable of %u compiled in "
                         "(b_tick=%lu frames_per_packet=%lu worst_case_encode_us=%lu)\r\n",
-                        (unsigned)required_slots, (unsigned)PL_A2DP_TX_QUEUE_SLOTS, (unsigned long)b_tick,
+                        (unsigned)required_slots, (unsigned)(PL_A2DP_TX_QUEUE_SLOTS - 1u),
+                        (unsigned)PL_A2DP_TX_QUEUE_SLOTS, (unsigned long)b_tick,
                         (unsigned long)s_ctx.frames_per_packet, (unsigned long)s_ctx.frame.worst_case_encode_us
                     );
                 }
