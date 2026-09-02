@@ -11,6 +11,7 @@
 #include "tusb.h"
 
 #include "bt.h"
+#include "media_keys.h"
 #include "usb_pump.h"
 
 // Longest valid line is "NAV SHORTCUT" territory -- "NAV SELECT\n" (11
@@ -195,6 +196,20 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                     // No address needed (there is only ever one connection).
                     pl_log("debug-remote: DISCONNECT -> dispatched\r\n");
                     pl_bt_debug_disconnect();
+                } else if (strcmp(s_line, "MEDIA PLAYPAUSE") == 0) {
+                    // Bead pico-link-47z.2 (T2): exercises the USB HID half
+                    // of media keys with NO Bluetooth/AVRCP involved -- see
+                    // media_keys.h's module doc. Mirrors CONNECT/DISCONNECT
+                    // above: dispatched directly, not a NavIntent, so it
+                    // bypasses out/pl_ui_input entirely.
+                    pl_log("debug-remote: MEDIA PLAYPAUSE -> dispatched\r\n");
+                    pl_media_keys_push_tap(PL_MEDIA_KEY_USAGE_PLAY_PAUSE);
+                } else if (strcmp(s_line, "MEDIA NEXT") == 0) {
+                    pl_log("debug-remote: MEDIA NEXT -> dispatched\r\n");
+                    pl_media_keys_push_tap(PL_MEDIA_KEY_USAGE_SCAN_NEXT);
+                } else if (strcmp(s_line, "MEDIA PREV") == 0) {
+                    pl_log("debug-remote: MEDIA PREV -> dispatched\r\n");
+                    pl_media_keys_push_tap(PL_MEDIA_KEY_USAGE_SCAN_PREV);
                 } else if (emitted < max) {
                     PlIntent intent;
                     if (parse_line(s_line, &intent)) {

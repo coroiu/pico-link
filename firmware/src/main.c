@@ -45,6 +45,7 @@
 #include "debug_remote.h"
 #endif
 #include "input.h"
+#include "media_keys.h"
 #include "ldac_bench.h"
 #include "panic_recorder.h"
 #include "persist.h"
@@ -356,6 +357,13 @@ int main(void) {
     pl_link_input_init();
     pl_log("pl_link_input_init OK\r\n");
 
+    // T2 of the media-keys epic (pico-link-47z.2) -- the USB HID
+    // consumer-control ring/drain/safety-timeout. No AVRCP wiring yet
+    // (T3, pico-link-47z.3): the only producer today is debug_remote.c's
+    // "MEDIA ..." console commands. See media_keys.h's module doc.
+    pl_media_keys_init();
+    pl_log("pl_media_keys_init OK\r\n");
+
     // --- M2: bring the radio up ---
     //
     // cyw43_arch_init() claims the SPI/PIO/DMA resources the bead's banked
@@ -503,6 +511,12 @@ int main(void) {
         // Bead pico-link-p1r.
         pl_loop_prof_record(PL_LOOP_PHASE_DEBUG_REMOTE, time_us_64() - debug_remote_start_us);
 #endif
+        // T2 of the media-keys epic (pico-link-47z.2): drains
+        // media_keys.c's own ring and runs its 600ms safety-release
+        // check. NOT gated behind PL_DEBUG_REMOTE -- T3's AVRCP handler
+        // will push into the same ring unconditionally, so the drain must
+        // always run regardless of whether the debug console is built in.
+        pl_media_keys_drain(frame_start_us);
 #ifndef PL_DIAG_SKIP_BT
         // Drains events the BTstack packet handler queued from IRQ context
         // (pico-link-6o2) and makes the real pl_ui_push_event calls here, in

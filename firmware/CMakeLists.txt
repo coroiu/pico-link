@@ -218,6 +218,11 @@ add_executable(pico_link
     src/usb_reset.c
     src/watchdog_sup.c
     src/persist.c
+    # Bead pico-link-47z.2 (media keys T2): the HID consumer-control
+    # ring/drain/safety-timeout. Compiled unconditionally (unlike
+    # debug_remote.c below) because T3's AVRCP handler is a second producer
+    # into this module's ring, independent of PL_DEBUG_REMOTE.
+    src/media_keys.c
     # Bead pico-link-cz0.5.4 (LDAC L0): temporary on-target benchmark, see
     # ldac_bench.h's module doc. Always compiled in (like codec_sbc.c);
     # pl_ldac_bench_run() is only ever CALLED under PL_DIAG_LDAC_BENCH
