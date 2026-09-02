@@ -17,7 +17,13 @@
 //! - [`list`]: [`VerticalList`], the primary scrolling content widget.
 //! - [`menu`][]: [`MenuList`]/[`MenuItem`] — the chip-less, single-line
 //!   action-row style used by action menus and other single-line rows,
-//!   kept deliberately separate from `list`'s two-line row style.
+//!   kept deliberately separate from `list`'s two-line row style. Also
+//!   owns the shared row-drawing primitive (`menu::draw_row`) [`fields`]
+//!   reuses.
+//! - [`fields`]: [`FieldList`]/[`FieldRow`] — a scrolling label/value
+//!   sheet whose rows are mostly inert (the device page, codec/quality
+//!   pickers), drawn via `menu`'s shared row primitive. See
+//!   `.planning/design/2026-09-02-field-list-widget-ruling.md`.
 //! - [`message`]: [`MessageView`] — the shared "nothing to show here"
 //!   widget (icon + headline + subline), reusable by any placeholder
 //!   content state.
@@ -63,6 +69,7 @@
 pub mod chrome;
 pub mod confirm;
 pub mod ctx;
+pub mod fields;
 pub mod framebuffer;
 pub mod hero;
 pub mod home;
@@ -81,6 +88,7 @@ pub use confirm::ConfirmView;
 pub use ctx::RenderCtx;
 pub use framebuffer::FrameBuffer565;
 pub use crate::platform::Instant;
+pub use fields::{FieldKind, FieldList, FieldRow, ValueFont};
 pub use hero::{BitrateStatus, CodecStatus, HeroStatusView};
 pub use home::{build_home_screen, HOME_TITLE};
 pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};

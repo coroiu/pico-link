@@ -102,6 +102,14 @@ impl RowStyle {
 /// plus a 4px gap before the label.
 pub(crate) const CHECK_GUTTER_WIDTH: i32 = 12;
 
+/// Compile-time enforcement of "the caret never moves the value"
+/// (field-list ruling §4.2/§5 test 5): `RowStyle::FIELD`'s caret must sit
+/// strictly right of the value column's right edge, in its own gutter, so
+/// gaining focus can never move the value. A `const` assertion catches a
+/// future edit to either margin immediately, at compile time, rather than
+/// only when the test suite happens to run.
+const _: () = assert!(RowStyle::FIELD.caret_right_margin < RowStyle::FIELD.value_right_margin);
+
 /// Gap (px) between a clipped label's right edge and the trailing value
 /// column's left edge — see [`draw_row`]'s label-clipping step.
 const LABEL_VALUE_GAP: i32 = 8;
@@ -563,14 +571,6 @@ mod tests {
             row_height(&RowStyle::FIELD, &font::value()) < row_height(&RowStyle::MENU, &font::value()),
             "RowStyle::FIELD must be shorter than RowStyle::MENU"
         );
-    }
-
-    #[test]
-    fn field_style_caret_never_moves_the_value() {
-        // Field-list ruling §5 test 5, as a type-level invariant: the
-        // caret must sit strictly right of the value column's right
-        // edge, in the gutter, so gaining focus never moves the value.
-        assert!(RowStyle::FIELD.caret_right_margin < RowStyle::FIELD.value_right_margin);
     }
 
     #[test]

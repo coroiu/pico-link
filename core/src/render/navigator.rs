@@ -138,6 +138,16 @@ impl Navigator {
         self.stack.get(index).and_then(Screen::selected_key)
     }
 
+    /// Generalizes scroll-position carry-forward to any stack depth —
+    /// see `Widget::scroll_top`'s doc comment and
+    /// [`Navigator::selected_index_at`]'s for why the "any stack depth"
+    /// generalization exists. `None` both for an out-of-range `index`
+    /// and for a screen whose focused widget has no scrolling concept.
+    #[must_use]
+    pub fn scroll_top_at(&self, index: usize) -> Option<usize> {
+        self.stack.get(index).and_then(Screen::scroll_top)
+    }
+
     /// The screen title at `index`, if any -- used by a caller (e.g.
     /// [`crate::app::App::rebuild_root`]) to check whether a specific
     /// live-data-backed screen (e.g. Devices) is currently sitting at a
