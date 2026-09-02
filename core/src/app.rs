@@ -2137,6 +2137,102 @@ mod tests {
         }
     }
 
+    /// Design rule 4 (`.planning/design/2026-09-02-a-button-label-rule.md`
+    /// §5(d)): "A's liveness and A's label are the same fact." This is the
+    /// **one central test**, not one per screen -- a per-screen assertion
+    /// is the exact scatter that caused the bug this rule fixes.
+    ///
+    /// Two things are checked per screen state, both against
+    /// [`Screen::focused_activation`] as the single source of truth:
+    ///
+    /// 1. `Screen::resolve_a` (what the rail actually renders) agrees with
+    ///    `focused_activation().is_some()`. This is a regression tripwire
+    ///    on the *mechanism*: today the two are one call apart by
+    ///    construction (`screen.rs`'s `activate_focused`/`resolve_a` both
+    ///    read `focused_activation`), so this cannot fail without someone
+    ///    reintroducing a second channel for A -- see the design doc's "what
+    ///    is NOT enforceable" note on `Box<dyn Widget>` wrapper forwarding,
+    ///    which is exactly the gap this line stands guard over.
+    /// 2. The rendered word matches Uma's assignment table (design doc §4)
+    ///    verbatim, which *is* capable of failing on an ordinary per-screen
+    ///    regression (wrong verb, or a screen silently losing its verb).
+    ///
+    /// Reuses [`freshness_cases`]'s table of screen-state builders rather
+    /// than hand-rolling a second one -- one table of "every production
+    /// screen state", not two that can drift apart.
+    #[test]
+    fn a_rail_liveness_matches_activation_for_every_screen() {
+        fn store_corrupt_boot_devices() -> App {
+            let mut app = App::new(240, 240);
+            app.handle_event(Event::StoreLoaded { status: StoreStatus::RecordCorrupt });
+            open_devices(&mut app);
+            app
+        }
+
+        // A paired device row focused on Devices -- design section 4's
+        // `open` row (row 3 of the audit table), distinct from
+        // `devices_list`'s empty-store "Pair new headphones" row.
+        fn devices_list_paired_row_focused() -> App {
+            let mut app = App::new(240, 240);
+            app.handle_event(upsert([9; 6], "Cans", 1));
+            open_devices(&mut app);
+            app
+        }
+
+        let mut cases: Vec<(&'static str, fn() -> App, Option<Verb>)> = freshness_cases()
+            .into_iter()
+            .map(|(name, build, _)| {
+                let expected = match name {
+                    "home, status face" | "home, status face, connected with live out level" => Some(Verb::Exception("devs")),
+                    "home, menu face" => Some(Verb::Open),
+                    // `devices_list`'s builder (see `freshness_cases`) has
+                    // no paired devices, so the only row is "Pair new
+                    // headphones" -- design doc section 4's `pair` row, not
+                    // its `open` row. `devices_list_paired_row_focused`
+                    // below covers the `open` case with an actual device
+                    // row focused.
+                    "devices list" => Some(Verb::Pair),
+                    "forget picker" => Some(Verb::Select),
+                    "forget confirm" => Some(Verb::Select),
+                    "device detail" | "settings" => None,
+                    "wizard: scanning" => Some(Verb::Pair),
+                    "wizard: nothing found" => Some(Verb::Scan),
+                    "wizard: connecting" | "wizard: not responding" | "wizard: failed" | "wizard: succeeded" => None,
+                    other => panic!(
+                        "{other}: no expected A-verb entry in this test -- add one from design doc \
+                         .planning/design/2026-09-02-a-button-label-rule.md section 4's assignment table, don't skip it"
+                    ),
+                };
+                (name, build, expected)
+            })
+            .collect();
+        // No devices survive a corrupt store, so (like `devices_list`) the
+        // only row is "Pair new headphones" -- `pair`, not `open`. This
+        // case exists to cover design row 14 (same defect class as row 3,
+        // a Devices screen with A silent), not to exercise a different
+        // verb.
+        cases.push(("store-corrupt boot, devices", store_corrupt_boot_devices, Some(Verb::Pair)));
+        cases.push(("devices list, paired row focused", devices_list_paired_row_focused, Some(Verb::Open)));
+
+        for (name, build, expected) in cases {
+            let app = build();
+            let screen = app.navigator.current();
+            let rendered_live = matches!(screen.resolve_a(), ButtonLabel::Live(_));
+            let activation = screen.focused_activation();
+
+            assert_eq!(
+                rendered_live,
+                activation.is_some(),
+                "{name}: rail A liveness ({rendered_live}) disagrees with focused_activation \
+                 ({activation:?}) -- design rule 4 says these are the same fact"
+            );
+            assert_eq!(
+                activation, expected,
+                "{name}: A's verb is {activation:?}, expected {expected:?} per design doc section 4's assignment table"
+            );
+        }
+    }
+
     #[test]
     fn is_audio_sink_accepts_the_audio_video_major_device_class() {
         // 0x24_04_04: real headphones-shaped CoD (major device class 0x04,

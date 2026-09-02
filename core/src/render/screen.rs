@@ -27,7 +27,7 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::rail::{draw_rail, ButtonLabel, ButtonLabels};
 use super::theme::{font, icon, palette};
-use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Widget};
+use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Verb, Widget};
 
 /// Margin (px) from the title bar's left/right edges to its content —
 /// now the same left rule `L = 12` the body content uses (design doc
@@ -294,12 +294,32 @@ impl Screen {
     /// static label (see [`Screen::with_button_labels`]) and never reads
     /// [`ChromeContribution`] — see [`Screen::activate_focused`] for the
     /// matching gate this must never disagree with.
-    fn resolve_a(&self) -> ButtonLabel {
-        let verb = self.focused_index.and_then(|index| self.widgets[index].activation());
+    ///
+    /// `pub(crate)`, not private: this is also the accessor
+    /// `app::tests::a_rail_liveness_matches_activation_for_every_screen`
+    /// reads to observe what the rail actually renders, independently of
+    /// [`Screen::focused_activation`] — see that method's doc comment for
+    /// why the two are kept as separate call sites in the test even though
+    /// they are, today, one expression apart.
+    pub(crate) fn resolve_a(&self) -> ButtonLabel {
+        let verb = self.focused_activation();
         match verb {
             Some(verb) => ButtonLabel::Live(String::from(verb.as_str())),
             None => ButtonLabel::Inert,
         }
+    }
+
+    /// The focused widget's [`Widget::activation`], or `None` if nothing is
+    /// focused — the same expression [`Screen::activate_focused`] gates
+    /// dispatch on and [`Screen::resolve_a`] renders from (design rule 4:
+    /// "A's liveness and A's label are the same fact"). `pub(crate)` so
+    /// `app`'s central regression test
+    /// (`a_rail_liveness_matches_activation_for_every_screen`) can assert
+    /// the invariant from outside this module, as a tripwire on the
+    /// mechanism rather than a proof of per-screen correctness — see the
+    /// design doc §5(d)'s "what is NOT enforceable" note.
+    pub(crate) fn focused_activation(&self) -> Option<Verb> {
+        self.focused_index.and_then(|index| self.widgets[index].activation())
     }
 
     /// Whether the focused widget wants B treated as live even at
