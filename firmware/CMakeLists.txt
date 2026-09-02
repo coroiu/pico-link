@@ -218,6 +218,12 @@ add_executable(pico_link
     src/usb_reset.c
     src/watchdog_sup.c
     src/persist.c
+    # Bead pico-link-nli.2 (G1): the multicore flash-write lockout -- see
+    # flash_lockout.c's module doc. Compiled unconditionally: it must be
+    # correct on every build, single-core or not, since it overrides
+    # pico-sdk's weak get_flash_safety_helper() for ALL flash writes,
+    # including BTstack's own link-key saves.
+    src/flash_lockout.c
     # Bead pico-link-47z.2 (media keys T2): the HID consumer-control
     # ring/drain/safety-timeout. Compiled unconditionally (unlike
     # debug_remote.c below) because T3's AVRCP handler is a second producer
@@ -311,10 +317,22 @@ target_compile_definitions(pico_link PRIVATE
     # overflowed during PIO/SPI init with a badly misleading symptom (a
     # diagnostic store on the FIRST line of a task appeared never to
     # execute, depending on what code came LATER). Set well above that
-    # floor. Core1 is never launched (see main.c/bt.c's module docs --
-    # matching USBPods' own working reference, everything runs on core0),
-    # so PICO_CORE1_STACK_SIZE is left at the SDK default.
+    # floor. Core1 is STILL never launched as of this bead (pico-link-nli.2,
+    # G1 of the "LDAC encoder on core1" epic) -- only the multicore flash
+    # lockout (flash_lockout.c) is wired up, ready for G3
+    # (pico-link-nli.4) to actually call multicore_launch_core1().
     PICO_STACK_SIZE=0xC000
+    # Explicit rather than the SDK default (0x800/2KB) so G3 does not
+    # inherit a silently-too-small core1 stack -- pico_multicore is now
+    # linked (below) purely for multicore_lockout; nothing runs on core1
+    # yet. core1's stack (`.stack1_dummy`) is placed in the SCRATCH_X SRAM
+    # bank by the default linker script, which is a FIXED 4KB region --
+    # 0x2000 (8KB) overflows it at link time (measured on this bead).
+    # 0x1000 (4KB) is the practical ceiling without a linker-script change;
+    # generous for the encoder loop G3 will add (libldac's working set +
+    # local buffers) relative to core0's cyw43-driven 0xC000 above, since
+    # core1 never touches BTstack/cyw43.
+    PICO_CORE1_STACK_SIZE=0x1000
     # bd pico-link-gap, DEV AFFORDANCE (see panic_recorder.h's ship-marker
     # note): routes pico-sdk's own panic()/assert path (the one that
     # produced the bare "*** PANIC ***" banner with zero context on
@@ -408,6 +426,15 @@ target_link_libraries(pico_link
     hardware_gpio
     hardware_watchdog
     ui_ffi
+    # Bead pico-link-nli.2 (G1): needed ONLY for multicore_lockout_* (see
+    # flash_lockout.c) and to reserve core1's stack (PICO_CORE1_STACK_SIZE
+    # above). Linking this flips on
+    # PICO_FLASH_SAFE_EXECUTE_PICO_SUPPORT_MULTICORE_LOCKOUT for pico-sdk's
+    # flash_safe_execute() tree-wide, which is exactly why flash_lockout.c
+    # overrides get_flash_safety_helper() rather than relying on the SDK
+    # default -- see that file's module doc. multicore_launch_core1() is
+    # NOT called anywhere yet; that is G3 (pico-link-nli.4).
+    pico_multicore
     # M2: the ready-made HCI transport this C-first pivot exists to use
     # (see bt.c's module doc). pico_btstack_cyw43 pulls in
     # pico_btstack_hci_transport_cyw43 and pico_btstack_base transitively.

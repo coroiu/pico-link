@@ -32,9 +32,13 @@
 // isolation + no MRU-bump rewrite storm (design point 6).
 //
 // TIMING is the hard constraint here, not wear (design point 4): a flash
-// write is up to 3 blackouts of ~3ms each (save_and_disable_interrupts,
-// since no multicore is linked -- flash_safe_execute reduces to that, see
-// pico-sdk's flash.c), and usb_audio.c's ISO-OUT re-arm has a 2ms bar with
+// write is up to 3 blackouts of ~3ms each (save_and_disable_interrupts on
+// this core, plus -- as of bead pico-link-nli.2 -- a bounded
+// multicore_lockout handshake with core1 if and when core1 is running; see
+// flash_lockout.c. Single-core today: core1 is not launched until
+// pico-link-nli.4 (G3), so the handshake is inert and this reduces to
+// exactly the pre-multicore behaviour, see pico-sdk's flash.c), and
+// usb_audio.c's ISO-OUT re-arm has a 2ms bar with
 // exactly ONE missed re-arm being PERMANENT (audio_device.c:759-762). So
 // this module NEVER writes flash while USB audio or A2DP is streaming --
 // gated on both pl_usb_audio_streaming() and pl_a2dp_streaming() being
