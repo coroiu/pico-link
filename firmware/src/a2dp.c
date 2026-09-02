@@ -517,6 +517,17 @@ typedef struct {
     // from "silently happens sometimes" instead of assuming the former.
     volatile uint32_t fill_short_read;
 
+    // Bead pico-link-8b7: OUT-meter push instrumentation. level_push_count
+    // is a real Event::LevelsChanged push (the ONLY thing hero.rs's
+    // OUT_LEVEL_STALE_AFTER can see). level_push_skip_empty is
+    // pl_a2dp_maybe_push_levels's sample_count==0 early return (suspect 1
+    // in the bead). level_push_skip_interval is the 250ms-not-elapsed
+    // early return (expected to dominate in a healthy run -- fill() is
+    // called far more often than every 250ms).
+    volatile uint32_t level_push_count;
+    volatile uint32_t level_push_skip_empty;
+    volatile uint32_t level_push_skip_interval;
+
     // Bead pico-link-pbv round 2 (C2-6): cumulative whole frames dropped by
     // pl_pcm_reset() (a2dp.c's STREAM_ESTABLISHED/SUSPENDED/RELEASED
     // handlers) -- an uncounted route PCM leaves the ring by, outside
@@ -640,13 +651,16 @@ static uint32_t pl_a2dp_isqrt(uint64_t value) {
 // full-scale sample).
 static void pl_a2dp_maybe_push_levels(void) {
     if (s_level_accum.sample_count == 0) {
+        s_ctx.level_push_skip_empty++;
         return;
     }
     uint64_t now = time_us_64();
     if (s_level_accum.last_push_us != 0 &&
         now - s_level_accum.last_push_us < (uint64_t)PL_A2DP_LEVEL_PUSH_INTERVAL_MS * 1000) {
+        s_ctx.level_push_skip_interval++;
         return;
     }
+    s_ctx.level_push_count++;
 
     uint32_t mean_sq_l = (uint32_t)(s_level_accum.sum_sq_l / s_level_accum.sample_count);
     uint32_t mean_sq_r = (uint32_t)(s_level_accum.sum_sq_r / s_level_accum.sample_count);
@@ -2410,6 +2424,16 @@ void pl_a2dp_report(uint32_t report_dt_us) {
         "a2dp: payloads_sealed=%lu tx_depth_max=%lu grants=%lu spurious_grants=%lu dwell_max_us=%lu\r\n",
         (unsigned long)s_ctx.payloads_sealed, (unsigned long)s_ctx.tx_depth_max, (unsigned long)s_ctx.grants,
         (unsigned long)s_ctx.spurious_grants, (unsigned long)s_ctx.dwell_max_us
+    );
+    // Bead pico-link-8b7: OUT-meter push rate. level_push_count is
+    // cumulative -- divide its delta between two report lines by
+    // report_dt_us to get the real Event::LevelsChanged rate hero.rs
+    // actually sees. Healthy/expected: ~4/s (250ms interval),
+    // skip_interval dominating skip_empty.
+    pl_log(
+        "a2dp: level_push_count=%lu level_push_skip_empty=%lu level_push_skip_interval=%lu\r\n",
+        (unsigned long)s_ctx.level_push_count, (unsigned long)s_ctx.level_push_skip_empty,
+        (unsigned long)s_ctx.level_push_skip_interval
     );
 }
 
