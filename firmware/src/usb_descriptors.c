@@ -36,6 +36,9 @@
 #define EPNUM_CDC_NOTIF (0x82)
 #define EPNUM_CDC_OUT   (0x03)
 #define EPNUM_CDC_IN    (0x83)
+// HID consumer-control (media keys), interrupt IN only -- see bead
+// pico-link-47z.1 / .planning/design/2026-09-02-media-keys.md.
+#define EPNUM_HID_IN    (0x84)
 
 //--------------------------------------------------------------------+
 // Device Descriptor
@@ -62,7 +65,10 @@ static const tusb_desc_device_t usbd_desc_device = {
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = USBD_VID,
     .idProduct = USBD_PID,
-    .bcdDevice = 0x0100,
+    // Bumped 0x0100 -> 0x0101 for the HID interface addition (bead
+    // pico-link-47z.1). PID deliberately NOT bumped -- see
+    // .planning/design/2026-09-02-media-keys.md section 2.5.
+    .bcdDevice = 0x0101,
     .iManufacturer = STRID_MANUFACTURER,
     .iProduct = STRID_PRODUCT,
     .iSerialNumber = STRID_SERIAL,
@@ -81,7 +87,17 @@ const uint8_t *tud_descriptor_device_cb(void) {
 #define USBD_DESC_LEN (TUD_CONFIG_DESC_LEN \
     + TUD_AUDIO_SPEAKER_STEREO_FB_DESC_LEN \
     + TUD_CDC_DESC_LEN \
-    + TUD_RPI_RESET_DESC_LEN)
+    + TUD_RPI_RESET_DESC_LEN \
+    + TUD_HID_DESC_LEN)
+
+// HID consumer-control report descriptor -- single 16-bit usage field, no
+// report ID (TinyUSB's stock consumer-control template). Covers play/pause
+// (0x00CD), scan next (0x00B5) and scan previous (0x00B6), which is what
+// T2/T3 (bead pico-link-47z.2/.3) will send. T1 sends nothing; this bead is
+// descriptors/enumeration only.
+static const uint8_t desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_CONSUMER()
+};
 
 // Sized by the initializer list, not by USBD_DESC_LEN directly: this way a
 // mismatch between USBD_DESC_LEN's macro arithmetic and what the
@@ -119,7 +135,16 @@ static const uint8_t usbd_desc_cfg[] = {
 
     // Driverless-reset vendor interface -- keeps `picotool reboot -f -u`
     // working (see reset_interface.c, still linked via pico_enable_stdio_usb).
+    // FROZEN at ITF_NUM_RESET == 4. Nothing may be inserted between this
+    // entry and the HID entry below -- see usb_descriptors.h's comment on
+    // ITF_NUM_RESET for why.
+    // NOTE: TUD_RPI_RESET_DESCRIPTOR's own expansion (usb_descriptors.h)
+    // already ends in a trailing comma, so no comma is added here.
     TUD_RPI_RESET_DESCRIPTOR(ITF_NUM_RESET, STRID_RESET)
+
+    // HID consumer-control (media keys) -- MUST stay last, after RESET.
+    // Interface number, string index, protocol, report descriptor len, EP In addr, size, polling interval (ms).
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, STRID_HID, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID_IN, 8, 10)
 };
 
 _Static_assert(sizeof(usbd_desc_cfg) == USBD_DESC_LEN,
@@ -142,6 +167,7 @@ static const char *const usbd_desc_str[STRID_COUNT] = {
     [STRID_AUDIO] = "Pico Link Speaker",
     [STRID_CDC] = "Pico Link Console",
     [STRID_RESET] = "Reset",
+    [STRID_HID] = "Pico Link Media Keys",
 };
 
 const uint16_t *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
@@ -170,4 +196,39 @@ const uint16_t *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
 
     desc_str[0] = (uint16_t)((TUSB_DESC_STRING << 8) | (2 * len + 2));
     return desc_str;
+}
+
+//--------------------------------------------------------------------+
+// HID class callbacks
+//--------------------------------------------------------------------+
+// T1 (bead pico-link-47z.1) only: descriptors and enumeration. No reports
+// are ever sent from this bead -- that is T2/T3 (media_keys.c and the
+// AVRCP passthrough handler).
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
+    (void)instance;
+    return desc_hid_report;
+}
+
+// Host GET_REPORT (e.g. polling current key state): we are output-only, so
+// report nothing.
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
+                                uint8_t *buffer, uint16_t reqlen) {
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+    return 0;
+}
+
+// Host SET_REPORT (e.g. output/feature reports): consumer control has none
+// we accept; no-op.
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
+                            uint8_t const *buffer, uint16_t bufsize) {
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)bufsize;
 }
