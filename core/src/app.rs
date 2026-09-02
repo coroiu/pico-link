@@ -1413,6 +1413,17 @@ impl App {
             self.navigator.pop_to_root();
             *self.wizard_phase.borrow_mut() = WizardPhase::default();
             self.wizard_devices.borrow_mut().clear();
+            // pico-link-l4d: `pop_to_root` only restores navigation depth --
+            // it doesn't touch which of Home's two faces (`HomeFace::Status`
+            // vs `HomeFace::Menu`) is showing. The user reached the wizard
+            // via Home's Menu face (Home -> A -> Devices -> pair), so without
+            // this the auto-dismiss silently landed back on the
+            // Bluetooth/Settings list instead of the hero -- which is the
+            // entire point of auto-dismissing: showing the codec just paired.
+            // This is a deliberate, automatic choice of destination (see the
+            // policy note on `on_devices_back`/wizard-success-B for why the
+            // *manual* B routes are treated differently).
+            *self.home_face.borrow_mut() = HomeFace::Status;
             self.dirty = true;
         }
     }
@@ -1649,6 +1660,17 @@ impl App {
     #[cfg(test)]
     pub(crate) fn wizard_phase_for_test(&self) -> WizardPhase {
         self.wizard_phase.borrow().clone()
+    }
+
+    /// Test-only: reads which of Home's two faces (`HomeFace::Status` vs
+    /// `HomeFace::Menu`) is currently showing. Not part of the public API.
+    /// Added for pico-link-l4d, whose bug (auto-dismiss landing on the
+    /// menu face instead of the hero) was invisible to every existing
+    /// test because they only ever asserted `navigator_depth()`, never
+    /// the face -- depth alone can't tell Home's two faces apart.
+    #[cfg(test)]
+    pub(crate) fn home_face_for_test(&self) -> HomeFace {
+        *self.home_face.borrow()
     }
 
     /// Dispatches every polled `NavIntent` to the navigator, in order.

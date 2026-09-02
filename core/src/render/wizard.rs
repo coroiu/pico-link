@@ -424,6 +424,16 @@ impl Widget for PairingWizardView {
             // left unhandled, so pressing it is inert rather than
             // silently falling through to some other behavior. See this
             // bead's completion report for the explicit callout.
+            //
+            // pico-link-l4d POLICY: `(Back, Succeeded { .. })` also falls
+            // through to here -- a plain, side-effect-free pop, deliberately
+            // NOT touching `App::home_face`. Manual B is the user retracing
+            // their own steps one screen at a time; only the *automatic*
+            // dismiss (`App::on_wizard_auto_dismiss`) resets Home to its
+            // status face, because there the app itself is choosing the
+            // destination. A user who backs out manually lands on Devices,
+            // then a further B on Home's menu face (wherever it was left),
+            // exactly retracing Home -> A -> Devices -> wizard.
             _ => Action::None,
         }
     }
@@ -541,7 +551,7 @@ impl Widget for PairingWizardView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ConnectFailureReason, ConnectStep, DeviceEntry, Event, LinkState, WizardPhase, DEVICES_TITLE};
+    use crate::app::{App, ConnectFailureReason, ConnectStep, DeviceEntry, Event, HomeFace, LinkState, WizardPhase, DEVICES_TITLE};
     use crate::input::NavIntent;
     use crate::platform::Instant;
 
@@ -904,7 +914,7 @@ mod tests {
         // pico-link-4vb.2: Andreas wanted auto-dismiss to land on Home, not
         // Devices, so he doesn't have to press Back a bunch of times.
         let mut app = App::new(240, 240);
-        open_wizard(&mut app);
+        open_wizard(&mut app); // Home status -> menu face -> Devices -> wizard
         let addr = [8; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
@@ -913,6 +923,15 @@ mod tests {
 
         app.handle_event(Event::WizardAutoDismiss);
         assert_eq!(app.navigator_depth(), 1, "a plain success must auto-dismiss all the way back to Home");
+        // pico-link-l4d: `open_wizard` reaches the wizard via Home's MENU
+        // face (Home -> A -> Devices -> pair), so before the fix this
+        // landed back on the Bluetooth/Settings list, not the hero --
+        // `navigator_depth() == 1` alone can't see that, only the face can.
+        assert_eq!(
+            app.home_face_for_test(),
+            HomeFace::Status,
+            "auto-dismiss must land on the status hero, not whatever face was showing when the wizard was opened"
+        );
     }
 
     #[test]
