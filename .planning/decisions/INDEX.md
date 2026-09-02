@@ -12,3 +12,4 @@ Superseded entries are marked Deprecated, never deleted.
 | 2026-08-27 | [TinyUSB owns the USB device controller; the embassy-usb CDC console is unwound](2026-08-27-usb-device-stack-returns-to-tinyusb.md) | Accepted |
 | 2026-08-27 | [C-first: pico-sdk owns `main()`; the Rust core becomes a staticlib called over FFI](2026-08-27-c-first-pico-sdk-owns-main.md) | Accepted |
 | 2026-08-31 | [The widget-facing clock seam: a frame-scoped `RenderCtx`, not a `Clock` trait object](2026-08-31-render-ctx-frame-scoped-clock.md) | Accepted (designed, not yet implemented) |
+| 2026-09-02 | [Core 1 allocation, and how to raise the repaint ceiling](2026-09-02-core1-allocation-and-the-repaint-ceiling.md) | Accepted (rejects `pico-link-yz6`'s original premise: core1 is reserved for LDAC, not the display) |
