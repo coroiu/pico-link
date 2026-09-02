@@ -1567,6 +1567,23 @@ pub enum PlCommandTag {
     /// (pico-link-znb.7's completion report). [`pl_command_from`] has no
     /// match arm for it yet -- unreachable until T4 lands.
     ForgetDevice = 6,
+    /// Bead pico-link-44w: user-initiated "drop the current Bluetooth
+    /// link" -- FFI surface only, no screen queues this yet (the
+    /// design-of-record's manage-connected-device screen is the eventual
+    /// caller; wiring it up now would be a labelled-but-dead UI
+    /// affordance, which the design of record's rule 2 forbids). Carries
+    /// no payload: `firmware/src/a2dp.c` tracks at most one active
+    /// connection (`s_ctx.a2dp_cid`), and C's existing debug-only
+    /// disconnect path (`pl_bt_debug_disconnect`, bead pico-link-nb6)
+    /// already queues its `PL_BT_PENDING_DISCONNECT` pending-queue entry
+    /// with a null address for the same reason -- see
+    /// [`pl_command_from`]'s `Command::Disconnect` arm, which reuses the
+    /// zeroed `connect` payload the same way `StartScan`/`CancelScan` do.
+    /// Purely additive to the tag enum -- no existing payload shape
+    /// changed -- so this does not bump [`PL_COMMAND_ABI_VERSION`] (see
+    /// that constant's doc comment: the bump is reserved for non-additive
+    /// changes to an *existing* tag's payload, which this is not).
+    Disconnect = 7,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -1725,6 +1742,14 @@ fn pl_command_from(command: Command) -> PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::ForgetDevice,
             payload: PlCommandPayload { addr: PlAddrPayload { addr } },
+        },
+        // Bead pico-link-44w: no payload -- see `PlCommandTag::Disconnect`'s
+        // doc comment. Reuses the zeroed `connect` payload the same way
+        // `StartScan`/`CancelScan` do, since there is nothing to carry.
+        Command::Disconnect => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::Disconnect,
+            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
         },
     }
 }
@@ -2556,5 +2581,18 @@ mod tests {
         assert_eq!(wire.tag as u32, PlCommandTag::ForgetDevice as u32);
         // SAFETY: `wire.tag` above confirms the union currently holds `addr`.
         assert_eq!(unsafe { wire.payload.addr.addr }, addr);
+    }
+
+    #[test]
+    fn disconnect_command_maps_to_the_disconnect_tag_with_the_current_abi_version() {
+        // Bead pico-link-44w: FFI surface only, no UI wiring. No address
+        // payload -- see `PlCommandTag::Disconnect`'s doc comment (at most
+        // one active connection, same assumption C's existing
+        // `PL_BT_PENDING_DISCONNECT` pending-queue entry already makes).
+        // Purely additive, so the current ABI version is unchanged.
+        assert_eq!(PlCommandTag::Disconnect as u32, 7);
+        let wire = pl_command_from(Command::Disconnect);
+        assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
+        assert_eq!(wire.tag as u32, PlCommandTag::Disconnect as u32);
     }
 }
