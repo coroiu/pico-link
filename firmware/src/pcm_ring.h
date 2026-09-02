@@ -2,13 +2,26 @@
 // M4 design .planning/design/2026-08-29-a2dp-source-pipeline.md sec 3).
 //
 // Producer: usb_audio.c's pl_usb_audio_task(), which runs inside usb_pump.c's
-// 0xC0 worker IRQ. Consumer: the coming A2DP module's media timer, in the
-// cyw43/BTstack background IRQ (PICO_LOWEST_IRQ_PRIORITY, 0xFF).
+// 0xC0 worker IRQ, always on core0. Consumer: the A2DP fill loop -- today
+// still core0's media timer in the cyw43/BTstack background IRQ
+// (PICO_LOWEST_IRQ_PRIORITY, 0xFF); as of the `pico-link-nli` epic (G3) it
+// moves to core1's thread-context encoder loop. See §3.1 of
+// .planning/decisions/2026-09-03-ldac-encoder-on-core1.md.
 //
 // SPSC and lock-free: each side writes only its own index (s_head / s_tail),
-// both indices are single aligned 32-bit words, so a 0xC0 preemption of the
-// 0xFF consumer mid-read is safe. Same discipline input.c uses -- NOT bt.c's,
-// which needed a critical section only because it has two producers.
+// both indices are single aligned 32-bit words. Historically (single-core)
+// that alone was sufficient, because the only ordering hazard was a 0xC0
+// preemption of the 0xFF consumer mid-read on the SAME core, which an
+// IRQ-nesting argument covers. **That argument does not survive core1: the
+// two sides can now run on genuinely different cores, executing
+// simultaneously rather than nested, so interrupt priority protects
+// nothing.** RP2350's SRAM is coherent across both M33s through the bus
+// fabric (no data cache; the XIP cache is flash-only), but store *ordering*
+// is not free -- a `__dmb()` on each side of the seam (see pcm_ring.c) makes
+// the data write visible before the index publish that hands it off, and
+// the index read visible before the data read that trusts it. Same
+// discipline input.c uses -- NOT bt.c's, which needed a critical section
+// only because it has two producers.
 //
 // Owned by neither side of the seam it crosses: this module must not
 // #include usb_pump.h or any A2DP header. usb_audio.c and the future a2dp.c

@@ -4,6 +4,10 @@
 
 #include <string.h>
 
+#include "hardware/sync.h" // __dmb() -- see pcm_ring.h's module doc on why
+                            // ordering barriers replace the old IRQ-nesting
+                            // argument once the consumer can be core1.
+
 // PL_PCM_RING_CAPACITY is a power of two (checked below), so masking
 // replaces modulo for both indexing and the wraparound distance
 // computation (head - tail) & PL_PCM_RING_MASK.
@@ -67,6 +71,12 @@ void pl_pcm_push(const uint8_t *data, uint32_t len) {
         memcpy(&s_ring[0], data + first_chunk, accept_bytes - first_chunk);
     }
 
+    // Publish-after-write: make the memcpy's stores visible to the other
+    // core BEFORE the index update that tells it there is new data to
+    // read. Without this a core1 consumer could observe the new `s_head`
+    // and read stale/torn bytes out of s_ring -- the two are otherwise
+    // unordered with respect to each other across cores.
+    __dmb();
     s_head = (head + accept_bytes) & PL_PCM_RING_MASK;
 }
 
@@ -86,6 +96,12 @@ uint32_t pl_pcm_read(uint8_t *out, uint32_t max) {
         return 0;
     }
 
+    // Read-after-acquire: `head` above is the signal that the producer's
+    // memcpy into s_ring already happened (see the __dmb() at its publish
+    // site in pl_pcm_push). Order that acquire read before this side's own
+    // reads of s_ring so a core1 consumer cannot observe a fresh `head`
+    // paired with stale bytes still in flight from the other core.
+    __dmb();
     uint32_t tail_idx = tail & PL_PCM_RING_MASK;
     uint32_t first_chunk = PL_PCM_RING_CAPACITY - tail_idx;
     if (first_chunk > n) {
