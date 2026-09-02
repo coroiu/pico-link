@@ -61,6 +61,33 @@ typedef struct __attribute__((packed)) {
 // preset assigned", not implemented on the read/write side yet (that store
 // doesn't exist this bead), but the field's presence now is what avoids a
 // format migration later.
+//
+// `codec_id` and `ldac_quality` (design findings 1.1/1.2,
+// .planning/design/2026-09-02-device-page-seam.md, bead pico-link-ay0.1),
+// confirmed against the existing (pre-this-bead) shape: PL_PERSIST_SCHEMA_VERSION
+// stays 1 -- both fields already existed and already rode through
+// pl_persist_rmw's read-modify-write untouched before this bead populated
+// them, so an existing record's zero bytes are already exactly the
+// sentinels these encodings want. Neither is written by anything before
+// this bead lands, so every record in the field today reads back 0 for
+// both.
+//
+//   codec_id: codec_table.h's PL_CODEC_ID_* -- a PINNED per-row identity,
+//   NEVER the PL_CODECS array index (index order is the negotiation
+//   preference order and is designed to change). 0 (PL_CODEC_ID_AUTOMATIC)
+//   means "no pin, follow the normal preference walk" and is also the
+//   correct reading of an old/never-written record.
+//
+//   ldac_quality: 1-BASED, NOT a raw LDACBT_EQMID_* value --
+//   LDACBT_EQMID_HQ is literally 0 (ldacBT.h:129), so storing the raw
+//   EQMID would make "never chosen" and "explicitly chose 990 kbps" the
+//   same byte forever. 0 = unset (use whatever codec_ldac.c's init()
+//   configures by default), 1 = 990 kbps (LDACBT_EQMID_HQ), 2 = 660 kbps
+//   (LDACBT_EQMID_SQ), 3 = 330 kbps (LDACBT_EQMID_MQ), 4 = Adaptive
+//   (reserved -- not implementable with the vendored libldac, design sec
+//   5). The EQMID mapping itself lives in exactly one place, codec_ldac.c
+//   (a later task) -- this module stores and moves the byte, never
+//   interprets it.
 typedef struct __attribute__((packed)) {
     uint8_t addr[6];
     uint8_t name[32];
@@ -94,41 +121,48 @@ static const btstack_tlv_t *s_tlv_impl;
 
 static pl_persist_status_t s_boot_status = PL_PERSIST_STATUS_FIRST_BOOT;
 
-// Bead pico-link-4vb.7 (T3): every surviving record loaded at boot, in slot
-// order (not MRU order -- bt.c pushes one PairedDeviceUpserted per entry and
-// `core` folds them into its own `paired` list, so ordering here doesn't
-// matter). Replaces the old single-device s_boot_has_device/s_boot_device_addr
-// pair, which made "which device to reconnect to" C's decision -- that
-// policy now belongs to `core` (design section 5.2). Populated by
-// pl_persist_init()'s load loop; read only via pl_persist_boot_device_count()/
-// pl_persist_boot_device_at() below.
+// Design finding 1.4 (.planning/design/2026-09-02-device-page-seam.md sec
+// 1.4, bead pico-link-ay0.1): the LIVE in-RAM mirror of every occupied slot
+// -- supersedes two things that used to be separate and, critically, went
+// stale after boot: the old s_boot_devices snapshot (bead pico-link-4vb.7,
+// filled ONLY by pl_persist_init()'s load loop and never touched again) and
+// the old s_slot_occupied/s_slot_addr slot-selection cache (bead
+// pico-link-4vb.6, which WAS kept live by every write but only carried
+// occupancy + address, not settings). This struct is now the one place
+// that answers "what does slot N currently hold" for every purpose --
+// pl_persist_find_slot_for_addr/find_free_slot's slot selection,
+// pl_persist_boot_device_count/at's boot snapshot (computed live from this,
+// see those functions below), and pl_persist_get_device_settings's reader.
+//
+// Populated by pl_persist_init()'s load loop AND updated by the shared RMW
+// core (pl_persist_rmw) on every successful write, in the same
+// cyw43/BTstack async_context critical section that performs the flash
+// write itself -- so codec_id/ldac_quality here can never lag what was
+// actually written. Never itself written to flash; a stale read here can
+// only ever be corrected by the next get_tag inside pl_persist_rmw's own
+// read-modify-write, exactly as the old occupancy cache's doc comment
+// argued.
 typedef struct {
+    bool occupied;
     uint8_t addr[6];
     uint8_t name[32];
     uint8_t name_len;
     uint32_t mru_seq;
-} pl_persist_boot_device_t;
-static pl_persist_boot_device_t s_boot_devices[PL_PERSIST_DEVICE_SLOTS];
-static uint8_t s_boot_device_count;
+    // Design findings 1.1/1.2: codec_id is codec_table.h's PL_CODEC_ID_*
+    // (0 = Automatic), ldac_quality is 1-based (0 = unset; NOT a raw
+    // LDACBT_EQMID_* value -- see pl_persist_write_device_settings's doc
+    // comment in persist.h).
+    uint8_t codec_id;
+    uint8_t ldac_quality;
+} pl_persist_slot_t;
+static pl_persist_slot_t s_slots[PL_PERSIST_DEVICE_SLOTS];
+
 // Next mru_seq to stamp on a save -- seeded from whatever was loaded at
 // boot (if anything) so a fresh save's mru_seq is monotonic across a
 // reflash, not just within one power-on session. Bead pico-link-4vb.6 (T1):
 // now the max mru_seq loaded across ALL PL_PERSIST_DEVICE_SLOTS slots, plus
 // one (design section 6) -- not just slot 0's.
 static uint32_t s_next_mru_seq = 1;
-
-// In-RAM mirror of "which slots are occupied, and by which address" --
-// populated by pl_persist_init()'s load loop and kept in sync by every
-// write/forget after that. Exists purely to avoid re-reading flash (up to
-// 8 get_tag calls) on every slot-selection decision in pl_persist_do_write/
-// pl_persist_forget_device -- bead pico-link-4vb.6 (T1). Never itself
-// written to flash; reconstructed fresh from the real on-flash records
-// every boot in pl_persist_init(), so it can never drift from what's
-// actually stored (a stale cache can only cause a spurious "occupied" read,
-// self-correcting the moment get_tag itself is consulted inside
-// pl_persist_do_write's own read-modify-write).
-static bool s_slot_occupied[PL_PERSIST_DEVICE_SLOTS];
-static uint8_t s_slot_addr[PL_PERSIST_DEVICE_SLOTS][6];
 
 // Staged-save state (design point 4's "staged, gated, flushed" split).
 static bool s_pending;
@@ -263,25 +297,25 @@ void pl_persist_init(void) {
             continue;
         }
 
-        s_slot_occupied[slot] = true;
-        memcpy(s_slot_addr[slot], rec.addr, 6);
+        // Design finding 1.4: populate the live slot mirror directly, not a
+        // separate boot-only snapshot -- see s_slots's doc comment above.
+        pl_persist_slot_t *sl = &s_slots[slot];
+        sl->occupied = true;
+        memcpy(sl->addr, rec.addr, 6);
+        memcpy(sl->name, rec.name, sizeof(sl->name));
+        sl->name_len = rec.name_len;
+        sl->mru_seq = rec.mru_seq;
+        sl->codec_id = rec.codec_id;
+        sl->ldac_quality = rec.ldac_quality;
         any_loaded = true;
         if (rec.mru_seq > max_mru_seq) {
             max_mru_seq = rec.mru_seq;
         }
-        // Bead pico-link-4vb.7 (T3): snapshot every surviving record so
-        // bt.c can push one PairedDeviceUpserted per entry -- see
-        // s_boot_devices's doc comment above. s_boot_device_count can never
-        // exceed PL_PERSIST_DEVICE_SLOTS (the array's own size), since this
-        // loop runs at most once per slot.
-        pl_persist_boot_device_t *boot_dev = &s_boot_devices[s_boot_device_count++];
-        memcpy(boot_dev->addr, rec.addr, 6);
-        memcpy(boot_dev->name, rec.name, sizeof(boot_dev->name));
-        boot_dev->name_len = rec.name_len;
-        boot_dev->mru_seq = rec.mru_seq;
         pl_log(
-            "persist: loaded device slot=%u %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u)\r\n", slot, rec.addr[0], rec.addr[1],
-            rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len
+            "persist: loaded device slot=%u %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u, codec_id=%u, "
+            "ldac_quality=%u)\r\n",
+            slot, rec.addr[0], rec.addr[1], rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len,
+            rec.codec_id, rec.ldac_quality
         );
     }
 
@@ -296,23 +330,41 @@ pl_persist_status_t pl_persist_boot_status(void) {
     return s_boot_status;
 }
 
+// Design finding 1.4: computed live from s_slots rather than a fixed
+// boot-time count -- these two functions are called exactly once, at boot,
+// before pl_persist_service() or any write can run, so the live-vs-snapshot
+// distinction doesn't change their observed behaviour; iterating the same
+// PL_PERSIST_DEVICE_SLOTS-sized array in slot order, counting/indexing only
+// occupied entries, reproduces the old s_boot_devices ordering exactly.
 uint8_t pl_persist_boot_device_count(void) {
-    return s_boot_device_count;
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
+        if (s_slots[i].occupied) {
+            count++;
+        }
+    }
+    return count;
 }
 
 void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq) {
-    if (index >= s_boot_device_count) {
-        memset(out_addr, 0, 6);
-        memset(out_name, 0, 32);
-        *out_name_len = 0;
-        *out_mru_seq = 0;
-        return;
+    uint8_t seen = 0;
+    for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
+        if (!s_slots[i].occupied) {
+            continue;
+        }
+        if (seen == index) {
+            memcpy(out_addr, s_slots[i].addr, 6);
+            memcpy(out_name, s_slots[i].name, 32);
+            *out_name_len = s_slots[i].name_len;
+            *out_mru_seq = s_slots[i].mru_seq;
+            return;
+        }
+        seen++;
     }
-    const pl_persist_boot_device_t *boot_dev = &s_boot_devices[index];
-    memcpy(out_addr, boot_dev->addr, 6);
-    memcpy(out_name, boot_dev->name, 32);
-    *out_name_len = boot_dev->name_len;
-    *out_mru_seq = boot_dev->mru_seq;
+    memset(out_addr, 0, 6);
+    memset(out_name, 0, 32);
+    *out_name_len = 0;
+    *out_mru_seq = 0;
 }
 
 // Code-review finding (bd-pico-link-cz0.6, 2026-09-01, CONFIRMED): this
@@ -379,11 +431,11 @@ void pl_persist_request_save_device(const uint8_t addr[6], const uint8_t *name, 
 // handler, called directly and synchronously -- see that function's own
 // doc comment for why a queue+wait round-trip isn't needed there).
 // Finds which slot currently holds `addr`, if any -- returns the slot index
-// or -1. Consults the in-RAM `s_slot_occupied`/`s_slot_addr` cache, not
-// flash (see that cache's doc comment).
+// or -1. Consults the in-RAM `s_slots` mirror, not flash (see its doc
+// comment).
 static int pl_persist_find_slot_for_addr(const uint8_t addr[6]) {
     for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
-        if (s_slot_occupied[i] && memcmp(s_slot_addr[i], addr, 6) == 0) {
+        if (s_slots[i].occupied && memcmp(s_slots[i].addr, addr, 6) == 0) {
             return (int)i;
         }
     }
@@ -397,45 +449,75 @@ static int pl_persist_find_slot_for_addr(const uint8_t addr[6]) {
 // (PL_PERSIST_WRITE_STORE_FULL).
 static int pl_persist_find_free_slot(void) {
     for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
-        if (!s_slot_occupied[i]) {
+        if (!s_slots[i].occupied) {
             return (int)i;
         }
     }
     return -1;
 }
 
-// Bead pico-link-4vb.6 (T1) -- THE MOST IMPORTANT CHANGE IN THIS SECTION,
-// per the design doc: this is now READ-MODIFY-WRITE, not
-// construct-from-scratch. Previously this memset a fresh record and filled
-// only addr/mru_seq/crc16, so EVERY OTHER FIELD (name, codec_id,
-// ldac_quality, volume, flags, preset_id) was silently zeroed on every save
-// -- a bug that was invisible while nothing but addr/mru_seq was ever
-// populated, and would have become a real, hard-to-diagnose defect ("looks
-// like flash corruption") the moment a per-device-setting write landed on
-// top of this. Fix: if the target slot already holds a valid record, start
-// from IT (not a zeroed one); only overwrite the fields THIS call actually
-// carries. Today only `addr` and (optionally) `name`/`name_len` are
-// call-supplied -- `name_len == 0` means "this caller has no name to
-// contribute, leave whatever is already stored." `codec_id`/
-// `ldac_quality`/`volume`/`flags`/`preset_id` are never touched by this
-// function at all (no caller populates them yet -- those are Tier 2 work,
-// design section 2 point 5) and so ride through RMW unchanged for free.
-// `mru_seq` is ALWAYS bumped -- every write, by construction, means "this
-// device was just used."
+// Design finding 1.3 (.planning/design/2026-09-02-device-page-seam.md sec
+// 1.3, bead pico-link-ay0.1): what a particular RMW call carries and how it
+// should behave, so pl_persist_do_write (pairing/reconnect writes) and
+// pl_persist_write_device_settings (a codec pin) share ONE
+// read-modify-write core (pl_persist_rmw below) instead of forking the RMW
+// logic -- two independently written RMW paths over the same on-flash
+// struct is exactly how a CRC-checked store starts producing "corruption"
+// nobody can reproduce.
+typedef struct {
+    // NULL (or non-NULL with name_len == 0) => leave rec.name/rec.name_len
+    // exactly as already on record (or zeroed, for a brand-new slot) -- the
+    // same RMW convention pl_persist_do_write always used.
+    const uint8_t *name;
+    uint8_t name_len;
+    // true => overwrite rec.codec_id/rec.ldac_quality with the values
+    // below. false => leave them exactly as already on record. A pairing
+    // write (pl_persist_do_write) never sets this -- codec/quality are Tier
+    // 2 settings, not pairing facts.
+    bool set_codec_settings;
+    uint8_t codec_id;
+    uint8_t ldac_quality;
+    // Design finding 1.3: a settings write ("I pinned a codec") is NOT "I
+    // used this device" -- only a pairing/reconnect write bumps mru_seq.
+    // Bumping on a settings write would make a pinned-but-unconnected
+    // device the boot auto-reconnect target
+    // (core::paired.iter().max_by_key(|d| d.mru_seq)).
+    bool bump_mru;
+    // true (pl_persist_do_write): the original find-existing-slot else
+    // first-free-slot else refuse policy (design section 6, NO eviction).
+    // false (pl_persist_write_device_settings): never claim a fresh slot --
+    // refuse (return false from pl_persist_rmw, writing nothing) if no
+    // existing slot holds the target address.
+    bool allow_create_slot;
+} pl_persist_rmw_fields_t;
+
+// THE shared read-modify-write core (design finding 1.3) -- every actual
+// flash write to a device record funnels through here. Previously this was
+// pl_persist_do_write's own body (bead pico-link-4vb.6, T1's fix for the
+// original construct-from-scratch bug that silently zeroed every
+// unpopulated field on each save): if the target slot already holds a
+// valid record, start from IT, not a zeroed one, and only overwrite the
+// fields `fields` actually carries.
 //
-// `name`/`name_len` are NULL/0 from every call site in this bead (T3,
-// deferred, is what will thread a real name through
-// PlCommandTag::Connect's payload -> bt.c's in-flight connect-target cache
-// -> here) -- the parameters exist now so T3 only has to change call
-// sites, not this function's RMW logic.
+// Returns false, writing nothing, if `fields->allow_create_slot` is false
+// and no slot currently holds `addr` (pl_persist_write_device_settings's
+// "refuses to create a slot" contract) -- `*out_result` is left untouched
+// in that case. Returns true otherwise, with `*out_result` set to
+// PL_PERSIST_WRITE_OK or PL_PERSIST_WRITE_STORE_FULL (STORE_FULL only
+// reachable when allow_create_slot is true and pl_persist_find_free_slot
+// also fails -- structurally unreachable when allow_create_slot is false,
+// since that path never calls find_free_slot at all).
 //
-// Slot selection (design section 6): match by `addr` against an existing
-// slot (a re-pairing of an already-remembered device updates that same
-// slot rather than consuming a new one) -- else the first free slot -- else
-// NO EVICTION, refuse the write and return PL_PERSIST_WRITE_STORE_FULL.
-static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], const uint8_t *name, uint8_t name_len) {
+// # Calling contract
+//
+// Same as pl_persist_do_write's / this file's module doc (Reentrancy
+// section): cyw43/BTstack background async_context ONLY.
+static bool pl_persist_rmw(const uint8_t addr[6], const pl_persist_rmw_fields_t *fields, pl_persist_write_result_t *out_result) {
     int slot = pl_persist_find_slot_for_addr(addr);
     if (slot < 0) {
+        if (!fields->allow_create_slot) {
+            return false;
+        }
         slot = pl_persist_find_free_slot();
     }
     if (slot < 0) {
@@ -447,7 +529,8 @@ static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], cons
         // Bead pico-link-4vb.7 (T3): S18 -- "must never silently evict", so
         // the UI must hear about a refused write too.
         pl_bt_push_paired_store_full();
-        return PL_PERSIST_WRITE_STORE_FULL;
+        *out_result = PL_PERSIST_WRITE_STORE_FULL;
+        return true;
     }
 
     pl_persist_marker_t marker = {.schema_version = PL_PERSIST_SCHEMA_VERSION};
@@ -455,9 +538,7 @@ static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], cons
 
     // Read-modify-write: start from the slot's existing record if it has
     // one and it's valid; otherwise (brand new slot, or a corrupt existing
-    // record we're about to overwrite anyway) start from zeroed fields --
-    // same fresh-record shape the old construct-from-scratch code always
-    // produced, just no longer the ONLY path.
+    // record we're about to overwrite anyway) start from zeroed fields.
     pl_persist_device_record_t rec;
     memset(&rec, 0, sizeof(rec));
     int existing_len = s_tlv_impl->get_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, (uint8_t)slot), (uint8_t *)&rec, sizeof(rec));
@@ -473,9 +554,9 @@ static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], cons
     }
 
     memcpy(rec.addr, addr, 6);
-    if (name != NULL && name_len > 0) {
-        uint8_t copy_len = name_len > (uint8_t)sizeof(rec.name) ? (uint8_t)sizeof(rec.name) : name_len;
-        memcpy(rec.name, name, copy_len);
+    if (fields->name != NULL && fields->name_len > 0) {
+        uint8_t copy_len = fields->name_len > (uint8_t)sizeof(rec.name) ? (uint8_t)sizeof(rec.name) : fields->name_len;
+        memcpy(rec.name, fields->name, copy_len);
         if (copy_len < (uint8_t)sizeof(rec.name)) {
             memset(rec.name + copy_len, 0, sizeof(rec.name) - copy_len);
         }
@@ -483,31 +564,124 @@ static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], cons
     }
     // else: leave rec.name/rec.name_len exactly as read (or zeroed, for a
     // brand new slot) -- this call has no name to contribute.
-    rec.mru_seq = s_next_mru_seq++;
-    // codec_id/ldac_quality/volume/flags/preset_id: untouched above --
-    // whatever was in `rec` (from the existing record, or zeroed for a new
-    // slot) rides through unchanged. No call site populates these yet
-    // (Tier 2, design section 2 point 5).
+
+    if (fields->set_codec_settings) {
+        rec.codec_id = fields->codec_id;
+        rec.ldac_quality = fields->ldac_quality;
+    }
+    // else: leave rec.codec_id/rec.ldac_quality exactly as read -- a
+    // pairing write must not clobber a previously pinned preference.
+
+    if (fields->bump_mru) {
+        rec.mru_seq = s_next_mru_seq++;
+    }
+    // else: leave rec.mru_seq exactly as read -- design finding 1.3, a
+    // settings write is not a use.
+
+    // volume/flags/preset_id: untouched -- no caller populates them yet
+    // (Tier 2, design section 2 point 5). Rides through RMW unchanged.
     rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
 
     s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, (uint8_t)slot), (const uint8_t *)&rec, sizeof(rec));
 
-    s_slot_occupied[(uint8_t)slot] = true;
-    memcpy(s_slot_addr[(uint8_t)slot], addr, 6);
+    // Design finding 1.4: this mirror IS the live source of truth for
+    // pl_persist_get_device_settings and boot-snapshot reads now, not just
+    // a slot-occupancy cache -- update it fully from what was actually
+    // written, in the same async_context call that performed the write, so
+    // a pin set now is visible immediately, not after the next power cycle.
+    pl_persist_slot_t *sl = &s_slots[(uint8_t)slot];
+    sl->occupied = true;
+    memcpy(sl->addr, rec.addr, 6);
+    memcpy(sl->name, rec.name, sizeof(sl->name));
+    sl->name_len = rec.name_len;
+    sl->mru_seq = rec.mru_seq;
+    sl->codec_id = rec.codec_id;
+    sl->ldac_quality = rec.ldac_quality;
 
     s_last_write_us = time_us_64();
     s_have_last_write = true;
     pl_log(
-        "persist: wrote device record slot=%d %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u)\r\n", slot, rec.addr[0], rec.addr[1],
-        rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len
+        "persist: wrote device record slot=%d %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u, codec_id=%u, "
+        "ldac_quality=%u)\r\n",
+        slot, rec.addr[0], rec.addr[1], rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len,
+        rec.codec_id, rec.ldac_quality
     );
     // Bead pico-link-4vb.7 (T3): echo the write that actually landed --
     // design section 3's single-writer rule ("no echo means no row") means
     // this is the ONLY place PlEventTag::PairedDeviceUpserted is pushed for
-    // a save (both pl_persist_execute_pending_write and
-    // pl_persist_save_device_now funnel through this one function).
+    // a save (pl_persist_do_write and pl_persist_write_device_settings both
+    // funnel through this one function).
     pl_bt_push_paired_device_upserted(rec.addr, rec.name, rec.name_len, rec.mru_seq);
-    return PL_PERSIST_WRITE_OK;
+    *out_result = PL_PERSIST_WRITE_OK;
+    return true;
+}
+
+// Bead pico-link-4vb.6 (T1), now a thin wrapper over the shared RMW core
+// (pl_persist_rmw, design finding 1.3): pairing/reconnect writes always
+// bump mru_seq and may claim a fresh slot (design section 6: match by
+// `addr` against an existing slot, else the first free slot, else NO
+// EVICTION -- refuse and return PL_PERSIST_WRITE_STORE_FULL). Never touches
+// codec_id/ldac_quality -- those are Tier 2 settings, written only via
+// pl_persist_write_device_settings.
+//
+// `name`/`name_len` are NULL/0 from most call sites -- `name_len == 0`
+// means "this caller has no name to contribute, leave whatever is already
+// stored" (pl_persist_save_device_now supplies a real name from bt.c's
+// in-flight connect-target cache).
+static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], const uint8_t *name, uint8_t name_len) {
+    pl_persist_rmw_fields_t fields = {
+        .name = name,
+        .name_len = name_len,
+        .set_codec_settings = false,
+        .codec_id = 0,
+        .ldac_quality = 0,
+        .bump_mru = true,
+        .allow_create_slot = true,
+    };
+    pl_persist_write_result_t result = PL_PERSIST_WRITE_OK;
+    // allow_create_slot=true means pl_persist_rmw always attempts a write
+    // (finds-or-creates a slot, or reports STORE_FULL) -- it can only
+    // return false when allow_create_slot is false, which never applies
+    // here.
+    (void)pl_persist_rmw(addr, &fields, &result);
+    return result;
+}
+
+bool pl_persist_write_device_settings(const uint8_t addr[6], uint8_t codec_id, uint8_t ldac_quality) {
+    pl_persist_rmw_fields_t fields = {
+        .name = NULL,
+        .name_len = 0,
+        .set_codec_settings = true,
+        .codec_id = codec_id,
+        .ldac_quality = ldac_quality,
+        .bump_mru = false,
+        .allow_create_slot = false,
+    };
+    pl_persist_write_result_t result = PL_PERSIST_WRITE_OK;
+    if (!pl_persist_rmw(addr, &fields, &result)) {
+        pl_log(
+            "persist: write_device_settings for %02x:%02x:%02x:%02x:%02x:%02x but no slot holds it -- refusing "
+            "(the device page is only reachable for a remembered or connected device)\r\n",
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+        );
+        return false;
+    }
+    // allow_create_slot=false means STORE_FULL is structurally unreachable
+    // here (pl_persist_rmw only calls pl_persist_find_free_slot, the one
+    // path that can fail full, when allow_create_slot is true) -- but
+    // treat it as failure anyway rather than asserting, in case that
+    // invariant is ever weakened.
+    return result == PL_PERSIST_WRITE_OK;
+}
+
+bool pl_persist_get_device_settings(const uint8_t addr[6], uint8_t *out_codec_id, uint8_t *out_ldac_quality) {
+    int slot = pl_persist_find_slot_for_addr(addr);
+    if (slot < 0) {
+        return false;
+    }
+    *out_codec_id = s_slots[(uint8_t)slot].codec_id;
+    *out_ldac_quality = s_slots[(uint8_t)slot].ldac_quality;
+    return true;
 }
 
 // Called EXCLUSIVELY from pl_bt_pending_service (bt.c), which itself only
@@ -647,8 +821,12 @@ bool pl_persist_forget_device(const uint8_t addr[6]) {
     }
 
     s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, (uint8_t)slot));
-    s_slot_occupied[(uint8_t)slot] = false;
-    memset(s_slot_addr[(uint8_t)slot], 0, 6);
+    // Design finding 1.4: clear the whole live mirror entry, not just
+    // occupied/addr -- a subsequent pl_persist_get_device_settings for this
+    // address is already refused via `occupied`, but a fully-zeroed entry
+    // avoids leaving stale codec_id/ldac_quality/name bytes sitting in RAM
+    // for a slot that no longer represents any device.
+    memset(&s_slots[(uint8_t)slot], 0, sizeof(s_slots[(uint8_t)slot]));
 
     // S18: forgetting removes the link key too -- a PL:D record without its
     // key is a row that says "Paired" but can't connect without re-pairing.

@@ -278,6 +278,7 @@ pl_codec_t pl_codec_ldac = {
     .avdtp_codec_type = AVDTP_CODEC_NON_A2DP,
     .vendor_id = 0x0000012D,
     .vendor_codec_id = 0x00AA,
+    .codec_id = PL_CODEC_ID_LDAC,
 
     // Preference-ordered table walk (a2dp.c's CAPABILITIES_COMPLETE
     // handler, design sec 4.3): LDAC is tried first. This field is

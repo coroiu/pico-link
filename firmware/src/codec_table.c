@@ -21,3 +21,19 @@ pl_codec_t *const PL_CODECS[] = {
 };
 
 const size_t PL_CODEC_COUNT = sizeof(PL_CODECS) / sizeof(PL_CODECS[0]);
+
+pl_codec_t *pl_codec_table_find_by_id_in(pl_codec_t *const *table, size_t count, uint8_t codec_id) {
+    if (codec_id == PL_CODEC_ID_AUTOMATIC) {
+        return NULL;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (table[i]->codec_id == codec_id) {
+            return table[i];
+        }
+    }
+    return NULL;
+}
+
+pl_codec_t *pl_codec_table_find_by_id(uint8_t codec_id) {
+    return pl_codec_table_find_by_id_in(PL_CODECS, PL_CODEC_COUNT, codec_id);
+}

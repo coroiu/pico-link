@@ -1991,6 +1991,41 @@ void pl_a2dp_init(struct PlUi *ui) {
     a2dp_source_init();
     a2dp_source_register_packet_handler(&pl_a2dp_packet_handler);
 
+    // Design finding 1.1 (.planning/design/2026-09-02-device-page-seam.md
+    // sec 1.1, bead pico-link-ay0.1): codec_id is a PINNED per-row identity,
+    // persisted to flash -- never the array index above, which is the
+    // negotiation preference order and is designed to change. This is the
+    // cheapest possible guard against the one mistake (a new row shipped
+    // with codec_id 0, or reusing an id already claimed by another row)
+    // that would otherwise silently repoint every device that pinned the
+    // colliding id at the wrong codec, with a valid CRC and no way to
+    // detect it. Halts (like this file's other "must never happen" guards,
+    // e.g. persist.c's flash-collision check) rather than limping on with a
+    // codec table that cannot be trusted.
+    for (size_t i = 0; i < PL_CODEC_COUNT; i++) {
+        if (PL_CODECS[i]->codec_id == PL_CODEC_ID_AUTOMATIC) {
+            pl_log(
+                "a2dp: FATAL codec row \"%s\" has codec_id 0 (PL_CODEC_ID_AUTOMATIC is reserved, never a "
+                "table row) -- halting\r\n",
+                PL_CODECS[i]->display_name
+            );
+            while (true) {
+                tight_loop_contents();
+            }
+        }
+        for (size_t j = i + 1; j < PL_CODEC_COUNT; j++) {
+            if (PL_CODECS[j]->codec_id == PL_CODECS[i]->codec_id) {
+                pl_log(
+                    "a2dp: FATAL duplicate codec_id %u shared by \"%s\" and \"%s\" -- halting\r\n",
+                    (unsigned)PL_CODECS[i]->codec_id, PL_CODECS[i]->display_name, PL_CODECS[j]->display_name
+                );
+                while (true) {
+                    tight_loop_contents();
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < PL_CODEC_COUNT; i++) {
         pl_codec_t *row = PL_CODECS[i];
         avdtp_stream_endpoint_t *ep = a2dp_source_create_stream_endpoint(
