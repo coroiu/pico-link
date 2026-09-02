@@ -174,6 +174,119 @@ change says "you did not get what you asked for" without spending a single
 extra pixel, and one `A` press gets the sentence. That is section 11's
 "diagnosis and remedy are one gesture", one level deeper.
 
+### 3.1.1 AMENDMENT — the save-pending state, and why it is not amber
+
+Added 2026-09-02 in answer to `.planning/design/2026-09-02-device-page-seam.md`
+§3.2 (Ada). Her finding: a flash write is three ~3ms interrupts-off blackouts,
+and USB ISO-OUT's re-arm bar is 2ms where **one** miss is permanent (the
+`pico-link-2ap` failure class). So `persist.c`'s streaming gate is physics, not
+policy: a pin set **while the host is actively streaming** is staged in RAM and
+lands when streaming stops. Her Tier 1 proposal was to render the unconfirmed
+pin in `STATUS_WARNING` until the `PairedDeviceUpserted` echo confirms it, and
+she correctly handed the visual back here. **I am declining the amber and
+moving the state off the trailing value entirely.**
+
+#### The reason: the trailing value is already a two-meaning channel
+
+`STATUS_WARNING` on this exact row already means two things in §3.1's table —
+`SBC` (the pin was not honoured) and `SBC pending` (the change is not live on
+the link yet). A third amber meaning is not a vocabulary stretch, it is a
+**collision**: pin LDAC on a connected device that is streaming and both of
+these are true at once —
+
+- the pin is **not live** (renegotiation needs a reconnect), and
+- the pin is **not durable** (the flash write is blocked).
+
+One right-aligned string cannot say both, and the two facts are orthogonal.
+So they get different channels:
+
+> **RULING. The `CODEC` trailing value describes the LINK — what you are
+> getting now, or will get on the next connect. It NEVER encodes whether the
+> setting reached flash. §3.1's table is unchanged. Durability gets its own
+> row.**
+
+There is also a plainer argument. Amber's product meaning is *"you did not get
+what you asked for."* A save-pending pin is the opposite: the user got exactly
+what they asked for, `core` is holding it, and it will be honoured on the next
+connect. The only thing at risk is survival of a power cycle in the next few
+minutes. Painting that amber would teach the user that amber means "something
+might be wrong somewhere", which is how a status colour dies.
+
+#### The note row
+
+One conditional row, immediately **below** `CODEC`, present only while a pin
+write for this device is outstanding. It uses `FieldKind::Readonly` with a
+label and **no value** — a sentence, not a field. That is inside Fern's ruling
+as written (`.planning/design/2026-09-02-field-list-widget-ruling.md` §4.1/4.3):
+label-only `Readonly` rows are already expressible, no leading gutter is
+requested (a gutter is per-list and would push every label from `L = 12` to 24,
+breaking the Home grid), and no new row capability is invented.
+
+| Save state | Row | Label | Colour | `A` |
+|---|---|---|---|---|
+| Landed (the common case) | **absent** | — | — | — |
+| Pending, blocked by streaming | `Readonly` | `Saves when playback stops` | `TEXT_SECONDARY` | no-op |
+| Write failed | `Action` | `Save failed` + value `retry` | `STATUS_WARNING` | re-issues the write |
+
+Sentence case, deliberately: every other label on this page is a CAPS field
+name, so a lowercase sentence reads as a note rather than a setting. Width:
+25 chars in `font::value` from `L = 12` is ~175px against the 182px measure —
+**Ruby must measure it**, and the fallback if it overruns is `Saves after
+playback` (20 chars). Do not shrink the font; a note nobody can read is worse
+than a shorter note.
+
+`Save failed` is amber, and here amber has no competitor — it is the only
+meaning this row ever carries, and it is squarely "you did not get what you
+asked for": the setting works this session and evaporates on the next power
+cycle. It must never look like pending-forever, which is why it changes the
+**word**, gains a caret, and offers a remedy. Colour alone would not have
+distinguished them and that is the whole reason this state got a row.
+
+```
+  DEVICE                            drop     DEVICE                     drop
+  ---------------------------       A pick   ---------------------      A retry
+   CODEC                  LDAC      B back    CODEC             LDAC    B back
+   Saves when playback stops                  Save failed      retry >
+   LDAC QUALITY       990 kbps                LDAC QUALITY  990 kbps
+   SAMPLE RATE          96 kHz                SAMPLE RATE     96 kHz
+        pending (dim note)                         failed (amber, actionable)
+```
+
+#### When it appears, and the flicker it must not have
+
+Gate the row on **known-blocked**, not on "no echo yet". `core` learns the host
+is streaming from the USB-IN and A2DP stream-state events the seam already
+gives it (seam §2.5, §2.6). If nothing is streaming, the write is happening
+right now and the UI says nothing — the echo arrives on the async context a
+few ms later. If `core` cannot know reliably, the fallback is
+pending-and-no-echo, which costs one frame of a visible note row in the common
+case; that is tolerable but it is the worse option, so try the gate first.
+
+There is no timer, no animation, `redraw_after` stays `None`.
+
+#### Leaving and coming back
+
+The pending state is a per-address field on the app model, not screen state.
+`B` out of the page and the write is still outstanding; come back and the row
+is still there, unchanged, with no re-prompt and no second write. Home is
+unaffected — Home is a reassurance surface and does not report save state; §11's
+"Home shows what you are getting" is untouched, because what you are getting
+did not change. Pin twice before the echo: last write wins, one pending state
+per device, the row does not multiply.
+
+If power is lost while pending, the pin is gone and the page truthfully shows
+the old value on next boot. That is the residual `pico-link-15n` window and the
+UI does not pretend otherwise.
+
+#### Repaint (note for Ruby, not a design choice)
+
+Entering **pending** is caused by a local `A` press, not by an event, so the
+handler that sets it **must mark the model dirty itself**. The firmware gates
+the blit on `pl_ui_dirty()` (`pico-link-vxc`), so a state that changes without
+dirtying silently freezes on screen. Leaving pending is caused by the
+`PairedDeviceUpserted` echo (or the failure event), which marks dirty for free.
+
+
 ### 3.2 `LDAC QUALITY`
 
 Present only when the effective-or-pinned codec is LDAC (section 10's rule).
@@ -661,3 +774,46 @@ Assertions worth their own tests: `SIGNAL` is absent while `USB IN` is dashed;
 the caret appears only on Action rows; `A` on an Info row returns
 `Action::None`; both forget routes produce the identical confirm; the longest
 plausible name plus the longest trailing value do not collide at `R = 194`.
+
+---
+
+## 11. Handoff addendum — save-pending (2026-09-02, with §3.1.1)
+
+**To Ada.** §10 item 2 is answered by seam §3.2 except for the streaming window,
+which §3.1.1 now renders. One thing that design needs and the seam does not yet
+have:
+
+- **A terminal failure signal for a settings write.** Today a failed write is
+  indistinguishable from a slow one: silence. §3.1.1's `Save failed` row cannot
+  be reached without it, and "pending forever" is exactly the mystery state this
+  amendment exists to avoid. Preferred: an additive
+  `DeviceSettingsWriteFailed { addr }` tag (no ABI bump; a reason code is
+  welcome but the UI does not currently print one). Acceptable Tier 1 fallback
+  if you decline: `core` times out after ~3s **only while nothing is
+  streaming** — a timeout during streaming is meaningless because the legitimate
+  wait is unbounded.
+- Confirmed as unnecessary: any way to cancel or query a staged write. Last
+  write wins and there is one pending state per address.
+
+**To Fern.** Nothing new. §3.1.1 uses `FieldKind::Readonly` with a label and no
+value, and `FieldKind::Action` with `with_label_color` + `with_activate_label`
+— all four already in your §4.1/§4.3 ruling. No leading gutter is requested on
+this list. The only requirement is that a row appearing or disappearing
+mid-list preserves focus by `ListItemKey` rather than by index.
+
+**To Ruby.**
+- The pending flag is per-address app-model state, set in the `A` handler for
+  the codec picker, cleared by the `PairedDeviceUpserted` echo. **The setter
+  must mark dirty** — see §3.1.1's last paragraph.
+- Measure `Saves when playback stops` at `font::value` before committing to it;
+  fall back to `Saves after playback` if it exceeds the 182px measure.
+- The `retry` A-press re-issues the identical `SetDeviceCodecPref` command; it
+  is not a different code path.
+
+**To Tess.** Two headless PNGs at zoom, added to §10's list:
+
+8. Connected + streaming, pin just changed — `CODEC` trailing unchanged and at
+   `TEXT_PRIMARY`, dim note row present directly beneath it.
+9. Write failed — amber `Save failed` row with `retry`, focusable, caret
+   visible when focused. Assert it is visually distinct from case 8 in **text**,
+   not only in colour.
