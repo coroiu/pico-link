@@ -521,6 +521,96 @@ where
     Ok(())
 }
 
+/// Number of segments in one [`draw_level_meter`] channel row — the
+/// design's own "6-8 segments per channel" (section 6/21 E17), pinned to
+/// the top of that range: 8 divides the 0-255 linear scale evenly (32 per
+/// segment) with no remainder bucket to special-case.
+const METER_SEGMENT_COUNT: i32 = 8;
+/// Width (px) of a single segment.
+const METER_SEGMENT_WIDTH: i32 = 6;
+/// Gap (px) between adjacent segments.
+const METER_SEGMENT_GAP: i32 = 2;
+/// Total footprint (px) of one full meter row — exposed for the same
+/// "caller can reserve exact width" reason as [`SIGNAL_GLYPH_WIDTH`].
+pub const METER_GLYPH_WIDTH: u32 =
+    (METER_SEGMENT_COUNT * METER_SEGMENT_WIDTH + (METER_SEGMENT_COUNT - 1) * METER_SEGMENT_GAP) as u32;
+
+/// Which colour segment `index` (0-based, quietest first) draws in when
+/// filled — green for the bottom 5/8, amber for the next 2/8, red only
+/// for the top 1/8 (design section 6's "OUT meter ... peak-hold and a
+/// `STATUS_ERROR` cap" — the cap is a colour a peak can reach, not a
+/// separate glyph).
+fn level_segment_color(index: i32) -> Rgb565 {
+    if index >= METER_SEGMENT_COUNT - 1 {
+        palette::STATUS_ERROR
+    } else if index >= METER_SEGMENT_COUNT - 3 {
+        palette::STATUS_WARNING
+    } else {
+        palette::TEXT_PRIMARY
+    }
+}
+
+/// Draws one stereo OUT-meter channel row (design section 6/21 E17/C8,
+/// bead pico-link-du0): [`METER_SEGMENT_COUNT`] segments, left to right,
+/// bottom-aligned within `rect` — same left-to-right growth convention as
+/// [`draw_signal_bars`]. `level` (0-255 linear, 255 == full-scale/
+/// clipping) sets how many segments are filled; `hold` (also 0-255) draws
+/// a single highlighted segment at the peak-hold cap's position, on top
+/// of whichever fill colour would otherwise be there — [`palette::
+/// STATUS_ERROR`] if the hold segment is the top (clip) one, [`palette::
+/// BRAND_BRIGHT`] otherwise, so the cap always reads as "the peak", never
+/// blends into an ordinary filled segment. `hold == 0` draws no cap at
+/// all (nothing has peaked yet).
+///
+/// Every segment draws regardless of fill state (unfilled segments use
+/// [`palette::DIVIDER`]) for the same "zero-bars must still read as
+/// present, not as nothing rendered" reason [`draw_signal_bars`]'s doc
+/// comment gives.
+///
+/// `rect.size.width` is ignored, same caveat as [`draw_signal_bars`]:
+/// this always lays out all `METER_SEGMENT_COUNT` segments starting at
+/// `rect.top_left`, relying on the framebuffer's own out-of-range
+/// discard rather than rect-relative clipping.
+///
+/// # Errors
+///
+/// Returns `Infallible`'s uninhabited variant in practice — see
+/// [`super::widget::Widget::render`]'s doc comment for why the `Result`
+/// return exists at all.
+pub fn draw_level_meter<D>(target: &mut D, rect: Rectangle, level: u8, hold: u8) -> Result<(), Infallible>
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    // Round-to-nearest segment count from a 0-255 linear level -- e.g.
+    // level=255 (full scale) must fill all 8 segments, not 7 from a floor
+    // division that leaves the top segment looking un-driven at max input.
+    let filled = (i32::from(level) * METER_SEGMENT_COUNT + 127) / 256;
+    // Hold segment index: which segment the peak-hold cap sits on.
+    // `hold == 0` is "no peak recorded yet" (a fresh channel with no
+    // reading above silence), drawn as no cap rather than a cap pinned to
+    // segment 0 -- segment 0 already reads as "quietest filled segment"
+    // on its own, so a permanent cap there for genuine silence would be
+    // visual noise, not information.
+    let hold_index = if hold == 0 { None } else { Some((i32::from(hold) * METER_SEGMENT_COUNT / 256).min(METER_SEGMENT_COUNT - 1)) };
+
+    for i in 0..METER_SEGMENT_COUNT {
+        let x = rect.top_left.x + i * (METER_SEGMENT_WIDTH + METER_SEGMENT_GAP);
+        let is_hold = hold_index == Some(i);
+        let color = if is_hold {
+            if i >= METER_SEGMENT_COUNT - 1 { palette::STATUS_ERROR } else { palette::BRAND_BRIGHT }
+        } else if i < filled {
+            level_segment_color(i)
+        } else {
+            palette::DIVIDER
+        };
+        Rectangle::new(Point::new(x, rect.top_left.y), Size::new(METER_SEGMENT_WIDTH as u32, rect.size.height))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(target)?;
+    }
+
+    Ok(())
+}
+
 /// Width, in pixels, of the left accent bar [`draw_selection`] draws.
 pub const SELECTION_ACCENT_WIDTH: u32 = 4;
 

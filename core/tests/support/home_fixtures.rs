@@ -29,10 +29,11 @@ use pico_link_core::{App, ConnectedCodec, DeviceEntry, Event, LinkState, PairedD
 
 pub const ZOOM: u32 = 3;
 
-/// Names of the three fixtures `generate` writes, in the order it writes
-/// them -- also the base filenames (without `.png`) under
-/// `home-screenshots/` at the repo root.
-pub const FIXTURE_NAMES: [&str; 3] = ["01_no_link", "02_connected_ldac", "03_disconnected_after_ldac"];
+/// Names of the fixtures `generate` writes, in the order it writes them --
+/// also the base filenames (without `.png`) under `home-screenshots/` at
+/// the repo root.
+pub const FIXTURE_NAMES: [&str; 4] =
+    ["01_no_link", "02_connected_ldac", "03_disconnected_after_ldac", "04_connected_with_out_level"];
 
 pub fn save_zoomed_png(app: &mut App, out_dir: &Path, name: &str) {
     let framebuffer = app.render();
@@ -93,4 +94,24 @@ pub fn generate(out_dir: &Path) {
     // matching 01 exactly. ---
     app.handle_event(Event::LinkStateChanged(LinkState::Idle));
     save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[2]);
+
+    // --- Connected, with a live stereo OUT level meter (bead
+    // pico-link-du0, design section 21 E17): a fresh connected `App`
+    // (not a reuse of the one above, which is now disconnected), ticked
+    // to a nonzero `now_us` so `OutLevelSample::received_at` reads as a
+    // real timestamp, then fed one `Event::LevelsChanged` reading. `peak_l`
+    // is intentionally well above `rms_l` so the L channel's peak-hold cap
+    // (the bright/red single segment) visibly sits above its RMS-driven
+    // bar fill in the fixture -- proving the two aren't the same number
+    // rendered twice. `peak_r`/`rms_r` are close together, so the R
+    // channel shows an ordinary reading with its hold cap right at the
+    // bar's edge. ---
+    let mut app = App::new(240, 240);
+    let addr = [0xDD; 6];
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1 }));
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+    app.tick(1);
+    app.handle_event(Event::LevelsChanged { peak_l: 240, peak_r: 150, rms_l: 90, rms_r: 140 });
+    save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[3]);
 }

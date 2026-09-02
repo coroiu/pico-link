@@ -26,6 +26,7 @@
 use alloc::format;
 use alloc::string::String;
 use core::convert::Infallible;
+use core::time::Duration;
 
 use embedded_graphics::draw_target::DrawTargetExt;
 use embedded_graphics::prelude::{Point, Primitive, Size};
@@ -34,9 +35,11 @@ use embedded_graphics::Drawable;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
+use crate::platform::Instant;
+
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
-use super::theme::{font, palette};
+use super::theme::{self, font, palette};
 use super::widget::{ChromeContribution, Widget};
 
 /// Left rule `L` (px, area-relative) — shared by the device-name line, the
@@ -98,6 +101,28 @@ const BANNER_TOP: i32 = 100;
 /// doc section 4/7: absolute panel y 144. Fixed for the same reason as
 /// `BANNER_TOP`.
 const STAT_TOP: i32 = 128;
+/// Height (px) of a single OUT-meter channel row (bead pico-link-du0,
+/// design section 21 E17). Matches [`super::theme::draw_level_meter`]'s
+/// segment height.
+const METER_ROW_HEIGHT: i32 = 8;
+/// Gap (px) between the L and R meter rows.
+const METER_ROW_GAP: i32 = 4;
+/// How long a stale OUT-meter reading is still drawn before this widget
+/// treats it as "no PCM" and stops drawing it at all (design section 15:
+/// **absent, never frozen** — the hard constraint this whole feature was
+/// commissioned under, since a still VU meter reads as silence when it
+/// means no data). A little over 2x the ~4Hz push cadence C's
+/// `PL_A2DP_LEVEL_PUSH_INTERVAL_MS` targets, so one merely-late reading
+/// doesn't blank the meter but a genuinely stopped stream reads as
+/// silence within a couple of frames rather than staying frozen
+/// indefinitely.
+pub(crate) const OUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(600);
+/// The OUT meter's own repaint cadence while live. Andreas's 2026-09-02
+/// override on this bead: ship at the design's ~4Hz refresh, do not run a
+/// framerate sweep to tune it — this is the one named constant that makes
+/// a future rate change a one-line edit. See
+/// [`HeroStatusView::redraw_after`].
+pub(crate) const OUT_LEVEL_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The hero codec word's colour is a reassurance mechanic (design section
 /// 6): steady green means "you got what you asked for", amber means "you
@@ -154,6 +179,32 @@ pub enum BitrateStatus {
     Kbps(u32),
 }
 
+/// One live OUT-meter reading, as this widget's own render-time clock
+/// will judge it (bead pico-link-du0, design section 21 E17/C8). A
+/// hero-local type, deliberately not `crate::app::OutLevelSample`
+/// directly — same "the widget stays decoupled from `BtModel`" shape
+/// [`CodecStatus`]/[`BitrateStatus`] already use; `render::home` is the
+/// only place that translates live model data into this widget's own
+/// vocabulary (see that module's `HomeView::new`).
+///
+/// `peak_l`/`peak_r`/`rms_l`/`rms_r`/`hold_l`/`hold_r` are linear 0-255
+/// (255 == full-scale PCM / clipping). `received_at` is what
+/// [`HeroStatusView::render`] and [`HeroStatusView::redraw_after`]
+/// compare against [`RenderCtx::now`] to decide whether this reading is
+/// still live or has gone stale — see [`OUT_LEVEL_STALE_AFTER`]'s doc
+/// comment for why that comparison, not a boolean C sends, is the
+/// mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutLevelDisplay {
+    pub peak_l: u8,
+    pub peak_r: u8,
+    pub rms_l: u8,
+    pub rms_r: u8,
+    pub hold_l: u8,
+    pub hold_r: u8,
+    pub received_at: Instant,
+}
+
 /// Which persistent banner (if any) is currently showing — resolved by
 /// [`HeroStatusView::active_banner`] from `muted`/`CodecStatus::fallback`
 /// per the design's priority rule: **at most one banner, MUTED outranks
@@ -182,12 +233,13 @@ pub struct HeroStatusView {
     status: CodecStatus,
     muted: bool,
     stat_line: Option<String>,
+    out_level: Option<OutLevelDisplay>,
 }
 
 impl HeroStatusView {
     #[must_use]
     pub fn new(device_name: impl Into<String>, status: CodecStatus) -> Self {
-        Self { device_name: device_name.into(), status, muted: false, stat_line: None }
+        Self { device_name: device_name.into(), status, muted: false, stat_line: None, out_level: None }
     }
 
     /// Design section 6.3: device-side volume at zero with the host
@@ -202,16 +254,34 @@ impl HeroStatusView {
     }
 
     /// The bottom stat strip's text (e.g. "USB 48K 24-BIT"). `None` draws
-    /// nothing there — the `OUT` level meter and `LINK`/`SIGNAL` bars this
-    /// row shows in the design sketch are CUT for Tier 1 (design section
-    /// 13: unconfirmed data, cut entirely rather than dashed or frozen),
-    /// so building the specific field-by-field logic for what remains is
+    /// nothing there — the `LINK`/`SIGNAL` bars this row shows in the
+    /// design sketch are still CUT for Tier 1 (design section 13:
+    /// unconfirmed data, cut entirely rather than dashed or frozen), so
+    /// building the specific field-by-field logic for what remains is
     /// this widget's caller's job, not this widget's — it just renders
     /// whatever single line it's handed, uppercase-styled per the design's
-    /// `font::label` stat-label rule.
+    /// `font::label` stat-label rule. (The `OUT` level meter itself is no
+    /// longer CUT — see [`Self::with_out_level`], bead pico-link-du0: it
+    /// was gated on M3, which is now proven and shipping audio.)
     #[must_use]
     pub fn with_stat_line(mut self, line: impl Into<String>) -> Self {
         self.stat_line = Some(line.into());
+        self
+    }
+
+    /// The stereo OUT level meter (design section 21 E17/C8, bead
+    /// pico-link-du0) — `None` draws nothing at all, which is the correct
+    /// state whenever there is no live PCM to measure (design section 15:
+    /// absent, never frozen or faked) or the caller couldn't produce a
+    /// reading. `Some` is not a promise the meter actually draws this
+    /// frame, either: [`Widget::render`] separately checks
+    /// [`OutLevelDisplay::received_at`] against [`RenderCtx::now`] and
+    /// still draws nothing if it's gone stale (see
+    /// [`OUT_LEVEL_STALE_AFTER`]'s doc comment) — the caller is not
+    /// expected to re-derive that judgement itself before calling this.
+    #[must_use]
+    pub fn with_out_level(mut self, level: Option<OutLevelDisplay>) -> Self {
+        self.out_level = level;
         self
     }
 
@@ -304,8 +374,11 @@ impl Widget for HeroStatusView {
     /// Returns `Infallible`'s uninhabited variant in practice — see
     /// [`Widget::render`]'s doc comment for why the `Result` return exists
     /// at all.
-    #[allow(clippy::too_many_lines)]
-    fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+    // `row_l_y`/`row_r_y` are the OUT meter's two channel rows -- the L/R
+    // domain vocabulary, same false-positive clippy::similar_names has on
+    // `App::on_levels_changed`.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
 
         // --- Device name: truncates with an ellipsis, never a marquee. ---
@@ -430,6 +503,39 @@ impl Widget for HeroStatusView {
             );
         }
 
+        // --- Stereo OUT level meter (design section 21 E17/C8, bead
+        // pico-link-du0): two horizontal segmented bars, L above R,
+        // sharing the stat strip's grid slot with `stat_line` above
+        // (they don't collide in practice — nothing populates
+        // `stat_line` with live data yet). **Absent whenever there is no
+        // live reading, or the last one has gone stale** — this is the
+        // hard constraint the bead was commissioned under (design
+        // section 15): a still meter reads as silence when it means no
+        // data, so a stale reading is simply not drawn, not frozen and
+        // not dashed. See `OUT_LEVEL_STALE_AFTER`'s doc comment for the
+        // staleness window and `HeroStatusView::redraw_after` for how
+        // this widget schedules its own repaint to *notice* staleness
+        // with no new event to trigger a rebuild. ---
+        if let Some(level) = &self.out_level {
+            if ctx.now().saturating_duration_since(level.received_at) <= OUT_LEVEL_STALE_AFTER {
+                let meter_x = area.top_left.x + LEFT_MARGIN;
+                let row_l_y = area.top_left.y + STAT_TOP;
+                let row_r_y = row_l_y + METER_ROW_HEIGHT + METER_ROW_GAP;
+                theme::draw_level_meter(
+                    &mut clipped,
+                    Rectangle::new(Point::new(meter_x, row_l_y), Size::new(0, METER_ROW_HEIGHT as u32)),
+                    level.rms_l,
+                    level.hold_l,
+                )?;
+                theme::draw_level_meter(
+                    &mut clipped,
+                    Rectangle::new(Point::new(meter_x, row_r_y), Size::new(0, METER_ROW_HEIGHT as u32)),
+                    level.rms_r,
+                    level.hold_r,
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -440,6 +546,28 @@ impl Widget for HeroStatusView {
     /// which is `pico-link-znb.5` (E2)'s job, not this widget's.
     fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
         Some(ChromeContribution { fallback: self.is_fallback(), ..Default::default() })
+    }
+
+    /// Requests another render before this widget's OUT-meter reading
+    /// would otherwise go stale-but-still-drawn (bead pico-link-du0) —
+    /// the mechanism that lets the "absent, never frozen" rule in
+    /// `render` above actually fire on schedule even when no new
+    /// [`crate::app::Event::LevelsChanged`] arrives to trigger a rebuild
+    /// (e.g. the host stops sending PCM mid-stream). Bounded at
+    /// [`OUT_LEVEL_REFRESH_INTERVAL`] while comfortably live, and at
+    /// exactly the remaining time-to-staleness once close to it, so the
+    /// meter disappears within one frame of going stale rather than up to
+    /// a whole refresh interval late. Returns `None` once already stale
+    /// (this frame already drew it absent; nothing more to schedule) or
+    /// when there's no reading at all.
+    fn redraw_after(&self, ctx: &RenderCtx) -> Option<Duration> {
+        let level = self.out_level.as_ref()?;
+        let age = ctx.now().saturating_duration_since(level.received_at);
+        if age >= OUT_LEVEL_STALE_AFTER {
+            None
+        } else {
+            Some(OUT_LEVEL_REFRESH_INTERVAL.min(OUT_LEVEL_STALE_AFTER.saturating_sub(age)))
+        }
     }
 }
 

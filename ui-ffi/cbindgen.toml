@@ -31,6 +31,7 @@ include = [
     "PlDeviceDiscoveredPayload",
     "PlConnectFailedPayload",
     "PlCodecChangedPayload",
+    "PlLevelsChangedPayload",
     "PlEventTag",
     "PlEventPayload",
     "PlEvent",
