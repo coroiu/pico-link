@@ -1195,11 +1195,15 @@ static void pl_a2dp_fill(void) {
 // stays on core0 (0xFF, this file's IRQ-context contract) even after the
 // `pico-link-nli` epic moves the producer (pl_a2dp_seal_head) to core1.
 // Two `__dmb()`s bracket the cross-core-sensitive part:
-// - read-after-acquire, before touching `slot`: orders the read of
-//   tx_head/tx_tail (via pl_a2dp_tx_count() below) before the reads of
-//   slot->frames/rtp_ts/data/len, mirroring pl_a2dp_seal_head()'s
-//   publish-after-write on the other side -- without it this core could
-//   observe a just-sealed tx_head and still read stale/torn slot bytes.
+// - read-after-acquire, AFTER the tx_count()==0 check and BEFORE touching
+//   `slot`: orders the read of tx_head/tx_tail (via pl_a2dp_tx_count()
+//   above) before the reads of slot->frames/rtp_ts/data/len, mirroring
+//   pl_a2dp_seal_head()'s publish-after-write on the other side --
+//   without it this core could observe a just-sealed tx_head and still
+//   read stale/torn slot bytes. It must sit after the tx_count() load
+//   (an early return has nothing to order) and before the slot reads
+//   (the actual dependency it protects), not before the tx_count() load
+//   itself.
 // - publish-after-read, before advancing tx_tail: orders every read of
 //   `slot` above it before the tx_tail update that tells core1 the slot
 //   is free to reuse. Without it core1 could start overwriting the slot
@@ -1207,12 +1211,12 @@ static void pl_a2dp_fill(void) {
 static void pl_a2dp_send_media_packet(void) {
     s_ctx.grants++;
 
-    __dmb(); // read-after-acquire: order the tx_count() read below before the slot reads that follow
     if (pl_a2dp_tx_count() == 0) {
         s_ctx.spurious_grants++;
         s_ctx.send_requested = false;
         return;
     }
+    __dmb(); // read-after-acquire: order the tx_count() read above before the slot reads that follow
 
     pl_a2dp_slot_t *slot = &s_ctx.tx[s_ctx.tx_tail];
     // Bead pico-link-cz0.5.6: byte 0 is the num_frames header content for
@@ -1979,11 +1983,20 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 uint32_t denom = s_ctx.frame.worst_case_encode_us * s_ctx.frames_per_packet;
                 uint32_t b_tick = (PL_A2DP_MAX_ENCODE_DWELL_US + denom - 1) / denom; // ceil
                 uint32_t required_slots = 1u + 2u * b_tick;
-                if (required_slots > PL_A2DP_TX_QUEUE_SLOTS) {
+                // Bead pico-link-nli.3 (G2): the usable ceiling is
+                // SLOTS - 1, not SLOTS -- one slot is permanently
+                // reserved so pl_a2dp_tx_count()'s masked head-tail
+                // derivation can disambiguate empty from full (see
+                // pcm_ring.c's byte-ring discipline, applied here to
+                // the slot ring). Comparing against the raw SLOTS
+                // count would silently pass a queue that is actually
+                // one slot too small.
+                if (required_slots > PL_A2DP_TX_QUEUE_SLOTS - 1u) {
                     pl_log(
-                        "a2dp: WARNING tx queue depth %u required but only %u compiled in "
+                        "a2dp: WARNING tx queue depth %u required but only %u usable of %u compiled in "
                         "(b_tick=%lu frames_per_packet=%lu worst_case_encode_us=%lu)\r\n",
-                        (unsigned)required_slots, (unsigned)PL_A2DP_TX_QUEUE_SLOTS, (unsigned long)b_tick,
+                        (unsigned)required_slots, (unsigned)(PL_A2DP_TX_QUEUE_SLOTS - 1u),
+                        (unsigned)PL_A2DP_TX_QUEUE_SLOTS, (unsigned long)b_tick,
                         (unsigned long)s_ctx.frames_per_packet, (unsigned long)s_ctx.frame.worst_case_encode_us
                     );
                 }
