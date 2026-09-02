@@ -2179,7 +2179,9 @@ mod tests {
             app
         }
 
-        let mut cases: Vec<(&'static str, fn() -> App, Option<Verb>)> = freshness_cases()
+        type ActivationCase = (&'static str, fn() -> App, Option<Verb>);
+
+        let mut cases: Vec<ActivationCase> = freshness_cases()
             .into_iter()
             .map(|(name, build, _)| {
                 let expected = match name {

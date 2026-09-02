@@ -67,6 +67,16 @@ fn main() {
     let out_dir: PathBuf = env::args().nth(1).map_or_else(|| env::temp_dir().join("pico-link-devices-screenshots"), PathBuf::from);
     std::fs::create_dir_all(&out_dir).expect("failed to create output directory");
 
+    // --- Home, menu face (design row 2): the first `Select` out of
+    // `open_devices` toggles Home's status face to its menu face
+    // (Bluetooth pre-selected); captured here rather than only passed
+    // through, since no other fixture set renders this face on its own. A
+    // reads `open` (design doc section 4: both Bluetooth/Settings rows
+    // push a deeper screen and draw a caret). ---
+    let mut app = App::new(240, 240);
+    app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
+    save_zoomed_png(&mut app, &out_dir, "00_home_menu_face");
+
     // --- First run: nothing remembered yet -- the only row is "Pair new
     // headphones" (design section 4). Proves the empty state is navigable,
     // not a dead/blank-looking single-row screen. ---
@@ -145,4 +155,13 @@ fn main() {
     open_devices(&mut app);
     app.handle_input(vec![NavIntent::Select]);
     save_zoomed_png(&mut app, &out_dir, "07_device_detail_stub");
+
+    // --- Settings (stub, design row 7): reached from Home's status face
+    // via ShortcutY, per `build_settings_screen`'s doc comment. No
+    // widgets, so A is Inert -- design doc
+    // .planning/design/2026-09-02-a-button-label-rule.md section 4's
+    // "Device detail (stub) / Settings (stub)" row.
+    let mut app = App::new(240, 240);
+    app.handle_input(vec![NavIntent::ShortcutY]); // Home status face -> Settings
+    save_zoomed_png(&mut app, &out_dir, "08_settings_stub");
 }
