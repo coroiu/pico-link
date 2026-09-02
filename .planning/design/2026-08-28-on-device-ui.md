@@ -119,6 +119,14 @@ intent table and the rail edge together, never separately.
 2. **An unlabelled X or Y does nothing.** A mispress is always free.
 3. **B never navigates forward, on any screen, ever.** It is the only escape
    gesture and its reliability is the point.
+4. **A's liveness and A's label are the same fact.** A widget expresses its
+   A-affordance once, as `Option<Verb>` over the fixed set `open` / `select` /
+   `pair` / `scan`: present means A acts *and* the rail reads that word, absent
+   means A is dim *and* pressing it is a guaranteed no-op. "A works but is dim"
+   is not representable. Added 2026-09-02 after Andreas found A grey and silent
+   on five of the eight states where it acts -- the exact inverse of rule 2.
+   Full ruling, vocabulary, enforcement and per-screen table:
+   `.planning/design/2026-09-02-a-button-label-rule.md`.
 
 > **The Home exception, stated once:** Home has no focusable list, so "move
 > focus" and "activate the focused thing" are vacuous there. On Home *only*,
