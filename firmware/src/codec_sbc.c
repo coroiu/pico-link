@@ -197,6 +197,7 @@ pl_codec_t pl_codec_sbc = {
     .avdtp_codec_type = AVDTP_CODEC_SBC,
     .vendor_id = 0,
     .vendor_codec_id = 0,
+    .codec_id = PL_CODEC_ID_SBC,
 
     .preference = 0, // only row in S1's table; S4 gives LDAC a lower number
     .capabilities = s_sbc_capabilities,

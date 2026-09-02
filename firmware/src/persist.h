@@ -278,6 +278,57 @@ pl_persist_write_result_t pl_persist_save_device_now(const uint8_t addr[6]);
 // closed.
 bool pl_persist_forget_device(const uint8_t addr[6]);
 
+// Design finding 1.3 (.planning/design/2026-09-02-device-page-seam.md sec
+// 1.3, bead pico-link-ay0.1): updates per-device SETTINGS on an
+// ALREADY-REMEMBERED device -- `codec_id` (codec_table.h's PL_CODEC_ID_*,
+// 0 = Automatic) and `ldac_quality` (1-based: 0 = unset, 1 = 990 kbps, 2 =
+// 660 kbps, 3 = 330 kbps, 4 = Adaptive/reserved -- NOT a raw LDACBT_EQMID_*
+// value, since LDACBT_EQMID_HQ is literally 0 and would make "never chosen"
+// and "explicitly chose 990" the same byte forever). Shares ONE
+// read-modify-write core with pl_persist_do_write (persist.c) rather than
+// forking the RMW logic.
+//
+// Does NOT bump mru_seq: setting a preference is not using a device, and
+// core's auto-reconnect policy is paired.iter().max_by_key(|d| d.mru_seq)
+// -- bumping here would make a pinned-but-unconnected device the boot
+// reconnect target.
+//
+// Does NOT create a slot: returns false, writing nothing, if no slot
+// currently holds `addr`. The device page is only reachable for a
+// remembered device or the connected one (a connected device is written at
+// pairing time via pl_persist_save_device_now/pl_persist_request_save_device)
+// -- there is no legitimate "pin a codec on a device we've never stored"
+// path, and inventing one would let a pin consume one of
+// PL_PERSIST_DEVICE_SLOTS slots without pairing.
+//
+// # Calling contract
+//
+// Identical to pl_persist_execute_pending_write's: cyw43/BTstack background
+// async_context ONLY, via bt.c's pending queue. Calling this from thread
+// context reintroduces the exact race code-review finding 1 closed (see
+// this header's module doc, Reentrancy section).
+//
+// On an actual write, pushes PlEventTag::PairedDeviceUpserted, same as
+// every other successful write in this file (design point 3's single-writer
+// rule: no echo means no row) -- see pl_persist_do_write's doc comment.
+bool pl_persist_write_device_settings(const uint8_t addr[6], uint8_t codec_id, uint8_t ldac_quality);
+
+// Design finding 1.4 (.planning/design/2026-09-02-device-page-seam.md sec
+// 1.4, bead pico-link-ay0.1): reads the LIVE in-RAM slot mirror -- no flash
+// access, no allocation. Kept live by every write (pl_persist_do_write and
+// pl_persist_write_device_settings both funnel through the same RMW core,
+// which updates this mirror as part of the same write), NOT just populated
+// once at boot -- so a pin set now is visible to a2dp.c's next connection
+// attempt immediately, not only after a power cycle (the exact failure this
+// bead exists to prevent). Returns false, leaving the outputs untouched, if
+// `addr` is not currently remembered.
+//
+// Safe to call from the cyw43/BTstack background async_context (a2dp.c's
+// CAPABILITIES_COMPLETE handler, design sec 3.3) -- the mirror is only ever
+// mutated on that same async_context, so this is an uncontended same-context
+// read, not a cross-context one.
+bool pl_persist_get_device_settings(const uint8_t addr[6], uint8_t *out_codec_id, uint8_t *out_ldac_quality);
+
 // Tag namespace, exposed so a future preset-store implementation (hardening,
 // not MVP -- design point 8/pico-link-ryw) reuses this exact scheme rather
 // than inventing a second one. tag = ('P'<<24)|('L'<<16)|(kind<<8)|index.

@@ -100,6 +100,25 @@ typedef struct {
     bool payload_complete;
 } pl_codec_encode_result_t;
 
+// Pinned per-row codec identity -- design finding 1.1
+// (.planning/design/2026-09-02-device-page-seam.md sec 1.1, bead
+// pico-link-ay0.1). This is NOT the PL_CODECS array index: array order is
+// the negotiation PREFERENCE order (codec_table.c's own doc comment) and is
+// designed to change as rows are inserted -- a persisted
+// pl_persist_device_record_t::codec_id byte that meant "index into
+// PL_CODECS" would silently repoint at the wrong codec the day a row is
+// inserted ahead of it, with a valid CRC and no way to detect it. These
+// values are therefore ABI to the flash store: pinned here, never renumbered,
+// never reused even if a row is later removed.
+//
+// 0 is reserved for "Automatic" / "unset" and must never be assigned to a
+// table row -- pl_a2dp_init's boot check (a2dp.c) halts if it is.
+#define PL_CODEC_ID_AUTOMATIC 0u
+#define PL_CODEC_ID_SBC 1u
+#define PL_CODEC_ID_LDAC 2u
+// Next new codec's id is 3, allocated here (not at the call site) and
+// permanent from the moment it ships.
+
 // One codec table row. Statically allocated (one instance per codec,
 // defined in that codec's own .c file, e.g. codec_sbc.c's pl_codec_sbc) --
 // never malloc'd (design sec 5: the encode path must not allocate).
@@ -109,6 +128,9 @@ typedef struct pl_codec {
     uint8_t avdtp_codec_type; // AVDTP_CODEC_SBC | ..._MPEG_2_4_AAC | ..._NON_A2DP
     uint32_t vendor_id;       // vendor-specific only (LDAC 0x0000012D), else 0
     uint16_t vendor_codec_id; // vendor-specific only (LDAC 0x00AA), else 0
+    // PL_CODEC_ID_* above -- a pinned, persisted, never-recycled identity.
+    // Never the array index. See this header's doc comment just above.
+    uint8_t codec_id;
 
     // --- negotiation ---
     uint8_t preference; // lower tried first; table sorted by this (S4)
@@ -150,5 +172,22 @@ typedef struct pl_codec {
 // the fallback chain terminates on. S1's whole table is { &pl_codec_sbc }.
 extern pl_codec_t *const PL_CODECS[];
 extern const size_t PL_CODEC_COUNT;
+
+// Resolves a pinned codec_id (PL_CODEC_ID_* above, e.g. from a persisted
+// device-settings pin) back to its table row, independent of PL_CODECS'
+// current array order -- this is the whole point of finding 1: a caller
+// that looks up BY ID, never by array position, is immune to a future row
+// insertion. Returns NULL for PL_CODEC_ID_AUTOMATIC or any id no current
+// row claims. Design task 3 (the pinned negotiation walk, a2dp.c) is the
+// first real caller; exposed here because it is a codec-table primitive,
+// not a2dp.c's own logic.
+pl_codec_t *pl_codec_table_find_by_id(uint8_t codec_id);
+
+// Same search, parameterized over an explicit table -- exposed only so
+// firmware/tests/test_codec_id_stability.c can exercise the real search
+// logic against a deliberately REORDERED copy of a table (proving lookup
+// is by id, not by position) without needing to mutate the real, global
+// PL_CODECS. pl_codec_table_find_by_id() above is a thin wrapper over this.
+pl_codec_t *pl_codec_table_find_by_id_in(pl_codec_t *const *table, size_t count, uint8_t codec_id);
 
 #endif // PICO_LINK_CODEC_TABLE_H
