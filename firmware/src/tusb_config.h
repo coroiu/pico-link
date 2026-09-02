@@ -80,7 +80,10 @@ extern "C" {
 //--------------------------------------------------------------------+
 #define CFG_TUD_CDC    1
 #define CFG_TUD_MSC    0
-#define CFG_TUD_HID    0
+// HID consumer-control (media keys) -- descriptors/enumeration only as of
+// bead pico-link-47z.1 (T1); it sends no reports yet. See
+// .planning/design/2026-09-02-media-keys.md.
+#define CFG_TUD_HID    1
 #define CFG_TUD_MIDI   0
 #define CFG_TUD_AUDIO  1
 // Vendor class is NOT used for the reset interface -- that is a hand-rolled
@@ -92,6 +95,14 @@ extern "C" {
 // load without costing meaningful RAM (RP2350B has 520KB SRAM).
 #define CFG_TUD_CDC_RX_BUFSIZE 256
 #define CFG_TUD_CDC_TX_BUFSIZE 256
+
+//--------------------------------------------------------------------+
+// HID class (consumer control / media keys)
+//--------------------------------------------------------------------+
+// One 16-bit usage field, no report ID -- 2 bytes is enough, but TinyUSB's
+// examples use 16 as a conventional minimum; costs nothing meaningful on
+// RP2350B's 520KB SRAM.
+#define CFG_TUD_HID_EP_BUFSIZE 16
 
 //--------------------------------------------------------------------+
 // Audio class (speaker, stereo, 16-bit, async + explicit feedback)

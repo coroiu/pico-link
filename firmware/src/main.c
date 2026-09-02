@@ -22,6 +22,21 @@
 #include "pico/bootrom.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
+
+// btstack.h (above, via btstack_hid.h) and TinyUSB's class/hid/hid_device.h
+// both declare a global `hid_report_type_t` enum with identical member
+// names -- BTstack's is its own unrelated Classic-HID-host module, pulled
+// in unconditionally by the btstack.h umbrella header. This collides only
+// in a translation unit that includes BOTH headers, which as of enabling
+// CFG_TUD_HID (bead pico-link-47z.1, USB HID consumer-control interface)
+// is just this file. main.c calls no tud_hid_*() function -- that's
+// usb_descriptors.c's job -- so locally force CFG_TUD_HID off before
+// pulling in tusb.h here; tusb_config.h's own include guard
+// (PICO_LINK_TUSB_CONFIG_H) means this override sticks for this TU only.
+// Every other class knob (CDC, AUDIO) is untouched and still enabled here.
+#include "tusb_config.h"
+#undef CFG_TUD_HID
+#define CFG_TUD_HID 0
 #include "tusb.h"
 
 #include "a2dp.h"

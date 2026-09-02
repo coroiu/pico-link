@@ -48,12 +48,26 @@
 #define UAC2_ENTITY_FEATURE_UNIT    0x02
 #define UAC2_ENTITY_OUTPUT_TERMINAL 0x03
 
+// ITF_NUM_RESET MUST STAY AT INDEX 4 -- FROZEN. The hand-run press-free
+// BOOTSEL snippet (memory note "bootsel-over-cdc-command"; also
+// picotool's `-f` path) does `claim_interface(d, 4)` then
+// `ctrl_transfer(0x21, 0x01, wIndex=4, ...)` with the literal 4 baked in,
+// not looked up by class code. If RESET's index ever moves, that transfer
+// silently retargets whatever interface now sits at 4 -- on HID that is
+// class request 0x01 = SET_REPORT, which TinyUSB will accept or stall with
+// NO error saying "wrong interface". The board just stops rebooting on
+// command, with no diagnostic, on exactly the recovery path you need when
+// something else is already broken. See
+// .planning/design/2026-09-02-media-keys.md section 2.4. Any new interface
+// (HID included) MUST be appended AFTER ITF_NUM_RESET, never inserted
+// before it.
 enum {
     ITF_NUM_AUDIO_CONTROL = 0,
     ITF_NUM_AUDIO_STREAMING,
     ITF_NUM_CDC,
     ITF_NUM_CDC_DATA,
-    ITF_NUM_RESET,
+    ITF_NUM_RESET,   // FROZEN at 4 -- see comment above.
+    ITF_NUM_HID,     // Consumer-control (media keys). Appended LAST, after RESET.
     ITF_NUM_TOTAL
 };
 
@@ -65,6 +79,7 @@ enum {
     STRID_AUDIO,
     STRID_CDC,
     STRID_RESET,
+    STRID_HID,
     STRID_COUNT
 };
 
