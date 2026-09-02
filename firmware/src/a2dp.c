@@ -98,6 +98,7 @@
 #include "codec_ldac.h"
 #include "codec_sbc.h"
 #include "codec_table.h"
+#include "media_keys.h"
 #include "pcm_ring.h"
 #include "persist.h"
 #include "pl_prio.h"
@@ -688,18 +689,74 @@ static void pl_a2dp_avrcp_packet_handler(uint8_t packet_type, uint16_t channel, 
     }
 }
 
-// S1 registers AVRCP Target/Controller purely so a sink that opens an
-// AVRCP channel unprompted (common real-hardware behaviour right after
-// A2DP connects) gets a clean accept against a registered service instead
-// of failing against an unregistered PSM -- design sec 9's rationale for
-// sizing L2CAP channels/services around AVRCP even though S1 doesn't act
-// on transport controls. Acting on play/pause/volume/metadata queries is
-// out of scope here -- deliberately deferred, not implemented.
+// T3 (pico-link-47z.3, design sec 3): media-key passthrough FROM the
+// headphones arrives here, not in pl_a2dp_avrcp_controller_packet_handler
+// above -- BTstack's avrcp_target.c is the module that handles
+// AVRCP_CMD_OPCODE_PASS_THROUGH and emits AVRCP_SUBEVENT_OPERATION
+// (avrcp_target.c:1092-1109); the controller module only emits
+// OPERATION_START/COMPLETE for commands *we* send, which nothing here does
+// yet. This runs on the cyw43/BTstack background IRQ (priority 0xFF, same
+// context as pl_bt_packet_handler -- see bt.c:50-127's doc comment), so it
+// must only push into media_keys.c's ring and return; it must NEVER call
+// tud_hid_* directly (that is media_keys.c's exclusive job, see its module
+// doc) nor call into Rust (pico-link-6o2's constraint).
+//
+// avrcp_target_operation_accepted() is already called by BTstack itself at
+// avrcp_target.c:1104, BEFORE this handler's event is even emitted -- we
+// must not call avrcp_target_operation_accepted/rejected ourselves, or the
+// AVCTP response would be double-sent.
 static void pl_a2dp_avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
-    (void)packet_type;
     (void)channel;
-    (void)packet;
     (void)size;
+    if (packet_type != HCI_EVENT_PACKET) {
+        return;
+    }
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) {
+        return;
+    }
+    if (packet[2] != AVRCP_SUBEVENT_OPERATION) {
+        return;
+    }
+
+    uint8_t operation_id = avrcp_subevent_operation_get_operation_id(packet);
+    // button_pressed: nonzero on press, zero on release (avrcp_target.c:1102
+    // derives it from (packet[6] & 0x80) == 0, but BTstack's own accessor
+    // already gives us the resolved value) -- press and release arrive as
+    // two separate AVRCP_SUBEVENT_OPERATION events with the same
+    // operation_id, design sec 3.2.
+    bool pressed = avrcp_subevent_operation_get_button_pressed(packet) != 0;
+
+    // Design sec 3.4's mapping. PLAY and PAUSE both map to the single
+    // 0x00CD toggle usage -- deliberately, not an oversight: we never call
+    // avrcp_target_set_playback_status, so the headphone's own view of
+    // play/pause state is not ours to keep in sync, and mapping both
+    // operation IDs to the toggle is correct regardless of which one the
+    // XM3 happens to send. Discrete play/pause is a later bead once
+    // playback status is reported upstream (design sec 9).
+    uint16_t usage;
+    switch (operation_id) {
+        case AVRCP_OPERATION_ID_PLAY:
+        case AVRCP_OPERATION_ID_PAUSE:
+            usage = PL_MEDIA_KEY_USAGE_PLAY_PAUSE;
+            break;
+        case AVRCP_OPERATION_ID_FORWARD:
+            usage = PL_MEDIA_KEY_USAGE_SCAN_NEXT;
+            break;
+        case AVRCP_OPERATION_ID_BACKWARD:
+            usage = PL_MEDIA_KEY_USAGE_SCAN_PREV;
+            break;
+        default:
+            // Anything else (design sec 3.4: "anything else -- ignored, no
+            // report") -- e.g. volume up/down, which this bead does not
+            // implement.
+            return;
+    }
+
+    if (pressed) {
+        pl_media_keys_push_press(usage);
+    } else {
+        pl_media_keys_push_release();
+    }
 }
 
 static void pl_a2dp_avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {

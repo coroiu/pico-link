@@ -3,15 +3,36 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "hardware/sync.h"
+
 #include "tusb.h"
 
 #include "usb_pump.h"
 
-// Single-producer/single-consumer ring, same shape as input.c's -- each
-// side owns exactly one index (s_ring_head producer, s_ring_tail consumer),
-// so plain volatile reads/writes of a single byte are sufficient with no
-// mutex or IRQ masking. See media_keys.h's module doc for the current
-// single-producer assumption and what T3 needs to revisit.
+// T3 (pico-link-47z.3): MPSC, not SPSC -- same fix as bt.c's ring
+// (firmware/src/bt.c:50-127) and for the identical reason. This ring now
+// has TWO producer contexts: debug_remote.c's console commands (thread
+// context, via pl_media_keys_push_tap) and the AVRCP target passthrough
+// handler in a2dp.c (BTstack/cyw43 IRQ context, priority 0xFF, via
+// pl_media_keys_push_press/release). The console producer is kept
+// deliberately -- pico-link-47z.5 wants a debug command that pushes a bare
+// press without its release, which push_press() alone still supports.
+//
+// Plain volatile head/tail (T2's original scheme) is a read-modify-write
+// race the moment a second producer context exists: push()'s
+// read-check-write-write sequence on s_ring_head can be preempted by the
+// IRQ producer between the read and the final write, and both producers
+// then compute the same `head`, both write the same slot, and one event
+// is silently lost without even incrementing the drop counter. So push()
+// runs its entire body inside save_and_disable_interrupts()/
+// restore_interrupts(), exactly like pl_bt_ring_push: this also correctly
+// serializes the two THREAD-context producers (console command handler
+// and, hypothetically, any future one) since disabling interrupts on this
+// single core excludes both the IRQ producer and any other thread-context
+// caller for the duration. The critical section is tiny (a few field
+// writes, no memcpy unlike bt.c's ring), so the interrupt-disable window
+// is negligible. The consumer (pl_media_keys_drain) still only touches
+// s_ring_tail from the superloop and needs no lock of its own.
 //
 // Capacity: 8 is generous for what a human can generate via the debug
 // console (one command line drives exactly one press+release pair) and
@@ -57,8 +78,11 @@ void pl_media_keys_init(void) {
 
 // Shared push implementation -- both push_press and push_release funnel
 // through here so the ring-full policy (drop newest, count it) lives in
-// exactly one place.
+// exactly one place. Callable from ANY context (see module doc above) --
+// the whole body runs under save_and_disable_interrupts() so the two
+// producer contexts (console thread, AVRCP IRQ) can't race s_ring_head.
 static void push(uint16_t usage, bool pressed) {
+    uint32_t saved_irq = save_and_disable_interrupts();
     uint8_t head = s_ring_head;
     uint8_t next_head = (uint8_t)((head + 1) % PL_MEDIA_KEYS_RING_CAPACITY);
     if (next_head == s_ring_tail) {
@@ -66,11 +90,13 @@ static void push(uint16_t usage, bool pressed) {
         // one (which would corrupt the consumer's view), same policy as
         // input.c's identical ring.
         s_ring_drop_count++;
+        restore_interrupts(saved_irq);
         return;
     }
     s_ring[head].usage = usage;
     s_ring[head].pressed = pressed;
     s_ring_head = next_head;
+    restore_interrupts(saved_irq);
 }
 
 void pl_media_keys_push_press(uint16_t usage) {

@@ -9,26 +9,26 @@
 // tud_hid_* call anywhere else; route through the functions below instead.
 //
 // Two producer contexts, one consumer:
-//   - T2 (this bead): firmware/src/debug_remote.c's "MEDIA PLAYPAUSE" /
-//     "MEDIA NEXT" / "MEDIA PREV" console commands, thread context, calling
+//   - T2: firmware/src/debug_remote.c's "MEDIA PLAYPAUSE" / "MEDIA NEXT" /
+//     "MEDIA PREV" console commands, thread context, calling
 //     pl_media_keys_push_tap() below -- proves the USB half end to end
 //     (console command pauses/skips on the host) with NO Bluetooth
-//     involved, so a later AVRCP failure is unambiguous.
-//   - T3 (pico-link-47z.3, not yet wired): the AVRCP target passthrough
-//     handler, running on the cyw43/BTstack background IRQ (priority
-//     0xFF), calling pl_media_keys_push_press/release() as real
+//     involved, so a later AVRCP failure is unambiguous. Kept live
+//     alongside T3, not retired -- pico-link-47z.5 wants a debug command
+//     that pushes a bare press without its release.
+//   - T3 (pico-link-47z.3, this bead): the AVRCP target passthrough
+//     handler in a2dp.c, running on the cyw43/BTstack background IRQ
+//     (priority 0xFF), calling pl_media_keys_push_press/release() as real
 //     press/release AVRCP_SUBEVENT_OPERATION events arrive.
 //   - The consumer, pl_media_keys_drain(), runs once per superloop
 //     iteration (thread context) and is the only caller of tud_hid_report().
 //
-// NOTE for T3: this ring's SPSC contract (see media_keys.c) assumes a
-// single producer context. During T2 that is true (only the console
-// pushes). Once T3 adds the AVRCP IRQ producer, if the console commands
-// remain reachable in the same build, there would be two producer
-// contexts and the plain volatile head/tail scheme below is not safe
-// against a console push racing an AVRCP-handler push (both write
-// s_ring_head). T3 must either retire the console commands or add proper
-// synchronization -- flagging here rather than solving it speculatively.
+// MPSC, not SPSC: with both producer contexts live, push() in
+// media_keys.c runs its whole body under save_and_disable_interrupts()/
+// restore_interrupts() -- the same fix bt.c's ring applies for the
+// identical reason (see bt.c:50-127's doc comment). This was chosen over
+// retiring the console producer specifically so pico-link-47z.5 stays
+// possible.
 #ifndef PICO_LINK_MEDIA_KEYS_H
 #define PICO_LINK_MEDIA_KEYS_H
 
