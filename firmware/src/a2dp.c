@@ -593,13 +593,15 @@ typedef struct {
     // from "silently happens sometimes" instead of assuming the former.
     volatile uint32_t fill_short_read;
 
-    // Bead pico-link-8b7: OUT-meter push instrumentation. level_push_count
-    // is a real Event::LevelsChanged push (the ONLY thing hero.rs's
-    // OUT_LEVEL_STALE_AFTER can see). level_push_skip_empty is
-    // pl_a2dp_maybe_push_levels's sample_count==0 early return (suspect 1
-    // in the bead). level_push_skip_interval is the 250ms-not-elapsed
-    // early return (expected to dominate in a healthy run -- fill() is
-    // called far more often than every 250ms).
+    // Bead pico-link-8b7: OUT-meter publish instrumentation. Bead
+    // pico-link-nli.5 (G4) retargeted these from a bt.c ring push to the
+    // seqlock snapshot (pl_a2dp_publish_levels), but the counters mean the
+    // same things. level_push_count is a real snapshot publish (the ONLY
+    // thing pl_a2dp_poll_levels/hero.rs's OUT_LEVEL_STALE_AFTER can see).
+    // level_push_skip_empty is pl_a2dp_publish_levels's sample_count==0
+    // early return (suspect 1 in the original bead). level_push_skip_interval
+    // is the 250ms-not-elapsed early return (expected to dominate in a
+    // healthy run -- fill() is called far more often than every 250ms).
     volatile uint32_t level_push_count;
     volatile uint32_t level_push_skip_empty;
     volatile uint32_t level_push_skip_interval;
@@ -653,11 +655,16 @@ static int16_t s_pcm_scratch[256 * 2];
 // Updated cheaply (integer only, no sqrt/float) inside pl_a2dp_fill's
 // per-unit loop, right where the PCM already sits in s_pcm_scratch for
 // encoding -- "sampled cheaply where the PCM already is", never a
-// separate read of its own. Reduced to one Event::LevelsChanged push
-// every PL_A2DP_LEVEL_PUSH_INTERVAL_MS by pl_a2dp_maybe_push_levels,
-// called once per pl_a2dp_fill call (IRQ context, media timer handler) --
-// this whole struct is therefore only ever touched from that one IRQ
-// context, no lock needed (same single-writer shape s_ctx itself has).
+// separate read of its own. Reduced to one seqlock-snapshot publish every
+// PL_A2DP_LEVEL_PUSH_INTERVAL_MS by pl_a2dp_publish_levels (bead
+// pico-link-nli.5, G4 -- originally a direct Event::LevelsChanged ring
+// push, see that function's doc comment), called once per pl_a2dp_fill
+// call. That call site is IRQ context (media timer handler) under
+// PL_ENCODER_ON_CORE1=OFF and core1 thread context under =ON -- either
+// way this whole struct is touched from exactly one context per build, so
+// no lock is needed here (same single-writer shape s_ctx itself has; the
+// seqlock in pl_a2dp_publish_levels is for its OWN reader, a different
+// core/context, not for this accumulator).
 typedef struct {
     uint32_t peak_l; // running max abs sample this window (0..32768)
     uint32_t peak_r;
@@ -668,6 +675,44 @@ typedef struct {
 } pl_a2dp_level_accum_t;
 
 static pl_a2dp_level_accum_t s_level_accum;
+
+// Bead pico-link-nli.5 (G4, design sec 5): the cross-core level publish.
+// Replaces the old bt.c-ring push (pl_bt_push_levels_changed, deleted by
+// this bead) with a seqlock snapshot: a level is not an event -- the
+// newest value is always the wanted one, and a ring that drops the NEWEST
+// entry when full (bt.c's own documented policy) is exactly backwards for
+// that. A seqlock has no queue to overflow: the writer always wins, and
+// the reader (pl_a2dp_poll_levels below, core0's superloop) simply takes
+// whatever is current, retrying only if it caught a write in progress.
+//
+// `seq` is even when the snapshot is quiescent and odd while a write is in
+// flight. The writer brackets its field writes with two `__dmb()`s (same
+// publish-after-write discipline as the tx ring's `tx_head`, see that
+// field's doc comment) so the reader never observes a field write before
+// the odd `seq` that guards it, nor the final even `seq` before the field
+// writes it guards. This is the standard seqlock shape (Linux's
+// `include/linux/seqlock.h` is the canonical reference) with plain
+// `__dmb()` in place of `smp_wmb()`/`smp_rmb()` -- RP2350's two M33s share
+// coherent SRAM with no cache to maintain, so only store ORDERING needs
+// enforcing, exactly design sec 3.1's argument for the two PCM/tx rings.
+//
+// No lock: the writer never blocks and never disables interrupts, which is
+// what makes this legal to call from core1 (design sec 4.3 invariant 3 --
+// the multicore lockout handshake in flash_lockout.c depends on core1
+// never sitting in a critical section).
+//
+// `seq == 0` is the sentinel "never published" -- the writer's first
+// publish takes it to 2 (0 -> 1 -> 2), never back to 0, so the reader can
+// tell "no sample yet" from "a real even sequence" unambiguously.
+typedef struct {
+    volatile uint32_t seq;
+    uint8_t peak_l;
+    uint8_t peak_r;
+    uint8_t rms_l;
+    uint8_t rms_r;
+} pl_a2dp_level_snapshot_t;
+
+static pl_a2dp_level_snapshot_t s_level_snapshot;
 
 // Folds `frame_count` stereo PCM frames (interleaved L/R int16, exactly
 // s_pcm_scratch's own layout) into s_level_accum. Integer-only: an abs
@@ -710,22 +755,32 @@ static uint32_t pl_a2dp_isqrt(uint64_t value) {
     return (uint32_t)x;
 }
 
-// Reduces s_level_accum to one Event::LevelsChanged push, if
+// Reduces s_level_accum to one seqlock-published snapshot, if
 // PL_A2DP_LEVEL_PUSH_INTERVAL_MS has elapsed since the last one AND at
 // least one sample was accumulated this window (an empty window -- the
 // ring genuinely starved, design's "silent, not zero-but-live" case --
-// pushes nothing rather than a misleading all-zero reading; the Home
+// publishes nothing rather than a misleading all-zero reading; the Home
 // hero's own staleness window then correctly shows the meter as absent
 // once PL_A2DP_LEVEL_PUSH_INTERVAL_MS's worth of silence has passed. See
 // core/src/render/hero.rs's OUT_LEVEL_STALE_AFTER doc comment). Called
-// once per pl_a2dp_fill invocation, IRQ context.
+// once per pl_a2dp_fill invocation.
+//
+// Bead pico-link-nli.5 (G4): this is s_level_snapshot's SOLE writer, but
+// which execution context that is depends on PL_ENCODER_ON_CORE1 -- IRQ
+// context (media timer handler) when OFF, core1 thread context when ON.
+// Either way there is exactly one writer at a time, so no writer-side lock
+// is needed; the seqlock exists for the READER (a different core, or a
+// different context on the same core) to observe consistent fields, not
+// to arbitrate between writers. Invariant 4 (no pl_log) and invariant 6
+// (no bt.c ring push) both hold here in both builds -- this function
+// touches only its own file-scope statics and the seqlock below.
 //
 // peak_l/peak_r/rms_l/rms_r are linear 0-255 (matching
 // PlLevelsChangedPayload's scale, 255 == full-scale/clipping): a 16-bit
 // PCM sample's magnitude tops out at 32768, so `>> 7` maps that range
 // onto 0-255 (32768 >> 7 == 256, clamped to 255 below for the exact
 // full-scale sample).
-static void pl_a2dp_maybe_push_levels(void) {
+static void pl_a2dp_publish_levels(void) {
     if (s_level_accum.sample_count == 0) {
         s_ctx.level_push_skip_empty++;
         return;
@@ -748,7 +803,20 @@ static void pl_a2dp_maybe_push_levels(void) {
     uint8_t rms_l_u8 = (uint8_t)(rms_l >> 7 > 255 ? 255 : rms_l >> 7);
     uint8_t rms_r_u8 = (uint8_t)(rms_r >> 7 > 255 ? 255 : rms_r >> 7);
 
-    pl_bt_push_levels_changed(peak_l_u8, peak_r_u8, rms_l_u8, rms_r_u8);
+    // Seqlock write. seq starts even (or 0, the sentinel); bump to odd
+    // FIRST so a reader that samples mid-write sees odd and retries, THEN
+    // publish the fields, THEN bump back to even so a reader that sampled
+    // the new even seq is guaranteed (by the __dmb() below) to see the
+    // fields that go with it, not a torn mix of old and new.
+    uint32_t seq = s_level_snapshot.seq;
+    s_level_snapshot.seq = seq + 1u; // odd -- write in flight, readers must retry
+    __dmb(); // publish-after-write half 1: the odd seq must be visible before the fields change
+    s_level_snapshot.peak_l = peak_l_u8;
+    s_level_snapshot.peak_r = peak_r_u8;
+    s_level_snapshot.rms_l = rms_l_u8;
+    s_level_snapshot.rms_r = rms_r_u8;
+    __dmb(); // publish-after-write half 2: the fields must be visible before the even seq is
+    s_level_snapshot.seq = seq + 2u; // even -- consistent, and never back to the 0 sentinel
 
     s_level_accum.peak_l = 0;
     s_level_accum.peak_r = 0;
@@ -756,6 +824,79 @@ static void pl_a2dp_maybe_push_levels(void) {
     s_level_accum.sum_sq_r = 0;
     s_level_accum.sample_count = 0;
     s_level_accum.last_push_us = now;
+}
+
+// Bead pico-link-nli.5 (G4): s_level_snapshot's sole reader. Intended to be
+// called once per superloop iteration, thread context (main.c), AFTER
+// pl_ui_tick -- deliberately, not before. pl_ui_tick is what advances the
+// app core's own clock (ui-ffi's `now_us`, which becomes
+// Event::LevelsChanged's received_at on the Rust side, core/src/app.rs's
+// `on_levels_changed`); calling this before tick would stamp a fresh
+// sample with the PREVIOUS iteration's clock value, which was
+// pico-link-8b7's original staleness-at-birth bug (main.c used to drain
+// BTstack/level events before ticking). Reading directly in the superloop
+// and pushing right here closes that at the root: the sample is now
+// timestamped in the same iteration that will render it.
+//
+// No time-based rate limit is needed on this side beyond "did the
+// sequence actually change since last time": the writer already
+// rate-limits itself to one publish per PL_A2DP_LEVEL_PUSH_INTERVAL_MS
+// (pl_a2dp_publish_levels above), so an unchanged sequence means nothing
+// new landed, and re-pushing the same values with a fresher received_at
+// would be misleading, not helpful.
+void pl_a2dp_poll_levels(struct PlUi *ui) {
+    static uint32_t s_last_seen_seq;
+
+    uint32_t seq_before = 0;
+    uint32_t seq_after = 0;
+    uint8_t peak_l = 0;
+    uint8_t peak_r = 0;
+    uint8_t rms_l = 0;
+    uint8_t rms_r = 0;
+    bool consistent = false;
+
+    // Bounded retry, not a spin: an odd seq or a seq that changed under us
+    // means the writer was mid-publish, and that critical section is four
+    // field writes between two __dmb()s -- microseconds. A handful of
+    // retries comfortably covers that; if it's still inconsistent after
+    // this many tries something is more wrong than a race (a wedged
+    // writer), and spinning the superloop waiting for it would turn a
+    // diagnostic overlay into a real-time hazard. Bail and try again next
+    // iteration instead.
+    for (int tries = 0; tries < 8; tries++) {
+        seq_before = s_level_snapshot.seq;
+        if (seq_before & 1u) {
+            continue; // writer mid-publish
+        }
+        __dmb();
+        peak_l = s_level_snapshot.peak_l;
+        peak_r = s_level_snapshot.peak_r;
+        rms_l = s_level_snapshot.rms_l;
+        rms_r = s_level_snapshot.rms_r;
+        __dmb();
+        seq_after = s_level_snapshot.seq;
+        if (seq_after == seq_before) {
+            consistent = true;
+            break;
+        }
+    }
+    if (!consistent) {
+        return;
+    }
+    if (seq_before == 0 || seq_before == s_last_seen_seq) {
+        // 0: never published yet (the sentinel, see s_level_snapshot's doc
+        // comment). Otherwise: same value already delivered -- see this
+        // function's doc comment for why that's a no-op, not a re-push.
+        return;
+    }
+    s_last_seen_seq = seq_before;
+
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_LEVELS_CHANGED,
+        .payload = {.levels_changed = {.peak_l = peak_l, .peak_r = peak_r, .rms_l = rms_l, .rms_r = rms_r}},
+    };
+    pl_ui_push_event(ui, event);
 }
 
 static void pl_a2dp_avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -1253,25 +1394,20 @@ static void pl_a2dp_fill(void) {
         s_ctx.silent_ticks = 0;
     }
 
-#ifndef PL_ENCODER_ON_CORE1
-    // Bead pico-link-du0: reduce/push the OUT-meter accumulator, once per
-    // fill call regardless of how many units this tick encoded -- keeps
-    // the once-per-window isqrt/ring-push cost off the per-unit hot path
-    // above.
+    // Bead pico-link-du0: reduce/publish the OUT-meter accumulator, once
+    // per fill call regardless of how many units this tick encoded --
+    // keeps the once-per-window isqrt/publish cost off the per-unit hot
+    // path above.
     //
-    // Bead pico-link-nli.4 (G3): NOT called under PL_ENCODER_ON_CORE1.
-    // pl_a2dp_maybe_push_levels() calls pl_bt_push_levels_changed(), a
-    // bt.c ring push -- forbidden from core1 (design sec 4.3 invariant 6;
-    // this file runs on core1 under this flag). s_level_accum keeps
-    // accumulating above (pl_a2dp_accumulate_levels, a plain local struct
-    // write, no BTstack/no ring) so no data is lost, but nothing reduces
-    // and pushes it to the UI yet -- level_push_count/skip_* stay at 0
-    // under this build. G4 (pico-link-nli.5, depends on this bead) replaces
-    // this with a seqlock snapshot core0's superloop reads and turns into
-    // the LevelsChanged push itself -- see design sec 5. Deliberately not
-    // done here: one variable at a time (design sec 8's own discipline).
-    pl_a2dp_maybe_push_levels();
-#endif
+    // Bead pico-link-nli.5 (G4): unconditional in both builds. Under
+    // PL_ENCODER_ON_CORE1 this runs in core1 thread context and writes
+    // only the seqlock below (design sec 4.3 invariant 6 -- no bt.c ring
+    // push here, unlike the pico-link-nli.4 interim state this replaces);
+    // under the OFF path it's the same IRQ-context call site pico-link-du0
+    // originally wired. Either way the write lands in s_level_snapshot,
+    // and core0's superloop (pl_a2dp_poll_levels, called from main.c after
+    // pl_ui_tick) is what turns it into the actual LevelsChanged push.
+    pl_a2dp_publish_levels();
 }
 
 // Bead pico-link-85v (D1/D6): sends the slot at tx_tail as one AVDTP media
@@ -1511,6 +1647,26 @@ static volatile uint32_t s_enc_quiesce_timeouts;
 // above pl_a2dp_fill) leaves 3ms of headroom under this 5ms budget for an
 // in-flight fill() call to finish once its own cap trips -- see that
 // macro's doc comment for the full reasoning.
+
+// Non-blocking follow-up from pico-link-nli.4's code review: previously
+// PL_A2DP_CORE1_FILL_BUDGET_US was a bare magic number with no compile-time
+// tie to the numbers that make 2ms safe. PL_A2DP_WORST_CASE_ENCODE_US_MAX
+// mirrors the largest worst_case_encode_us across the codec table
+// (codec_ldac.c's 2000; codec_sbc.c's is 800) -- duplicated here
+// deliberately, not `#include`d from a shared constant, so this assert
+// fails loudly at compile time if a future codec's worst case grows
+// without anyone re-checking this budget. The quantity being bounded is
+// pl_a2dp_fill's true worst-case dwell once its own 2ms cap trips: the cap
+// is checked only between units (a2dp.c's stop_core1_budget site), so one
+// more worst-case encode can still complete after the cap fires -- see
+// PL_A2DP_CORE1_FILL_BUDGET_US's own doc comment above.
+#define PL_A2DP_WORST_CASE_ENCODE_US_MAX 2000u
+_Static_assert(
+    PL_A2DP_CORE1_FILL_BUDGET_US + PL_A2DP_WORST_CASE_ENCODE_US_MAX < PL_A2DP_QUIESCE_TIMEOUT_US,
+    "PL_A2DP_CORE1_FILL_BUDGET_US plus one more worst-case encode call must stay under "
+    "PL_A2DP_QUIESCE_TIMEOUT_US, or core0's quiesce handshake can time out against a fill() "
+    "call that is still legitimately finishing, not a wedged core1"
+);
 
 // core1's own credit-clock tick source (design sec 4.1 change 1): a
 // core1-private time_us_64() delta, replacing the media timer's role.

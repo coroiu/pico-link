@@ -545,6 +545,17 @@ int main(void) {
         // Bead pico-link-p1r.
         pl_loop_prof_record(PL_LOOP_PHASE_UI_TICK, time_us_64() - ui_tick_start_us);
 
+        // Bead pico-link-nli.5 (G4): the OUT-meter's seqlock read. Must
+        // stay AFTER pl_ui_tick above, not before -- pl_ui_tick is what
+        // advances the clock a fresh LevelsChanged is stamped with
+        // (received_at), so reading here means the sample is timestamped
+        // in the same iteration that will render it. See a2dp.h's doc
+        // comment on pl_a2dp_poll_levels for the staleness bug this
+        // ordering closes at the root.
+#ifndef PL_DIAG_SKIP_BT
+        pl_a2dp_poll_levels(ui);
+#endif
+
         // Idle-screensaver seam (pico-link-i3e): a LEVEL, read once per
         // iteration right after pl_ui_tick and applied idempotently to the
         // backlight GPIO -- see pl_ui_display_power's doc comment and
