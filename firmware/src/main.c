@@ -387,6 +387,16 @@ int main(void) {
     pl_log("cyw43_arch_init OK\r\n");
 
     pl_bt_init(ui);
+
+#ifdef PL_ENCODER_ON_CORE1
+    // Bead pico-link-nli.4 (G3, epic pico-link-nli): launch core1 into the
+    // LDAC encoder loop, after cyw43/BTstack init per design sec 8 -- core1
+    // runs forever from here on (design sec 4.2, no corresponding stop
+    // call). PL_STACK_SIZE/PICO_CORE1_STACK_SIZE are both already sized for
+    // this (CMakeLists.txt, G1's own doc comment there).
+    pl_a2dp_launch_core1();
+    pl_log("pl_a2dp_launch_core1 OK -- LDAC encoder running on core1\r\n");
+#endif
 #else
     pl_log("PL_DIAG_SKIP_BT set -- skipping cyw43_arch_init/pl_bt_init\r\n");
 #endif
@@ -534,6 +544,17 @@ int main(void) {
         pl_ui_tick(ui, frame_start_us);
         // Bead pico-link-p1r.
         pl_loop_prof_record(PL_LOOP_PHASE_UI_TICK, time_us_64() - ui_tick_start_us);
+
+        // Bead pico-link-nli.5 (G4): the OUT-meter's seqlock read. Must
+        // stay AFTER pl_ui_tick above, not before -- pl_ui_tick is what
+        // advances the clock a fresh LevelsChanged is stamped with
+        // (received_at), so reading here means the sample is timestamped
+        // in the same iteration that will render it. See a2dp.h's doc
+        // comment on pl_a2dp_poll_levels for the staleness bug this
+        // ordering closes at the root.
+#ifndef PL_DIAG_SKIP_BT
+        pl_a2dp_poll_levels(ui);
+#endif
 
         // Idle-screensaver seam (pico-link-i3e): a LEVEL, read once per
         // iteration right after pl_ui_tick and applied idempotently to the

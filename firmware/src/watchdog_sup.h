@@ -45,6 +45,17 @@ typedef enum {
     PL_WDT_USB_TASK,       // tud_task() is actually being reached
     PL_WDT_BTSTACK,        // the BTstack run loop is still servicing timers
     PL_WDT_MEDIA,          // the A2DP media timer is ticking (conditional)
+    // Bead pico-link-nli.4 (G3, epic pico-link-nli): fed from core1's
+    // s_enc_heartbeat advancing -- NEVER fed by core1 itself calling this
+    // function directly (core1 must never call anything that could touch
+    // pl_log's mutex or any core0-only state; see a2dp.c's core1 section).
+    // Core0's superloop is the sole caller, same single-producer-per-slot
+    // discipline every other subsystem here already has -- it just reads
+    // core1's heartbeat counter and re-kicks this slot when it has moved.
+    // Enabled only while streaming (STREAM_STARTED/SUSPENDED/RELEASED),
+    // same lifecycle as PL_WDT_MEDIA above, so an idle encoder is never
+    // judged stale.
+    PL_WDT_ENCODER,
     PL_WDT_COUNT
 } pl_wdt_subsys_t;
 

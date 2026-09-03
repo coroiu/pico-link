@@ -380,21 +380,13 @@ void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t nam
     pl_bt_ring_push(event, NULL, 0);
 }
 
-// Bead pico-link-du0 (design section 21 E17/C8): pushes
-// Event::LevelsChanged. Every field is a plain u8, no deferred name
-// buffer needed (same as pl_bt_push_connect_succeeded/_failed above) --
-// unlike pl_bt_push_codec_changed this is expected to be called from IRQ
-// context (a2dp.c's media timer handler), which is exactly why it goes
-// through this ring rather than calling pl_ui_push_event directly
-// (pico-link-6o2).
-void pl_bt_push_levels_changed(uint8_t peak_l, uint8_t peak_r, uint8_t rms_l, uint8_t rms_r) {
-    struct PlEvent event = {
-        .version = PL_EVENT_ABI_VERSION,
-        .tag = PL_EVENT_TAG_LEVELS_CHANGED,
-        .payload = {.levels_changed = {.peak_l = peak_l, .peak_r = peak_r, .rms_l = rms_l, .rms_r = rms_r}},
-    };
-    pl_bt_ring_push(event, NULL, 0);
-}
+// Bead pico-link-du0 (design section 21 E17/C8) originally put
+// Event::LevelsChanged through this ring. Deleted by pico-link-nli.5 (G4):
+// a level is not an event, and this ring's drop-newest-on-full policy is
+// exactly wrong for a value where only the freshest reading matters. See
+// a2dp.c's s_level_snapshot doc comment for the seqlock that replaced it
+// and pl_a2dp_poll_levels for the thread-context pl_ui_push_event call
+// that now does what this function used to.
 
 // Bead pico-link-4vb.2 (bug 3): pushes Event::WizardAutoDismiss -- no
 // payload, same shape as pl_bt_push_devices_cleared above. Called from
