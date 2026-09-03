@@ -35,8 +35,10 @@ use embedded_graphics::Drawable;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
+use crate::panel::{Edge, PANEL};
 use crate::platform::Instant;
 
+use super::chrome::carve_edge;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::theme::{self, font, palette};
@@ -99,14 +101,44 @@ const BANNER_TEXT_INSET: i32 = 12;
 const BANNER_TOP: i32 = 100;
 /// Stat strip's fixed top y (px, relative to `area.top_left.y`) — design
 /// doc section 4/7: absolute panel y 144. Fixed for the same reason as
-/// `BANNER_TOP`.
+/// `BANNER_TOP`. As of the vertical OUT meter
+/// (`.planning/design/2026-09-03-vertical-out-meter.md`), this slot is no
+/// longer shared with the OUT meter — see [`HeroStatusView::render`]'s
+/// stat-strip comment for how that collision is resolved.
 const STAT_TOP: i32 = 128;
-/// Height (px) of a single OUT-meter channel row (bead pico-link-du0,
-/// design section 21 E17). Matches [`super::theme::draw_level_meter`]'s
-/// segment height.
-const METER_ROW_HEIGHT: i32 = 8;
-/// Gap (px) between the L and R meter rows.
-const METER_ROW_GAP: i32 = 4;
+/// Height (px) of the name row's own band, carved off `Edge::Top` before
+/// anything else (design section 3/4): `TOP_PADDING 12 + line_height(name)
+/// 16 + GAP_NAME_TO_HERO 12`. Derived, not a magic number — carving the
+/// meter strip off the *whole* content instead of below this band would
+/// narrow the device-name budget from 206px to 158px, and "Sony
+/// WH-1000XM5" measures 144px: it would truncate to "Sony WH-1000X...",
+/// losing the model digit that disambiguates two paired Sonys.
+const NAME_BAND_HEIGHT: u32 = (TOP_PADDING + 16 + GAP_NAME_TO_HERO) as u32;
+/// Width (px) of the vertical OUT-meter strip, carved off
+/// `PANEL.button_edge()` immediately inboard of the button rail (design
+/// section 4): `LEAD_GAP 12 + CHANNEL_WIDTH 12 + CHANNEL_GAP 4 +
+/// CHANNEL_WIDTH 12 + TRAIL_GAP 8`.
+const METER_STRIP_WIDTH: u32 = 48;
+/// Gap (px) between the meter strip and the hero/bitrate/banner/stat body
+/// it sits beside (the content-facing side of the strip) — the largest of
+/// the three gap sizes, so Gestalt proximity binds the two meter columns
+/// to each other rather than to the hero body (design section 4).
+const LEAD_GAP: u32 = 12;
+/// Gap (px) between the meter strip and the button rail (the rail-facing
+/// side of the strip) — smaller than `LEAD_GAP`, larger than
+/// `CHANNEL_GAP` (design section 4's gap rhythm: 4 < 8 < 12).
+const TRAIL_GAP: u32 = 8;
+/// Width (px) of one meter channel column.
+const CHANNEL_WIDTH: u32 = 12;
+/// Gap (px) between the L and R meter columns — the smallest of the three
+/// gap sizes (design section 4's gap rhythm).
+const CHANNEL_GAP: u32 = 4;
+/// Inset (px) between the meter block's bottom edge and the content band's
+/// bottom edge (design section 4) — the block itself is exactly
+/// [`super::theme::VERTICAL_METER_GLYPH_HEIGHT`] (174px) tall, bottom-
+/// pinned here and growing upward, so its top lands flush with the hero
+/// codec word's own top rule.
+const METER_BLOCK_BOTTOM_INSET: u32 = 10;
 /// How long a stale OUT-meter reading is still drawn before this widget
 /// treats it as "no PCM" and stops drawing it at all (design section 15:
 /// **absent, never frozen** — the hard constraint this whole feature was
@@ -374,27 +406,63 @@ impl Widget for HeroStatusView {
     /// Returns `Infallible`'s uninhabited variant in practice — see
     /// [`Widget::render`]'s doc comment for why the `Result` return exists
     /// at all.
-    // `row_l_y`/`row_r_y` are the OUT meter's two channel rows -- the L/R
-    // domain vocabulary, same false-positive clippy::similar_names has on
-    // `App::on_levels_changed`.
+    // `l_block`/`r_block`/`l_col`/`r_col` are the OUT meter's two channel
+    // columns -- the L/R domain vocabulary, same false-positive
+    // clippy::similar_names has on `App::on_levels_changed`.
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
 
-        // --- Device name: truncates with an ellipsis, never a marquee. ---
+        // --- Geometry (`.planning/design/2026-09-03-vertical-out-meter.md`
+        // section 4): a name band off `Edge::Top` (full content width, so
+        // the device name keeps its whole 206px budget), then the meter
+        // strip off `PANEL.button_edge()` of the remainder, immediately
+        // inboard of the button rail. Every element below the name row
+        // (hero word, bitrate, banner, stat strip) narrows to `hero_body`'s
+        // width; the name row alone keeps `area`'s full width. Zero left/
+        // right literals here -- both carves follow the orientation knob,
+        // exactly the shape `carve_edge`'s own doc comment and the rail
+        // already establish. ---
+        let (name_band, rest) = carve_edge(area, Edge::Top, NAME_BAND_HEIGHT);
+        let (strip, hero_body) = carve_edge(rest, PANEL.button_edge(), METER_STRIP_WIDTH);
+        let (_trail_gap, s) = carve_edge(strip, PANEL.button_edge(), TRAIL_GAP);
+        let (_lead_gap, pair) = carve_edge(s, PANEL.button_edge().opposite(), LEAD_GAP);
+        // The L/R column split is deliberately NOT wired to the
+        // orientation knob (design section 6): screen-left is screen-left
+        // in both orientations (nothing mirrors the framebuffer when the
+        // panel flips), so L is always the *literal* `Edge::Left` half of
+        // `pair`, never `PANEL.button_edge()` or its opposite. Wiring
+        // channel order to the rail edge would silently swap L/R on a
+        // panel flip -- a bug nobody would catch by looking.
+        let (l_col, remainder) = carve_edge(pair, Edge::Left, CHANNEL_WIDTH);
+        let (_channel_gap, r_col) = carve_edge(remainder, Edge::Left, CHANNEL_GAP);
+        // Each column's meter block is bottom-pinned `METER_BLOCK_BOTTOM_
+        // INSET` above the content band's bottom edge and grows upward --
+        // carving the inset off `Edge::Bottom` and keeping the *rest*
+        // (the top portion) gives exactly that: a 174px-tall,
+        // top-of-`hero_body` -aligned block whose top rule lands flush
+        // with the hero codec word's own top rule (40 + 174 = 214, and the
+        // strip spans content-rel y40..224).
+        let (_l_bottom_pad, l_block) = carve_edge(l_col, Edge::Bottom, METER_BLOCK_BOTTOM_INSET);
+        let (_r_bottom_pad, r_block) = carve_edge(r_col, Edge::Bottom, METER_BLOCK_BOTTOM_INSET);
+
+        // --- Device name: truncates with an ellipsis, never a marquee.
+        // Uses `name_band`'s full width -- protected alongside the hero
+        // word by the same "if it crowds, it loses" ruling, per section 3.
+        // ---
         let name_font = font::name();
         let name_line_h = line_height(&name_font);
-        let name_max_width = (area.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
+        let name_max_width = (name_band.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
         let name_text = truncate_to_width(&name_font, &self.device_name, name_max_width);
-        let name_y = area.top_left.y + TOP_PADDING;
+        let name_y = name_band.top_left.y + TOP_PADDING;
         let name_rect = Rectangle::new(
-            Point::new(area.top_left.x + LEFT_MARGIN, name_y),
+            Point::new(name_band.top_left.x + LEFT_MARGIN, name_y),
             Size::new(name_max_width, name_line_h as u32),
         );
         let mut name_target = clipped.clipped(&name_rect);
         let _ = name_font.render_aligned(
             name_text.as_str(),
-            Point::new(area.top_left.x + LEFT_MARGIN, name_y),
+            Point::new(name_band.top_left.x + LEFT_MARGIN, name_y),
             VerticalPosition::Top,
             HorizontalAlignment::Left,
             FontColor::Transparent(palette::TEXT_PRIMARY),
@@ -404,7 +472,9 @@ impl Widget for HeroStatusView {
         // --- Hero codec word: the fixed 32px slot, regardless of word.
         // Left-aligned on `LEFT_MARGIN`, not centered — design doc section
         // 3.1: a centred hero moves both its edges the moment the codec
-        // changes, exactly when the change most needs to be noticed. ---
+        // changes, exactly when the change most needs to be noticed.
+        // Narrowed to `hero_body`'s width now that the meter strip sits
+        // beside it, not under it. ---
         let hero_font = font::hero();
         let hero_y = name_y + name_line_h + GAP_NAME_TO_HERO;
         let (hero_text, hero_color) = match &self.status {
@@ -416,7 +486,7 @@ impl Widget for HeroStatusView {
         };
         let _ = hero_font.render_aligned(
             hero_text.as_str(),
-            Point::new(area.top_left.x + LEFT_MARGIN, hero_y),
+            Point::new(hero_body.top_left.x + LEFT_MARGIN, hero_y),
             VerticalPosition::Top,
             HorizontalAlignment::Left,
             FontColor::Transparent(hero_color),
@@ -437,7 +507,7 @@ impl Widget for HeroStatusView {
                 BitrateStatus::Kbps(kbps) => format!("{kbps} kbps"),
             };
             let slot_rect = Rectangle::new(
-                Point::new(area.top_left.x + LEFT_MARGIN, bitrate_y),
+                Point::new(hero_body.top_left.x + LEFT_MARGIN, bitrate_y),
                 Size::new(BITRATE_SLOT_WIDTH, value_line_h as u32),
             );
             slot_rect.into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND)).draw(&mut clipped)?;
@@ -454,8 +524,12 @@ impl Widget for HeroStatusView {
         // --- Persistent banner slot: at most one, MUTED outranks
         // FALLBACK (design section 6.2/6.3). Not a toast: no timer, no
         // auto-dismiss, drawn every render exactly like everything else
-        // on this widget. Fixed y (`BANNER_TOP`), not cursor-derived, so
-        // showing/hiding it never moves the stat strip below it. ---
+        // on this widget. Fixed y (`BANNER_TOP`, relative to `area`, not
+        // `hero_body` -- it does not move), not cursor-derived, so
+        // showing/hiding it never moves the stat strip below it. Narrowed
+        // to `hero_body`'s width now that the meter strip sits beside it —
+        // measured to still fit: the MUTED text is 128px, `hero_body`'s
+        // text budget is 158 - 2*12 = 134px, 6px slack. ---
         if let Some(banner) = self.active_banner() {
             let banner_y = area.top_left.y + BANNER_TOP;
             let (text, color) = match banner {
@@ -463,17 +537,17 @@ impl Widget for HeroStatusView {
                 ActiveBanner::Fallback(reason) => (String::from(reason), palette::STATUS_WARNING),
             };
             let banner_rect = Rectangle::new(
-                Point::new(area.top_left.x, banner_y),
-                Size::new(area.size.width, BANNER_HEIGHT as u32),
+                Point::new(hero_body.top_left.x, banner_y),
+                Size::new(hero_body.size.width, BANNER_HEIGHT as u32),
             );
             banner_rect.into_styled(PrimitiveStyle::with_fill(palette::SURFACE_ELEVATED)).draw(&mut clipped)?;
-            let banner_text_max_width = (area.size.width as i32 - 2 * BANNER_TEXT_INSET).max(0) as u32;
+            let banner_text_max_width = (hero_body.size.width as i32 - 2 * BANNER_TEXT_INSET).max(0) as u32;
             let label_font = font::label();
             let banner_text = truncate_to_width(&label_font, &text, banner_text_max_width);
             let banner_mid_y = banner_y + BANNER_HEIGHT / 2;
             let _ = label_font.render_aligned(
                 banner_text.as_str(),
-                Point::new(area.top_left.x + BANNER_TEXT_INSET, banner_mid_y),
+                Point::new(hero_body.top_left.x + BANNER_TEXT_INSET, banner_mid_y),
                 VerticalPosition::Center,
                 HorizontalAlignment::Left,
                 FontColor::Transparent(color),
@@ -482,20 +556,30 @@ impl Widget for HeroStatusView {
         }
 
         // --- Bottom stat strip. Whatever fields the design's data-
-        // dependency table (section 13) says survive Tier 1 — the OUT
-        // meter and LINK/SIGNAL bars are CUT entirely, not dashed, so
-        // they are simply not part of `stat_line` at all. Fixed y
-        // (`STAT_TOP`) — occupies the same rows whether or not a banner
-        // is showing; this is the whole point of the fixed grid. ---
+        // dependency table (section 13) says survive Tier 1 — the
+        // LINK/SIGNAL bars are still CUT entirely, not dashed, so they
+        // are simply not part of `stat_line` at all. Fixed y
+        // (`STAT_TOP`, relative to `area`, not `hero_body` -- it does not
+        // move) — occupies the same rows whether or not a banner is
+        // showing; this is the whole point of the fixed grid. Narrowed to
+        // `hero_body`'s width for the same reason the banner is. **This
+        // is also where the OUT meter's old collision with this slot gets
+        // resolved**: the horizontal meter used to share this exact grid
+        // slot with `stat_line` (a latent collision this module's own
+        // prior comment admitted, papered over only because nothing
+        // populated `stat_line` with live data yet). The vertical meter
+        // now lives entirely inside its own strip beside the rail, a
+        // disjoint rectangle from every text element on Home -- there is
+        // no longer anything to collide with here. ---
         if let Some(stat_line) = &self.stat_line {
             let stat_y = area.top_left.y + STAT_TOP;
             let label_font = font::label();
-            let stat_max_width = (area.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
+            let stat_max_width = (hero_body.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
             let upper = stat_line.to_uppercase();
             let stat_text = truncate_to_width(&label_font, &upper, stat_max_width);
             let _ = label_font.render_aligned(
                 stat_text.as_str(),
-                Point::new(area.top_left.x + LEFT_MARGIN, stat_y),
+                Point::new(hero_body.top_left.x + LEFT_MARGIN, stat_y),
                 VerticalPosition::Top,
                 HorizontalAlignment::Left,
                 FontColor::Transparent(palette::TEXT_SECONDARY),
@@ -504,35 +588,36 @@ impl Widget for HeroStatusView {
         }
 
         // --- Stereo OUT level meter (design section 21 E17/C8, bead
-        // pico-link-du0): two horizontal segmented bars, L above R,
-        // sharing the stat strip's grid slot with `stat_line` above
-        // (they don't collide in practice — nothing populates
-        // `stat_line` with live data yet). **Absent whenever there is no
-        // live reading, or the last one has gone stale** — this is the
-        // hard constraint the bead was commissioned under (design
-        // section 15): a still meter reads as silence when it means no
-        // data, so a stale reading is simply not drawn, not frozen and
-        // not dashed. See `OUT_LEVEL_STALE_AFTER`'s doc comment for the
-        // staleness window and `HeroStatusView::redraw_after` for how
-        // this widget schedules its own repaint to *notice* staleness
-        // with no new event to trigger a rebuild. ---
+        // pico-link-du0; moved to the vertical strip beside the rail per
+        // `.planning/design/2026-09-03-vertical-out-meter.md`, bead
+        // pico-link-ky8): a vertical pair of segmented columns, L (screen-
+        // left, always) beside R, in their own disjoint strip. **Absent
+        // whenever there is no live reading, or the last one has gone
+        // stale** — this is the hard constraint the bead was
+        // commissioned under (design section 15): a still meter reads as
+        // silence when it means no data, so a stale reading is simply not
+        // drawn, not frozen and not dashed, and the unlit `DIVIDER`
+        // segments must NOT be left behind as a ghost outline -- that IS
+        // a frozen meter pinned at zero. The `OUT` legend vanishes with
+        // the columns for the same reason -- a label over nothing reads
+        // as broken, not as silent. See `OUT_LEVEL_STALE_AFTER`'s doc
+        // comment for the staleness window and `HeroStatusView::
+        // redraw_after` for how this widget schedules its own repaint to
+        // *notice* staleness with no new event to trigger a rebuild. ---
         if let Some(level) = &self.out_level {
             if ctx.now().saturating_duration_since(level.received_at) <= OUT_LEVEL_STALE_AFTER {
-                let meter_x = area.top_left.x + LEFT_MARGIN;
-                let row_l_y = area.top_left.y + STAT_TOP;
-                let row_r_y = row_l_y + METER_ROW_HEIGHT + METER_ROW_GAP;
-                theme::draw_level_meter(
+                let label_font = font::label();
+                let legend_center_x = pair.top_left.x + pair.size.width as i32 / 2;
+                let _ = label_font.render_aligned(
+                    "OUT",
+                    Point::new(legend_center_x, name_y),
+                    VerticalPosition::Top,
+                    HorizontalAlignment::Center,
+                    FontColor::Transparent(palette::TEXT_SECONDARY),
                     &mut clipped,
-                    Rectangle::new(Point::new(meter_x, row_l_y), Size::new(0, METER_ROW_HEIGHT as u32)),
-                    level.rms_l,
-                    level.hold_l,
-                )?;
-                theme::draw_level_meter(
-                    &mut clipped,
-                    Rectangle::new(Point::new(meter_x, row_r_y), Size::new(0, METER_ROW_HEIGHT as u32)),
-                    level.rms_r,
-                    level.hold_r,
-                )?;
+                );
+                theme::draw_vertical_level_meter(&mut clipped, l_block, level.rms_l, level.hold_l)?;
+                theme::draw_vertical_level_meter(&mut clipped, r_block, level.rms_r, level.hold_r)?;
             }
         }
 
