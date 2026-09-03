@@ -33,6 +33,24 @@ pub enum Edge {
     Right,
 }
 
+impl Edge {
+    /// The edge directly across the rectangle from this one — `Top`/
+    /// `Bottom` and `Left`/`Right` pair off. Added for the vertical OUT
+    /// meter (`.planning/design/2026-09-03-vertical-out-meter.md` section
+    /// 4): the strip's inner layout carves `TRAIL_GAP` off
+    /// `orientation.button_edge()` and `LEAD_GAP` off the *opposite* side,
+    /// with zero left/right literals in that part of the geometry.
+    #[must_use]
+    pub const fn opposite(self) -> Edge {
+        match self {
+            Edge::Top => Edge::Bottom,
+            Edge::Bottom => Edge::Top,
+            Edge::Left => Edge::Right,
+            Edge::Right => Edge::Left,
+        }
+    }
+}
+
 /// A physical button identity, independent of where on screen it is
 /// currently drawn. `slot_order()` maps *physical top-to-bottom position*
 /// to one of these; labels are looked up by this identity, not by slot
@@ -140,5 +158,20 @@ mod tests {
     #[test]
     fn todays_hardware_value_is_buttons_right() {
         assert_eq!(PANEL, PanelOrientation::ButtonsRight);
+    }
+
+    #[test]
+    fn edge_opposite_pairs_off_correctly() {
+        assert_eq!(Edge::Top.opposite(), Edge::Bottom);
+        assert_eq!(Edge::Bottom.opposite(), Edge::Top);
+        assert_eq!(Edge::Left.opposite(), Edge::Right);
+        assert_eq!(Edge::Right.opposite(), Edge::Left);
+    }
+
+    #[test]
+    fn edge_opposite_is_its_own_inverse() {
+        for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+            assert_eq!(edge.opposite().opposite(), edge);
+        }
     }
 }

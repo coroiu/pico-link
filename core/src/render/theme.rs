@@ -611,6 +611,104 @@ where
     Ok(())
 }
 
+/// Number of segments in one [`draw_vertical_level_meter`] channel column —
+/// `.planning/design/2026-09-03-vertical-out-meter.md` section 5: 16, up
+/// from [`METER_SEGMENT_COUNT`]'s 8. The horizontal meter's 8 segments in a
+/// 174px-tall column would read as a crude three-state light; 16 stay
+/// individually resolvable at 30-50cm.
+const VERTICAL_METER_SEGMENT_COUNT: i32 = 16;
+/// Height (px) of a single vertical-meter segment.
+const VERTICAL_METER_SEGMENT_HEIGHT: i32 = 9;
+/// Gap (px) between adjacent vertical-meter segments.
+const VERTICAL_METER_SEGMENT_GAP: i32 = 2;
+/// Total footprint (px) of one full vertical meter column —
+/// `16*9 + 15*2 = 174`, exactly the design's meter-block height (section 4).
+pub const VERTICAL_METER_GLYPH_HEIGHT: u32 = (VERTICAL_METER_SEGMENT_COUNT * VERTICAL_METER_SEGMENT_HEIGHT
+    + (VERTICAL_METER_SEGMENT_COUNT - 1) * VERTICAL_METER_SEGMENT_GAP) as u32;
+
+/// Which colour segment `index` (0-based, quietest/bottom-most first) draws
+/// in when filled — design section 5: the colour zones keep the *same
+/// proportions* as the horizontal meter (green bottom 5/8, amber next 2/8,
+/// red top 1/8), not the literal indices, since porting the indices from
+/// [`level_segment_color`] verbatim would halve the red zone at 16
+/// segments. At 16: green bottom 10/16 (indices 0-9), amber next 4/16
+/// (indices 10-13), red top 2/16 (indices 14-15).
+fn vertical_level_segment_color(index: i32) -> Rgb565 {
+    if index >= VERTICAL_METER_SEGMENT_COUNT - 2 {
+        palette::STATUS_ERROR
+    } else if index >= VERTICAL_METER_SEGMENT_COUNT - 6 {
+        palette::STATUS_WARNING
+    } else {
+        palette::TEXT_PRIMARY
+    }
+}
+
+/// Draws one stereo OUT-meter channel *column* (design section 5, the
+/// vertical placement beside the button rail supersedes [`draw_level_meter`]'s
+/// horizontal row for this purpose — that function is unchanged and kept
+/// for now, but Home no longer calls it): [`VERTICAL_METER_SEGMENT_COUNT`]
+/// segments, bottom to top, growing *upward* from `rect`'s bottom edge —
+/// the bottom is the datum because that is where the level grows from
+/// (design section 4). `level` (0-255 linear) sets how many segments are
+/// filled; `hold` (also 0-255) draws a single highlighted segment at the
+/// peak-hold cap's position, [`palette::STATUS_ERROR`] if it lands on the
+/// top (clip) segment, [`palette::BRAND_BRIGHT`] otherwise. `hold == 0`
+/// draws no cap (nothing has peaked yet).
+///
+/// Every segment draws regardless of fill state (unfilled segments use
+/// [`palette::DIVIDER`]) while this reading is live — same "zero must still
+/// read as present" reasoning as [`draw_level_meter`]. Callers implement
+/// "absent, never frozen" themselves by not calling this function at all
+/// once a reading has gone stale (see `hero.rs`'s staleness check) — this
+/// function has no concept of staleness and will happily draw a fully
+/// unfilled column forever if asked to, which is exactly the frozen-ghost
+/// outline the design explicitly forbids leaving on screen.
+///
+/// `rect.size.width` sets the column's width (the design's 12px channel
+/// width); `rect.size.height` is ignored in favor of the fixed
+/// [`VERTICAL_METER_GLYPH_HEIGHT`] footprint, same
+/// ignore-caller-supplied-extent convention [`draw_level_meter`] and
+/// [`draw_signal_bars`] already use.
+///
+/// # Errors
+///
+/// Returns `Infallible`'s uninhabited variant in practice — see
+/// [`super::widget::Widget::render`]'s doc comment for why the `Result`
+/// return exists at all.
+pub fn draw_vertical_level_meter<D>(target: &mut D, rect: Rectangle, level: u8, hold: u8) -> Result<(), Infallible>
+where
+    D: DrawTarget<Color = Rgb565, Error = Infallible>,
+{
+    // Round-to-nearest segment count, same reasoning as `draw_level_meter`.
+    let filled = (i32::from(level) * VERTICAL_METER_SEGMENT_COUNT + 127) / 256;
+    let hold_index = if hold == 0 {
+        None
+    } else {
+        Some((i32::from(hold) * VERTICAL_METER_SEGMENT_COUNT / 256).min(VERTICAL_METER_SEGMENT_COUNT - 1))
+    };
+
+    let bottom = rect.top_left.y + VERTICAL_METER_GLYPH_HEIGHT as i32;
+
+    for i in 0..VERTICAL_METER_SEGMENT_COUNT {
+        // i=0 is the bottom-most (quietest) segment; growth is upward, so
+        // higher i means smaller y.
+        let y = bottom - (i + 1) * VERTICAL_METER_SEGMENT_HEIGHT - i * VERTICAL_METER_SEGMENT_GAP;
+        let is_hold = hold_index == Some(i);
+        let color = if is_hold {
+            if i >= VERTICAL_METER_SEGMENT_COUNT - 1 { palette::STATUS_ERROR } else { palette::BRAND_BRIGHT }
+        } else if i < filled {
+            vertical_level_segment_color(i)
+        } else {
+            palette::DIVIDER
+        };
+        Rectangle::new(Point::new(rect.top_left.x, y), Size::new(rect.size.width, VERTICAL_METER_SEGMENT_HEIGHT as u32))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(target)?;
+    }
+
+    Ok(())
+}
+
 /// Width, in pixels, of the left accent bar [`draw_selection`] draws.
 pub const SELECTION_ACCENT_WIDTH: u32 = 4;
 
@@ -803,5 +901,110 @@ mod tests {
         // controls.
         draw_signal_bars(&mut fb, rect, 200).unwrap();
         assert_eq!(sample_bar_tops(&fb, rect), [palette::BRAND_BRIGHT; 4]);
+    }
+
+    // --- draw_vertical_level_meter: bottom-up growth, proportional colour
+    // zones (design section 5 -- porting the horizontal meter's literal
+    // indices instead of its proportions would halve the red zone) -------
+
+    fn vertical_meter_segment_color_at(fb: &FrameBuffer565, rect: Rectangle, index_from_bottom: i32) -> Rgb565 {
+        let bottom = rect.top_left.y + VERTICAL_METER_GLYPH_HEIGHT as i32;
+        let y = bottom
+            - (index_from_bottom + 1) * VERTICAL_METER_SEGMENT_HEIGHT
+            - index_from_bottom * VERTICAL_METER_SEGMENT_GAP
+            + 1;
+        fb.pixel(Point::new(rect.top_left.x + 1, y))
+    }
+
+    #[test]
+    fn vertical_meter_glyph_height_is_174() {
+        assert_eq!(VERTICAL_METER_GLYPH_HEIGHT, 174);
+    }
+
+    #[test]
+    fn draw_vertical_level_meter_zero_level_draws_every_segment_unfilled() {
+        let mut fb = FrameBuffer565::new(20, 180);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
+        draw_vertical_level_meter(&mut fb, rect, 0, 0).unwrap();
+        for i in 0..VERTICAL_METER_SEGMENT_COUNT {
+            assert_eq!(
+                vertical_meter_segment_color_at(&fb, rect, i),
+                palette::DIVIDER,
+                "segment {i} from the bottom should be unfilled DIVIDER at level=0"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_vertical_level_meter_full_scale_fills_bottom_up_with_proportional_colour_zones() {
+        let mut fb = FrameBuffer565::new(20, 180);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
+        draw_vertical_level_meter(&mut fb, rect, 255, 0).unwrap();
+        // Bottom 10/16 segments (indices 0-9) are the green zone.
+        for i in 0..10 {
+            assert_eq!(
+                vertical_meter_segment_color_at(&fb, rect, i),
+                palette::TEXT_PRIMARY,
+                "segment {i} from the bottom must be in the green (TEXT_PRIMARY) zone"
+            );
+        }
+        // Next 4/16 (indices 10-13) are the amber zone.
+        for i in 10..14 {
+            assert_eq!(
+                vertical_meter_segment_color_at(&fb, rect, i),
+                palette::STATUS_WARNING,
+                "segment {i} from the bottom must be in the amber (STATUS_WARNING) zone"
+            );
+        }
+        // Top 2/16 (indices 14-15) are the red zone -- porting the
+        // horizontal meter's literal indices (top 1/8) instead of the
+        // proportion would wrongly leave index 14 amber.
+        for i in 14..16 {
+            assert_eq!(
+                vertical_meter_segment_color_at(&fb, rect, i),
+                palette::STATUS_ERROR,
+                "segment {i} from the bottom must be in the red (STATUS_ERROR) zone"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_vertical_level_meter_half_scale_fills_only_the_bottom_half() {
+        let mut fb = FrameBuffer565::new(20, 180);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
+        // 128/256 -> filled = (128*16+127)/256 = 8 segments from the bottom.
+        draw_vertical_level_meter(&mut fb, rect, 128, 0).unwrap();
+        for i in 0..8 {
+            assert_ne!(
+                vertical_meter_segment_color_at(&fb, rect, i),
+                palette::DIVIDER,
+                "segment {i} from the bottom should be filled at half scale"
+            );
+        }
+        for i in 8..16 {
+            assert_eq!(
+                vertical_meter_segment_color_at(&fb, rect, i),
+                palette::DIVIDER,
+                "segment {i} from the bottom should still be unfilled at half scale"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_vertical_level_meter_hold_zero_draws_no_peak_cap() {
+        // hold == 0 means "no peak recorded yet" -- same convention as
+        // draw_level_meter -- so no segment should render BRAND_BRIGHT.
+        let mut fb = FrameBuffer565::new(20, 180);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
+        draw_vertical_level_meter(&mut fb, rect, 0, 0).unwrap();
+        assert!(!fb.pixels().any(|p| p.1 == palette::BRAND_BRIGHT));
+    }
+
+    #[test]
+    fn draw_vertical_level_meter_hold_draws_a_peak_cap() {
+        let mut fb = FrameBuffer565::new(20, 180);
+        let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
+        draw_vertical_level_meter(&mut fb, rect, 0, 128).unwrap();
+        assert!(fb.pixels().any(|p| p.1 == palette::BRAND_BRIGHT), "a non-zero hold must draw a peak-hold cap");
     }
 }
