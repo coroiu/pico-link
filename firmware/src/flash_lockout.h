@@ -32,12 +32,26 @@
 // a hung core1 is still a dead encoder either way).
 void pl_flash_lockout_core1_init(void);
 
-// Diagnostics, read-only, monotonic, never reset. Bumped whenever a
-// lockout start/end handshake with core1 timed out (core1 wedged or not
-// yet servicing its FIFO IRQ). Zero on a single-core build/boot, and
-// necessarily zero until G3 launches core1 -- there is no "other core" to
-// time out on yet. Intended for G3/G5's reporter, not wired into one here
-// (out of this bead's scope).
+// Diagnostics, read-only, monotonic, never reset. Bumped on EITHER a START
+// or an END handshake timeout with core1 -- but the two are NOT the same
+// outcome, corrected 2026-09-03 after code review (this header used to say
+// "counted, never hang" for both, which is wrong for END):
+//   - START timeout: benign and recoverable. core1 never entered
+//     multicore_lockout_handler; nothing latches. The write is skipped,
+//     the RAM-staged value survives, and firmware execution continues
+//     normally -- this counter is the only trace it leaves.
+//   - END timeout: FATAL. flash_lockout.c panics into the recorder
+//     (naming core1 as the suspect) and reboots before returning, because
+//     pico-sdk's lockout_in_progress is now latched true forever with no
+//     public reset and the next flash write anywhere would hard_assert
+//     with no attribution. See flash_lockout.c's module doc and ADR
+//     .planning/decisions/2026-09-03-ldac-encoder-on-core1.md sec 7.1.
+//     This counter will therefore never be observed to increment more
+//     than once from an END timeout in a given boot -- the boot ends
+//     there.
+// Zero on a single-core build/boot, and necessarily zero until G3 launches
+// core1 -- there is no "other core" to time out on yet. Intended for
+// G3/G5's reporter, not wired into one here (out of this bead's scope).
 uint32_t pl_flash_lockout_timeout_count(void);
 
 // Diagnostics: how many times the REAL multicore-lockout handshake ran

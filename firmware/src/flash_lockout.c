@@ -43,9 +43,24 @@
 //     nothing to hang on. THIS IS THE SHIPPING CASE for this bead.
 //   - core1 IS a lockout victim (after G3) -> the real
 //     multicore_lockout_start/end pair, TIMEOUT variants only (never the
-//     _blocking ones), so a wedged core1 fails one save -- counted --
-//     instead of hanging the device forever waiting for a core that will
-//     never respond (design doc sec 6/7: "never hang").
+//     _blocking ones), so a wedged core1 never hangs the device forever
+//     waiting for a core that will never respond (design doc sec 6/7.1).
+//     The two timeouts are NOT symmetric, though -- see the two-outcome
+//     policy below, corrected 2026-09-03 after code review found the
+//     original "counted, never hang" framing wrong for END:
+//       - START timeout: benign, recoverable. core1 never entered the
+//         handler; nothing pico-sdk-side latches. Counted, write skipped,
+//         RAM-staged value kept, next attempt is clean.
+//       - END timeout: FATAL, by design. A successful START already
+//         proved core1 was alive in the handler, so END timing out means
+//         core1 died there -- pico-sdk's lockout_in_progress is now
+//         latched true forever with no public reset, and the NEXT flash
+//         write anywhere (BTstack's own link-key save included) would
+//         hard_assert at an arbitrary later moment with no attribution.
+//         This module panics into the recorder (naming core1) and reboots
+//         rather than let that happen silently later. See ADR sec 7.1 for
+//         the full rationale and why this is contained at this file's own
+//         get_flash_safety_helper() seam rather than a pico-sdk fork.
 //
 // EVERY FLASH WRITE PATH IN THIS FIRMWARE, audited for this bead (grep for
 // flash_range_program/flash_range_erase/flash_safe_execute across
@@ -80,16 +95,23 @@
 #include "flash_lockout.h"
 
 #include "hardware/sync.h"
+#include "pico/assert.h"
 #include "pico/flash.h"
 #include "pico/multicore.h"
 #include "pico/platform.h"
 
-// Per-phase timeout for the real lockout handshake. Generous on purpose:
-// this only matters once G3 exists, and the failure mode of "too long" is
-// a slower save; the failure mode of "too short" is a spurious lost save
-// under normal jitter. 5s is far above any plausible core1 scheduling
-// delay and far below "the user would notice a hang".
-#define PL_FLASH_LOCKOUT_TIMEOUT_US (5u * 1000u * 1000u)
+#include "panic_recorder.h"
+
+// Per-phase timeout for the real lockout handshake. Corrected 2026-09-03
+// (Ada's ruling, ADR sec 7.1): the original 5s figure could never be
+// observed -- the hardware watchdog is 2000ms (watchdog_sup.c:59) and
+// PL_WDT_USB_TASK's deadline is 250ms, and flash writes run from the
+// superloop, so the watchdog would always reboot first, uncontrolled and
+// unattributed, before a 5s wait ever timed out on its own. Both phases
+// must stay well under 250ms. 20ms is ~1000x headroom over a FIFO
+// round-trip to a core spinning in a four-instruction RAM loop -- the only
+// thing this timeout is actually waiting on.
+#define PL_FLASH_LOCKOUT_TIMEOUT_US (20u * 1000u)
 
 static uint32_t s_saved_irq;
 static uint32_t s_timeout_count;
@@ -110,8 +132,13 @@ static bool pl_flash_helper_core_init_deinit(bool init) {
     return true;
 }
 
+// core0 is always the locker in this design (flash writes never originate
+// from core1; core1 only ever runs the encoder loop). s_saved_irq is a
+// single static, not per-core, on that assumption -- assert it rather than
+// silently corrupting a nonexistent core1 flash write's IRQ state.
 static int pl_flash_helper_enter_safe_zone(uint32_t timeout_ms) {
     (void)timeout_ms;  // this module owns its own timeout, see above.
+    hard_assert(get_core_num() == 0);
 
     // Runtime, not compile-time: true only once G3 has launched core1 AND
     // core1 has run pl_flash_lockout_core1_init(). False for every build
@@ -119,12 +146,14 @@ static int pl_flash_helper_enter_safe_zone(uint32_t timeout_ms) {
     if (multicore_lockout_victim_is_initialized(1)) {
         s_active_count++;
         if (!multicore_lockout_start_timeout_us(PL_FLASH_LOCKOUT_TIMEOUT_US)) {
+            // START timeout is benign (ADR sec 7.1): core1 never entered
+            // multicore_lockout_handler, lockout_in_progress latches
+            // nothing (multicore_lockout_start_block_until sets it to the
+            // call's own return code), core0 has not yet disabled
+            // interrupts. Count it, skip the write, keep the RAM-staged
+            // value -- the caller (flash_safe_execute) skips the mutation
+            // function entirely when enter_safe_zone returns non-PICO_OK.
             s_timeout_count++;
-            // Do NOT disable interrupts or proceed: the caller
-            // (flash_safe_execute) skips the mutation function entirely
-            // when enter_safe_zone returns non-PICO_OK, matching the
-            // design's "skip the write, keep the RAM-staged value, never
-            // hang" failure response.
             return PICO_ERROR_TIMEOUT;
         }
     }
@@ -134,11 +163,25 @@ static int pl_flash_helper_enter_safe_zone(uint32_t timeout_ms) {
 
 static int pl_flash_helper_exit_safe_zone(uint32_t timeout_ms) {
     (void)timeout_ms;
+    hard_assert(get_core_num() == 0);
     restore_interrupts_from_disabled(s_saved_irq);
     if (multicore_lockout_victim_is_initialized(1)) {
         if (!multicore_lockout_end_timeout_us(PL_FLASH_LOCKOUT_TIMEOUT_US)) {
+            // END timeout is FATAL, unlike START (ADR sec 7.1). A
+            // successful START already proved core1 was alive inside
+            // multicore_lockout_handler; for END to now time out, core1
+            // must have faulted or wedged while parked in that
+            // four-instruction RAM loop. pico-sdk's lockout_in_progress
+            // is now latched true forever -- there is no public reset --
+            // so the NEXT multicore_lockout_start_* anywhere in the
+            // firmware, including BTstack's own link-key save, would
+            // hard_assert at an arbitrary later moment with no
+            // attribution. Do NOT retry: a second MAGIC_END push can sit
+            // unconsumed in core1's FIFO and poison the next START,
+            // trading a diagnosable fatal for an undiagnosable
+            // intermittent. Panic now, while the cause is still known.
             s_timeout_count++;
-            return PICO_ERROR_TIMEOUT;
+            pl_panic_record_flash_lockout_end_timeout();
         }
     }
     return PICO_OK;

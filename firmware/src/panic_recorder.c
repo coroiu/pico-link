@@ -84,6 +84,7 @@
 #define PL_PANIC_MAGIC_C 0x504c4343u         // "PLCC" -- C-side panic() (PICO_PANIC_FUNCTION)
 #define PL_PANIC_MAGIC_HARDFAULT 0x504c4846u // "PLHF" -- a real Cortex-M HardFault exception
 #define PL_PANIC_MAGIC_ASSERT 0x504c4153u    // "PLAS" -- plain assert() (bd pico-link-itf)
+#define PL_PANIC_MAGIC_LOCKOUT 0x504c4c4fu   // "PLLO" -- flash-lockout END timeout, core1 dead (bd pico-link-nli.2)
 
 // Short enough that a wedged recording path still recovers well inside the
 // "a bare *** PANIC *** cost a whole session" territory this bead exists to
@@ -197,6 +198,22 @@ void __attribute__((noreturn)) pl_panic_record_watchdog_stale(uint32_t subsys, u
     while (true) {
         tight_loop_contents();
     }
+}
+
+// --- Multicore flash-lockout END-handshake timeout (bead pico-link-nli.2)
+// -- see panic_recorder.h's doc comment for why this is fatal-with-no-retry
+// rather than counted-and-skipped like a START timeout. Unlike the watchdog
+// breadcrumb above, this DOES go through the full
+// pl_panic_arm_record_and_reboot() path (retry counter, BOOTSEL escalation
+// on an unresolved second panic) -- this is a genuine panic, not a
+// supervised heartbeat trip, and a second flash write racing a wedged core1
+// deserves the same "give up on warm reboot, go flashable" treatment as any
+// other unresolved fault. ---
+static const char s_lockout_msg[] = "flash lockout END handshake timed out -- core1 wedged in multicore_lockout_handler";
+
+void __attribute__((noreturn)) pl_panic_record_flash_lockout_end_timeout(void) {
+    pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_LOCKOUT, 0, 0, (const uint8_t *)s_lockout_msg,
+                                    sizeof(s_lockout_msg) - 1);
 }
 
 // --- C-side panic() entry point (PICO_PANIC_FUNCTION, wired in
@@ -366,7 +383,7 @@ void pl_panic_report_and_clear(void) {
     // boot reads scratch[0] as 0, which matches none of our magics.
     uint32_t magic = watchdog_hw->scratch[0];
     if (magic != PL_PANIC_MAGIC_RUST && magic != PL_PANIC_MAGIC_C && magic != PL_PANIC_MAGIC_HARDFAULT &&
-        magic != PL_PANIC_MAGIC_ASSERT && magic != PL_PANIC_MAGIC_WDT) {
+        magic != PL_PANIC_MAGIC_ASSERT && magic != PL_PANIC_MAGIC_WDT && magic != PL_PANIC_MAGIC_LOCKOUT) {
         return;
     }
 
@@ -407,6 +424,10 @@ void pl_panic_report_and_clear(void) {
             pl_log("kind: watchdog supervisor -- stale subsystem\r\n");
             pl_log("subsystem: %s (id %lu)\r\n", pl_wdt_subsys_name((pl_wdt_subsys_t)address), (unsigned long)address);
             pl_log("observed staleness: %lums\r\n", (unsigned long)diag);
+            break;
+        case PL_PANIC_MAGIC_LOCKOUT:
+            pl_log("kind: flash lockout END handshake timeout (core1 suspect)\r\n");
+            pl_log("message: %s\r\n", s_panic_msg);
             break;
         default:
             break;
