@@ -59,6 +59,20 @@
 //                        a hang hunt: if BOOTSEL-over-CDC doesn't work,
 //                        that is not new information about the hang, it's
 //                        the expected outcome of a wedged board.
+//   VOL GET          -- bead pico-link-4v2.1 (VT1, volume-sync risk gate,
+//                        .planning/design/2026-09-02-volume-sync.md sec 9):
+//                        dumps usb_audio.c's stored fu_volume[]/fu_mute[]
+//                        per channel plus fu_set_calls/fu_get_calls.
+//   VOL WATCH        -- toggles logging of every feature-unit SET (channel,
+//                        selector, raw value) as it happens, from inside
+//                        the 0xC0 worker IRQ (pl_log() is IRQ-safe). Second
+//                        call turns it back off.
+//   VOL HOSTUP [n]   -- pushes n (default 1, max 100) HID Consumer Volume
+//   VOL HOSTDOWN [n]    Increment/Decrement taps via media_keys.c's
+//                        already-proven ring, to measure whether it moves
+//                        macOS's own output-volume slider (design sec 6,
+//                        mechanism M2) and whether macOS then writes our FU
+//                        back in response.
 // An unrecognized or malformed line is logged and ignored -- never fatal,
 // never wedges the poll loop. See tools/usb-console/cdc_sender.py for the
 // host-side counterpart.

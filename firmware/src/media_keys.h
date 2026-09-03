@@ -43,6 +43,13 @@
 #define PL_MEDIA_KEY_USAGE_SCAN_NEXT  0x00B5u
 #define PL_MEDIA_KEY_USAGE_SCAN_PREV  0x00B6u
 #define PL_MEDIA_KEY_USAGE_STOP       0x00B7u
+// Bead pico-link-4v2.1 (VT1, volume-sync risk gate): HID Consumer Volume
+// Increment/Decrement. Pushed via pl_media_keys_push_tap() from
+// debug_remote.c's "VOL HOSTUP"/"VOL HOSTDOWN" console commands to measure
+// whether a HID tap moves macOS's own output-volume slider -- see
+// .planning/design/2026-09-02-volume-sync.md sec 6, mechanism M2.
+#define PL_MEDIA_KEY_USAGE_VOLUME_INCREMENT 0x00E9u
+#define PL_MEDIA_KEY_USAGE_VOLUME_DECREMENT 0x00EAu
 
 // Call once at startup, before the first pl_media_keys_push_*/drain call.
 // Resets the ring and safety-timeout state. No hardware side effects (the

@@ -54,8 +54,16 @@
 //   0 = "ctr" -- a2dp LDAC-falsifier counters (a2dp.c, pl_a2dp_publish_counters)
 //   1 = "atr" -- pl_log producer attribution, top-3 by bytes (pl_log_ring.c)
 //   2 = "drn" -- drain-side saturation ledger (pl_log_ring.c)
-//   3 = spare, reserved for a future non-starvable counter
-#define PL_PRIO_SLOT_COUNT 4u
+//   3 = "lpf" -- pl_loop_prof.c's per-phase latency histogram (round-robins
+//       one pl_loop_phase_t per publish)
+//   4 = "vol" -- bead pico-link-4v2.1 (VT1, volume-sync risk gate):
+//       debug_remote.c's "VOL GET"/"VOL WATCH" snapshot. Added because
+//       logging the feature unit's FU SET events via plain pl_log() was
+//       measured unreliable under this firmware's background log-ring
+//       congestion (log_drops in the tens of thousands within seconds of
+//       boot -- the same problem this module exists to solve for the
+//       other four slots).
+#define PL_PRIO_SLOT_COUNT 5u
 
 // Formats `fmt`/`...` into slot `slot_id`, right-padded with spaces to
 // PL_PRIO_SLOT_LEN - 2 and terminated with CRLF, then marks it fresh.
