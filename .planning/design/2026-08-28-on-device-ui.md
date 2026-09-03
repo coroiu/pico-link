@@ -170,6 +170,14 @@ Home(0) [status <-> menu]  -> Devices(1)       -> Pair wizard(2)
  |VO| OUT  LINK ||||.  USB 48k 24-bit|
 ```
 
+> **SUPERSEDED (2026-09-03, bead `pico-link-ky8`):** the `OUT` meter no longer
+> sits in the bottom stat strip. It is a **vertical stereo pair in its own 48px
+> strip immediately inboard of the button rail**, 16 segments per channel — see
+> `.planning/design/2026-09-03-vertical-out-meter.md`, which is the design of
+> record for the meter's placement, size and segment count. Everything else in
+> this section (the hero, the bitrate rules, the banner, the stat strip) is
+> unchanged, and the stat strip *gains* the slot the meter vacated.
+
 | Element | Font | Colour |
 |---|---|---|
 | Codec word (hero) | **`font::hero()` - NEW, ~20-26px** | see below |
@@ -201,8 +209,11 @@ is right-aligned into a fixed slot cleared to `BACKGROUND` first.
 > when "it's working" is the message - and is perfectly still otherwise.
 > Budget: 1Hz already for bitrate; 4Hz costs 3 extra frames/sec ~= 11.6% duty.
 
-`VOL` is the AVRCP setting; `OUT` is the live output level, 6-8 segments per
-channel with peak-hold and a `STATUS_ERROR` cap. **The OUT meter is a
+`VOL` is the AVRCP setting; `OUT` is the live output level, with peak-hold and a
+`STATUS_ERROR` cap. **The "6-8 segments per channel" figure here is superseded:**
+the meter is vertical beside the rail and carries **16 segments per channel**,
+with the same 5/8 green - 2/8 amber - 1/8 red *proportions* (10/16, 4/16, 2/16).
+See `.planning/design/2026-09-03-vertical-out-meter.md`. **The OUT meter is a
 commissioned feature, not one drawn in the sketch** - proposed with its redraw
 cost and M3 dependency stated, and accepted on that basis.
 
@@ -697,7 +708,7 @@ quality-of-feel item **after** the MVP ships (E22).
 | E14 | **`NVM_NUM_LINK_KEYS` 1 -> 8** + the persisted bond store specced in S22 | The entire multi-device story. **Highest-value Tier 2 item** - until it lands, pairing a second set of headphones forgets the first, which makes the whole Devices screen a fiction. |
 | E15 | **Settings persistence (M5)** | S19. Without it Settings is a demo. |
 | E16 | **AVRCP absolute volume + capability flag** | VOL gauge, d-pad Up/Down, MUTED banner, volume limit, per-device volume. |
-| E17 | **Per-channel peak/RMS at ~4Hz**, off the real-time path | The OUT meter and its peak cap. Ship absent, never frozen. |
+| E17 | **Per-channel peak/RMS at ~4Hz**, off the real-time path | The OUT meter and its peak cap. Ship absent, never frozen. **Placement superseded 2026-09-03 (`pico-link-ky8`): vertical pair beside the rail, 16 segments — see `.planning/design/2026-09-03-vertical-out-meter.md`.** |
 | E18 | **Connected-link HCI RSSI** | SIGNAL row and the Home LINK bar. |
 | E19 | **USB IN rate (M3)** | USB IN field; also gates the meter, since without USB audio there is no PCM. |
 | E20 | **Live/adaptive bitrate readout** | The "(adaptive)" qualifier. Nominal-only until then. |
