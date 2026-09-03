@@ -1691,12 +1691,35 @@ static void pl_a2dp_core1_entry(void) {
         pl_enc_state_t state = s_enc_state;
         if (state != PL_ENC_STATE_RUNNING) {
             // Not running: touch NOTHING shared beyond the two flags below,
-            // and keep looping. Interrupts stay enabled for the entire
-            // life of this function (invariant 3) -- the multicore lockout
-            // handler (and any future doorbell) keeps being serviced
-            // normally, including right here while otherwise idle.
+            // then park in WFE instead of bare-spinning (bead pico-link-1n4.3
+            // / ADR sec 12.4's F2 -- measured on hardware at 6.28M spins/s and
+            // 73M added XIP accesses/s for zero work, F0). Interrupts stay
+            // enabled for the entire life of this function (invariant 3), so
+            // WFE is NOT an interrupts-disabled wait: the multicore lockout
+            // handler (and any future doorbell) keeps being serviced exactly
+            // as before, waking this core the same way any IRQ always does.
+            //
+            // RACE-FREE BY CONSTRUCTION, not by luck: WFE/SEV share one
+            // architectural event flag per core, and SEV -- per hardware/
+            // sync.h's own doc comment -- "sends an event to both cores".
+            // The flag latches independently of instruction ordering: if
+            // pl_a2dp_core1_arm_running()'s __sev() (the only place that
+            // transitions this core out of non-RUNNING, see that function)
+            // fires ANY time between this core's last state re-check and its
+            // WFE retiring -- including strictly before this loop iteration
+            // even started -- the flag is already set and WFE returns
+            // immediately without sleeping. There is no window in which a
+            // state change can be missed: either this core observes RUNNING
+            // on its next volatile read (state was already updated), or it
+            // was still non-RUNNING when read but the pending/latched event
+            // wakes the WFE right after, and the very next loop iteration
+            // re-reads state and finds RUNNING. Nothing here is edge-
+            // triggered on the SEV call itself; only the state variable is
+            // ever branched on, so a "lost" event costs at most one extra,
+            // harmless WFE wake -- it can never cost a missed transition.
             s_enc_quiesced = true;
             s_enc_heartbeat++;
+            __wfe();
             continue;
         }
         s_enc_quiesced = false;
@@ -1817,6 +1840,14 @@ static void pl_a2dp_core1_arm_running(void) {
     s_ctx.samples_owed_rem_us = 0;
     __dmb();
     s_enc_state = PL_ENC_STATE_RUNNING;
+    // Wake core1 out of the WFE it parks in while non-RUNNING (bead
+    // pico-link-1n4.3). __sev() is unconditional and cheap -- if core1 is
+    // not currently asleep (e.g. still unwinding a prior DRAINING
+    // iteration) this is a harmless no-op event, never a correctness
+    // requirement; the state read in pl_a2dp_core1_entry's loop is what
+    // core1 actually acts on. See that loop's WFE comment for why the two
+    // together are race-free.
+    __sev();
 }
 
 // Diagnostics for G3/G5's reporter -- see s_enc_quiesce_timeouts's doc
