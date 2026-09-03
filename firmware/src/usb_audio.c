@@ -37,6 +37,19 @@ static volatile bool streaming = false;
 static volatile uint32_t pcm_bytes_total = 0;
 static volatile uint32_t packet_count = 0;
 
+// Bead pico-link-4v2.1 (VT1, volume-sync risk gate): "VOL WATCH" toggle.
+// Plain volatile flag, no locking -- the only writer is debug_remote.c's
+// thread-context console handler. The reader is ALSO thread context
+// (debug_remote.c's poll, once per superloop iteration -- see that file):
+// logging from inside this file's 0xC0 IRQ callbacks via pl_log() was
+// tried first and measured unreliable under this firmware's background
+// log-ring congestion (log_drops in the tens of thousands within seconds
+// of boot, pl_prio.h's module doc measured the same thing for other
+// counters). Polling fu_set_calls()'s counter from thread context and
+// publishing through pl_prio.h's spare slot 3 (thread-context-only by
+// that module's own contract) is the reliable path -- see debug_remote.c.
+static volatile bool s_watch_enabled = false;
+
 // --- Instrumentation (bead pico-link-icb probe 2): lightweight integer
 // counters only -- no printf/vsnprintf here, this file's callbacks run
 // inside the 0xC0 worker IRQ via tud_task() (pl_usb_pump_worker_irq).
@@ -539,4 +552,31 @@ uint32_t pl_usb_audio_rx_short_packets(void) {
 
 uint32_t pl_usb_audio_ep_out_busy_at_alt1_entry(void) {
     return s_ep_out_busy_at_alt1_entry;
+}
+
+// Bead pico-link-4v2.1 (VT1, volume-sync risk gate).
+int16_t pl_usb_audio_fu_volume(uint8_t ch) {
+    if (ch >= CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1) {
+        return 0;
+    }
+    return fu_volume[ch];
+}
+
+int8_t pl_usb_audio_fu_mute(uint8_t ch) {
+    if (ch >= CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1) {
+        return 0;
+    }
+    return fu_mute[ch];
+}
+
+uint8_t pl_usb_audio_fu_channel_count(void) {
+    return CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1;
+}
+
+void pl_usb_audio_set_watch(bool enabled) {
+    s_watch_enabled = enabled;
+}
+
+bool pl_usb_audio_watch_enabled(void) {
+    return s_watch_enabled;
 }

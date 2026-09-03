@@ -158,4 +158,38 @@ uint32_t pl_usb_audio_fill_min(void);
 // be attributed to the stream that's about to start.
 void pl_usb_audio_fb_reset(void);
 
+// --- Bead pico-link-4v2.1 (VT1, volume-sync risk gate) ---
+// debug_remote.c's "VOL GET"/"VOL WATCH" console commands read these to
+// measure what macOS actually sends to the feature unit, per
+// .planning/design/2026-09-02-volume-sync.md sec 9 (T1). All are plain
+// reads of state already written from the 0xC0 worker IRQ callbacks above
+// -- safe to call from thread context, same convention as every other
+// accessor in this header.
+
+// Current stored volume (raw UAC2 1/256 dB units, i.e. the range this
+// device declares: bMin=-12800, bMax=0, bRes=256) for channel `ch` (0 =
+// master, 1..N = per-channel). Returns 0 if `ch` is out of range.
+int16_t pl_usb_audio_fu_volume(uint8_t ch);
+
+// Current stored mute flag (host's raw bCur: 0 or 1, per
+// audio_control_cur_1_t) for channel `ch`. Returns 0 if `ch` is out of
+// range.
+int8_t pl_usb_audio_fu_mute(uint8_t ch);
+
+// Highest channel index this device's feature unit accepts (master + N
+// audio channels) -- i.e. valid `ch` for the two accessors above is
+// 0..pl_usb_audio_fu_channel_count()-1.
+uint8_t pl_usb_audio_fu_channel_count(void);
+
+// Enables/disables "VOL WATCH" mode. Does not itself log anything --
+// debug_remote.c's poll (thread context, once per superloop iteration)
+// checks this flag and, when set, watches pl_usb_audio_fu_set_calls() for
+// changes and publishes the current fu_volume[]/fu_mute[] snapshot via
+// pl_prio.h's non-starvable slot 3 when it does. See usb_audio.c's doc
+// comment on s_watch_enabled for why logging directly from this file's
+// 0xC0 IRQ callbacks via pl_log() was tried first and rejected (measured
+// unreliable under log-ring congestion).
+void pl_usb_audio_set_watch(bool enabled);
+bool pl_usb_audio_watch_enabled(void);
+
 #endif // PICO_LINK_USB_AUDIO_H

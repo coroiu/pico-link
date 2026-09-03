@@ -12,6 +12,8 @@
 
 #include "bt.h"
 #include "media_keys.h"
+#include "pl_prio.h"
+#include "usb_audio.h"
 #include "usb_pump.h"
 
 // Longest valid line is "NAV SHORTCUT" territory -- "NAV SELECT\n" (11
@@ -128,8 +130,58 @@ static bool parse_connect_addr(const char *line, uint8_t addr[6]) {
     return byte_idx == 6 && *p == '\0';
 }
 
+// Bead pico-link-4v2.1 (VT1): formats the feature unit's current state
+// (per-channel volume/mute plus the SET/GET call counters) into ONE line
+// and publishes it through pl_prio.h's slot 4 -- see that header's slot-4
+// doc comment for why this does not use pl_log(). CFG_TUD_AUDIO_FUNC_1_N_
+// CHANNELS_RX is 2 (tusb_config.h) -> 3 channels (master + L + R), so the
+// whole snapshot fits comfortably inside one PL_PRIO_SLOT_LEN=128 slot.
+// Thread context only (pl_prio_publish()'s own contract) -- this is only
+// ever called from pl_debug_remote_poll(), itself thread-context-only.
+static void log_vol_snapshot(void) {
+    uint8_t n_ch = pl_usb_audio_fu_channel_count();
+    int16_t v0 = n_ch > 0 ? pl_usb_audio_fu_volume(0) : 0;
+    int8_t m0 = n_ch > 0 ? pl_usb_audio_fu_mute(0) : 0;
+    int16_t v1 = n_ch > 1 ? pl_usb_audio_fu_volume(1) : 0;
+    int8_t m1 = n_ch > 1 ? pl_usb_audio_fu_mute(1) : 0;
+    int16_t v2 = n_ch > 2 ? pl_usb_audio_fu_volume(2) : 0;
+    int8_t m2 = n_ch > 2 ? pl_usb_audio_fu_mute(2) : 0;
+    pl_prio_publish(
+        4,
+        "vol c0 v=%d m=%d c1 v=%d m=%d c2 v=%d m=%d set=%lu get=%lu",
+        (int)v0,
+        (int)m0,
+        (int)v1,
+        (int)m1,
+        (int)v2,
+        (int)m2,
+        (unsigned long)pl_usb_audio_fu_set_calls(),
+        (unsigned long)pl_usb_audio_fu_get_calls()
+    );
+}
+
 size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
     size_t emitted = 0;
+
+    // Bead pico-link-4v2.1 (VT1) "VOL WATCH": independent of whatever CDC
+    // bytes are or aren't available below, republish the slot-4 snapshot
+    // every time fu_set_calls() has advanced since the last check -- i.e.
+    // once per FU SET macOS actually sends, at this poll's cadence (once
+    // per superloop iteration, unconditional -- does not need
+    // pl_usb_lock_try(), pl_prio_publish() touches only its own module's
+    // memory). A burst of SETs faster than one superloop iteration apart
+    // coalesces to the latest value in the burst, same latch semantics as
+    // every other coalescing point in this firmware (pl_prio.h's own
+    // module doc) -- acceptable for a step-grid measurement, since T1's
+    // question is what values arrive, not their exact arrival timing.
+    static uint32_t s_last_fu_set_calls;
+    if (pl_usb_audio_watch_enabled()) {
+        uint32_t calls = pl_usb_audio_fu_set_calls();
+        if (calls != s_last_fu_set_calls) {
+            s_last_fu_set_calls = calls;
+            log_vol_snapshot();
+        }
+    }
 
     // Bead pico-link-okx (F2b): getchar_timeout_us(0) went through
     // pico_stdio_usb's stdio_usb_in_chars(), which calls tud_task() from
@@ -210,6 +262,57 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                 } else if (strcmp(s_line, "MEDIA PREV") == 0) {
                     pl_log("debug-remote: MEDIA PREV -> dispatched\r\n");
                     pl_media_keys_push_tap(PL_MEDIA_KEY_USAGE_SCAN_PREV);
+                } else if (strcmp(s_line, "VOL GET") == 0) {
+                    // Bead pico-link-4v2.1 (VT1): dumps the feature unit's
+                    // stored state and call counters -- answers "did macOS
+                    // ever write our feature unit, and what does it hold
+                    // now", per design doc sec 9 (T1) question (i).
+                    //
+                    // Published via pl_prio.h's slot 4, NOT pl_log() --
+                    // this file's own MEDIA/CONNECT/etc acknowledgements
+                    // above use pl_log() and can be silently dropped under
+                    // this firmware's background log-ring congestion (see
+                    // pl_prio.h's slot-4 doc comment); a one-shot
+                    // measurement command like this one must not be lost
+                    // to that.
+                    pl_log("debug-remote: VOL GET -> dispatched\r\n");
+                    log_vol_snapshot();
+                } else if (strcmp(s_line, "VOL WATCH") == 0) {
+                    // Toggle. While on, pl_debug_remote_poll()'s own
+                    // per-iteration check below (thread context, same as
+                    // this handler) republishes the slot-4 snapshot every
+                    // time pl_usb_audio_fu_set_calls() changes -- i.e.
+                    // every FU SET macOS sends -- answering question (ii),
+                    // the actual step grid macOS uses, not what the RANGE
+                    // descriptor invites. Polled rather than logged
+                    // straight from feature_unit_set_request()'s 0xC0 IRQ
+                    // for the same reliability reason as VOL GET above,
+                    // and because pl_prio_publish() is thread-context-only
+                    // by its own contract (pl_prio.h).
+                    bool now_on = !pl_usb_audio_watch_enabled();
+                    pl_usb_audio_set_watch(now_on);
+                    pl_log("debug-remote: VOL WATCH -> %s\r\n", now_on ? "ON" : "OFF");
+                } else if (strncmp(s_line, "VOL HOSTUP", 10) == 0 || strncmp(s_line, "VOL HOSTDOWN", 12) == 0) {
+                    // Bead pico-link-4v2.1 (VT1): pushes n HID Consumer
+                    // Volume Increment/Decrement taps through the
+                    // already-proven media_keys.c ring -- answers question
+                    // (iii)/(iv), whether mechanism M2 moves macOS's own
+                    // slider and whether macOS then writes our FU back in
+                    // response (design doc sec 6, sec 9 T1).
+                    bool up = (strncmp(s_line, "VOL HOSTUP", 10) == 0);
+                    const char *arg = s_line + (up ? 10 : 12);
+                    long n = (*arg == ' ') ? strtol(arg + 1, NULL, 10) : 1;
+                    if (n < 1) {
+                        n = 1;
+                    }
+                    if (n > 100) {
+                        n = 100; // guard against a typo flooding the HID ring
+                    }
+                    pl_log("debug-remote: VOL %s %ld -> dispatched\r\n", up ? "HOSTUP" : "HOSTDOWN", n);
+                    uint16_t usage = up ? PL_MEDIA_KEY_USAGE_VOLUME_INCREMENT : PL_MEDIA_KEY_USAGE_VOLUME_DECREMENT;
+                    for (long i = 0; i < n; i++) {
+                        pl_media_keys_push_tap(usage);
+                    }
                 } else if (emitted < max) {
                     PlIntent intent;
                     if (parse_line(s_line, &intent)) {
