@@ -1,7 +1,7 @@
 ---
 name: hardware-debugger
 description: Hard-problem debugging and troubleshooting - USB device hangs, wedged buses, intermittent hardware faults. Use when a bug has resisted a normal investigation round, when the failure is intermittent or timing-dependent, or when the instrument itself may be lying.
-model: claude-fable-5
+model: claude-opus-5
 tools:
   - Read
   - Glob
