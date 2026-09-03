@@ -2,9 +2,17 @@
 
 - **Date:** 2026-09-02
 - **Bead:** `pico-link-yz6` (supersedes that bead's original premise)
-- **Status:** Accepted — **do not move the display and UI to core1.** Reserve
-  core1 for the LDAC encoder. Raise the repaint ceiling with damage-rect
-  render + partial blit instead.
+- **Status:** Accepted, **partially amended 2026-09-03** by
+  `2026-09-03-ldac-encoder-on-core1.md`. The central decision stands: **do not
+  move the display and UI to core1; reserve core1 for the LDAC encoder.** The
+  amendment (a) fires the deferral trigger in Decision 2 on different and
+  stronger evidence — measured encoder duty of ~94% of core 0 at 990 kbps,
+  `pico-link-8b7`, not the per-encode 1159/1100 us budget; (b) narrows the
+  "`pico-link-15n` must land first" prerequisite to its multicore-lockout half
+  only; and (c) corrects how this ADR weighted its own fact D. Damage-rect
+  render + partial blit remains correct and remains the only lever on the
+  full-frame ceiling, but it is no longer the critical path. Read the amendment
+  before acting on the build order below.
 - **Author:** Ada (architect)
 
 ## Context

@@ -267,7 +267,7 @@ endif()
 # even exist in that build). pico_multicore is already linked below
 # unconditionally (G1, pico-link-nli.2, for the flash lockout) regardless of
 # this flag.
-option(PL_ENCODER_ON_CORE1 "Run the LDAC encoder on core1 instead of core0's media timer" ON)
+option(PL_ENCODER_ON_CORE1 "Run the LDAC encoder on core1 instead of core0's media timer" OFF)
 if(PL_ENCODER_ON_CORE1)
     target_compile_definitions(pico_link PRIVATE PL_ENCODER_ON_CORE1=1)
 endif()
