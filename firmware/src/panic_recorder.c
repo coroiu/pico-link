@@ -375,15 +375,34 @@ void pl_panic_report_and_clear(void) {
     // recovery path. Gating on it meant returning early without clearing
     // scratch[3], leaving the retry flag set to 1 so the *next* genuine,
     // unrelated panic was misdiagnosed as recursive and skipped recording
-    // entirely -- the very failure mode this bead exists to fix. Magic
-    // alone is still safe: the watchdog scratch registers live in the
-    // always-on domain and are NOT retained across an actual power-on
-    // reset (only across warm/watchdog/software resets and a BOOTSEL
-    // reflash cycle, none of which are power cycles), so a genuine cold
-    // boot reads scratch[0] as 0, which matches none of our magics.
+    // entirely -- the very failure mode this bead exists to fix.
+    //
+    // Magic alone is NOT safe either, and this function must still clear
+    // scratch[0..3] before returning on the early-return path below.
+    // Measured 2026-09-03 (bead pico-link-1cp): the RP2350 boot ROM
+    // CLOBBERS the watchdog scratch registers across a BOOTSEL reflash --
+    // scratch[3] read back as 0x00000975 and 0x00000978 on two separate
+    // reflashes, neither zero nor one of our magics. A genuine cold boot
+    // (actual power-on reset) does reliably read scratch[0] as 0 --
+    // scratch lives in the always-on domain and is retained across warm/
+    // watchdog/software resets -- but the boot that follows a BOOTSEL
+    // reflash is NOT a power-on reset, and it can leave scratch[0] holding
+    // ROM garbage that also matches none of our magics, landing in this
+    // same early-return branch. Previously this branch returned without
+    // clearing anything, leaving whatever garbage the ROM left in
+    // scratch[3] in place; pl_panic_arm_record_and_reboot()'s retry test
+    // (scratch[3] != 0) then misdiagnoses the very next unrelated panic --
+    // of any kind, on any boot -- as recursive/unresolved and routes it
+    // straight to reset_usb_boot() with no record and no report. Clearing
+    // scratch[0..3] here, unconditionally, on every early-return path,
+    // closes that hole.
     uint32_t magic = watchdog_hw->scratch[0];
     if (magic != PL_PANIC_MAGIC_RUST && magic != PL_PANIC_MAGIC_C && magic != PL_PANIC_MAGIC_HARDFAULT &&
         magic != PL_PANIC_MAGIC_ASSERT && magic != PL_PANIC_MAGIC_WDT && magic != PL_PANIC_MAGIC_LOCKOUT) {
+        watchdog_hw->scratch[0] = 0;
+        watchdog_hw->scratch[1] = 0;
+        watchdog_hw->scratch[2] = 0;
+        watchdog_hw->scratch[3] = 0;
         return;
     }
 
