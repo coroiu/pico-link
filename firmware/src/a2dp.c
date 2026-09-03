@@ -204,6 +204,24 @@ _Static_assert(
 // (pico-link-p1r): 4ms more dwell against a 164ms iteration is noise.
 #define PL_A2DP_MAX_ENCODE_DWELL_US 10000u
 
+// Bead pico-link-nli.4 (G3), G4 review hardening: a hard per-call
+// wall-clock cap on pl_a2dp_fill()'s loop under PL_ENCODER_ON_CORE1,
+// independent of PL_A2DP_MAX_ENCODE_DWELL_US above (that computation stays
+// #ifndef'd out for core1 -- see its own doc comment -- this is a NEW,
+// separate bound, not a revival of it). Why one is needed here and not
+// under the legacy build: samples_owed is clamped to what's actually in
+// the PCM ring (see samples_owed's/credit_clamped_samples's doc comments),
+// so a single pl_a2dp_fill() call's iteration count is bounded by ring
+// depth, not by wall time directly -- a large backlog immediately before a
+// quiesce (e.g. after a scheduling gap) could in principle still push one
+// call's real duration past pl_a2dp_core1_quiesce_and_wait()'s 5ms
+// timeout, which would then be racing a live, still-encoding core1 rather
+// than the wedged one it was designed to detect -- a different and worse
+// failure. 2ms leaves 3ms of headroom under that 5ms budget for the
+// in-flight call to actually finish once it trips this cap and returns.
+// See pl_a2dp_fill's loop (stop_core1_budget) for the check that uses it.
+#define PL_A2DP_CORE1_FILL_BUDGET_US (2u * 1000u)
+
 // Bead pico-link-85v (D4): work-bound multiplier -- the fill loop never
 // needs more than CATCHUP_K times the work real time has owed it; beyond
 // that is not catch-up, it is running ahead of the sink. K=2 retires a
@@ -529,6 +547,16 @@ typedef struct {
     // nonzero means the SEND side, not fill, is the limiter -- read
     // grants/s.
     volatile uint32_t stop_queue_full;
+
+    // Bead pico-link-nli.4 (G3), G4 review hardening: counts trips of
+    // PL_A2DP_CORE1_FILL_BUDGET_US's wall-clock cap -- see that macro's
+    // doc comment. ONLY wired under PL_ENCODER_ON_CORE1 (asserted 0 under
+    // the legacy build, same convention as stop_dwell there); a nonzero
+    // reading here under core1 means a single fill() call actually
+    // approached the quiesce timeout's margin on real backlog, worth
+    // investigating but not itself a correctness bug -- the cap's job is
+    // exactly to make that case return promptly instead of overrunning.
+    volatile uint32_t stop_core1_budget;
 
     // Bead pico-link-85v (D7): payloads_sealed's rate vs pkt_sent's rate is
     // the single most important stop/send-side split -- divergence means
@@ -1056,6 +1084,20 @@ static void pl_a2dp_fill(void) {
             s_ctx.stop_dwell++;
             break;
         }
+#else
+        // 0. Bead pico-link-nli.4 (G3), G4 review hardening: core1's own
+        // wall-clock cap -- see PL_A2DP_CORE1_FILL_BUDGET_US's doc
+        // comment. Deliberately reuses dwell_us (real measured encode
+        // time, accumulated below) rather than adding a second timer read
+        // per iteration -- dwell_us is already kept unconditionally for
+        // exactly this kind of diagnostic, per its own doc comment above.
+        // This does NOT touch the retired frame-count dwell_budget_us
+        // computation (still #ifndef'd out above) -- it is a new,
+        // independent bound.
+        if (dwell_us >= PL_A2DP_CORE1_FILL_BUDGET_US) {
+            s_ctx.stop_core1_budget++;
+            break;
+        }
 #endif
         // 1. Credit: has the real-time clock actually owed us a whole
         // encoded frame's worth of samples yet? Most-common stop reason
@@ -1464,6 +1506,11 @@ static volatile uint32_t s_enc_quiesce_timeouts;
 // 1495-1517us (ADR sec 11.0); 5ms is generous headroom above any single
 // frame.
 #define PL_A2DP_QUIESCE_TIMEOUT_US (5u * 1000u)
+
+// PL_A2DP_CORE1_FILL_BUDGET_US (2ms, defined near PL_A2DP_MAX_ENCODE_DWELL_US
+// above pl_a2dp_fill) leaves 3ms of headroom under this 5ms budget for an
+// in-flight fill() call to finish once its own cap trips -- see that
+// macro's doc comment for the full reasoning.
 
 // core1's own credit-clock tick source (design sec 4.1 change 1): a
 // core1-private time_us_64() delta, replacing the media timer's role.
@@ -2216,19 +2263,23 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             }
             s_ctx.local_seid = a2dp_subevent_stream_established_get_local_seid(packet);
             int mtu = a2dp_max_media_payload_size(s_ctx.a2dp_cid, s_ctx.local_seid);
-            s_ctx.max_media_payload_size = btstack_min(mtu, (int)PL_A2DP_PAYLOAD_SLOT_BYTES - 1);
 #ifdef PL_ENCODER_ON_CORE1
-            // Bead pico-link-nli.4 (G3): a defensive quiesce before
-            // touching any shared field below -- by the time a FRESH
-            // connection reaches STREAM_ESTABLISHED, any prior session's
-            // SIGNALING_CONNECTION_RELEASED handler should already have
-            // quiesced and idled core1, so this is normally a same-cycle
-            // no-op (s_enc_quiesced already true). Kept unconditional
-            // rather than assumed, per pl_a2dp_tx_flush's own doc comment
-            // reasoning: every call site that touches these fields must be
-            // provably safe, not merely usually safe.
+            // Bead pico-link-nli.4 (G3), G4 review fix: a defensive quiesce
+            // BEFORE touching any shared field below, INCLUDING
+            // max_media_payload_size itself -- it is read on every
+            // pl_a2dp_fill() call (pl_a2dp_usable_payload), so writing it
+            // ahead of this quiesce (the original, incorrect ordering)
+            // could race a still-RUNNING core1 mid-read of it. By the time
+            // a FRESH connection reaches STREAM_ESTABLISHED, any prior
+            // session's SIGNALING_CONNECTION_RELEASED handler should
+            // already have quiesced and idled core1, so this is normally a
+            // same-cycle no-op (s_enc_quiesced already true). Kept
+            // unconditional rather than assumed, per pl_a2dp_tx_flush's own
+            // doc comment reasoning: every call site that touches these
+            // fields must be provably safe, not merely usually safe.
             pl_a2dp_core1_quiesce_and_wait();
 #endif
+            s_ctx.max_media_payload_size = btstack_min(mtu, (int)PL_A2DP_PAYLOAD_SLOT_BYTES - 1);
             // Bead pico-link-85v (D6): flush the tx ring here too -- a
             // stale payload surviving into a new stream is an audible
             // artefact (a burst of the previous track with a stale RTP
@@ -2855,6 +2906,25 @@ void pl_a2dp_report(uint32_t report_dt_us) {
         );
     }
     s_last_stop_dwell = stop_dwell_now;
+#ifdef PL_ENCODER_ON_CORE1
+    // Bead pico-link-nli.4 (G3), G4 review hardening: same "never let a
+    // safety-trip go silent" treatment for stop_core1_budget -- see
+    // PL_A2DP_CORE1_FILL_BUDGET_US's doc comment. A rise here means a
+    // single fill() call actually approached the quiesce timeout's
+    // margin -- worth investigating, but the cap itself did its job by
+    // returning promptly rather than overrunning.
+    static uint32_t s_last_stop_core1_budget;
+    uint32_t stop_core1_budget_now = s_ctx.stop_core1_budget;
+    if (stop_core1_budget_now != s_last_stop_core1_budget) {
+        pl_log(
+            "a2dp: WARNING stop_core1_budget rose by %lu this report window (total=%lu) -- "
+            "a fill() call hit PL_A2DP_CORE1_FILL_BUDGET_US's 2ms wall-clock cap on a real "
+            "backlog; check quiesce timeouts (pl_a2dp_encoder_quiesce_timeouts) for margin.\r\n",
+            (unsigned long)(stop_core1_budget_now - s_last_stop_core1_budget), (unsigned long)stop_core1_budget_now
+        );
+    }
+    s_last_stop_core1_budget = stop_core1_budget_now;
+#endif
     // Bead pico-link-85v (D7): the new drain-side counters. payloads_sealed
     // vs pkt_sent (above) is the single most important split -- equal
     // means fill-limited (healthy); sealed > sent means send-limited (read
