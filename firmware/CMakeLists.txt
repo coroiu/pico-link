@@ -255,6 +255,23 @@ if(PL_WATCHDOG)
     endif()
 endif()
 
+# Bead pico-link-nli.4 (G3, epic pico-link-nli, "LDAC encoder on core1"):
+# moves the LDAC encoder + pcm-ring fill loop to core1. Default ON -- this
+# is the bead's whole point -- but kept a real option, per the epic's own
+# design doc sec 8 ("Behind a compile-time PL_ENCODER_ON_CORE1 so a bad
+# build is one flag from reverting"). Off reproduces the exact pre-G3
+# single-core behaviour: pl_a2dp_seal_head() calls
+# a2dp_source_stream_endpoint_request_can_send_now() directly again, the
+# media timer's credit-clock/dwell-budget/fill()/level-push call sites are
+# all restored, and core1 is never launched (pl_a2dp_launch_core1 does not
+# even exist in that build). pico_multicore is already linked below
+# unconditionally (G1, pico-link-nli.2, for the flash lockout) regardless of
+# this flag.
+option(PL_ENCODER_ON_CORE1 "Run the LDAC encoder on core1 instead of core0's media timer" ON)
+if(PL_ENCODER_ON_CORE1)
+    target_compile_definitions(pico_link PRIVATE PL_ENCODER_ON_CORE1=1)
+endif()
+
 add_dependencies(pico_link pico_link_ui_header)
 target_include_directories(pico_link PRIVATE ${PICO_LINK_UI_HEADER_DIR})
 

@@ -72,6 +72,12 @@ static const uint32_t PL_WDT_DEADLINE_US[PL_WDT_COUNT] = {
     [PL_WDT_USB_TASK] = 250000u,
     [PL_WDT_BTSTACK] = 1000000u,
     [PL_WDT_MEDIA] = 500000u,
+    // Bead pico-link-nli.4 (G3): core1's own loop iterates far faster than
+    // 100Hz (no dwell budget, no timer -- see a2dp.c's core1 section), so
+    // this deadline is generous headroom, not a measured cadence; it exists
+    // to catch a WEDGED core1 (a fault, an infinite loop with interrupts
+    // still enabled but no forward progress), not to police pacing.
+    [PL_WDT_ENCODER] = 500000u,
 };
 
 typedef struct {
@@ -95,6 +101,8 @@ const char *pl_wdt_subsys_name(pl_wdt_subsys_t s) {
             return "BTSTACK";
         case PL_WDT_MEDIA:
             return "MEDIA";
+        case PL_WDT_ENCODER:
+            return "ENCODER";
         default:
             return "UNKNOWN";
     }
@@ -268,6 +276,9 @@ void pl_wdt_arm(void) {
     s_state[PL_WDT_USB_TASK].enabled = true;
     s_state[PL_WDT_BTSTACK].enabled = true;
     s_state[PL_WDT_MEDIA].enabled = false;
+    // Bead pico-link-nli.4 (G3): same lifecycle as PL_WDT_MEDIA above --
+    // a2dp.c enables it only while actually streaming.
+    s_state[PL_WDT_ENCODER].enabled = false;
 
     pl_log("wdt: arming hardware watchdog timeout_ms=%u pause_on_debug=1 observe_only=%d\r\n",
            (unsigned)PL_WDT_TIMEOUT_MS,

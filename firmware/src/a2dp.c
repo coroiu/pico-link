@@ -107,6 +107,16 @@
 #include "usb_pump.h"
 #include "watchdog_sup.h"
 
+#ifdef PL_ENCODER_ON_CORE1
+// Bead pico-link-nli.4 (G3, epic pico-link-nli): the LDAC encoder moves to
+// core1. pico/multicore.h for multicore_launch_core1(); flash_lockout.h for
+// pl_flash_lockout_core1_init() (G1, pico-link-nli.2) -- see this file's
+// "CORE1" section below, just above pl_a2dp_media_timer_handler.
+#include "pico/multicore.h"
+
+#include "flash_lockout.h"
+#endif
+
 // Bead pico-link-85v (D1): renamed from SBC_STORAGE_SIZE -- generous
 // headroom over any real AVDTP media MTU (~650-1013B typical), -1 reserved
 // for the media payload header byte (num_frames), see pl_a2dp_slot_t. The
@@ -370,7 +380,14 @@ typedef struct {
     volatile uint32_t tx_tail;
     bool send_requested;
 
-    uint32_t silent_ticks;
+    // Bead pico-link-nli.4 (G3): `volatile`. Written by pl_a2dp_fill() --
+    // core1's thread context as of this epic -- and read by core0's media
+    // timer handler for the auto-pause decision while streaming is
+    // genuinely concurrent on both cores (not a quiesced transition point).
+    // pause_requested/auto_resume/state below stay plain: they are written
+    // and read ONLY from core0 (the packet handler and the media timer
+    // handler), never touched by pl_a2dp_fill() itself.
+    volatile uint32_t silent_ticks;
     bool pause_requested;
     bool auto_resume;
 
@@ -903,10 +920,24 @@ static void pl_a2dp_seal_head(void) {
         s_ctx.tx_depth_max = depth;
     }
     s_ctx.payloads_sealed++;
+#ifndef PL_ENCODER_ON_CORE1
     if (!s_ctx.send_requested) {
         s_ctx.send_requested = true;
         a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
     }
+#endif
+    // Bead pico-link-nli.4 (G3): under PL_ENCODER_ON_CORE1 this function
+    // runs on core1, and a2dp_source_stream_endpoint_request_can_send_now
+    // is a BTstack call -- forbidden from core1 (design sec 4.3 invariant
+    // 5/6; BTstack is not reentrant across cores and owns no cross-core
+    // locking of its own). The request is issued instead by core0's media
+    // timer handler's "send kick" (design sec 5: "if slots pending and not
+    // send_requested, request now") -- see pl_a2dp_media_timer_handler
+    // below. send_requested itself stays a plain (non-volatile) bool under
+    // core1 mode because it is then written/read ONLY from core0 (this
+    // function no longer touches it; pl_a2dp_send_media_packet and the
+    // media timer's send-kick are both core0) -- no cross-core access, no
+    // barrier needed.
 }
 
 // Bead pico-link-nli.3 (G2): still core0-only today, and per the
@@ -980,7 +1011,17 @@ static void pl_a2dp_fill(void) {
     // else, D5/pico-link-cz0.5.6).
     uint32_t usable_payload = pl_a2dp_usable_payload(s_ctx.max_media_payload_size, s_ctx.frame.header_bytes);
 
+#ifndef PL_ENCODER_ON_CORE1
     // Bead pico-link-85v (D4): the dwell budget, derived fresh every call.
+    // Bead pico-link-nli.4 (G3), design sec 4.1 change 2: RETIRED under
+    // PL_ENCODER_ON_CORE1 -- this bound exists solely to stop one IRQ
+    // dwelling too long and starving something else on the SAME core;
+    // core1 has no other tenant to yield to. This whole computation
+    // (including its read of s_ctx.last_tick_elapsed_us, a core0-written
+    // field) is compiled OUT under core1 mode rather than left as a
+    // functionally-dead cross-core read -- see stop_dwell's own doc comment
+    // on pl_a2dp_ctx_t for why the counter itself stays, wired to nothing,
+    // asserted 0.
     uint32_t owed_frames = pcm_frame_count > 0 ? s_ctx.samples_owed / pcm_frame_count : 0;
     uint32_t work_bound_us =
         (uint32_t)((uint64_t)PL_A2DP_CATCHUP_K * owed_frames * s_ctx.frame.worst_case_encode_us);
@@ -997,11 +1038,17 @@ static void pl_a2dp_fill(void) {
     if (dwell_budget_us < s_ctx.frame.worst_case_encode_us) {
         dwell_budget_us = s_ctx.frame.worst_case_encode_us; // floored -- never deadlock
     }
+#endif
 
     uint8_t frames_this_tick = 0;
     bool starved = false;
+    // Bead pico-link-nli.4 (G3): dwell_us itself is kept unconditionally
+    // (still feeds dwell_max_us below, a useful diagnostic even without
+    // enforcement) -- only the enforcement break is retired under core1
+    // mode.
     uint32_t dwell_us = 0;
     for (;;) {
+#ifndef PL_ENCODER_ON_CORE1
         // 0. Dwell safety: has this tick's fill loop already consumed its
         // (freshly derived) dwell budget? The one true safety-trip stop
         // reason -- see this function's doc comment.
@@ -1009,6 +1056,7 @@ static void pl_a2dp_fill(void) {
             s_ctx.stop_dwell++;
             break;
         }
+#endif
         // 1. Credit: has the real-time clock actually owed us a whole
         // encoded frame's worth of samples yet? Most-common stop reason
         // by far in steady state -- not a fault.
@@ -1163,11 +1211,25 @@ static void pl_a2dp_fill(void) {
         s_ctx.silent_ticks = 0;
     }
 
+#ifndef PL_ENCODER_ON_CORE1
     // Bead pico-link-du0: reduce/push the OUT-meter accumulator, once per
     // fill call regardless of how many units this tick encoded -- keeps
     // the once-per-window isqrt/ring-push cost off the per-unit hot path
     // above.
+    //
+    // Bead pico-link-nli.4 (G3): NOT called under PL_ENCODER_ON_CORE1.
+    // pl_a2dp_maybe_push_levels() calls pl_bt_push_levels_changed(), a
+    // bt.c ring push -- forbidden from core1 (design sec 4.3 invariant 6;
+    // this file runs on core1 under this flag). s_level_accum keeps
+    // accumulating above (pl_a2dp_accumulate_levels, a plain local struct
+    // write, no BTstack/no ring) so no data is lost, but nothing reduces
+    // and pushes it to the UI yet -- level_push_count/skip_* stay at 0
+    // under this build. G4 (pico-link-nli.5, depends on this bead) replaces
+    // this with a seqlock snapshot core0's superloop reads and turns into
+    // the LevelsChanged push itself -- see design sec 5. Deliberately not
+    // done here: one variable at a time (design sec 8's own discipline).
     pl_a2dp_maybe_push_levels();
+#endif
 }
 
 // Bead pico-link-85v (D1/D6): sends the slot at tx_tail as one AVDTP media
@@ -1250,6 +1312,252 @@ static void pl_a2dp_send_media_packet(void) {
     }
 }
 
+// Bead pico-link-nli.4 (G3), design sec 4.1 change 1: extracted from
+// pl_a2dp_media_timer_handler's body so the SAME credit-clock arithmetic
+// (samples_owed/samples_owed_rem_us accrual + the ring-keyed clamp) can be
+// driven by two different tick sources without being re-derived: the media
+// timer's own ~10ms elapsed_us under the legacy (single-core) build, or
+// core1's own time_us_64() delta under PL_ENCODER_ON_CORE1 (see the CORE1
+// section below). elapsed_us is the only input; every field this touches
+// (samples_owed, samples_owed_rem_us, credit_clamped_samples,
+// credit_clamp_events) is owned by whichever context is currently allowed
+// to run the fill loop (core0 legacy, core1 under this epic) -- never both
+// at once, so no cross-core synchronization is needed here even though the
+// FUNCTION itself is now shared code.
+static void pl_a2dp_accrue_credit(uint32_t elapsed_us) {
+    // Credit-pacing accrual (bead pico-link-pbv fix). Accrues
+    // unconditionally every tick, including IDLE/PRIMING -- harmless,
+    // since STREAM_STARTED resets samples_owed/samples_owed_rem_us to
+    // 0, so accrual only ever matters from the instant real streaming
+    // begins. sample_rate_hz falls back to 48000 before the first
+    // codec negotiation has populated s_ctx.format (a2dp.c never
+    // reaches STREAMING before that anyway, so this only affects
+    // idle-tick bookkeeping that gets discarded regardless).
+    uint32_t sample_rate = s_ctx.format.sample_rate_hz != 0 ? s_ctx.format.sample_rate_hz : 48000u;
+    uint64_t owed_us_hz = (uint64_t)elapsed_us * sample_rate + s_ctx.samples_owed_rem_us;
+    // The real PCM-sample-frames accrued THIS tick. Bead pico-link-nzw:
+    // no longer a term of the credit clamp bound below (that bound is
+    // now keyed to the ring's fill, not to per-tick accrual or packet
+    // size -- see the clamp's own comment) -- still needed here to
+    // update samples_owed/samples_owed_rem_us.
+    uint32_t accrued_this_tick = (uint32_t)(owed_us_hz / 1000000u);
+    s_ctx.samples_owed += accrued_this_tick;
+    s_ctx.samples_owed_rem_us = (uint32_t)(owed_us_hz % 1000000u);
+
+    // Bead pico-link-pbv ROUND 3 (R3-1) / bead pico-link-nzw: clamp the
+    // credit to the largest backlog the drain can genuinely retire.
+    // Round 2's bound (exactly one packet) sat precisely on the
+    // drain's natural steady-state operating point (measured ~7.2
+    // frames against a 7-frame bound), so it stopped being a windup
+    // guard and became an in-band regulator that converts ordinary
+    // tick jitter into permanently destroyed credit -- see
+    // credit_clamped_samples's doc comment on pl_a2dp_ctx_t for the
+    // full mechanism.
+    //
+    // Round 3's fix (keyed to frames_per_packet, i.e. PACKET SIZE) was
+    // itself wrong: credit is only fictitious when the RING is dry.
+    // Keying the bound to packet size means it can ALSO bind while the
+    // ring is deep, where the credit is genuine and destroying it is
+    // simply lost drain -- every such event is a permanent step up in
+    // ring fill, removable only by the +/-500ppm USB feedback loop at
+    // ~96 B/s (roughly 48 SECONDS to work off one clamp event). See
+    // bead pico-link-nzw and .planning/design/2026-08-30-pcm-pacing.md
+    // finding 2.
+    //
+    // The corrected bound is keyed to the RING, not the packet: the
+    // ring's current fill converted to sample-frames (pl_pcm_fill_bytes()
+    // / PL_PCM_FRAME_BYTES -- everything the drain could legitimately
+    // retire right now) plus one frame (the sub-frame remainder
+    // pcm_frame_count granularity forces). This never binds while the
+    // ring is full/deep (fill_bytes alone already exceeds any real
+    // samples_owed there), and is exactly the deficit-side resync the
+    // clamp was meant to be: it only bites when the ring is dry enough
+    // that samples_owed has run ahead of what physically exists to
+    // drain.
+    //
+    // pcm_frame_count_for_clamp guards against clamping before a codec
+    // has negotiated (frames_per_packet/pcm_frames_per_encoded_frame
+    // both 0 pre-negotiation) -- accrual during IDLE/PRIMING is
+    // discarded at STREAM_STARTED anyway (see samples_owed's doc
+    // comment), so skipping the clamp there is harmless.
+    uint32_t pcm_frame_count_for_clamp = s_ctx.frame.pcm_frames_per_encoded_frame;
+    if (s_ctx.frames_per_packet > 0 && pcm_frame_count_for_clamp > 0) {
+        uint32_t max_samples_owed = pl_pcm_fill_bytes() / PL_PCM_FRAME_BYTES + pcm_frame_count_for_clamp;
+        if (s_ctx.samples_owed > max_samples_owed) {
+            uint32_t excess_samples = s_ctx.samples_owed - max_samples_owed;
+            s_ctx.samples_owed = max_samples_owed;
+            // R3-2: exact accounting, no division, no truncation --
+            // see credit_clamped_samples's doc comment for why round
+            // 2's floor-divided credit_clamped could not close the
+            // conservation identity.
+            s_ctx.credit_clamped_samples += excess_samples;
+            s_ctx.credit_clamp_events++;
+        }
+    }
+}
+
+#ifdef PL_ENCODER_ON_CORE1
+// === CORE1: the LDAC encoder (bead pico-link-nli.4, epic pico-link-nli,
+// design of record .planning/decisions/2026-09-03-ldac-encoder-on-core1.md
+// sec 2/4). Everything below this point until the matching #endif runs on
+// core1, or is core0's half of the handshake that talks to it. Nothing
+// outside this section (and the two `#ifdef`s already threaded through
+// pl_a2dp_seal_head/pl_a2dp_fill above) is aware core1 exists.
+//
+// THE FIVE INVARIANTS THIS SECTION MUST HOLD, at every call site below:
+// no Rust, no alloc, no interrupts-off (never save_and_disable_interrupts),
+// no pl_log, no bt.c ring push. A sixth, structural one: no BTstack call
+// (a2dp_source_*, pl_persist_*) -- covered by construction, since this
+// section never calls any of those; the ones that were needed
+// (request_can_send_now) moved to core0's media timer instead (see
+// pl_a2dp_seal_head's doc comment and the "send kick" in
+// pl_a2dp_media_timer_handler below).
+
+typedef enum {
+    PL_ENC_STATE_IDLE = 0,
+    PL_ENC_STATE_RUNNING,
+    PL_ENC_STATE_DRAINING,
+} pl_enc_state_t;
+
+// Written ONLY by core0 (this file's packet-handler transition points),
+// read ONLY by core1 (pl_a2dp_core1_entry's loop) -- design sec 4.2's
+// IDLE -> RUNNING -> DRAINING -> IDLE state machine, the one authoritative
+// signal for whether core1 may touch any fill/seal-side shared field.
+// `volatile`: read every core1 loop iteration; written from an execution
+// context the compiler has no visibility into.
+static volatile pl_enc_state_t s_enc_state = PL_ENC_STATE_IDLE;
+
+// Written ONLY by core1, read ONLY by core0. true whenever core1 has
+// observed a non-RUNNING state and is therefore NOT touching any fill/seal
+// field -- core0's DRAINING transition spins on this (bounded) before it
+// touches rtp_next/the tx ring/pl_pcm_reset/codec state. Starts true: core1
+// has not launched yet, so there is nothing to quiesce.
+static volatile bool s_enc_quiesced = true;
+
+// Bumped once per core1 loop iteration that completes, whether or not that
+// iteration actually encoded anything -- proves LOOP progress, the same
+// "still alive", not-throughput contract every other pl_wdt_kick producer
+// already has (watchdog_sup.h's module doc). Read by core0's media timer,
+// which feeds PL_WDT_ENCODER from it -- core1 must NEVER call pl_wdt_kick()
+// itself (that would be a cross-core call into a module whose state
+// core1 does not own, and is not one of the two things -- flash-lockout
+// registration and the fill loop -- this core exists to do).
+static volatile uint32_t s_enc_heartbeat;
+
+// Diagnostics: how many times core0's bounded quiesce wait
+// (pl_a2dp_core1_quiesce_and_wait) actually hit its timeout instead of
+// observing s_enc_quiesced in time. NOT fatal (contrast the flash lockout's
+// END timeout, ADR sec 7.1) -- see that function's doc comment for why
+// proceeding anyway, logged via this counter, is the correct response for
+// a cooperative software flag rather than a latched SDK handshake.
+static volatile uint32_t s_enc_quiesce_timeouts;
+
+// Cooperative poll bound for the quiesce handshake -- NOT the flash
+// lockout's own 20ms IRQ-serviced budget (flash_lockout.c's
+// PL_FLASH_LOCKOUT_TIMEOUT_US): that one is bounded by interrupt latency
+// regardless of what core1's thread-mode loop is doing, because core1
+// never disables interrupts (invariant 3) and the lockout's SIO FIFO IRQ
+// preempts it either way. This bound instead waits for a plain volatile
+// flag that core1 only updates between iterations of its own C loop, so it
+// needs enough margin for one in-flight encode() call plus a queue-full
+// seal to finish unwinding -- LDAC HQ's measured in-situ encode cost is
+// 1495-1517us (ADR sec 11.0); 5ms is generous headroom above any single
+// frame.
+#define PL_A2DP_QUIESCE_TIMEOUT_US (5u * 1000u)
+
+// core1's own credit-clock tick source (design sec 4.1 change 1): a
+// core1-private time_us_64() delta, replacing the media timer's role.
+// Plain static, not part of s_ctx -- core0 never reads or writes this.
+static uint64_t s_enc_last_tick_us;
+
+// The core1 thread-mode entry point (multicore_launch_core1's target).
+// Registers as the flash lockout's victim FIRST (flash_lockout.h) -- core0
+// flash writes must never assume core1 is safely parked before this call
+// has run -- and never returns (design sec 4.2: core1 is launched once at
+// boot and never reset).
+static void pl_a2dp_core1_entry(void) {
+    pl_flash_lockout_core1_init();
+    s_enc_last_tick_us = time_us_64();
+
+    for (;;) {
+        // Bare volatile read of a naturally-aligned enum: cannot tear on
+        // this architecture, and a one-iteration-late observation of a
+        // state change is harmless -- the safety boundary is the quiesce
+        // handshake below (s_enc_quiesced), not the timeliness of this
+        // read.
+        pl_enc_state_t state = s_enc_state;
+        if (state != PL_ENC_STATE_RUNNING) {
+            // Not running: touch NOTHING shared beyond the two flags below,
+            // and keep looping. Interrupts stay enabled for the entire
+            // life of this function (invariant 3) -- the multicore lockout
+            // handler (and any future doorbell) keeps being serviced
+            // normally, including right here while otherwise idle.
+            s_enc_quiesced = true;
+            s_enc_heartbeat++;
+            continue;
+        }
+        s_enc_quiesced = false;
+
+        uint64_t now = time_us_64();
+        uint32_t elapsed_us = (uint32_t)(now - s_enc_last_tick_us);
+        s_enc_last_tick_us = now;
+        pl_a2dp_accrue_credit(elapsed_us);
+        pl_a2dp_fill();
+
+        s_enc_heartbeat++;
+    }
+}
+
+// Launches core1 into pl_a2dp_core1_entry(). Call once, after cyw43/BTstack
+// init (design sec 8's G3 bead description) -- core1 then runs forever;
+// there is no corresponding "stop core1" function (design sec 4.2).
+void pl_a2dp_launch_core1(void) {
+    multicore_launch_core1(pl_a2dp_core1_entry);
+}
+
+// Core0's half of the quiesce handshake (design sec 4.2). Sets DRAINING and
+// spins, bounded, for core1 to leave the fill body. MUST be called before
+// any of the STREAM_SUSPENDED/STREAM_RELEASED/SIGNALING_CONNECTION_RELEASED
+// handlers below touch rtp_next/the tx ring (pl_a2dp_tx_flush)/pl_pcm_reset/
+// codec state -- mirroring the exact reasoning pl_a2dp_tx_flush's own doc
+// comment already gives for why those call sites are safe. A timeout here
+// is counted, not fatal (see s_enc_quiesce_timeouts's doc comment): the
+// caller still completes its own transition regardless, because holding a
+// stream-teardown open forever on a maybe-wedged core1 would trade a
+// bounded, logged race for an unbounded hang -- s_enc_heartbeat/
+// PL_WDT_ENCODER remains the real backstop if core1 is genuinely dead.
+static void pl_a2dp_core1_quiesce_and_wait(void) {
+    __dmb(); // publish-after-write: order any of THIS caller's own prior writes before the state change core1 observes
+    s_enc_state = PL_ENC_STATE_DRAINING;
+    uint64_t deadline = time_us_64() + PL_A2DP_QUIESCE_TIMEOUT_US;
+    while (!s_enc_quiesced) {
+        if (time_us_64() >= deadline) {
+            s_enc_quiesce_timeouts++;
+            break;
+        }
+    }
+    __dmb(); // read-after-acquire: order the s_enc_quiesced read above before this caller's own shared-state writes that follow
+}
+
+// Core0's half of arming core1 for a fresh stream (design sec 4.2): resets
+// the credit-clock fields core1 owns, THEN publishes RUNNING -- core1 only
+// starts reading/writing them once it observes RUNNING (pl_a2dp_core1_entry
+// above), so this publish-after-write ordering is what makes the reset
+// race-free without needing any cooperation from core1 itself.
+static void pl_a2dp_core1_arm_running(void) {
+    s_ctx.samples_owed = 0;
+    s_ctx.samples_owed_rem_us = 0;
+    __dmb();
+    s_enc_state = PL_ENC_STATE_RUNNING;
+}
+
+// Diagnostics for G3/G5's reporter -- see s_enc_quiesce_timeouts's doc
+// comment. Zero in a healthy run.
+uint32_t pl_a2dp_encoder_quiesce_timeouts(void) {
+    return s_enc_quiesce_timeouts;
+}
+#endif // PL_ENCODER_ON_CORE1
+
 static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_set_timer(ts, PL_A2DP_AUDIO_TIMEOUT_MS);
     btstack_run_loop_add_timer(ts);
@@ -1277,75 +1585,13 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
             s_ctx.worst_tick_interval_us = elapsed_us;
         }
 
-        // Credit-pacing accrual (bead pico-link-pbv fix). Accrues
-        // unconditionally every tick, including IDLE/PRIMING -- harmless,
-        // since STREAM_STARTED resets samples_owed/samples_owed_rem_us to
-        // 0, so accrual only ever matters from the instant real streaming
-        // begins. sample_rate_hz falls back to 48000 before the first
-        // codec negotiation has populated s_ctx.format (a2dp.c never
-        // reaches STREAMING before that anyway, so this only affects
-        // idle-tick bookkeeping that gets discarded regardless).
-        uint32_t sample_rate = s_ctx.format.sample_rate_hz != 0 ? s_ctx.format.sample_rate_hz : 48000u;
-        uint64_t owed_us_hz = (uint64_t)elapsed_us * sample_rate + s_ctx.samples_owed_rem_us;
-        // The real PCM-sample-frames accrued THIS tick. Bead pico-link-nzw:
-        // no longer a term of the credit clamp bound below (that bound is
-        // now keyed to the ring's fill, not to per-tick accrual or packet
-        // size -- see the clamp's own comment) -- still needed here to
-        // update samples_owed/samples_owed_rem_us.
-        uint32_t accrued_this_tick = (uint32_t)(owed_us_hz / 1000000u);
-        s_ctx.samples_owed += accrued_this_tick;
-        s_ctx.samples_owed_rem_us = (uint32_t)(owed_us_hz % 1000000u);
-
-        // Bead pico-link-pbv ROUND 3 (R3-1) / bead pico-link-nzw: clamp the
-        // credit to the largest backlog the drain can genuinely retire.
-        // Round 2's bound (exactly one packet) sat precisely on the
-        // drain's natural steady-state operating point (measured ~7.2
-        // frames against a 7-frame bound), so it stopped being a windup
-        // guard and became an in-band regulator that converts ordinary
-        // tick jitter into permanently destroyed credit -- see
-        // credit_clamped_samples's doc comment on pl_a2dp_ctx_t for the
-        // full mechanism.
-        //
-        // Round 3's fix (keyed to frames_per_packet, i.e. PACKET SIZE) was
-        // itself wrong: credit is only fictitious when the RING is dry.
-        // Keying the bound to packet size means it can ALSO bind while the
-        // ring is deep, where the credit is genuine and destroying it is
-        // simply lost drain -- every such event is a permanent step up in
-        // ring fill, removable only by the +/-500ppm USB feedback loop at
-        // ~96 B/s (roughly 48 SECONDS to work off one clamp event). See
-        // bead pico-link-nzw and .planning/design/2026-08-30-pcm-pacing.md
-        // finding 2.
-        //
-        // The corrected bound is keyed to the RING, not the packet: the
-        // ring's current fill converted to sample-frames (pl_pcm_fill_bytes()
-        // / PL_PCM_FRAME_BYTES -- everything the drain could legitimately
-        // retire right now) plus one frame (the sub-frame remainder
-        // pcm_frame_count granularity forces). This never binds while the
-        // ring is full/deep (fill_bytes alone already exceeds any real
-        // samples_owed there), and is exactly the deficit-side resync the
-        // clamp was meant to be: it only bites when the ring is dry enough
-        // that samples_owed has run ahead of what physically exists to
-        // drain.
-        //
-        // pcm_frame_count_for_clamp guards against clamping before a codec
-        // has negotiated (frames_per_packet/pcm_frames_per_encoded_frame
-        // both 0 pre-negotiation) -- accrual during IDLE/PRIMING is
-        // discarded at STREAM_STARTED anyway (see samples_owed's doc
-        // comment), so skipping the clamp there is harmless.
-        uint32_t pcm_frame_count_for_clamp = s_ctx.frame.pcm_frames_per_encoded_frame;
-        if (s_ctx.frames_per_packet > 0 && pcm_frame_count_for_clamp > 0) {
-            uint32_t max_samples_owed = pl_pcm_fill_bytes() / PL_PCM_FRAME_BYTES + pcm_frame_count_for_clamp;
-            if (s_ctx.samples_owed > max_samples_owed) {
-                uint32_t excess_samples = s_ctx.samples_owed - max_samples_owed;
-                s_ctx.samples_owed = max_samples_owed;
-                // R3-2: exact accounting, no division, no truncation --
-                // see credit_clamped_samples's doc comment for why round
-                // 2's floor-divided credit_clamped could not close the
-                // conservation identity.
-                s_ctx.credit_clamped_samples += excess_samples;
-                s_ctx.credit_clamp_events++;
-            }
-        }
+#ifndef PL_ENCODER_ON_CORE1
+        // Bead pico-link-nli.4 (G3), design sec 4.1 change 1: under
+        // PL_ENCODER_ON_CORE1 the credit clock is accrued by core1 itself,
+        // from its own time_us_64() delta -- see pl_a2dp_core1_entry in the
+        // CORE1 section above. Calling it again here would double-accrue.
+        pl_a2dp_accrue_credit(elapsed_us);
+#endif
     }
     s_ctx.last_tick_us = pbv_now_us;
     s_ctx.tick_count++;
@@ -1379,6 +1625,7 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
         return;
     }
 
+#ifndef PL_ENCODER_ON_CORE1
     // Bead pico-link-85v (D1): the old "only fill if not already waiting
     // on a grant" gate is GONE -- that was the actual ceiling mechanism
     // (a tick with sbc_ready_to_send still true did no filling at all).
@@ -1386,6 +1633,35 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     // request_can_send_now as slots fill, so it is simply called every
     // tick regardless of any pending grant.
     pl_a2dp_fill();
+#else
+    // Bead pico-link-nli.4 (G3), design sec 5: core1 fills and seals; this
+    // handler's job shrinks to the "send kick" -- if a slot is pending and
+    // we don't already have an outstanding request, ask BTstack for one.
+    // pl_a2dp_seal_head() (core1) no longer calls
+    // a2dp_source_stream_endpoint_request_can_send_now itself (that would
+    // be a BTstack call from core1, forbidden) -- this is where that
+    // request now originates instead. send_requested is plain (not
+    // volatile): under this build it is written/read ONLY from core0 (this
+    // check, and pl_a2dp_send_media_packet's own re-arm) -- see
+    // pl_a2dp_seal_head's doc comment.
+    if (pl_a2dp_tx_count() > 0 && !s_ctx.send_requested) {
+        s_ctx.send_requested = true;
+        a2dp_source_stream_endpoint_request_can_send_now(s_ctx.a2dp_cid, s_ctx.local_seid);
+    }
+
+    // Bead pico-link-nli.4 (G3): feed PL_WDT_ENCODER from core1's heartbeat
+    // advancing, never from core1 calling pl_wdt_kick() itself (invariant:
+    // core1 must not call into a module whose state it does not own -- see
+    // s_enc_heartbeat's doc comment in the CORE1 section above). A plain
+    // compare-and-kick, same "prove forward progress" contract as every
+    // other subsystem.
+    static uint32_t s_last_seen_enc_heartbeat;
+    uint32_t heartbeat_now = s_enc_heartbeat;
+    if (heartbeat_now != s_last_seen_enc_heartbeat) {
+        s_last_seen_enc_heartbeat = heartbeat_now;
+        pl_wdt_kick(PL_WDT_ENCODER);
+    }
+#endif
 
     // design sec 3.5 case 2: host silent -> not a fault. Auto-pause once,
     // wait for SUSPENDED, then re-prime (see the SUSPENDED case below).
@@ -1941,6 +2217,18 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.local_seid = a2dp_subevent_stream_established_get_local_seid(packet);
             int mtu = a2dp_max_media_payload_size(s_ctx.a2dp_cid, s_ctx.local_seid);
             s_ctx.max_media_payload_size = btstack_min(mtu, (int)PL_A2DP_PAYLOAD_SLOT_BYTES - 1);
+#ifdef PL_ENCODER_ON_CORE1
+            // Bead pico-link-nli.4 (G3): a defensive quiesce before
+            // touching any shared field below -- by the time a FRESH
+            // connection reaches STREAM_ESTABLISHED, any prior session's
+            // SIGNALING_CONNECTION_RELEASED handler should already have
+            // quiesced and idled core1, so this is normally a same-cycle
+            // no-op (s_enc_quiesced already true). Kept unconditional
+            // rather than assumed, per pl_a2dp_tx_flush's own doc comment
+            // reasoning: every call site that touches these fields must be
+            // provably safe, not merely usually safe.
+            pl_a2dp_core1_quiesce_and_wait();
+#endif
             // Bead pico-link-85v (D6): flush the tx ring here too -- a
             // stale payload surviving into a new stream is an audible
             // artefact (a burst of the previous track with a stale RTP
@@ -2132,6 +2420,11 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // stream that was idle/priming beforehand is never judged stale
             // against history from before real streaming began.
             pl_wdt_set_enabled(PL_WDT_MEDIA, true);
+#ifdef PL_ENCODER_ON_CORE1
+            // Bead pico-link-nli.4 (G3): PL_WDT_ENCODER shares PL_WDT_MEDIA's
+            // lifecycle -- meaningful only while actually streaming.
+            pl_wdt_set_enabled(PL_WDT_ENCODER, true);
+#endif
             s_ctx.state = PL_A2DP_MEDIA_STREAMING;
             s_ctx.silent_ticks = 0;
             s_ctx.pause_requested = false;
@@ -2142,8 +2435,17 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // here rather than carried forward as a false backlog that
             // would let the very first ticks of streaming burst ahead of
             // real time.
+#ifdef PL_ENCODER_ON_CORE1
+            // Bead pico-link-nli.4 (G3), design sec 4.2: resets
+            // samples_owed/samples_owed_rem_us THEN publishes RUNNING (with
+            // a __dmb() between) so core1 never observes RUNNING before the
+            // reset has landed -- see pl_a2dp_core1_arm_running's doc
+            // comment. Replaces the plain reset below.
+            pl_a2dp_core1_arm_running();
+#else
             s_ctx.samples_owed = 0;
             s_ctx.samples_owed_rem_us = 0;
+#endif
             // Bead pico-link-r44: reset the tick-jitter high-water mark
             // exactly at the instant real streaming begins, same reasoning
             // as the credit-clock reset above -- a stall from a PRIOR
@@ -2198,6 +2500,16 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
 
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
             pl_wdt_set_enabled(PL_WDT_MEDIA, false);
+#ifdef PL_ENCODER_ON_CORE1
+            pl_wdt_set_enabled(PL_WDT_ENCODER, false);
+            // Bead pico-link-nli.4 (G3): quiesce core1 BEFORE touching the
+            // tx ring/PCM ring below -- see pl_a2dp_core1_quiesce_and_wait's
+            // doc comment. Whether this transition lands in PRIMING
+            // (auto-resume) or IDLE, core1 must not run again until the
+            // next STREAM_STARTED explicitly re-arms it.
+            pl_a2dp_core1_quiesce_and_wait();
+            s_enc_state = PL_ENC_STATE_IDLE;
+#endif
             pl_log("a2dp: stream suspended (auto_resume=%d)\r\n", s_ctx.auto_resume ? 1 : 0);
             // Bead pico-link-85v (D6): flush the tx ring -- rtp_next is
             // deliberately PRESERVED here (not reset) so auto-resume
@@ -2220,6 +2532,16 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
 
         case A2DP_SUBEVENT_STREAM_RELEASED:
             pl_wdt_set_enabled(PL_WDT_MEDIA, false);
+#ifdef PL_ENCODER_ON_CORE1
+            pl_wdt_set_enabled(PL_WDT_ENCODER, false);
+            // Bead pico-link-nli.4 (G3): quiesce before rtp_next/tx-ring/
+            // PCM-ring resets below, same reasoning as STREAM_SUSPENDED
+            // above. Defensive against SUSPENDED not having already run
+            // (e.g. a direct establish->release edge) -- a no-op if core1
+            // is already quiesced.
+            pl_a2dp_core1_quiesce_and_wait();
+            s_enc_state = PL_ENC_STATE_IDLE;
+#endif
             pl_log("a2dp: stream released\r\n");
             s_ctx.state = PL_A2DP_MEDIA_IDLE;
             s_ctx.codec = NULL;
@@ -2240,6 +2562,17 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
 
         case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
             pl_wdt_set_enabled(PL_WDT_MEDIA, false);
+#ifdef PL_ENCODER_ON_CORE1
+            pl_wdt_set_enabled(PL_WDT_ENCODER, false);
+            // Bead pico-link-nli.4 (G3): quiesce before this handler's own
+            // tx-ring/rtp_next/PCM-ring resets below, same reasoning as
+            // STREAM_SUSPENDED/STREAM_RELEASED above. Defensive against
+            // this being the FIRST teardown event to fire for a given
+            // session (e.g. the ACL simply dropping before a clean
+            // SUSPENDED/RELEASED pair) -- a no-op if already quiesced.
+            pl_a2dp_core1_quiesce_and_wait();
+            s_enc_state = PL_ENC_STATE_IDLE;
+#endif
             pl_log("a2dp: signaling connection released\r\n");
             // Bead pico-link-648: belt-and-suspenders -- if a retry was
             // still armed when the signaling connection went away some

@@ -35,6 +35,23 @@
 // signalling from a peer.
 void pl_a2dp_init(struct PlUi *ui);
 
+#ifdef PL_ENCODER_ON_CORE1
+// Bead pico-link-nli.4 (G3, epic pico-link-nli): launches core1 into the
+// LDAC encoder loop (a2dp.c's CORE1 section). Call once, from main.c, after
+// cyw43_arch_init()/pl_bt_init() have succeeded (design sec 8) -- core1
+// then runs forever; there is no corresponding "stop" call (design sec
+// 4.2). Behind PL_ENCODER_ON_CORE1 so a build with this flag off never
+// links pico_multicore's launch path or touches core1 at all -- the
+// single-core behaviour this epic started from is one CMake flag away.
+void pl_a2dp_launch_core1(void);
+
+// Diagnostics: how many times core0's bounded quiesce wait
+// (a stream-teardown handshake with core1) actually timed out instead of
+// observing core1 park in time. Zero in a healthy run -- see
+// a2dp.c's s_enc_quiesce_timeouts doc comment for the full mechanism.
+uint32_t pl_a2dp_encoder_quiesce_timeouts(void);
+#endif
+
 // Initiates an A2DP source connection to `addr` -- wraps
 // a2dp_source_establish_stream() and pushes
 // Event::ConnectStepChanged(SettingUpAudio). Called from bt.c's

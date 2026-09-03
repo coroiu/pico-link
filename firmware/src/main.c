@@ -387,6 +387,16 @@ int main(void) {
     pl_log("cyw43_arch_init OK\r\n");
 
     pl_bt_init(ui);
+
+#ifdef PL_ENCODER_ON_CORE1
+    // Bead pico-link-nli.4 (G3, epic pico-link-nli): launch core1 into the
+    // LDAC encoder loop, after cyw43/BTstack init per design sec 8 -- core1
+    // runs forever from here on (design sec 4.2, no corresponding stop
+    // call). PL_STACK_SIZE/PICO_CORE1_STACK_SIZE are both already sized for
+    // this (CMakeLists.txt, G1's own doc comment there).
+    pl_a2dp_launch_core1();
+    pl_log("pl_a2dp_launch_core1 OK -- LDAC encoder running on core1\r\n");
+#endif
 #else
     pl_log("PL_DIAG_SKIP_BT set -- skipping cyw43_arch_init/pl_bt_init\r\n");
 #endif
