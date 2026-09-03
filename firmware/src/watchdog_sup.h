@@ -81,6 +81,16 @@ void pl_wdt_arm(void);
 // its deadline; if not, and it has been stale longer than its deadline,
 // record the breadcrumb and reboot (or, under PL_WDT_OBSERVE_ONLY, just log
 // and keep feeding). If nothing is stale, feeds the hardware watchdog.
+//
+// PL_WDT_ENCODER is a carve-out from PL_WDT_OBSERVE_ONLY (bd pico-link-
+// nli.6, G5): it always reboots on staleness, even in an observe-only
+// build, because a stale encoder heartbeat means core1 is already dead and
+// audio has already stopped -- see the "not a failed save, it is a
+// corrupted machine" precedent in
+// .planning/decisions/2026-09-03-ldac-encoder-on-core1.md sec 7.1, and
+// watchdog_sup.c's call site for the full justification. Every other
+// subsystem's OBSERVE_ONLY behaviour is unchanged and remains a separate
+// rollout decision (bd pico-link-4ju).
 void pl_wdt_service(void);
 
 // For the cz0.6.1 flash-write path: call begin() before disabling
