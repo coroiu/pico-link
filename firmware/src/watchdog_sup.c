@@ -325,10 +325,28 @@ void pl_wdt_service(void) {
 
     if (stale_subsys != PL_WDT_COUNT) {
 #ifdef PL_WDT_OBSERVE_ONLY
-        // Rollout step 6 (design doc): report-only. Feed unconditionally --
+        // Rollout step 6 (design doc): report-only for the subsystems this
+        // rollout is still validating. PL_WDT_ENCODER is a deliberate
+        // carve-out -- bd pico-link-nli.6 (G5), justified against the
+        // encoder-on-core1 design doc's sec 7.1 precedent for the
+        // flash-lockout END timeout: once this heartbeat has gone stale,
+        // core1 is ALREADY DEAD (or wedged with interrupts on but no
+        // forward progress) and audio has ALREADY STOPPED -- there is no
+        // "keep going and see" available the way there is for e.g.
+        // PL_WDT_BTSTACK, where a false trip mid-call is a real cost this
+        // rollout hasn't measured away yet. Logging-and-continuing for
+        // ENCODER only prolongs a dead board with a UI that still looks
+        // healthy -- exactly the failure mode pico-link-4ju measured
+        // (8816ms stale, logged, nothing acted). Reboot recovers a stream
+        // that is already lost either way, same reasoning as sec 7.1's
+        // "not a failed save, it is a corrupted machine".
+        if (stale_subsys == PL_WDT_ENCODER) {
+            pl_panic_record_watchdog_stale((uint32_t)stale_subsys, stale_ms);
+        }
+        // Every other subsystem: report-only. Feed unconditionally --
         // staleness is instrumented but never trips a reset yet, so the
         // deadlines above can be turned from judgement into measurement
-        // before step 7 enables tripping.
+        // before step 7 enables tripping for them too.
         pl_log("wdt: OBSERVE-ONLY would-trip subsys=%s stale_ms=%u deadline_ms=%u\r\n",
                pl_wdt_subsys_name(stale_subsys), (unsigned)stale_ms,
                (unsigned)(PL_WDT_DEADLINE_US[stale_subsys] / 1000u));

@@ -360,7 +360,46 @@ void __attribute__((noreturn)) pl_hardfault_record(uint32_t *frame) {
 
     uint32_t faulting_pc = frame[6];
     uint32_t cfsr = PL_SCB_CFSR;
-    pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_HARDFAULT, faulting_pc, cfsr, NULL, 0);
+
+    // bd pico-link-nli.6 (G5, core1 panic observability): CFSR alone says
+    // PRECISERR/IMPRECISERR/INVSTATE/etc but throws away BFAR (the actual
+    // bad address) and, critically for this epic, WHICH CORE faulted --
+    // exactly the two facts Tex's desk-and-hardware round on pico-link-gmy
+    // needed to attribute two real core1 faults that were otherwise
+    // invisible to this recorder (0x10002d18/CFSR 0x8200 -- a precise bus
+    // error inside pl_a2dp_fill_inner's TX-ring fill; 0x2000b764/CFSR
+    // 0x00020000 -- an INVSTATE branch into .bss off a smashed stacked LR).
+    // Reused verbatim from that branch (e2055be), just no longer gated
+    // behind PL_BOOTSEL_TRAP -- this is not a debug-only affordance, it is
+    // the whole point of this bead. Hand-rolled hex only: no printf, no
+    // library call, no allocation -- this runs in HardFault handler
+    // context off whatever stack the fault interrupted, and the same "no
+    // pl_log from core1" invariant (design doc sec 4.3 item 4) applies
+    // doubly hard here since pl_log takes a critical section this context
+    // must never enter.
+    {
+        uint32_t vals[4] = {
+            *(volatile uint32_t *)0xE000ED38u, // BFAR
+            (uint32_t)(uintptr_t)frame,        // exception frame / SP
+            frame[5],                          // stacked LR
+            get_core_num(),                    // which core faulted
+        };
+        static const char kLbl[4] = {'B', 'S', 'L', 'C'};
+        char m[4 * 11 + 1];
+        int o = 0;
+        for (int v = 0; v < 4; v++) {
+            m[o++] = kLbl[v];
+            m[o++] = '=';
+            for (int nib = 7; nib >= 0; nib--) {
+                uint32_t d = (vals[v] >> (nib * 4)) & 0xFu;
+                m[o++] = (char)(d < 10u ? ('0' + d) : ('a' + (d - 10u)));
+            }
+            m[o++] = ' ';
+        }
+        m[o] = '\0';
+        pl_panic_arm_record_and_reboot(PL_PANIC_MAGIC_HARDFAULT, faulting_pc, cfsr, (const uint8_t *)m,
+                                        (uintptr_t)o);
+    }
 }
 
 // --- Reporting, next boot (main() calls this early) ---
@@ -438,6 +477,11 @@ void pl_panic_report_and_clear(void) {
             pl_log("kind: HardFault\r\n");
             pl_log("faulting PC: 0x%08lx\r\n", (unsigned long)address);
             pl_log("CFSR: 0x%08lx\r\n", (unsigned long)diag);
+            // bd pico-link-nli.6 (G5): BFAR/frame-SP/stacked-LR/core, see
+            // pl_hardfault_record. s_panic_msg holds the hand-rolled hex
+            // "B=... S=... L=... C=..." string; C is the field that
+            // answers "did core1 fault" directly instead of by inference.
+            pl_log("regs (B=BFAR S=frame/SP L=stacked_LR C=core): %s\r\n", s_panic_msg);
             break;
         case PL_PANIC_MAGIC_WDT:
             pl_log("kind: watchdog supervisor -- stale subsystem\r\n");
