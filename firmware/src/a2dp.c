@@ -1711,11 +1711,76 @@ static void pl_a2dp_core1_entry(void) {
     }
 }
 
+// Core1's stack, deliberately NOT the linker-provided .stack1_dummy in
+// SCRATCH_X (pico-link-0zr, found by Tex 2026-09-03 diagnosing
+// pico-link-gmy). pico-sdk 2.1.1's memmap_default.ld places core0's stack
+// (.stack_dummy) in the fixed 4KB SCRATCH_Y region and core1's
+// (.stack1_dummy) in the fixed 4KB SCRATCH_X region, on the documented
+// assumption -- stated in the ld script's own comment -- that "if core 1
+// stack is not used then all of SCRATCH_X is free". This firmware sets
+// PICO_STACK_SIZE=0xC000 (48KB, for cyw43/BTstack init) at a time when
+// core1 was never launched (see the PICO_STACK_SIZE comment above), so
+// __StackBottom = 0x20082000 - 0xC000 = 0x20076000 -- and core0's stack
+// range 0x20076000-0x20082000 STRICTLY CONTAINS core1's SCRATCH_X range
+// 0x20080000-0x20081000. G3 launched core1 and the assumption stopped
+// holding: core0 recursing past 4KB of its own 48KB budget silently writes
+// into core1's stack. Measured on hardware: two different core1 HardFault
+// signatures (a precise bus fault on a stack-derived load, and an INVSTATE
+// on a smashed LR) under load, both consistent with an external writer
+// stomping core1's stack, and core1's own high-water usage a comfortable
+// 1672 of 4096 bytes -- i.e. core1 was not overflowing its own stack, so
+// something else was writing into it. A/B with address as the only
+// variable -- same 4096-byte size, this array instead of SCRATCH_X --
+// eliminated the reboots: ~4 in 10 minutes of loaded streaming down to 0 in
+// 20 minutes at matched load. This is the minimal, proven fix. The
+// sustainable fix -- moving core0's stack into main RAM so SCRATCH_X can
+// stay the SDK-intended core1 stack -- is a linker-script change and is
+// Ada's call, filed separately; do not restructure the memory map here.
+static uint32_t s_core1_stack[1024] __attribute__((aligned(8)));
+
+// Backstop for the class of bug this array fixes, since the ld script
+// itself provides none (its only stack ASSERT compares heap against main
+// RAM, not core0's stack against core1's -- see the doc comment above).
+// Checks the ARRANGEMENT WE ACTUALLY LANDED ON: does s_core1_stack, above,
+// overlap core0's real stack range [__StackBottom, __StackTop)? It does
+// NOT check __StackOneTop/__StackOneBottom (the SCRATCH_X slot the linker
+// still reserves for a core1 stack that no longer lives there) -- those
+// linker symbols are unaffected by moving core1's stack to .bss, so a
+// check against them would report the pre-existing (harmless, because
+// unused) SCRATCH_X collision on every single boot rather than the live
+// one this fix actually addresses. If core0's stack budget
+// (PICO_STACK_SIZE, CMakeLists.txt) or this array's placement/size ever
+// changes such that they collide, this must catch it -- so it is
+// unconditional (NOT #ifndef NDEBUG-gated), matching persist.c's
+// pl_persist_check_no_firmware_collision() precedent: a plain assert()
+// would be silently elided by CMAKE_BUILD_TYPE unset -> NDEBUG defined
+// (pico-sdk's forced-Release default), which is exactly the build type
+// most likely to be flashed for a real hardware soak.
+static void pl_a2dp_assert_core1_stack_no_overlap(void) {
+    extern uint32_t __StackBottom;
+    extern uint32_t __StackTop;
+    uintptr_t core0_lo = (uintptr_t)&__StackBottom;
+    uintptr_t core0_hi = (uintptr_t)&__StackTop;
+    uintptr_t core1_lo = (uintptr_t)s_core1_stack;
+    uintptr_t core1_hi = (uintptr_t)s_core1_stack + sizeof(s_core1_stack);
+    if (core1_lo < core0_hi && core0_lo < core1_hi) {
+        pl_log(
+            "FATAL: core1 stack [0x%08lx, 0x%08lx) overlaps core0's stack range [0x%08lx, 0x%08lx) "
+            "-- see a2dp.c's s_core1_stack doc comment (bead pico-link-0zr) -- halting\r\n",
+            (unsigned long)core1_lo, (unsigned long)core1_hi, (unsigned long)core0_lo, (unsigned long)core0_hi
+        );
+        while (true) {
+            tight_loop_contents();
+        }
+    }
+}
+
 // Launches core1 into pl_a2dp_core1_entry(). Call once, after cyw43/BTstack
 // init (design sec 8's G3 bead description) -- core1 then runs forever;
 // there is no corresponding "stop core1" function (design sec 4.2).
 void pl_a2dp_launch_core1(void) {
-    multicore_launch_core1(pl_a2dp_core1_entry);
+    pl_a2dp_assert_core1_stack_no_overlap();
+    multicore_launch_core1_with_stack(pl_a2dp_core1_entry, s_core1_stack, sizeof(s_core1_stack));
 }
 
 // Core0's half of the quiesce handshake (design sec 4.2). Sets DRAINING and

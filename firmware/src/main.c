@@ -14,6 +14,7 @@
 // UsageFault shows up here, that falsifies the C-first pivot's premise --
 // stop and escalate, don't patch around it locally.
 
+#include <stdint.h>
 #include <stdio.h>
 
 #include "btstack.h"
@@ -394,6 +395,10 @@ int main(void) {
     // runs forever from here on (design sec 4.2, no corresponding stop
     // call). PL_STACK_SIZE/PICO_CORE1_STACK_SIZE are both already sized for
     // this (CMakeLists.txt, G1's own doc comment there).
+    // Bead pico-link-0zr: pl_a2dp_launch_core1() itself asserts (halts,
+    // unconditionally, matching persist.c's collision-check precedent) that
+    // its .bss-resident core1 stack does not overlap core0's real stack
+    // range -- see a2dp.c's doc comment on that stack array for why.
     pl_a2dp_launch_core1();
     pl_log("pl_a2dp_launch_core1 OK -- LDAC encoder running on core1\r\n");
 #endif
