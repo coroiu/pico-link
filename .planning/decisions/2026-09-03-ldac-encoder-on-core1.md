@@ -318,11 +318,72 @@ streaming" change trips over it.
 | **Core1 hangs / faults** — audio stops, UI stays perfectly healthy and lies | Core1 bumps a `volatile uint32_t s_enc_heartbeat` each loop iteration. Core0 gets a new `PL_WDT_ENCODER` subsystem, **enabled only while streaming**, fed from the heartbeat advancing — never fed by core1 itself. | Existing watchdog path: breadcrumb + reboot. |
 | **Core1 panics** | `pl_panic_c_hook` writes `__uninitialized_ram` and calls `watchdog_reboot`, which works from either core. **Add `get_core_num()` into the record's `diag` field** — otherwise a post-mortem cannot tell which core died, and that is the first question. | Record identifies the core; `pico-link-gap`'s reader prints it. |
 | **Recursive/racing panic, both cores** | The panic-in-progress flag is an RMW that can now race. Accept the race but make it visible: if the record's core number and the reporting core disagree, say so. | Do not add a lock in the panic path. |
-| **Lockout handshake never completes** (core1 wedged with IRQs off) | `multicore_lockout_start_timeout_us` returns false. | Count it, skip the write, keep the RAM-staged value. Never hang. |
+| **Lockout START times out** (core1 never entered the handler) | `multicore_lockout_start_timeout_us` returns false. | Count it, skip the write, keep the RAM-staged value. Recoverable: no SDK state is latched (`lockout_in_progress` stays false), core1 is untouched. Never hang. |
+| **Lockout END times out** (core1 entered the handler and then died in it) | `multicore_lockout_end_timeout_us` returns false. | **FATAL. Panic into the recorder with a distinct reason, then reboot.** See §7.1 — this is not a failed save, it is a corrupted machine. |
 | **Flash write while core1 runs from XIP** | Structurally prevented by the lockout. | — |
 | **Lost update on `tx_count`** | Structurally prevented by deleting the field (§3.2). | — |
 | **Core1 races a stream reset on core0** | Prevented by the quiesce handshake (§4.2); a timeout there is counted and logged by core0. | — |
 | **Encoder outruns the sender** | `stop_queue_full` > 0 and `tx_depth_max` == SLOTS-1. Already instrumented. | Tune depth / add the doorbell (§5). |
+
+### 7.1 Ruling: START and END timeouts are different failures (2026-09-03)
+
+Raised by code review on `pico-link-nli.2`; verified against pico-sdk 2.1.1
+`pico_multicore/multicore.c`. The row above originally conflated the two halves
+of the handshake. They are not the same failure and must not share a response.
+
+**START timeout is benign and recoverable.** `multicore_lockout_start_block_until`
+sets `lockout_in_progress = rc`, so a failure latches nothing; core0 never
+disabled interrupts (our helper returns before `save_and_disable_interrupts`);
+core1 never entered the handler and is unaffected. The write is skipped, the
+staged value survives in RAM, and the next attempt is clean. Count and continue.
+
+**END timeout is fatal and unrecoverable.** `multicore_lockout_end_block_until`
+only clears `lockout_in_progress` when the handshake succeeds, and there is no
+public API to reset it. Two consequences, both permanent:
+
+1. The next `multicore_lockout_start_*` anywhere in the firmware hits
+   `hard_assert(!lockout_in_progress)` and panics — in release builds too.
+   That includes BTstack's own link-key writes, which share the same funnel.
+2. Core1 is still spinning in `multicore_lockout_handler` with interrupts
+   disabled, inside an ISR, waiting for a `LOCKOUT_MAGIC_END` that will never
+   arrive. The encoder core is dead.
+
+Crucially, a successful START **proves core1 was alive and in the handler**. For
+END to then time out, core1 must have faulted or lockedup while parked in a
+four-instruction RAM loop. There is no benign reading of that event. Limping on
+buys nothing: audio is already dead, and the *next* flash write is a guaranteed
+`hard_assert` at an arbitrary later moment with no attribution.
+
+**Response: panic into the recorder (`pico-link-gap`) with a distinct reason
+code, then reboot.** Rationale specific to this project: a wedged board costs a
+physical BOOTSEL hold (the press-free CDC path needs a live main loop), so a
+controlled restart is strictly cheaper than a hang. Do **not** reboot silently —
+the panic record is the only diagnostic that will ever exist for this event, and
+it must name core1 as the suspect. Do **not** retry the END handshake: a second
+`LOCKOUT_MAGIC_END` push can be left unconsumed in the FIFO and poison the next
+START, trading a diagnosable fatal for an undiagnosable intermittent.
+
+Data safety: `exit_safe_zone` runs *after* the flash mutation completed, so the
+write itself has landed. A multi-operation TLV store can still be truncated at
+an entry boundary; BTstack's log-structured flash bank loses that one entry, not
+the bank. Accepted.
+
+**Timeout budget — a second defect the same review exposes.** The implementation
+used 5 s per phase. The hardware watchdog is 2000 ms (`watchdog_sup.c:59`) and
+`PL_WDT_USB_TASK`'s deadline is 250 ms; flash writes are performed from the
+superloop. A 5 s handshake wait therefore cannot ever be observed — the watchdog
+reboots first, uncontrolled and unattributed. **Both phases must use a budget
+well under 250 ms; 20 ms is the recommendation** (a FIFO round-trip to a core
+spinning in RAM is microseconds, so 20 ms is already ~1000x headroom).
+
+**No pico-sdk fork.** The gap is real — `lockout_in_progress` is latched with no
+reset API and `hard_assert` makes it terminal — but we do not need SDK surgery
+to be correct: because we own `get_flash_safety_helper()`, treating END failure
+as terminal means we never make the second call that would trip the assert. That
+is containment at our own seam, not a special case buried in a vendored tree.
+File a short upstream issue against `raspberrypi/pico-sdk` for the record; do not
+diverge the SDK. (Contrast the TinyUSB ISO backport, where the defect was in the
+vendored code path itself and there was no seam of ours to fix it from.)
 
 ## 8. Bead breakdown
 
