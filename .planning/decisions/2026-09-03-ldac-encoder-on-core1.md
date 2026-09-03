@@ -2,10 +2,13 @@
 
 - **Date:** 2026-09-03
 - **Bead:** `pico-link-8b7` (the measurement), epic to be filed from §8 below
-- **Status:** **Accepted — re-scoped 2026-09-03 after the G0 measurement.**
-  The architecture in §§1-7 stands unchanged; §9's success numbers were wrong
-  and are replaced. **Read §11 first — it is the ruling, and it supersedes §9's
-  original table and §8's G0 entry.** **Amends**
+- **Status:** **Accepted — architecture delivered, performance acceptance MISSED
+  (2026-09-03, after G3).** The architecture in §§1-7 stands unchanged and is
+  built, stable and proven over a 44-minute soak. §9's success numbers were
+  wrong and were replaced by §11.2a; §11.2a's numbers were **not met** and are
+  **not re-scoped**. **Read §12 first — it is the current ruling, and it
+  supersedes §11 where they disagree.** §11 remains the record of the post-G0
+  re-scope; §9's table and §8's G0 entry are superseded by it. **Amends**
   `.planning/decisions/2026-09-02-core1-allocation-and-the-repaint-ceiling.md`
   (see §1).
 - **Author:** Ada (architect)
@@ -732,3 +735,274 @@ caught this was the most valuable thing in the original design** — the epic
 would otherwise have been built against targets it could not hit, and the miss
 would have read as a failed implementation rather than a mis-set bar. Keep
 writing the risk gate first.
+
+---
+
+# 12. POST-G3 RULING (2026-09-03, after Tess's acceptance measurement)
+
+This section is the decision of record from here. Where it disagrees with §11,
+it wins. §11's *architecture* rulings (11.1, 11.3's "measure first", 11.4) all
+stand; §11.2a's numbers are **recorded as MISSED and are NOT re-scoped**.
+
+## 12.0 What G3 returned
+
+Tess, `pico-link-nli`, LDAC HQ 990 kbps verified on the board, active-paint
+windows only, n=17 over 25 s. Stability: **zero reboots, zero panic records,
+zero re-enumerations in a 2642 s (~44 min) monitored soak** — more than 2x
+Tex's record — and G1 pairing-persistence confirmed across a real BOOTSEL
+reboot, with the panic recorder proven live (`boot_seq=1`, no magic) on two
+separate reflashes.
+
+| Metric | idle | pre-epic | **G3 measured** | projection | target | fail |
+|---|---|---|---|---|---|---|
+| superloop iters/s | 61-64 | 3 | **20.5** | ~41 | >= 35 | < 25 |
+| `pl_ui_render` | 21.9 ms | 322-385 ms | **133-141 ms** | ~33 ms | <= 40 ms | > 55 ms |
+| steal factor | 1.0x | 16.3x | **~4.25x** | 1.75x | <= 1.75x | > 2.5x |
+| non-thread share | — | 93.9% | **not measurable** (proxy ~76%) | ~34% | <= 40% | > 48% |
+
+Two of the three measurable metrics fail **below the fail line**. This is a real
+6.8x improvement on iters/s and 2.5x on render, and it is nowhere near its bar.
+
+## 12.1 Where the projection went wrong: the model, not the subtraction
+
+**The §11.5 reopen condition fired, and the inference attached to it is
+refuted.** I wrote that a measured non-thread share above ~40% would mean the
+~11% subtraction tail was wrong. It does not, and the tail is not where this
+hid. G0's decomposition closes:
+
+    56.2 (encode) + 22.1 (send) + 3.6 (ring/level/seal) + ~11 (tail) = 92.9%
+    measured pre-epic non-thread share, both instruments             = 93.8%
+
+0.9 points apart. There is no room in that sum for a 45-point error. **§11.5
+stays closed; do not spend a flash splitting the tail.** The reopen condition
+was a correctly-chosen *trigger* pointed at the wrong *suspect* — recorded in
+§12.6.
+
+What was actually wrong is the model underneath the whole projection:
+
+> **I assumed core-0 time freed equals core-0 throughput gained. That
+> assumption requires the two cores to be independent. They are not.**
+
+The projection converted "59.8% of core 0's *busy time* moves to core1" into
+"core 0's thread context gets ~66% of a *nominal-speed* core". The second half
+does not follow. RP2350's two cores share one 16 KB XIP cache (confirmed:
+`XIP_SRAM_BASE 0x13ffc000 .. XIP_END 0x14000000`), one QSPI flash interface,
+the SRAM bank arbiter and the APB peripheral bridge. Moving a flash-resident,
+cache-hostile workload off core 0 stops it *consuming* core-0 cycles but does
+not stop it *degrading* them.
+
+### The evidence that this is stall, not hidden preemption
+
+**(a) The two instruments have come apart, in the direction contention
+predicts.** Pre-epic, the register-only steal probe and `pl_ui_render` — two
+completely different workloads — agreed on the factor to within 1% (16.3x vs
+16.2x). That is the signature of pure time-slicing: preemption is
+instrument-independent. Post-G3 they disagree by 43% (render 133/21.9 = **6.1x**;
+probe 11.9/2.8 = **4.25x**), and the heavier, more flash- and memory-resident
+instrument is the one that suffers more. Preemption cannot produce that.
+Cache/fetch stalls produce exactly that.
+
+**(b) libldac's hot working set is 1.8x the entire shared cache.** From
+`build_main/pico_link.elf.map`:
+
+    ldacBT.c.o   .text 0x10dc (4316)   .rodata 0x178  (376)
+    ldaclib.c.o  .text 0x2fa4 (12196)  .rodata 0x2d90 (11664)
+                 -------------------------------------------
+                 text 16.1 KB + rodata 11.8 KB = ~28.4 KB, all XIP-resident
+
+The XIP cache is 16 KB. At HQ the encoder runs ~375 times a second
+(56.2% of a core at 1495-1517 us in situ). So ~28.4 KB is streamed through a
+16 KB cache **375 times a second**, from core 1, continuously. Whatever core 0
+had resident is evicted on essentially every frame. Core 0 then re-fetches
+every line it touches over QSPI. Pre-epic this cost was hidden inside "the
+encoder is 56.2% of core 0"; post-G3 it is exposed as core 0 running at a
+fraction of its nominal IPC while looking idle.
+
+**(c) Core 1 never sleeps.** `a2dp.c:1690-1711`: the non-RUNNING branch is
+`s_enc_quiesced = true; s_enc_heartbeat++; continue;` — a bare spin — and the
+RUNNING branch calls `time_us_64()` **twice per iteration** (an APB peripheral
+read) plus `pl_a2dp_fill()`, with no pacing and no `__wfe`. Between encodes
+(~44% of wall time at HQ) core 1 issues a maximal-rate stream of APB reads and
+SRAM ring reads that core 0 must arbitrate against, and when no stream is
+running at all core 1 still spins flat-out from boot. This is a defect in its
+own right — it costs power and bus bandwidth for nothing — independent of
+whether it is the dominant term here.
+
+**Arithmetic of the residual, under this model.** If core 0's true busy stays
+at the predicted 33.1%, thread context gets 66.9% of core 0's *cycles*; render
+at 133 ms then implies core 0 is executing at 21.9 / (133 x 0.669) = **~25% of
+its uncontended rate**. A ~4x stall factor is large, and is what a 16 KB cache
+being swept 375 times a second by a 28 KB working set looks like.
+
+**This is a hypothesis with a decisive test, not a conclusion.** See §12.5.
+
+## 12.2 Is the send path the whole story? No, and it cannot be.
+
+`pico-link-lyv` is real — 22.1% of core 0, ~1190 us of CPU per media packet at
+~190 packets/s — and §11.3's ruling to measure before touching stands. But it
+cannot close this gap, under either reading of the data:
+
+- **Under the (now falsified) pure-time-slice model**: removing it takes core-0
+  busy from 33.1% to ~11%, render to ~24.6 ms, iters to ~55/s. That model
+  already failed to predict the current measurement, so this number is not
+  credible.
+- **Under the measurement we actually have**: removing 22.1 points from a
+  measured ~76% non-thread share leaves ~54%, i.e. render ~48 ms and iters
+  ~28/s. **Still fails both 11.2a targets, and is a whisker off the fail
+  lines.**
+
+So: worth doing, and **not sufficient**, and — see §12.4 — no longer the next
+lever. It also remains the most expensive option on the board (a fork of a
+vendored driver with a hardware-only test loop) for a term that is at most a
+third of the remaining problem.
+
+## 12.3 Ruling on the epic: it closes on architecture and stability. The numbers stay missed.
+
+**The epic does NOT get re-scoped a second time.** §11.2a's targets stay on the
+record as **MISSED**. Moving a bar after measuring against it, twice, converts
+the bar into a description of whatever happened, and Andreas is right that the
+justification bar for doing it again is higher than the first time. It is not
+met and I am not going to meet it by editing the table.
+
+**Ruling:** `pico-link-nli` is **delivered on its architecture and its
+stability, and failed on its performance acceptance.** It stays open for
+exactly two things and nothing else:
+
+1. `pico-link-nli.6` (G5, core1 panic observability) — the last open child.
+2. The two human checks only Andreas can do: the 5-minute ear test, and
+   eyeballing the VU meter on the panel.
+
+When those land, **close it, with the 11.2a result recorded as missed.**
+
+**The performance gap does not keep this epic open.** The gap is caused by a
+mechanism the epic did not create, is not scoped to fix, and cannot fix inside
+its own one-variable-at-a-time discipline. Keeping the epic open around it turns
+a finished, stable, 6.8x improvement into an open-ended container for a
+different problem — which is how a clean epic rots into a tracking bug. It
+moves to its own bead (§12.4).
+
+What the epic actually bought, stated plainly and without inflation: press-to-
+pixels goes from ~680 ms (unusable) to ~195-210 ms measured (poll ~49 ms +
+render ~133 ms + blit ~13-27 ms). That is not the ~57 ms projected and it is not
+"drivable". It is "usable under protest". The device is better and the job is
+not done.
+
+## 12.4 The next lever is the contention, not the send path — and it is the cheapest thing on the board
+
+**New P1 bead (recommended title): "Diagnose and fix cross-core memory
+contention: libldac's 28 KB working set thrashes the shared 16 KB XIP cache".**
+Sequenced **before** `pico-link-lyv`, and before `pico-link-7h5` (damage-rect).
+
+That reorders §11.3 and §11.4, and the reason is cost-of-change, the same
+criterion §11.4 used:
+
+| lever | change | cost | reversible | predicted render |
+|---|---|---|---|---|
+| **F1 libldac to SRAM** | ~28.4 KB of 520 KB SRAM, one linker fragment | build-system only, no fork | build flag | **~33 ms** (if H1 holds) |
+| **F2 park core1** | `__wfe` + `__sev` doorbell instead of a spin | ~20 lines in `a2dp.c` | trivially | improves F1's floor |
+| F3 `lyv` send path | fork of vendored cyw43 driver | high, hardware-only test loop | poorly | ~48 ms |
+| F4 `7h5` damage-rect | Rust in `core/`, host-testable | medium | yes | reduces the 21.9 ms base |
+
+**F1 is the falsifiable one.** If the contention hypothesis holds, moving
+libldac's `.text` and `.rodata` into SRAM restores core 0's IPC to near nominal
+and render lands at 21.9 / 0.669 = **~33 ms with ~41 iters/s — precisely the
+§11.2a projection.** That is the claim to test: the projection's *arithmetic*
+was right and its *memory model* was missing one term. If F1 lands and the
+numbers still sit at ~130 ms, H1 is dead and §12.5's core-0 busy measurement is
+the arbiter.
+
+F1 also speeds up the encoder itself — core 1's 1495-1517 us in-situ encode
+against the bench's 1069-1159 us is *itself* partly XIP-miss cost — which
+returns headroom on core 1 as a side effect.
+
+**Sustainability note on F1.** Do it as a supplementary linker fragment
+(`INSERT AFTER`-style placement of `*libpl_ldac_enc.a:(.text* .rodata*)` into
+the RAM-resident section), **not** by forking `memmap_default.ld`, and **not**
+by decorating vendored sources with `__not_in_flash_func`. The first keeps
+pico-sdk's linker script upgradable; the other two are exactly the kind of
+load-bearing, hard-to-undo edit this ADR exists to prevent. Gate it behind a
+CMake option so the A/B is one flag. If placement by archive name proves
+awkward, the acceptable fallback is a dedicated `.ldac_ram` section attribute
+applied at the *build-system* level (`-ffunction-sections` plus placement), not
+edits inside `vendor/`.
+
+**F2 (park core1) should land regardless of what F1 measures.** A core that
+free-spins from boot, calling `time_us_64()` twice per iteration forever, is a
+defect on power and bus grounds alone, and it is 20 lines. It should have been
+in §4.1 of this ADR and was not — my omission.
+
+`pico-link-lyv` and `pico-link-7h5` both stay open and both stay P1. Re-evaluate
+their ordering after F1 reports.
+
+## 12.5 Fixing the instrument: measure the specified quantity, and make it arbitrate
+
+The 4th metric is unmeasurable today because `a2dp.c:1393`'s `duty:`/`enc_us`
+accumulator sits outside the `#ifndef PL_ENCODER_ON_CORE1` guard, so under the
+flag one name reports two different quantities: core 0's non-thread share when
+OFF, core 1's own busy percent when ON. **A metric whose meaning changes with a
+build flag is not a metric.** Fix it as follows.
+
+**1. Split the accumulator into two names that can never be confused.**
+
+- `s_core1_busy_us` — core 1's own encode busy time. What the current
+  accumulator reports under the flag. Keep it; label it `core1_duty:`.
+- `s_core0_nonthread_us` — **new, core 0 only.** Accumulate `timer_hw->timerawl`
+  deltas across entry/exit of *every* core-0 exception handler that matters:
+  the 0xFF BTstack/cyw43 HCI path (including the grant handler already
+  instrumented for G0), the 0xC0 USB pump, and the alarm/run-loop timer.
+  Report `s_core0_nonthread_us / wall_us` as `core0_nonthread:`.
+
+This is the same busy-microseconds technique G0 already used and validated —
+applied on core 0, summed over all handlers, rather than on one handler.
+
+**2. Report both, always, in the same line, on both sides of the flag.** The
+whole defect was a single label doing double duty; the fix is not a better
+`#ifdef`, it is two unambiguous labels.
+
+**3. Add the arbiter: `XIP_CTR_HIT` / `XIP_CTR_ACC`.** RP2350's XIP block has
+free hardware hit and access counters
+(`hardware/regs/xip.h`: `XIP_CTR_HIT_OFFSET 0x0c`, `XIP_CTR_ACC` adjacent).
+Sample and reset them over each reporting window and print
+`xip_acc`/`xip_hit`/miss-rate. Zero CPU cost, no cores involved, and it settles
+§12.1 outright.
+
+**4. The decision table this produces.** One flash answers everything:
+
+| `core0_nonthread` | XIP miss rate vs core1-halted | verdict |
+|---|---|---|
+| **~33-40%** | **much higher** | H1 confirmed: stall, not preemption. Do F1. |
+| ~33-40% | unchanged | contention is real but not XIP — look at SRAM banks / APB. Do F2 first. |
+| **~76%** | either | H1 dead. G0's decomposition has a 45-point hole; re-derive it before touching anything else. |
+
+**5. The clean control, worth one flash on its own:** build with core 1 launched
+but the encoder left on core 0 (core 1 running only its idle spin), no audio,
+and measure iters/s and `pl_ui_render` against the 61-64 / 21.9 ms idle
+baseline. Any degradation at all is pure contention with **zero** audio work in
+the picture, and it quantifies F2's ceiling before F2 is written.
+
+## 12.6 What I got wrong this round, recorded so it is not repeated
+
+1. **I sized a multicore offload with single-core arithmetic.** Every number in
+   §11.2a follows from "time freed = throughput gained", which silently assumes
+   core independence. On a chip with one shared 16 KB cache and one flash
+   interface, that assumption is the whole ballgame, and I never wrote it down —
+   which means I never checked it. **When moving a workload between cores,
+   state the shared-resource assumption explicitly and size the working set
+   against the shared cache before projecting anything.** libldac's 28.4 KB
+   against a 16 KB cache was computable from the map file at design time, at
+   zero cost, and I did not compute it.
+2. **My reopen condition named the wrong suspect.** §11.5's trigger ("non-thread
+   share materially above 40%") fired correctly and its attached inference ("the
+   ~11% tail was wrong") is refuted by G0's own arithmetic closing to within
+   0.9 points. A reopen condition should name the *trigger* and demand a fresh
+   diagnosis — it should not pre-commit to a cause, because pre-committing sends
+   the next round to spend a flash on the one place the answer provably is not.
+3. **§4.1's "move the code, do not redesign it" was right, and I should still
+   have specified core 1's idle behaviour.** "Do not redesign" is not "do not
+   specify". A busy-spin fell out of the port by default, and defaults in a
+   design document are decisions whether or not anyone made them.
+4. This is the second time on this project that a fixed-input bench under-
+   predicted an in-situ cost (§11.0(a)), and it is now clear both instances have
+   the same root: **the bench had the cache to itself.** The lesson is stronger
+   than "measure in situ" — it is *benches do not model the memory system you
+   will actually run in*.
