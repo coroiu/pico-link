@@ -50,6 +50,22 @@ void pl_panic_record_rust(const uint8_t *msg, uintptr_t len);
 // Writes scratch[0..2] only, then watchdog_reboot(0, 0, ...). Never returns.
 void pl_panic_record_watchdog_stale(uint32_t subsys, uint32_t stale_ms) __attribute__((noreturn));
 
+// --- Multicore flash-lockout END-handshake timeout (bead pico-link-nli.2,
+// ADR .planning/decisions/2026-09-03-ldac-encoder-on-core1.md sec 7.1) ---
+//
+// "PLLO" -- a distinct magic naming core1 as the suspect. Called ONLY from
+// flash_lockout.c when multicore_lockout_end_timeout_us() fails: a
+// successful START already proved core1 was alive inside
+// multicore_lockout_handler, so an END timeout means core1 faulted or
+// wedged while parked there. pico-sdk's lockout_in_progress is now latched
+// true forever (no public reset) -- the NEXT flash write anywhere,
+// including BTstack's own link-key save, would hard_assert at an arbitrary
+// later moment with no attribution. There is no benign reading of this
+// event and no retry: goes through the normal
+// pl_panic_arm_record_and_reboot() path (full retry-counter/BOOTSEL
+// escalation applies, same as any other panic), never returns.
+void pl_panic_record_flash_lockout_end_timeout(void) __attribute__((noreturn));
+
 #ifdef __cplusplus
 }
 #endif
