@@ -152,9 +152,25 @@ static bool feature_unit_get_request(uint8_t rhport, audio_control_request_t con
     }
     if (request->bControlSelector == AUDIO_FU_CTRL_VOLUME) {
         if (request->bRequest == AUDIO_CS_REQ_RANGE) {
+            // Bead pico-link-4v2.2 (VT2), design sec 5: bMin=-12700,
+            // bRes=100 gives exactly 127 steps, a BIJECTION with AVRCP's
+            // 0..127 absolute-volume domain (volume.c's canonical
+            // domain), which is what makes the domain round-trip
+            // idempotent (design sec 4.1's termination proof depends on
+            // it). Was bMin=-12800/bRes=256 (51 steps against AVRCP's 128
+            // -- non-bijective). This is a class-specific GET_RANGE
+            // response value, not part of the enumeration descriptor blob
+            // in usb_descriptors.h -- same byte length, same interface
+            // layout, no alt-setting change, so it carries none of that
+            // file's enumeration/alt-setting risk history. VT1
+            // (pico-link-4v2.1) measured macOS sending bCur as an exact
+            // multiple of whatever bRes we declare with no off-grid
+            // values against the OLD range, which is the load-bearing
+            // assumption behind this change -- see that bead's RESULTS
+            // comment.
             audio_control_range_2_n_t(1) range = {
                 .wNumSubRanges = tu_htole16(1),
-                .subrange[0] = {.bMin = tu_htole16((int16_t)-12800), .bMax = tu_htole16(0), .bRes = tu_htole16(256)},
+                .subrange[0] = {.bMin = tu_htole16((int16_t)-12700), .bMax = tu_htole16(0), .bRes = tu_htole16(100)},
             };
             return tud_audio_buffer_and_schedule_control_xfer(rhport, (tusb_control_request_t const *)request, &range, sizeof(range));
         }

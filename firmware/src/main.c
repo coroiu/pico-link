@@ -56,6 +56,7 @@
 #include "st7789.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
+#include "volume.h"
 #include "watchdog_sup.h"
 
 // The one call in the Rust -> C direction (see pico_link_ui.h's doc comment
@@ -402,6 +403,14 @@ int main(void) {
     pl_media_keys_init();
     pl_log("pl_media_keys_init OK\r\n");
 
+    // Bead pico-link-4v2.2 (VT2 of the volume-sync epic pico-link-4v2):
+    // the canonical volume state/loop-rule/circuit-breaker module. No
+    // real producer wired yet (T3/T4) -- only debug_remote.c's "VOL SET"
+    // console command drives it today, via pl_volume_debug_set(). See
+    // volume.h's module doc.
+    pl_volume_init();
+    pl_log("pl_volume_init OK\r\n");
+
     // --- M2: bring the radio up ---
     //
     // cyw43_arch_init() claims the SPI/PIO/DMA resources the bead's banked
@@ -569,6 +578,13 @@ int main(void) {
         // will push into the same ring unconditionally, so the drain must
         // always run regardless of whether the debug console is built in.
         pl_media_keys_drain(frame_start_us);
+        // Bead pico-link-4v2.2 (VT2): drains volume.c's host/sink inbound
+        // latches and applies the loop rule. NOT gated behind
+        // PL_DEBUG_REMOTE for the same reason as pl_media_keys_drain
+        // above -- T3/T4's real USB/AVRCP producers will latch into this
+        // independent of the debug console; only the "VOL SET" producer
+        // is debug-only today.
+        pl_volume_service(frame_start_us);
 #ifndef PL_DIAG_SKIP_BT
         // Drains events the BTstack packet handler queued from IRQ context
         // (pico-link-6o2) and makes the real pl_ui_push_event calls here, in

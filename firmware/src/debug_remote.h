@@ -74,6 +74,14 @@
 //                        log-ring congestion (see VT1's LEARNED comment on
 //                        bead pico-link-4v2.1). Second call turns it back
 //                        off.
+//   VOL SET n        -- bead pico-link-4v2.2 (VT2, .planning/design/
+//                        2026-09-02-volume-sync.md sec 9): sets volume.c's
+//                        canonical value (0..127) through the SAME loop
+//                        rule and circuit breaker the real host/sink edges
+//                        will use once T3/T4 wire them, and logs what it
+//                        would emit to each peer via pl_prio.h's slot 4.
+//                        Emits nothing for real -- nothing reads the
+//                        outbound latches yet.
 //   VOL HOSTUP [n]   -- pushes n (default 1, max 100) HID Consumer Volume
 //   VOL HOSTDOWN [n]    Increment/Decrement taps via media_keys.c's
 //                        already-proven ring, to measure whether it moves
