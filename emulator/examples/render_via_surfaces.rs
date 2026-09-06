@@ -45,7 +45,7 @@ fn build_scene() -> Navigator {
 fn main() {
     let open_window = std::env::args().any(|arg| arg == "--window");
 
-    let navigator = build_scene();
+    let mut navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(WIDTH, HEIGHT);
     let ctx = RenderCtx::at(Instant::from_micros(0));
     navigator.render(&ctx, &mut framebuffer).expect("core DrawTarget is Infallible");

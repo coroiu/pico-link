@@ -87,7 +87,7 @@ mod tests {
         platform.power().enter_deep_sleep();
         assert_eq!(platform.power().deep_sleep_call_count(), 1);
 
-        let navigator = Navigator::new(Screen::new("Test", vec![]));
+        let mut navigator = Navigator::new(Screen::new("Test", vec![]));
         let mut framebuffer = FrameBuffer565::new(10, 10);
         let ctx = RenderCtx::at(Instant::from_micros(0));
         navigator.render(&ctx, &mut framebuffer).unwrap();

@@ -1935,13 +1935,24 @@ impl App {
     /// framebuffer's *content* never changed while the display was off,
     /// but the display itself needs a fresh flush once it's powered back
     /// on).
+    ///
+    /// Also forces the *whole framebuffer* damaged on that next render
+    /// (`Navigator::force_full_damage`) -- one of the damage pass's
+    /// enumerated full-damage triggers (design section 3.4, "wake from
+    /// display blank"): the panel was off, so nothing on it can be trusted
+    /// to already show the current screen's pixels, and a plain damage
+    /// diff (which only compares *this app's* last painted state, not
+    /// what's physically on the blanked panel) would otherwise see
+    /// nothing dirty and skip repainting entirely.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.navigator.force_full_damage();
     }
 
     /// Renders the current screen into the app's framebuffer and clears
-    /// the dirty flag, returning the freshly rendered framebuffer for the
-    /// caller to hand to a `DisplaySurface::flush`.
+    /// the dirty flag, returning the freshly rendered framebuffer (plus
+    /// the frame damage rect the damage pass actually painted -- see
+    /// [`RenderOutput`]) for the caller to hand to a `DisplaySurface::flush`.
     ///
     /// Also recomputes [`App::next_redraw_at`] from
     /// [`Navigator::redraw_after`] at this frame's `ctx` -- so a widget's
@@ -1956,14 +1967,40 @@ impl App {
     /// `Infallible`'s uninhabited error type (the core `DrawTarget` can
     /// never fail to draw). The `expect` exists only because
     /// `Result::expect` is how that's asserted at the call site.
-    pub fn render(&mut self) -> &FrameBuffer565 {
+    pub fn render(&mut self) -> RenderOutput<'_> {
         let ctx = RenderCtx::at(Instant::from_micros(self.now_us));
-        self.navigator
+        let damage = self
+            .navigator
             .render(&ctx, &mut self.framebuffer)
             .expect("core DrawTarget is Infallible");
         self.next_redraw_at = self.navigator.redraw_after(&ctx).map(|duration| ctx.now() + duration.max(MIN_REDRAW_DELAY));
         self.dirty = false;
-        &self.framebuffer
+        RenderOutput { framebuffer: &self.framebuffer, damage }
+    }
+}
+
+/// The result of one [`App::render`] call: the framebuffer that was drawn
+/// into, plus the frame damage rect the damage pass
+/// (`.planning/design/2026-09-06-damage-rect-render-and-partial-blit.md`
+/// section 3.3) actually painted this frame -- `Rectangle::zero()` on a
+/// frame that changed nothing on screen.
+///
+/// `Deref`s to [`FrameBuffer565`] so every existing call site that only
+/// ever wanted the framebuffer itself (`.pixel(..)`, `.pixels()`,
+/// `.size()`, a `DisplaySurface::flush(&output)`) keeps compiling
+/// unchanged -- only a caller that actually needs the rect (the FFI seam,
+/// bead `pico-link-7h5.6`; this bead's own A4 property test below) reads
+/// [`Self::damage`] directly.
+pub struct RenderOutput<'a> {
+    framebuffer: &'a FrameBuffer565,
+    pub damage: Rectangle,
+}
+
+impl core::ops::Deref for RenderOutput<'_> {
+    type Target = FrameBuffer565;
+
+    fn deref(&self) -> &FrameBuffer565 {
+        self.framebuffer
     }
 }
 
@@ -2242,6 +2279,87 @@ mod tests {
                     assert_ne!(
                         t0, t1,
                         "{name}: pixels are unchanged at t+{assert_differs_after:?} -- the redraw_after request is spurious"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bead `pico-link-7h5.4`'s acceptance criterion A4 (the damage-rect
+    /// render design, `.planning/design/2026-09-06-damage-rect-render-and-
+    /// partial-blit.md` section 10): for every screen, a damage-rendered
+    /// frame must be pixel-identical to a full-frame render of the same
+    /// state, and every pixel *outside* the reported damage rect must be
+    /// byte-identical to the previous frame. Modeled on
+    /// [`dirty_gate_freshness_invariant_holds_for_every_screen`] just
+    /// above -- same "prove it for every screen, not the one you thought
+    /// of" table-driven shape, reusing [`freshness_cases`] itself: each
+    /// case's [`Freshness`] promise doubles as this test's recipe for a
+    /// real, screen-appropriate state mutation (`Live` cases tick forward
+    /// to `assert_differs_after`, already proven elsewhere to change
+    /// pixels; `Static` cases get a `NavIntent::Down`, which is a no-op on
+    /// the handful of screens with nothing to move -- this test's
+    /// assertions then hold trivially for those, rather than not holding
+    /// at all).
+    ///
+    /// The "full-frame render of the same state" comparator is a second,
+    /// otherwise-untouched `App` built and driven through the exact same
+    /// setup-plus-mutation as the app under test, then rendered exactly
+    /// once: a freshly built `Navigator` starts with `force_full_damage:
+    /// true` (see that field's doc comment), so that single render is
+    /// guaranteed to be a full repaint -- no separate "full render" code
+    /// path needs to exist anywhere in production code for this test to
+    /// use.
+    #[test]
+    fn damage_rendered_frame_matches_a_full_frame_render_of_the_same_state_for_every_screen() {
+        fn apply_mutation(app: &mut App, freshness: &Freshness) {
+            match *freshness {
+                Freshness::Static => {
+                    app.handle_input(vec![NavIntent::Down]);
+                }
+                Freshness::Live { assert_differs_after, .. } => {
+                    let micros = u64::try_from(assert_differs_after.as_micros()).expect("test-only duration fits in u64 micros");
+                    app.tick(micros);
+                }
+            }
+        }
+
+        for (name, build, freshness) in freshness_cases() {
+            // The app under test: frame N and frame N+1 both go through
+            // the production damage path (the same `App`/`Navigator`, so
+            // frame N+1's diff is a real incremental diff against N, not
+            // another cache miss).
+            let mut app = build();
+            app.tick(0);
+            let frame_n: Vec<_> = app.render().pixels().collect();
+
+            apply_mutation(&mut app, &freshness);
+            let output = app.render();
+            let damage = output.damage;
+            let frame_n_plus_1: Vec<_> = output.pixels().collect();
+
+            // The comparator, per the doc comment above.
+            let mut full = build();
+            full.tick(0);
+            apply_mutation(&mut full, &freshness);
+            let full_frame: Vec<_> = full.render().pixels().collect();
+
+            assert_eq!(
+                frame_n_plus_1, full_frame,
+                "{name}: a damage-rendered frame differs from a full-frame render of the identical state"
+            );
+
+            assert_eq!(
+                frame_n.len(),
+                frame_n_plus_1.len(),
+                "{name}: pixel count must not change frame to frame"
+            );
+            for (pixel_n, pixel_n_plus_1) in frame_n.iter().zip(frame_n_plus_1.iter()) {
+                let point = pixel_n.0;
+                if !damage.contains(point) {
+                    assert_eq!(
+                        pixel_n.1, pixel_n_plus_1.1,
+                        "{name}: pixel {point:?} outside the reported damage rect {damage:?} changed anyway"
                     );
                 }
             }

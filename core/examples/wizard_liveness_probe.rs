@@ -66,7 +66,7 @@ fn main() {
     // Capture 1: render right at the connect attempt's start (elapsed 0s).
     app.tick(0);
     let frame_t0 = app.render();
-    dump_png_scaled(frame_t0, "wizard_liveness_t0.png", SCALE);
+    dump_png_scaled(&frame_t0, "wizard_liveness_t0.png", SCALE);
     println!("wrote wizard_liveness_t0.png (elapsed 0s)");
 
     // Capture 2: 2 seconds later. `tick` alone (no new event, no input)
@@ -75,6 +75,6 @@ fn main() {
     app.tick(2_000_000);
     assert!(app.dirty(), "redraw_after must have marked the app dirty from tick alone, 2s into a Connecting attempt");
     let frame_t1 = app.render();
-    dump_png_scaled(frame_t1, "wizard_liveness_t1.png", SCALE);
+    dump_png_scaled(&frame_t1, "wizard_liveness_t1.png", SCALE);
     println!("wrote wizard_liveness_t1.png (elapsed 2s)");
 }

@@ -72,7 +72,7 @@ fn selection_highlight_stays_on_the_same_device_row_as_new_devices_are_inserted_
     assert_eq!(carried_key, Some(ListItemKey::from_u64(1)));
 
     let screen1 = Screen::new("Pico Link", vec![Box::new(list1)]);
-    let navigator1 = Navigator::new(screen1);
+    let mut navigator1 = Navigator::new(screen1);
     let mut fb1 = FrameBuffer565::new(240, 240);
     navigator1.render(&test_ctx(), &mut fb1).expect("core DrawTarget is Infallible");
     dump_png(&fb1, "frame1-before-growth");
@@ -98,7 +98,7 @@ fn selection_highlight_stays_on_the_same_device_row_as_new_devices_are_inserted_
     assert_eq!(list2.selected_index(), 2, "Headphones moved from row 1 to row 2");
 
     let screen2 = Screen::new("Pico Link", vec![Box::new(list2)]);
-    let navigator2 = Navigator::new(screen2);
+    let mut navigator2 = Navigator::new(screen2);
     let mut fb2 = FrameBuffer565::new(240, 240);
     navigator2.render(&test_ctx(), &mut fb2).expect("core DrawTarget is Infallible");
     dump_png(&fb2, "frame2-after-growth");

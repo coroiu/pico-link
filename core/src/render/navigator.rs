@@ -13,13 +13,15 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::OriginDimensions;
+use embedded_graphics::prelude::Size;
+use embedded_graphics::primitives::Rectangle;
 
 use super::chrome::compute_chrome;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::screen::Screen;
+#[cfg(test)]
 use super::theme::palette;
 use super::widget::Action;
 use crate::input::NavIntent;
@@ -33,6 +35,25 @@ pub struct Navigator {
     /// by [`Navigator::take_output`]; `App::handle_input` is the caller
     /// that does so, folding this into its own pending-output buffer.
     pending_output: Vec<OutputRequest>,
+    /// Set by every stack-structural op (`push`/`pop`/`replace`/`pop_to_root`) and
+    /// by [`Navigator::force_full_damage`], consumed (and reset to
+    /// `false`) by the next [`Navigator::render`] -- one of the damage
+    /// pass's full-damage triggers (design section 3.4): a screen's own
+    /// per-slot cache has no way to know the *framebuffer* now shows a
+    /// different screen than the one its cache was built against (e.g. a
+    /// pop reveals a screen whose own widgets/chrome may be byte-for-byte
+    /// unchanged since it was last painted, but every pixel on the panel
+    /// right now belongs to whatever was pushed on top of it). Starts
+    /// `true` so the very first render is also a full-damage frame.
+    force_full_damage: bool,
+    /// The framebuffer size `Navigator::render` last computed chrome for.
+    /// `None` on a freshly built `Navigator` (folded into the initial
+    /// `force_full_damage: true` above, so a mismatch here on the very
+    /// first render is never separately observed). A change is a
+    /// full-damage trigger (design section 3.4, "framebuffer resize"): the
+    /// old cached chrome/widget areas belong to a framebuffer that no
+    /// longer exists.
+    last_size: Option<Size>,
 }
 
 impl Navigator {
@@ -41,7 +62,20 @@ impl Navigator {
     #[must_use]
     pub fn new(mut root: Screen) -> Self {
         root.initialize_focus();
-        Self { stack: vec![root], pending_output: Vec::new() }
+        Self { stack: vec![root], pending_output: Vec::new(), force_full_damage: true, last_size: None }
+    }
+
+    /// Forces the next [`Navigator::render`] to damage the whole
+    /// framebuffer, without any actual screen-state change -- the
+    /// navigation-external counterpart to the structural ops below (push/
+    /// `pop`/`replace`/`pop_to_root` already call this internally). `App` uses
+    /// this for the other two full-damage triggers it alone knows about:
+    /// waking the display from blank (see `App::mark_dirty`, whose own
+    /// doc comment this generalizes) and any other "the framebuffer's
+    /// prior content can no longer be trusted" event outside the
+    /// navigation stack itself.
+    pub fn force_full_damage(&mut self) {
+        self.force_full_damage = true;
     }
 
     /// The currently visible screen.
@@ -71,6 +105,7 @@ impl Navigator {
     pub fn push(&mut self, mut screen: Screen) {
         screen.initialize_focus();
         self.stack.push(screen);
+        self.force_full_damage = true;
     }
 
     /// Pops the current screen, unless it's the root. Returns whether a
@@ -78,6 +113,7 @@ impl Navigator {
     pub fn pop(&mut self) -> bool {
         if self.stack.len() > 1 {
             self.stack.pop();
+            self.force_full_damage = true;
             true
         } else {
             false
@@ -95,6 +131,7 @@ impl Navigator {
     /// Devices). A no-op if the stack is already at depth 1.
     pub fn pop_to_root(&mut self) {
         self.stack.truncate(1);
+        self.force_full_damage = true;
     }
 
     /// The root screen's (`stack[0]`'s) own focused widget's selection
@@ -173,6 +210,7 @@ impl Navigator {
     pub fn replace_root(&mut self, mut screen: Screen) {
         screen.initialize_focus();
         self.stack[0] = screen;
+        self.force_full_damage = true;
     }
 
     /// Generalizes [`Navigator::replace_root`] to any stack depth --
@@ -195,6 +233,7 @@ impl Navigator {
         }
         screen.initialize_focus();
         self.stack[index] = screen;
+        self.force_full_damage = true;
     }
 
     fn apply_action(&mut self, action: Action) {
@@ -295,28 +334,39 @@ impl Navigator {
     }
 
     /// Renders the current screen into `target`, computing chrome regions
-    /// from whatever size `target` happens to be.
+    /// from whatever size `target` happens to be, and returns the frame
+    /// damage rect that was actually (re)painted -- `Rectangle::zero()` if
+    /// nothing needed repainting this frame.
     ///
-    /// Clears `target` to [`palette::BACKGROUND`] first. This matters because, per the
-    /// presentation-surface ADR, the app core owns a single long-lived
-    /// framebuffer that gets re-rendered into every frame rather than
-    /// reallocated — without an explicit clear, a widget that doesn't
-    /// unconditionally repaint every pixel of its area (e.g.
-    /// `VerticalList` only fills a *selected* row's background, leaving
-    /// unselected rows' backgrounds untouched) would leave stale pixels
-    /// from a previous frame's selection highlight visible after the
-    /// selection moves away. Widgets and tests that always render into a
-    /// fresh `FrameBuffer565` (already black) are unaffected by this.
+    /// No longer clears `target` unconditionally: that whole-framebuffer
+    /// clear is exactly what the damage pass (design section 3.3) exists
+    /// to replace with a fill scoped to the damage rect alone --
+    /// `Screen::render` does that fill itself, once the rect is known. A
+    /// resize (this call's `target.size()` differing from the last call's)
+    /// is still one of the full-damage triggers this method detects and
+    /// forwards, alongside the stack-structural ops (`push`/`pop`/
+    /// `replace_root`/`replace_at`/`pop_to_root`) and
+    /// [`Navigator::force_full_damage`] -- so the "a widget only paints
+    /// its own selected-row background, not every row" hazard the old doc
+    /// comment here warned about is still covered: a screen whose own
+    /// per-slot cache would otherwise see nothing dirty still gets
+    /// damaged in full whenever the framebuffer's prior content can't be
+    /// trusted to already be correct.
     ///
     /// # Errors
     ///
     /// Never, in practice: `FrameBuffer565`'s `DrawTarget::Error` is
     /// `Infallible`. The `Result` return exists so this can use `?`
     /// against embedded-graphics `Drawable::draw` calls internally.
-    pub fn render(&self, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
-        target.clear(palette::BACKGROUND)?;
-        let chrome = compute_chrome(target.size());
-        self.current().render(&chrome, self.depth() > 1, ctx, target)
+    pub fn render(&mut self, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<Rectangle, Infallible> {
+        let size = target.size();
+        let resized = self.last_size != Some(size);
+        self.last_size = Some(size);
+        let force_full_damage = core::mem::take(&mut self.force_full_damage) || resized;
+
+        let chrome = compute_chrome(size);
+        let can_go_back = self.depth() > 1;
+        self.current_mut().render(&chrome, can_go_back, ctx, force_full_damage, target)
     }
 
     /// Delegates to the currently visible screen's
@@ -457,7 +507,7 @@ mod tests {
     #[test]
     fn render_works_end_to_end_on_a_fresh_navigator() {
         let mut fb = FrameBuffer565::new(240, 240);
-        let nav = Navigator::new(list_screen("List", 3));
+        let mut nav = Navigator::new(list_screen("List", 3));
         nav.render(&test_ctx(), &mut fb).unwrap();
         assert_eq!(fb.size(), Size::new(240, 240));
         // Sanity: the title bar's surface fill was drawn somewhere, i.e.

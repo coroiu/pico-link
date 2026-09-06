@@ -60,7 +60,7 @@ fn unpack_argb(pixel: u32) -> (u8, u8, u8) {
 
 #[test]
 fn headless_png_and_minifb_buffer_agree_on_every_pixel() {
-    let navigator = build_scene();
+    let mut navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
@@ -113,7 +113,7 @@ fn known_chrome_colors_match_between_surfaces_at_scale_one() {
     // agree with each other", which could pass if both were wrong in the
     // same way). Mirrors the assertions in `core/tests/render_png_dump.rs`.
 
-    let navigator = build_scene();
+    let mut navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&test_ctx(), &mut framebuffer).unwrap();
 
@@ -151,7 +151,7 @@ fn headless_and_windowed_both_blank_to_black_when_powered_off() {
     // ARGB buffer verbatim (see `emulator/src/platform/minifb_surface.rs`),
     // so that expected buffer is reproduced directly here rather than
     // exercised through a live window.
-    let navigator = build_scene();
+    let mut navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 

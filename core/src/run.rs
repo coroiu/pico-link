@@ -543,7 +543,7 @@ impl Runner {
             // `FlushErrorTracker` makes a persistent failure visible over
             // serial (rate-limited) instead of looking like an
             // inexplicable frozen screen.
-            match platform.display().flush(framebuffer) {
+            match platform.display().flush(&framebuffer) {
                 Ok(()) => self.flush_errors.on_ok(),
                 Err(error) => self.flush_errors.on_err(&error),
             }
