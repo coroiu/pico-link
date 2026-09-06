@@ -376,7 +376,11 @@ impl VolumeState {
     /// screen). Rounds half-up; checked to map the two endpoints exactly
     /// (`0 -> 0`, `127 -> 100`) since those are the only two values a user
     /// can act on ("0% must mean silent, 100% must mean maximum").
+    // `level` is a `u8` (0..=127), so `level * 100 + 63` is at most
+    // 12763 and `/ 127` caps the result at 100 -- always in-range for a
+    // `u8`, but clippy can't see that from the arithmetic alone.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn percent(&self) -> u8 {
         ((u32::from(self.level) * 100 + 63) / 127) as u8
     }

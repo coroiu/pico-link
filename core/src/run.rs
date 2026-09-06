@@ -353,6 +353,16 @@ impl IdlePolicy {
     /// don't extend the idle timer) is fully captured without it. If real
     /// PWM brightness ever lands, this is the one place that would gain a
     /// genuine dim level.
+    // Four independent boolean inputs, not a bitflags/enum bundle: each
+    // one is read from a different source at the call site (input poll,
+    // `App::is_at_home_root`, `PowerControl::on_external_power`,
+    // `App::volume_requires_dim_floor`) and named at every call site
+    // already (`policy.tick(now, had_input, at_home_root, ...)`), which is
+    // what this pedantic lint is really guarding against -- an opaque
+    // string of positional bools with no names in sight. Bundling them
+    // into a struct would cost every caller (and every existing test) a
+    // construction step for no readability gain here.
+    #[allow(clippy::fn_params_excessive_bools)]
     pub fn tick(
         &mut self,
         now: crate::platform::Instant,
