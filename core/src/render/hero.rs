@@ -437,18 +437,30 @@ impl HeroStatusView {
                 }
             }
         };
-        // Folds `percent`, `muted`, AND `source` -- unlike `Screen`'s
-        // `title_paint_key` (which only needs `percent`/`muted`, since the
-        // title bar never shows the source), THIS widget's own banner text
-        // depends on `source` too (the MUTED remedy differs by it -- design
-        // section 4.2), so it must be part of what decides whether this
-        // widget needs to repaint.
+        // Folds ONLY the banner-relevant bool (`muted || percent == 0`)
+        // plus `source` -- NOT the raw `percent`. This is
+        // `damage_region_key`'s value too (see that method below), which
+        // `Screen` diffs to decide whether a frame can narrow to
+        // `damage_hint`'s meter-only rect or must repaint the WHOLE hero
+        // widget area. The hero body never draws the percent -- only the
+        // title bar does (`Screen::render`, via `ChromeContribution::
+        // volume`) -- so folding it here would make an ordinary,
+        // banner-irrelevant tick (e.g. 40% -> 41%, still unmuted and
+        // nonzero) change this key and force a full hero repaint on every
+        // single volume tick, exactly the ~60/sec-during-a-slider-drag
+        // cost design section 9.2 rejected a hero-body VOL row FOR and
+        // section 2.4/7 sold the title-bar placement as avoiding (a
+        // code-review defect caught by a temporary probe test: percent-only
+        // 40->41 unmuted/nonzero gave `body_paint_key` `equal=false` before
+        // this fix). `source` still must fold -- unlike `Screen`'s
+        // `title_paint_key` (which never shows it), THIS widget's own
+        // banner text depends on it (the MUTED remedy differs by source --
+        // design section 4.2).
         let key = match &self.volume {
             None => key.fold(0),
             Some(volume) => key
                 .fold(1)
-                .fold(u64::from(volume.percent))
-                .fold(u64::from(volume.muted))
+                .fold(u64::from(volume.muted || volume.percent == 0))
                 .fold(match volume.source {
                     HeroVolumeSource::Host => 0,
                     HeroVolumeSource::Other => 1,
@@ -1765,6 +1777,44 @@ mod tests {
             CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
         );
         assert_ne!(no_stat.paint_key(&test_ctx()), base.paint_key(&test_ctx()), "a stat line vs none must change the key");
+    }
+
+    // --- Code-review regression: `body_paint_key`/`damage_region_key` must
+    // NOT fold the raw percent, only the banner-relevant bool -- folding
+    // the raw percent would force a full hero repaint on every ordinary
+    // volume tick (~60/sec during a slider drag), exactly what design
+    // section 9.2 rejected a hero-body VOL row for and section 2.4/7 sold
+    // the title-bar placement as avoiding. `damage_region_key` is the
+    // value `Screen` actually diffs to decide whether it can narrow to
+    // `damage_hint`'s meter-only rect (bead pico-link-7h5.9) -- see that
+    // method's doc comment. ---
+
+    #[test]
+    fn damage_region_key_is_unchanged_by_a_percent_only_change_with_no_banner_state_change() {
+        let ctx = test_ctx();
+        let at_40 = nominal().with_volume(Some(HeroVolume { percent: 40, muted: false, source: HeroVolumeSource::Host }));
+        let at_41 = nominal().with_volume(Some(HeroVolume { percent: 41, muted: false, source: HeroVolumeSource::Host }));
+        assert_eq!(
+            at_40.damage_region_key(&ctx),
+            at_41.damage_region_key(&ctx),
+            "an ordinary percent-only tick (both unmuted, both nonzero) must NOT change damage_region_key --              folding the raw percent here would force a full hero repaint on every volume tick"
+        );
+        // The same must hold for `paint_key`/`body_paint_key` (what
+        // `damage_region_key` is defined to equal) -- checked directly too
+        // so a future refactor that breaks that equality is caught here,
+        // not only via `damage_region_key`.
+        assert_eq!(at_40.paint_key(&ctx), at_41.paint_key(&ctx));
+    }
+
+    #[test]
+    fn damage_region_key_changes_when_crossing_into_or_out_of_the_banner_state() {
+        let ctx = test_ctx();
+        let normal = nominal().with_volume(Some(HeroVolume { percent: 41, muted: false, source: HeroVolumeSource::Host }));
+        let zero = nominal().with_volume(Some(HeroVolume { percent: 0, muted: false, source: HeroVolumeSource::Host }));
+        let muted = nominal().with_volume(Some(HeroVolume { percent: 41, muted: true, source: HeroVolumeSource::Host }));
+
+        assert_ne!(normal.damage_region_key(&ctx), zero.damage_region_key(&ctx), "crossing into VOLUME 0 must change the key -- the banner appears");
+        assert_ne!(normal.damage_region_key(&ctx), muted.damage_region_key(&ctx), "crossing into MUTED must change the key -- the banner appears");
     }
 
     #[test]
