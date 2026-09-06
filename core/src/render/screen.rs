@@ -108,14 +108,27 @@ fn draw_link_glyph(link_state: LinkState, right_cursor: i32, title_mid_y: i32, t
 /// and-partial-blit.md` section 3.3). Slot order is fixed and matches
 /// [`Screen::render`]'s own build order every frame: index 0 is the title
 /// bar pseudo-region, index 1 is the button rail pseudo-region, and index
-/// `2 + i` is `self.widgets[i]`. `damage_hint` is deliberately not part of
-/// this cache -- unlike `key`/`area`, it is cheap to recompute from the
-/// still-live widget the moment a slot turns out to be dirty (section
-/// 3.3 step 4), so there is nothing stale here to compare against.
+/// `2 + i` is `self.widgets[i]`. `damage_hint`'s own *rectangle* is
+/// deliberately not part of this cache -- unlike `key`/`area`, it is
+/// cheap to recompute from the still-live widget the moment a slot turns
+/// out to be dirty (section 3.3 step 4), so there is nothing stale here
+/// to compare against.
+///
+/// `region_key` (bead `pico-link-7h5.9`) IS cached, unlike `damage_hint`'s
+/// rectangle -- it is what makes narrowing to `damage_hint`'s rectangle
+/// trustworthy at all. A widget instance does not survive frames (it is
+/// routinely rebuilt from fresh model data), so "did only the narrow
+/// sub-region change?" can only be answered by comparing THIS frame's
+/// [`Widget::damage_region_key`] against the value `Screen` itself cached
+/// last frame -- never by the widget remembering its own previous value,
+/// which would compare a freshly-built instance's key against itself and
+/// be trivially "unchanged" every time. See [`Widget::damage_region_key`]
+/// for the full reasoning.
 #[derive(Debug, Clone, Copy)]
 struct PaintSlot {
     key: PaintKey,
     area: Rectangle,
+    region_key: PaintKey,
 }
 
 /// Seeds only need to differ from each other and from a widget's own seed
@@ -552,11 +565,18 @@ impl Screen {
         let rail_key = rail_paint_key(&labels);
 
         let mut new_slots: Vec<PaintSlot> = Vec::with_capacity(2 + self.widgets.len());
-        new_slots.push(PaintSlot { key: title_key, area: chrome.title });
-        new_slots.push(PaintSlot { key: rail_key, area: chrome.rail });
+        // Chrome pseudo-regions have no `damage_hint`/`damage_region_key`
+        // of their own (see the diff loop below) -- `PaintKey::ALWAYS` is
+        // an inert placeholder for `region_key` here, never compared.
+        new_slots.push(PaintSlot { key: title_key, area: chrome.title, region_key: PaintKey::ALWAYS });
+        new_slots.push(PaintSlot { key: rail_key, area: chrome.rail, region_key: PaintKey::ALWAYS });
         for (widget, &area) in self.widgets.iter().zip(widget_areas.iter()) {
-            let key = if area.is_zero_sized() { PaintKey::ALWAYS } else { widget.paint_key(ctx) };
-            new_slots.push(PaintSlot { key, area });
+            let (key, region_key) = if area.is_zero_sized() {
+                (PaintKey::ALWAYS, PaintKey::ALWAYS)
+            } else {
+                (widget.paint_key(ctx), widget.damage_region_key(ctx))
+            };
+            new_slots.push(PaintSlot { key, area, region_key });
         }
 
         // --- Steps 3-5: diff against the last painted frame, narrow via
@@ -581,10 +601,17 @@ impl Screen {
                     // cleared too), not just a `damage_hint` narrowing of
                     // the new position.
                     union_rect(old_slot.area, new_slot.area)
-                } else if index >= 2 {
-                    // Only a real widget can narrow its own dirty area;
-                    // the two chrome pseudo-regions (index 0/1) have no
-                    // `damage_hint` of their own.
+                } else if index >= 2 && old_slot.region_key == new_slot.region_key {
+                    // Only a real widget can narrow its own dirty area,
+                    // and only once `region_key` -- diffed HERE, against
+                    // `Screen`'s own cache, never by the widget itself
+                    // (see `Widget::damage_region_key`'s doc comment) --
+                    // proves nothing outside `damage_hint`'s rectangle
+                    // could have changed. A `region_key` change (or the
+                    // default `PaintKey::ALWAYS`, which never equals
+                    // anything) falls through to the `else` branch below:
+                    // the whole widget area, exactly like a widget with no
+                    // sub-widget damage support at all.
                     match self.widgets[index - 2].damage_hint(new_slot.area, ctx) {
                         Some(hint) => hint.intersection(&new_slot.area),
                         None => new_slot.area,

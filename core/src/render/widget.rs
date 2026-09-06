@@ -302,16 +302,58 @@ pub trait Widget {
     /// two columns, not its whole hero region) can narrow this to shrink
     /// the frame damage rect their change contributes (design section 4).
     ///
-    /// **There is no caller of this method yet** (bead `pico-link-7h5.3`
-    /// is additive-only) -- the frame damage pass that reads it lands in
-    /// `pico-link-7h5.4`. A widget that returns `Some(r)` here still must
-    /// itself consult `ctx.needs(..)` inside its own `render` if it wants
-    /// to actually *skip* rasterising the untouched part; returning
-    /// `Some(r)` only narrows what the *caller* considers damaged, it does
-    /// not, by itself, skip anything -- see [`RenderCtx::needs`] and the
+    /// `Screen` only trusts this method's `Some(r)` once it has ALSO
+    /// established, via [`Self::damage_region_key`] compared against its
+    /// own cache, that nothing outside `r` could have changed this frame
+    /// -- see that method's doc comment for why that comparison cannot
+    /// live here, in the widget itself. When `Screen` has not established
+    /// that (the common case for a widget that hasn't opted in via
+    /// `damage_region_key`), it damages this widget's whole `area`
+    /// regardless of what this method returns -- so implementations that
+    /// only narrow via `damage_hint` without also overriding
+    /// `damage_region_key` are dead code, not a partial win.
+    ///
+    /// A widget that returns `Some(r)` here still must itself consult
+    /// `ctx.needs(..)` inside its own `render` if it wants to actually
+    /// *skip* rasterising the untouched part; returning `Some(r)` only
+    /// narrows what the *caller* considers damaged, it does not, by
+    /// itself, skip anything -- see [`RenderCtx::needs`] and the
     /// module-level SKIP-not-CLIP note on [`PaintKey`].
     fn damage_hint(&self, _area: Rectangle, _ctx: &RenderCtx) -> Option<Rectangle> {
         None
+    }
+
+    /// A cheap, total summary of everything OUTSIDE the sub-rectangle
+    /// [`Self::damage_hint`] would report, for widgets that narrow their
+    /// own damage to less than their full area (bead `pico-link-7h5.9`).
+    ///
+    /// **This must be compared across frames by the CALLER (`Screen`,
+    /// via its own [`PaintKey`]-caching mechanism -- the same one that
+    /// already tracks [`Self::paint_key`]), never by the widget itself.**
+    /// A widget instance does not survive frames in this codebase: a
+    /// composite screen widget backed by live model data (the motivating
+    /// case, `HeroStatusView`) is routinely a brand-new instance every
+    /// time its owning screen is rebuilt from fresh data, which happens
+    /// far more often than once per widget lifetime. A widget-local
+    /// `Cell` attempting to remember "my own key last frame" is comparing
+    /// a freshly-constructed instance's key against itself the very first
+    /// time it is asked -- structurally always "unchanged", regardless of
+    /// what actually differs from the *previous* instance's last-painted
+    /// state. `Screen`'s [`PaintSlot`] cache is the only thing that
+    /// genuinely spans frames here, exactly the reasoning that already
+    /// gave `paint_key` its own external cache rather than a widget-local
+    /// one -- see `pico-link-7h5.9`'s postmortem for the concrete bug this
+    /// prevents (a stale device name/codec word after `damage_hint`
+    /// wrongly narrowed a real body change down to a sub-region).
+    ///
+    /// Defaults to [`PaintKey::ALWAYS`] (never equal to a previous frame's
+    /// value, including another `ALWAYS`) -- the same "opt in one widget
+    /// at a time" migration guarantee `paint_key`'s own default gives:
+    /// until a widget overrides this, `Screen` always treats its
+    /// `damage_hint` as untrustworthy and damages its whole `area`
+    /// instead, exactly today's behaviour.
+    fn damage_region_key(&self, _ctx: &RenderCtx) -> PaintKey {
+        PaintKey::ALWAYS
     }
 
     /// Whether this widget can receive focus. Defaults to `false` (e.g.
