@@ -1025,6 +1025,20 @@ static void pl_a2dp_avrcp_target_packet_handler(uint8_t packet_type, uint16_t ch
     // operation_id, design sec 3.2.
     bool pressed = avrcp_subevent_operation_get_button_pressed(packet) != 0;
 
+    // pico-link-wnk: this is the ONE unambiguous signal that a real headphone
+    // button press physically arrived over AVRCP passthrough -- distinct from
+    // any console-injected MEDIA PLAYPAUSE/NEXT/PREV command, which never
+    // reaches this function. Log unconditionally, unconditionally on every
+    // operation_id (even ones this handler ignores below), so a single
+    // morning button-press is visible in the log with no ambiguity about
+    // which producer fired. Timestamp is time_us_64() -- this handler runs on
+    // the cyw43/BTstack background IRQ, so it is not gated by the superloop's
+    // own cadence.
+    pl_log(
+        "avrcp-target: PASSTHROUGH operation_id=0x%02x %s at t=%llu us\r\n", operation_id,
+        pressed ? "PRESS" : "release", (unsigned long long)time_us_64()
+    );
+
     // Design sec 3.4's mapping. PLAY and PAUSE both map to the single
     // 0x00CD toggle usage -- deliberately, not an oversight: we never call
     // avrcp_target_set_playback_status, so the headphone's own view of
@@ -1047,7 +1061,11 @@ static void pl_a2dp_avrcp_target_packet_handler(uint8_t packet_type, uint16_t ch
         default:
             // Anything else (design sec 3.4: "anything else -- ignored, no
             // report") -- e.g. volume up/down, which this bead does not
-            // implement.
+            // implement. Still log it: the PASSTHROUGH line above already
+            // proved the button arrived, but this line says whether THIS
+            // firmware maps it to anything, which matters if the morning
+            // test is a button this handler does not recognize.
+            pl_log("avrcp-target: operation_id=0x%02x not mapped, no HID report\r\n", operation_id);
             return;
     }
 
@@ -1056,6 +1074,7 @@ static void pl_a2dp_avrcp_target_packet_handler(uint8_t packet_type, uint16_t ch
     } else {
         pl_media_keys_push_release();
     }
+    pl_log("avrcp-target: mapped to HID usage 0x%04x, pushed to media_keys ring\r\n", (unsigned)usage);
 }
 
 // T3 (pico-link-4v2.3), design sec 9: the response side of
