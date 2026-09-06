@@ -143,12 +143,14 @@ const METER_BLOCK_BOTTOM_INSET: u32 = 10;
 /// treats it as "no PCM" and stops drawing it at all (design section 15:
 /// **absent, never frozen** — the hard constraint this whole feature was
 /// commissioned under, since a still VU meter reads as silence when it
-/// means no data). A little over 2x the ~4Hz push cadence C's
-/// `PL_A2DP_LEVEL_PUSH_INTERVAL_MS` targets, so one merely-late reading
-/// doesn't blank the meter but a genuinely stopped stream reads as
-/// silence within a couple of frames rather than staying frozen
-/// indefinitely.
-pub(crate) const OUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(600);
+/// means no data). Bead pico-link-ajj (step D, 2026-09-06): shortened from
+/// 600ms to stay a small multiple (4x) of C's `PL_A2DP_LEVEL_PUSH_INTERVAL_MS`,
+/// which this same bead lowered from 250ms to 50ms -- keeping the same
+/// "one merely-late reading doesn't blank the meter, but a genuinely
+/// stopped stream reads as silence within a couple of frames" ratio at the
+/// new, much faster cadence rather than leaving a stopped stream visibly
+/// frozen for up to 600ms.
+pub(crate) const OUT_LEVEL_STALE_AFTER: Duration = Duration::from_millis(200);
 /// The OUT meter's own repaint cadence while live. Andreas's 2026-09-02
 /// override on this bead: ship at the design's ~4Hz refresh, do not run a
 /// framerate sweep to tune it — this is the one named constant that makes
@@ -235,6 +237,15 @@ pub struct OutLevelDisplay {
     pub hold_l: u8,
     pub hold_r: u8,
     pub received_at: Instant,
+    /// Release-ballistic attack anchor (bead pico-link-ajj, design
+    /// requirement C) -- a field-for-field carry of
+    /// `crate::app::OutLevelSample`'s own anchor fields; see
+    /// [`crate::app::decay_rms`]'s doc comment for what this widget does
+    /// with it at render time.
+    pub attack_rms_l: u8,
+    pub attack_rms_r: u8,
+    pub attack_rms_l_at: Instant,
+    pub attack_rms_r_at: Instant,
 }
 
 /// Which persistent banner (if any) is currently showing — resolved by
@@ -616,8 +627,36 @@ impl Widget for HeroStatusView {
                     FontColor::Transparent(palette::TEXT_SECONDARY),
                     &mut clipped,
                 );
-                theme::draw_vertical_level_meter(&mut clipped, l_block, level.rms_l, level.hold_l)?;
-                theme::draw_vertical_level_meter(&mut clipped, r_block, level.rms_r, level.hold_r)?;
+                // Release-ballistic decay (bead pico-link-ajj, design
+                // requirement C): the bar draws the attack anchor decayed
+                // to *now* -- NO floor against `level.rms_l`/`rms_r`. An
+                // earlier version floored at the latest raw sample,
+                // reasoning that it was a better estimate of "the level
+                // right now" than continuing to decay past it -- that
+                // reasoning was wrong and defeats the whole ballistic
+                // (code review on this bead, confirmed by the
+                // orchestrator): between publishes `rms_l`/`rms_r` are
+                // frozen at whatever the last event reported, so the
+                // `.max()` pinned the displayed value to that constant
+                // for the sample's entire life, making the release only
+                // ever move at publish events -- exactly the quantized-to-
+                // cadence behaviour this bead exists to fix, and worse in
+                // the loud-then-silence case (silence publishes nothing
+                // at all, per the deliberate empty-window skip, so the
+                // bar would sit frozen at the last loud reading until the
+                // staleness cutoff hides it outright). No floor is
+                // actually needed: `on_levels_changed` already
+                // re-anchors correctly from an arbitrarily large gap (its
+                // own fold-time decay saturates toward 0, it does not
+                // hold a stale anchor), and a genuinely stale reading is
+                // never rendered at all -- see the `OUT_LEVEL_STALE_AFTER`
+                // check just above this block. See `crate::app::
+                // decay_rms`'s doc comment for why this is computed here,
+                // at render time, rather than mutated on a schedule.
+                let displayed_rms_l = crate::app::decay_rms(level.attack_rms_l, ctx.now().saturating_duration_since(level.attack_rms_l_at));
+                let displayed_rms_r = crate::app::decay_rms(level.attack_rms_r, ctx.now().saturating_duration_since(level.attack_rms_r_at));
+                theme::draw_vertical_level_meter(&mut clipped, l_block, displayed_rms_l, level.hold_l)?;
+                theme::draw_vertical_level_meter(&mut clipped, r_block, displayed_rms_r, level.hold_r)?;
             }
         }
 

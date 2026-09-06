@@ -158,13 +158,33 @@ _Static_assert(
 
 // Bead pico-link-du0, design section 21 E17/C8: how often the OUT-meter
 // peak/RMS accumulator below is reduced to one Event::LevelsChanged push.
-// ~4Hz, matching the design's own "capped at 4Hz" motion rule (section 6)
-// -- named here (not a magic literal) because `core`'s own render-side
-// staleness window (`OUT_LEVEL_STALE_AFTER`, `core/src/render/hero.rs`)
-// is derived from this exact cadence and must not silently drift from it.
-// Andreas's 2026-09-02 override on this bead: ship at this rate, do not
-// run a framerate sweep to tune it.
-#define PL_A2DP_LEVEL_PUSH_INTERVAL_MS 250
+// `core`'s own render-side staleness window (`OUT_LEVEL_STALE_AFTER`,
+// `core/src/render/hero.rs`) is derived from this exact cadence and must
+// not silently drift from it.
+//
+// Bead pico-link-ajj (step D, 2026-09-06): lowered from the previous
+// 250ms/~4Hz to 50ms/20Hz -- gated on measuring core0's superloop rate
+// under a REAL live LDAC stream first (`pl_a2dp_poll_levels`, called once
+// per superloop iteration in main.c, is the hard ceiling on how often a
+// fresh reading can actually be read and rendered). Measured on hardware,
+// WH-1000XM3 connected and genuinely streaming (usb-audio: streaming +
+// a2dp: codec=LDAC + pkt_sent climbing, not idle/codec=none): the
+// pl_loop_prof "lpf ph=tot" histogram's p50 iteration period was 20ms
+// (~50 iterations/s), with two independent frame-counter-vs-wall-clock
+// spot checks giving ~86/s and ~165/s -- every one of those, including
+// the most conservative (p50), clears the ~20/s (50ms) floor this
+// interval needs by 2.5x-8x. This supersedes the previous "ship at 250ms,
+// do not tune" override on this same bead -- that override predates this
+// measurement.
+//
+// The publish reduction itself (2 divisions for the mean-square + 2
+// `pl_a2dp_isqrt` calls, each an internal division per Newton iteration)
+// is still negligible at the new rate: it runs once per push, not once
+// per sample, so 50ms -> 20 pushes/s is ~700 divisions/s total -- versus
+// the LDAC encoder's own `enc_max_us` measured at ~1.9ms *per frame* on
+// this same hardware (a2dp.c's own PL_A2DP_MAX_ENCODE_DWELL_US
+// falsifier), i.e. several orders of magnitude more budget than this adds.
+#define PL_A2DP_LEVEL_PUSH_INTERVAL_MS 50
 
 // Bead pico-link-648: delay before the single bounded 0x0b retry. Measured
 // on hardware (bead comments, 2026-09-01): the stale ACL cleared itself

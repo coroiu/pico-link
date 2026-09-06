@@ -99,19 +99,24 @@ pub fn generate(out_dir: &Path) {
     // pico-link-du0, design section 21 E17): a fresh connected `App`
     // (not a reuse of the one above, which is now disconnected), ticked
     // to a nonzero `now_us` so `OutLevelSample::received_at` reads as a
-    // real timestamp, then fed one `Event::LevelsChanged` reading. `peak_l`
-    // is intentionally well above `rms_l` so the L channel's peak-hold cap
-    // (the bright/red single segment) visibly sits above its RMS-driven
-    // bar fill in the fixture -- proving the two aren't the same number
-    // rendered twice. `peak_r`/`rms_r` are close together, so the R
-    // channel shows an ordinary reading with its hold cap right at the
-    // bar's edge. ---
+    // real timestamp, then fed one `Event::LevelsChanged` reading.
+    // Deliberately MID-RMS (bead pico-link-ajj code review): `rms_l`/
+    // `rms_r` are chosen on the dBFS scale to land mid-column (9 and 10
+    // of 16 segments) rather than near-full -- a near-full fixture can't
+    // tell a correct dBFS mapping apart from the old buggy linear one at
+    // a glance, which is exactly the failure mode this bead exists to
+    // fix. `peak_l` is intentionally well above `rms_l` so the L
+    // channel's peak-hold cap (the bright/red single segment) visibly
+    // sits above its RMS-driven bar fill in the fixture -- proving the
+    // two aren't the same number rendered twice. `peak_r`/`rms_r` are
+    // close together, so the R channel shows an ordinary reading with
+    // its hold cap right at the bar's edge. ---
     let mut app = App::new(240, 240);
     let addr = [0xDD; 6];
     app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1 }));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.tick(1);
-    app.handle_event(Event::LevelsChanged { peak_l: 240, peak_r: 150, rms_l: 90, rms_r: 140 });
+    app.handle_event(Event::LevelsChanged { peak_l: 90, peak_r: 45, rms_l: 26, rms_r: 40 });
     save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[3]);
 }
