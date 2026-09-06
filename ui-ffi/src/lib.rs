@@ -298,6 +298,16 @@ pub struct PlUi {
     /// pattern for "things dropped that a healthy system should chase."
     /// Read via [`pl_ui_malformed_tag_count`].
     malformed_tag_count: u32,
+    /// Backing storage for the `rects` array [`pl_ui_render_ex`] hands back
+    /// -- `PlRenderOut.rects` borrows this, so it must outlive the call and
+    /// live somewhere with the same lifetime contract as the framebuffer
+    /// pointer (valid until the next `pl_ui_input`/`pl_ui_tick`/
+    /// `pl_ui_render*`). Phase 1 (`pico-link-7h5.6`) only ever needs one
+    /// slot -- `App::render` reports a single bounding `Rectangle` -- but
+    /// this is a fixed-size array rather than a scalar field so a future
+    /// core-side move to multiple damage rects (design section 5) only
+    /// grows how many of these slots get filled, not the FFI shape.
+    last_damage_rects: [PlDamageRect; 1],
 }
 
 /// Creates a new UI instance rendering into a `width`x`height` framebuffer,
@@ -346,6 +356,7 @@ pub extern "C" fn pl_ui_create(width: u32, height: u32) -> *mut PlUi {
         idle: IdlePolicy::new(Some(DEFAULT_IDLE_TIMEOUT), None),
         input_since_last_tick: false,
         malformed_tag_count: 0,
+        last_damage_rects: [PlDamageRect { x: 0, y: 0, w: 0, h: 0 }; 1],
     };
     Box::into_raw(Box::new(ui))
 }
@@ -712,6 +723,151 @@ pub unsafe extern "C" fn pl_ui_render(ui: *mut PlUi, out_px: *mut *const u16, ou
     unsafe {
         *out_px = raw.as_ptr();
         *out_len = raw.len();
+    }
+}
+
+// --- The versioned render-out seam (pico-link-7h5.6) ---
+//
+// `pl_ui_render` above hands back only the pixel pointer/length -- there is
+// no way across that surface to say "you only need to blit rows 60..119."
+// `pl_ui_render_ex` adds exactly that, carrying the frame damage rect
+// `App::render`'s `RenderOutput` (`pico-link-7h5.4`) already computes, without
+// touching `pl_ui_render` itself: both are live until `pl_ui_render` is
+// retired in `pico-link-7h5.10`, once the partial-blit path
+// (`pico-link-7h5.8`) is proven on hardware. Same ABI-version-guard
+// discipline as `PlEvent`/`PL_EVENT_ABI_VERSION` above (module section doc,
+// `pl_ui_push_event`'s doc comment) -- a `version` field the consumer
+// checks before reading anything else in the struct.
+
+/// One damage rectangle, in framebuffer pixel coordinates (`x`/`y` are the
+/// top-left corner, `w`/`h` the extent) -- the sub-rectangle of
+/// [`PlRenderOut::px`] that actually changed this frame.
+///
+/// Deliberately **not** a packed copy of the damaged pixels: `px` always
+/// points at the whole framebuffer, and a rect only describes which part of
+/// it to read, at [`PlRenderOut::stride`]. Copying pixels out to pack them
+/// would spend on the CPU exactly what this design exists to save (design
+/// doc section 6).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlDamageRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// ABI version for [`PlRenderOut`], checked by the consumer the same way
+/// [`PL_EVENT_ABI_VERSION`]/[`PL_COMMAND_ABI_VERSION`] are: C reads
+/// `out.version` before trusting anything else in the struct and, on a
+/// mismatch, must fall back to blitting the **whole** framebuffer rather
+/// than trusting a `rects` shape it wasn't built to read -- a version
+/// mismatch degrades to slow-and-correct, never fast-and-wrong (design doc
+/// section 6).
+pub const PL_RENDER_ABI_VERSION: u32 = 1;
+
+/// The versioned render-out payload [`pl_ui_render_ex`] fills in. `px`
+/// always points at the **whole** framebuffer (same contract as
+/// [`pl_ui_render`]'s `out_px`) -- `rects` narrows which part of it is
+/// worth transferring to the panel, it never repackages the pixels
+/// themselves.
+///
+/// `rect_count == 0` means "nothing to paint this frame" and C must not
+/// blit at all. In practice this is reachable only if C calls
+/// [`pl_ui_render_ex`] without first checking [`pl_ui_dirty`] -- callers
+/// are expected to keep gating on that as today; this is a belt, not the
+/// primary mechanism.
+///
+/// Same borrow lifetime as [`pl_ui_render`]'s `out_px`/`out_len`: `px` and
+/// `rects` are both valid only until the next call that mutates `ui`
+/// (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render`/`pl_ui_render_ex` again). C
+/// must copy out (e.g. into a DMA source) before making that next call.
+#[repr(C)]
+pub struct PlRenderOut {
+    pub version: u32,
+    pub px: *const u16,
+    pub px_len: usize,
+    pub stride: u16,
+    pub rect_count: u16,
+    pub rects: *const PlDamageRect,
+}
+
+/// Renders the current screen, same unconditional/idempotent contract as
+/// [`pl_ui_render`] (see its doc comment -- everything there about *when*
+/// to call this and the dirty-flag interaction applies unchanged), but
+/// additionally reports the frame damage rect via `out`.
+///
+/// Writes `*out` unconditionally when `ui` and `out` are both non-null:
+/// on a null `ui`, `out->version` is still set to [`PL_RENDER_ABI_VERSION`]
+/// but `px` is null, `px_len`/`rect_count` are `0`, and `rects` is null --
+/// mirroring [`pl_ui_render`]'s null-`ui` behaviour rather than leaving the
+/// struct uninitialized. A no-op (does not touch `*out` at all) if `out`
+/// itself is null.
+///
+/// `out->rect_count` is `0` when the just-rendered frame changed nothing
+/// visible (`App::render`'s reported damage rect was empty) -- C must treat
+/// that as "do not blit," matching [`pl_ui_dirty`]'s gating contract.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `out`, if non-null, must point to valid, writable
+/// [`PlRenderOut`] storage. The `px`/`rects` pointers written into `*out`
+/// are borrowed until the next call that mutates `ui`
+/// (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render`/`pl_ui_render_ex` again) -- C
+/// must have copied out (e.g. into a DMA source) before making that next
+/// call.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_render_ex(ui: *mut PlUi, out: *mut PlRenderOut) {
+    if out.is_null() {
+        return;
+    }
+    if ui.is_null() {
+        // SAFETY: caller contract -- `out` is valid, writable storage per
+        // the null check above.
+        unsafe {
+            (*out).version = PL_RENDER_ABI_VERSION;
+            (*out).px = core::ptr::null();
+            (*out).px_len = 0;
+            (*out).stride = 0;
+            (*out).rect_count = 0;
+            (*out).rects = core::ptr::null();
+        }
+        return;
+    }
+    // SAFETY: caller contract above.
+    let ui = &mut *ui;
+    let output = ui.app.render();
+    // The framebuffer/panel are 240x240 today and any plausible future
+    // panel this project targets stays well under `u16::MAX` -- saturating
+    // rather than panicking or wrapping keeps this boundary infallible like
+    // every other FFI entry point (module doc's memory rules), at the cost
+    // of a (currently unreachable) clamp instead of UB on a pathological
+    // framebuffer size.
+    let stride = u16::try_from(output.width()).unwrap_or(u16::MAX);
+    let raw = output.as_raw_u16();
+    let damage = output.damage;
+
+    let rect_count = if damage.size.width == 0 || damage.size.height == 0 {
+        0u16
+    } else {
+        ui.last_damage_rects[0] = PlDamageRect {
+            x: u16::try_from(damage.top_left.x).unwrap_or(0),
+            y: u16::try_from(damage.top_left.y).unwrap_or(0),
+            w: u16::try_from(damage.size.width).unwrap_or(u16::MAX),
+            h: u16::try_from(damage.size.height).unwrap_or(u16::MAX),
+        };
+        1u16
+    };
+
+    // SAFETY: caller contract -- `out` is valid, writable storage.
+    unsafe {
+        (*out).version = PL_RENDER_ABI_VERSION;
+        (*out).px = raw.as_ptr();
+        (*out).px_len = raw.len();
+        (*out).stride = stride;
+        (*out).rect_count = rect_count;
+        (*out).rects = if rect_count == 0 { core::ptr::null() } else { ui.last_damage_rects.as_ptr() };
     }
 }
 
@@ -1846,6 +2002,85 @@ mod tests {
         let ui = pl_ui_create(16, 16);
         assert!(!ui.is_null(), "pl_ui_create(16, 16) unexpectedly returned null");
         ui
+    }
+
+    #[test]
+    fn pl_ui_render_ex_null_ui_degrades_to_zeroed_output_with_version_set() {
+        let mut out = PlRenderOut {
+            version: 0,
+            px: core::ptr::null(),
+            px_len: 0xDEAD,
+            stride: 0xDEAD,
+            rect_count: 0xDEAD,
+            rects: core::ptr::null(),
+        };
+        unsafe {
+            pl_ui_render_ex(core::ptr::null_mut(), &mut out);
+        }
+        assert_eq!(out.version, PL_RENDER_ABI_VERSION, "version must be set even for a null ui");
+        assert!(out.px.is_null());
+        assert_eq!(out.px_len, 0);
+        assert_eq!(out.rect_count, 0, "a null ui must report nothing to paint");
+        assert!(out.rects.is_null());
+    }
+
+    #[test]
+    fn pl_ui_render_ex_null_out_is_a_no_op() {
+        let ui = new_ui();
+        // Must not panic/segfault -- the only assertion here is survival.
+        unsafe {
+            pl_ui_render_ex(ui, core::ptr::null_mut());
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_render_ex_first_frame_reports_the_whole_framebuffer_as_one_damage_rect() {
+        let ui = new_ui();
+        let mut out = PlRenderOut {
+            version: 0,
+            px: core::ptr::null(),
+            px_len: 0,
+            stride: 0,
+            rect_count: 0,
+            rects: core::ptr::null(),
+        };
+        unsafe {
+            pl_ui_render_ex(ui, &mut out);
+            assert_eq!(out.version, PL_RENDER_ABI_VERSION);
+            assert!(!out.px.is_null());
+            assert_eq!(out.px_len, out.stride as usize * 16, "16x16 framebuffer from new_ui()");
+            assert_eq!(out.rect_count, 1, "first-ever render has no prior cache, so damage is the whole frame");
+            assert!(!out.rects.is_null());
+            let rect = &*out.rects;
+            assert_eq!((rect.x, rect.y), (0, 0));
+            assert_eq!((rect.w, rect.h), (out.stride, 16));
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_render_ex_second_call_with_no_intervening_change_reports_no_damage() {
+        let ui = new_ui();
+        let mut out = PlRenderOut {
+            version: 0,
+            px: core::ptr::null(),
+            px_len: 0,
+            stride: 0,
+            rect_count: 0,
+            rects: core::ptr::null(),
+        };
+        unsafe {
+            pl_ui_render_ex(ui, &mut out);
+            assert_eq!(out.rect_count, 1, "sanity: first render is dirty");
+            // No `pl_ui_input`/`pl_ui_tick`/`pl_ui_push_event` in between --
+            // nothing about the screen state changed, so the damage pass
+            // should find nothing to repaint the second time.
+            pl_ui_render_ex(ui, &mut out);
+            assert_eq!(out.rect_count, 0, "an unchanged screen must report zero damage on the next render");
+            assert!(out.rects.is_null());
+            pl_ui_destroy(ui);
+        }
     }
 
     #[test]
