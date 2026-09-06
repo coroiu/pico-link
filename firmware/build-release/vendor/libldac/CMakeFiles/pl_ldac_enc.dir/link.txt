@@ -1,2 +1,0 @@
-/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin/arm-none-eabi-ar qc libpl_ldac_enc.a CMakeFiles/pl_ldac_enc.dir/src/ldaclib.c.o CMakeFiles/pl_ldac_enc.dir/src/ldacBT.c.o
-/Applications/ArmGNUToolchain/15.2.rel1/arm-none-eabi/bin/arm-none-eabi-ranlib libpl_ldac_enc.a
