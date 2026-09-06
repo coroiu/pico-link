@@ -28,8 +28,14 @@ use crate::input::NavIntent;
 
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
+use super::paint_key::PaintKey;
 use super::theme::{self, font, icon, palette};
 use super::widget::{Action, FocusEvent, Verb, Widget};
+
+/// Seed for [`VerticalList::paint_key`] -- only needs to differ from other
+/// widgets' own seeds (each screen only ever compares a widget's key
+/// against its own previous frame).
+const LIST_PAINT_KEY_SEED: u64 = 11;
 
 /// An opaque row-identity key, supplied by the call site — e.g. a
 /// Bluetooth device's 6-byte address. `Copy`/allocation-free by design:
@@ -866,6 +872,39 @@ impl Widget for VerticalList {
         Some(self.top_index.get())
     }
 
+    /// Folds everything [`VerticalList::render`] actually reads: which row
+    /// is selected/focused (the selection fill + caret), the scroll-top row
+    /// (which rows are even visible), the item count, and per item the
+    /// label, sublabel, icon, signal-bars level, and activatable flag --
+    /// everything `draw_row` branches on. `key`/`verb` are deliberately
+    /// NOT folded: neither is ever read by `render` (identity and A-rail
+    /// verb are not pixels this widget itself draws).
+    ///
+    /// `VerticalList` does not override [`Widget::redraw_after`], so per
+    /// the mechanical review rule this `paint_key` must not fold time
+    /// either, and it doesn't -- `_ctx` is unused.
+    fn paint_key(&self, _ctx: &RenderCtx) -> PaintKey {
+        let mut key = PaintKey::of(LIST_PAINT_KEY_SEED)
+            .fold(self.selected as u64)
+            .fold(u64::from(self.focused))
+            .fold(self.top_index.get() as u64)
+            .fold(self.items.len() as u64);
+        for item in &self.items {
+            key = key.fold_str(&item.label);
+            key = key.fold_opt_str(item.sublabel.as_deref());
+            key = key.fold(match item.icon {
+                Some(c) => u64::from(u32::from(c)) + 1,
+                None => 0,
+            });
+            key = key.fold(match item.signal_bars {
+                Some(level) => u64::from(level) + 1,
+                None => 0,
+            });
+            key = key.fold(u64::from(item.activatable));
+        }
+        key
+    }
+
     fn on_focus(&mut self, event: FocusEvent) -> Action {
         match event {
             FocusEvent::Gained => {
@@ -1065,6 +1104,46 @@ mod tests {
             });
         let action = list.on_focus(FocusEvent::Activated);
         assert!(matches!(action, Action::Back), "on_activate_index must win when both callbacks are set");
+    }
+
+    // --- paint_key (bead pico-link-7h5.5) ---
+
+    #[test]
+    fn paint_key_is_stable_across_calls_with_no_state_change() {
+        let list = VerticalList::new(items(3));
+        assert_eq!(list.paint_key(&test_ctx()), list.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_selection_moves() {
+        let mut list = VerticalList::new(items(3));
+        let before = list.paint_key(&test_ctx());
+        list.on_intent(NavIntent::Down);
+        let after = list.paint_key(&test_ctx());
+        assert_ne!(before, after, "moving the selection must change the paint key");
+    }
+
+    #[test]
+    fn paint_key_changes_when_focus_changes() {
+        let mut list = VerticalList::new(items(3));
+        let before = list.paint_key(&test_ctx());
+        list.on_focus(FocusEvent::Gained);
+        let after = list.paint_key(&test_ctx());
+        assert_ne!(before, after, "gaining focus changes the selection fill, so the paint key must change");
+    }
+
+    #[test]
+    fn paint_key_changes_when_a_labels_signal_bars_change() {
+        let a = VerticalList::new(vec![ListItem::new("Cans").with_signal_bars(1)]);
+        let b = VerticalList::new(vec![ListItem::new("Cans").with_signal_bars(2)]);
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_ignores_the_identity_key_and_verb_since_neither_is_a_pixel() {
+        let a = VerticalList::new(vec![ListItem::new("Cans").with_key(ListItemKey::from_u64(1))]);
+        let b = VerticalList::new(vec![ListItem::new("Cans").with_key(ListItemKey::from_u64(2))]);
+        assert_eq!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()), "the identity key is never drawn, so it must not affect the paint key");
     }
 
     #[test]

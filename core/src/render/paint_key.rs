@@ -115,6 +115,50 @@ impl PaintKey {
     pub fn fold_str(self, s: &str) -> PaintKey {
         self.fold(fnv1a(s.as_bytes()))
     }
+
+    /// Chains an `Option<&str>` into this key, distinguishing `None` from
+    /// `Some("")` (an empty-but-present string) so the two can never
+    /// collide -- the same shape `super::screen`'s private `fold_opt_str`
+    /// free function uses for the title bar's readout, lifted onto
+    /// `PaintKey` itself so every widget-level `paint_key` (bead
+    /// `pico-link-7h5.5`) can reuse it instead of re-deriving the same
+    /// two-line match.
+    #[must_use]
+    pub fn fold_opt_str(self, s: Option<&str>) -> PaintKey {
+        match s {
+            None => self.fold(0),
+            Some(s) => self.fold(1).fold_str(s),
+        }
+    }
+
+    /// Chains an `Rgb565` color into this key -- every widget-level
+    /// `paint_key` that draws label/value/accent text in a
+    /// caller-selectable color (e.g. `MenuItem::with_label_color`,
+    /// `FieldRow::with_value`) needs the color folded in: two renders with
+    /// the same text but different colors must not compare equal, or the
+    /// SKIP would leave the old color's ink on screen.
+    #[must_use]
+    pub fn fold_color(self, color: embedded_graphics::pixelcolor::Rgb565) -> PaintKey {
+        use embedded_graphics::prelude::RgbColor;
+        self.fold(u64::from(color.r())).fold(u64::from(color.g())).fold(u64::from(color.b()))
+    }
+
+    /// Folds another widget's own [`PaintKey`] into this one -- for a
+    /// composite widget that forwards to exactly one active child instead
+    /// of drawing its own primitives (e.g. `HomeView`, which renders
+    /// whichever face -- status or menu -- is currently active). If
+    /// `other` is [`PaintKey::ALWAYS`] the result is `ALWAYS` too: a child
+    /// that hasn't opted into a real key yet must keep its wrapper
+    /// always-dirty as well, the same "opt in one widget at a time"
+    /// migration guarantee [`PaintKey::ALWAYS`]'s own doc comment
+    /// describes.
+    #[must_use]
+    pub fn fold_key(self, other: PaintKey) -> PaintKey {
+        match (self.0, other.0) {
+            (Some(_), Some(v)) => self.fold(v),
+            _ => PaintKey::ALWAYS,
+        }
+    }
 }
 
 const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
@@ -207,6 +251,77 @@ mod tests {
         // value in the first place (not e.g. a no-op equal to not folding
         // at all).
         assert_ne!(PaintKey::of(1).fold_str(""), PaintKey::of(1));
+    }
+
+    #[test]
+    fn fold_opt_str_distinguishes_none_from_some_empty() {
+        let none = PaintKey::of(1).fold_opt_str(None);
+        let some_empty = PaintKey::of(1).fold_opt_str(Some(""));
+        assert_ne!(none, some_empty);
+    }
+
+    #[test]
+    fn fold_opt_str_of_the_same_text_is_equal() {
+        let a = PaintKey::of(1).fold_opt_str(Some("hello"));
+        let b = PaintKey::of(1).fold_opt_str(Some("hello"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fold_opt_str_of_different_text_is_not_equal() {
+        let a = PaintKey::of(1).fold_opt_str(Some("hello"));
+        let b = PaintKey::of(1).fold_opt_str(Some("world"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fold_color_of_the_same_color_is_equal() {
+        use embedded_graphics::pixelcolor::Rgb565;
+        let a = PaintKey::of(1).fold_color(Rgb565::new(3, 8, 7));
+        let b = PaintKey::of(1).fold_color(Rgb565::new(3, 8, 7));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fold_color_of_different_colors_is_not_equal() {
+        use embedded_graphics::pixelcolor::Rgb565;
+        let a = PaintKey::of(1).fold_color(Rgb565::new(3, 8, 7));
+        let b = PaintKey::of(1).fold_color(Rgb565::new(4, 8, 7));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fold_key_of_two_real_keys_is_equal_when_both_match() {
+        let a = PaintKey::of(1).fold_key(PaintKey::of(2).fold(9));
+        let b = PaintKey::of(1).fold_key(PaintKey::of(2).fold(9));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fold_key_of_two_real_keys_is_not_equal_when_the_child_differs() {
+        let a = PaintKey::of(1).fold_key(PaintKey::of(2).fold(9));
+        let b = PaintKey::of(1).fold_key(PaintKey::of(2).fold(10));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fold_key_is_always_when_the_child_is_always() {
+        // A wrapper forwarding to a child that hasn't opted in yet must
+        // stay always-dirty too -- proven by comparing the result against
+        // itself, since `ALWAYS` is never equal to anything, including
+        // itself (see `PaintKey::ALWAYS`'s doc comment).
+        let wrapped = PaintKey::of(1).fold_key(PaintKey::ALWAYS);
+        #[allow(clippy::eq_op)]
+        let equal = wrapped == wrapped;
+        assert!(!equal, "forwarding an ALWAYS child must produce ALWAYS, which is never equal to itself");
+    }
+
+    #[test]
+    fn fold_key_is_always_when_the_receiver_is_always() {
+        let wrapped = PaintKey::ALWAYS.fold_key(PaintKey::of(2));
+        #[allow(clippy::eq_op)]
+        let equal = wrapped == wrapped;
+        assert!(!equal, "an ALWAYS receiver must stay ALWAYS regardless of the child");
     }
 
     #[test]

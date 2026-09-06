@@ -86,9 +86,14 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::hero::{BitrateStatus, CodecStatus, HeroStatusView, OutLevelDisplay};
 use super::menu::{MenuItem, MenuList};
+use super::paint_key::PaintKey;
 use super::rail::ButtonLabel;
 use super::screen::Screen;
 use super::widget::{Action, ChromeContribution, FocusEvent, Verb, Widget};
+
+/// Seed for [`HomeView::paint_key`] -- only needs to differ from other
+/// widgets' own seeds.
+const HOME_PAINT_KEY_SEED: u64 = 15;
 
 /// Home's fixed title -- the "Pico Link" brand mark, now that Home (not
 /// Devices) is the navigator root (design section 5's screen inventory).
@@ -370,6 +375,36 @@ impl Widget for HomeView {
         }
     }
 
+    /// Folds which face is active plus that active child's own
+    /// [`Widget::paint_key`] (via [`PaintKey::fold_key`]) -- the same
+    /// "forward to whichever child is actually showing" shape [`Self::
+    /// render`] itself uses, since only one face is ever drawn at a time.
+    /// The hidden face's key is not folded at all: it contributes nothing
+    /// to what's on screen, and folding it anyway would make `HomeView`
+    /// spuriously dirty every time the *other* face's state changed.
+    ///
+    /// `HomeView` overrides [`Widget::redraw_after`] (forwarding the `min`
+    /// over both children), so per the mechanical review rule this
+    /// `paint_key` must fold time -- and it does, transitively: whichever
+    /// child is active folds its own quantised time consequence into the
+    /// key this method returns (`hero.rs`'s `paint_key` does; `menu.rs`'s
+    /// does not, correctly, since `MenuList` has no time-driven appearance
+    /// of its own). There is nothing further for this wrapper to fold
+    /// directly.
+    fn paint_key(&self, ctx: &RenderCtx) -> PaintKey {
+        let face = self.face();
+        let child_key = match face {
+            HomeFace::Status => self.hero.paint_key(ctx),
+            HomeFace::Menu => self.menu.paint_key(ctx),
+        };
+        PaintKey::of(HOME_PAINT_KEY_SEED)
+            .fold(match face {
+                HomeFace::Status => 0,
+                HomeFace::Menu => 1,
+            })
+            .fold_key(child_key)
+    }
+
     /// The `min` over `hero` and `menu`'s own answers (pico-link-vxc, D2) --
     /// matching [`Screen::redraw_after`]'s fold over multiple widgets.
     /// Without this override the default (`None`) would silently swallow
@@ -435,6 +470,34 @@ mod tests {
             Some(Verb::Exception("devs")),
             "A must render live on the status face too (it toggles the face)"
         );
+    }
+
+    // --- paint_key (bead pico-link-7h5.5) ---
+
+    #[test]
+    fn paint_key_is_stable_across_calls_with_no_state_change() {
+        let view = fresh_home_view();
+        assert_eq!(view.paint_key(&test_ctx()), view.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_toggling_faces() {
+        let mut view = fresh_home_view();
+        let status_key = view.paint_key(&test_ctx());
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.face(), HomeFace::Menu);
+        let menu_key = view.paint_key(&test_ctx());
+        assert_ne!(status_key, menu_key, "toggling faces must change the paint key even if a child's own state happens to match");
+    }
+
+    #[test]
+    fn paint_key_on_the_menu_face_changes_when_the_menus_selection_moves() {
+        let mut view = fresh_home_view();
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        let before = view.paint_key(&test_ctx());
+        view.on_intent(NavIntent::Down);
+        let after = view.paint_key(&test_ctx());
+        assert_ne!(before, after, "moving the menu's selection must change HomeView's own paint key");
     }
 
     #[test]

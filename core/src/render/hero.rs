@@ -41,8 +41,13 @@ use crate::platform::Instant;
 use super::chrome::carve_edge;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
+use super::paint_key::PaintKey;
 use super::theme::{self, font, palette};
 use super::widget::{ChromeContribution, Widget};
+
+/// Seed for [`HeroStatusView::paint_key`] -- only needs to differ from
+/// other widgets' own seeds.
+const HERO_PAINT_KEY_SEED: u64 = 14;
 
 /// Left rule `L` (px, area-relative) — shared by the device-name line, the
 /// hero codec word, the banner text and the stat strip. Design
@@ -663,6 +668,129 @@ impl Widget for HeroStatusView {
         Ok(())
     }
 
+    /// Folds everything [`HeroStatusView::render`] actually reads: the
+    /// device name, the codec status (word/fallback reason/bitrate), the
+    /// muted flag (together with `fallback` this fully determines
+    /// [`Self::active_banner`] -- see that method's own priority rule, so
+    /// there is nothing left of the banner to fold separately), the stat
+    /// line, and the OUT-meter sample.
+    ///
+    /// **THE TIME-FOLDING TRAP** (design section 3.2, this widget's own
+    /// worked example in section 8): [`Self::redraw_after`] overrides the
+    /// default, so per the mechanical review rule this `paint_key` MUST
+    /// fold the *quantised visual consequence* of time -- never
+    /// `ctx.now()` itself.
+    ///
+    /// CORRECTED 2026-09-06 (coordinator finding, bead pico-link-7h5.5):
+    /// an earlier version of this method reasoned that the continuously-
+    /// decaying release ballistic `render` computes from `attack_rms_*`/
+    /// `attack_rms_*_at` (bead pico-link-ajj) didn't need folding, on the
+    /// theory that a fresh sample arrives on every `Event::LevelsChanged`
+    /// and that alone drives the visible motion. That reasoning was
+    /// backwards: `Self::redraw_after` schedules a repaint every
+    /// `OUT_LEVEL_REFRESH_INTERVAL` *specifically* so the bar keeps
+    /// decaying between publishes, with no new sample and therefore no
+    /// change to `received_at`. With nothing time-derived folded, the
+    /// damage pass saw an unchanged key on every one of those scheduled
+    /// repaints and skipped `render` outright -- the exact "folding
+    /// nothing time-related freezes a time-driven widget" failure this
+    /// bead's own rule warns about, and it made the ballistic invisible
+    /// (the bar only ever stepped at publish cadence, the behaviour bead
+    /// pico-link-ajj was written to eliminate).
+    ///
+    /// The fix: recompute the same decayed value `render` does from
+    /// `ctx.elapsed_since(attack_rms_*_at)`, then quantise it through
+    /// [`theme::vertical_level_dbfs_segment_count`] -- the exact mapping
+    /// [`theme::draw_vertical_level_meter`] uses to choose how many of the
+    /// 16 segments light up. That segment count (0..=16 per channel, 17
+    /// possible values) *is* the quantised visual consequence: it changes
+    /// only at the instant a segment actually lights or extinguishes on
+    /// screen, never merely because `ctx.now()` advanced. The peak-hold
+    /// cap gets the same treatment for scale consistency, though it needs
+    /// no time term of its own -- `render` draws it straight from
+    /// `level.hold_l`/`hold_r` with no decay, so its position cannot move
+    /// without a new sample, which `received_at` already catches.
+    ///
+    /// Also still folded: `level.received_at` (a sample timestamp, not the
+    /// render instant -- it only changes when a new reading actually
+    /// arrives, catching everything a new sample can change) and the
+    /// already-computed boolean `age >= OUT_LEVEL_STALE_AFTER` (the same
+    /// comparison `render` and `redraw_after` both make, catching the
+    /// "stream went silent" transition to absent). Folding `ctx.now()`
+    /// directly would make this widget permanently dirty (a silent no-op
+    /// -- see `PaintKey`'s doc comment); folding nothing time-related at
+    /// all is exactly the bug described above.
+    fn paint_key(&self, ctx: &RenderCtx) -> PaintKey {
+        let key = PaintKey::of(HERO_PAINT_KEY_SEED).fold_str(&self.device_name);
+        let key = match &self.status {
+            CodecStatus::NoLink => key.fold(0),
+            CodecStatus::Connected { word, fallback, bitrate } => {
+                let key = key.fold(1).fold_str(word);
+                let key = key.fold_opt_str(fallback.as_deref());
+                match bitrate {
+                    BitrateStatus::Idle => key.fold(0),
+                    BitrateStatus::Kbps(kbps) => key.fold(1).fold(u64::from(*kbps)),
+                }
+            }
+        };
+        let key = key.fold(u64::from(self.muted));
+        let key = key.fold_opt_str(self.stat_line.as_deref());
+        match &self.out_level {
+            None => key.fold(0),
+            Some(level) => {
+                let stale = ctx.elapsed_since(level.received_at) >= OUT_LEVEL_STALE_AFTER;
+                // The bar's actually-drawn value (coordinator finding on
+                // this bead, 2026-09-06): `render` does not draw
+                // `level.rms_l`/`rms_r` at all -- it draws
+                // `crate::app::decay_rms` applied to `attack_rms_*` and
+                // `attack_rms_*_at`, a value that changes continuously
+                // between publishes purely as `ctx.now()` advances (the
+                // release ballistic, bead pico-link-ajj). Folding the raw,
+                // publish-cadence `rms_l`/`rms_r` fields (as this key used
+                // to) folds a value the widget never paints, and folds
+                // nothing that actually tracks the bar's motion between
+                // samples -- exactly the "folding nothing time-related
+                // freezes a time-driven widget" failure this bead's own
+                // rule warns about: `HeroStatusView::redraw_after`
+                // schedules a repaint every `OUT_LEVEL_REFRESH_INTERVAL`
+                // while live, the damage pass would call this `paint_key`,
+                // see no change, and skip `render` -- the decay would only
+                // ever visibly step at publish events again.
+                //
+                // The fix folds the *quantised visual consequence*
+                // instead of `ctx.now()` itself: run the same decayed
+                // value `render` computes through
+                // `theme::vertical_level_dbfs_segment_count`, the exact
+                // mapping `draw_vertical_level_meter` uses to choose how
+                // many of the 16 segments light up. That count only has
+                // 17 possible values (0..=16) and only changes at the
+                // instant a segment actually lights or extinguishes on
+                // screen -- an honest, cheap total summary of what the eye
+                // can see, not a proxy for "time passed".
+                let displayed_rms_l = crate::app::decay_rms(level.attack_rms_l, ctx.elapsed_since(level.attack_rms_l_at));
+                let displayed_rms_r = crate::app::decay_rms(level.attack_rms_r, ctx.elapsed_since(level.attack_rms_r_at));
+                let segments_l = theme::vertical_level_dbfs_segment_count(displayed_rms_l);
+                let segments_r = theme::vertical_level_dbfs_segment_count(displayed_rms_r);
+                // The peak-hold cap (`draw_vertical_level_meter`'s `hold`
+                // parameter) is drawn straight from `level.hold_l`/
+                // `hold_r` with no decay applied -- its on-screen position
+                // cannot move without a new sample, so it needs no
+                // time-derived fold, only the same segment-count
+                // quantisation for consistency with the bar it shares a
+                // scale with.
+                let hold_segments_l = theme::vertical_level_dbfs_segment_count(level.hold_l);
+                let hold_segments_r = theme::vertical_level_dbfs_segment_count(level.hold_r);
+                key.fold(1)
+                    .fold(level.received_at.as_micros())
+                    .fold(u64::try_from(segments_l).expect("segment count is in 0..=16"))
+                    .fold(u64::try_from(segments_r).expect("segment count is in 0..=16"))
+                    .fold(u64::try_from(hold_segments_l).expect("segment count is in 0..=16"))
+                    .fold(u64::try_from(hold_segments_r).expect("segment count is in 0..=16"))
+                    .fold(u64::from(stale))
+            }
+        }
+    }
+
     /// Exposes the fallback state (design section 6.2, link 3: the X-rail
     /// label switches from "link" to "why?" under fallback) via
     /// [`ChromeContribution::fallback`] rather than painting the rail
@@ -1005,6 +1133,214 @@ mod tests {
             rows_without, rows_with,
             "the stat strip must occupy the SAME rows whether or not the banner is showing -- its y is a fixed grid slot (STAT_TOP), not derived from a cursor that the banner also advances"
         );
+    }
+
+    // --- paint_key (bead pico-link-7h5.5): the time-folding trap -------
+
+    fn out_level_at(received_at: Instant) -> OutLevelDisplay {
+        OutLevelDisplay {
+            peak_l: 200,
+            peak_r: 180,
+            rms_l: 120,
+            rms_r: 100,
+            hold_l: 150,
+            hold_r: 140,
+            received_at,
+            attack_rms_l: 120,
+            attack_rms_r: 100,
+            attack_rms_l_at: received_at,
+            attack_rms_r_at: received_at,
+        }
+    }
+
+    #[test]
+    fn paint_key_is_stable_across_calls_with_no_state_change() {
+        let view = nominal();
+        assert_eq!(view.paint_key(&test_ctx()), view.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_does_not_change_from_ctx_now_alone_with_no_out_level() {
+        // No `out_level` at all: this widget's own appearance has nothing
+        // time-driven left to fold (`redraw_after` returns `None` in this
+        // case too -- see that method), so advancing the clock alone must
+        // not change the key.
+        let view = nominal();
+        let t0 = RenderCtx::at(Instant::from_micros(0));
+        let t1 = RenderCtx::at(Instant::from_micros(10_000_000));
+        assert_eq!(view.paint_key(&t0), view.paint_key(&t1), "advancing the clock alone must not dirty a widget with no live OUT sample");
+    }
+
+    #[test]
+    fn paint_key_does_not_change_from_ctx_now_alone_while_the_out_level_is_still_fresh() {
+        // Same `OutLevelDisplay`, same `received_at` -- only `ctx.now()`
+        // moves, by an amount too small for the release ballistic to
+        // cross even one of `theme::VERTICAL_METER_DBFS_THRESHOLDS`' 16
+        // segment boundaries (1ms of decay is well under 1% of any
+        // starting value -- see `decay_rms`'s own doc comment for the
+        // decay curve). This is the "folding raw now() makes the widget
+        // permanently dirty" failure mode this test exists to rule out --
+        // NOT a claim that no time span ever changes the key while
+        // "fresh": `paint_key_changes_as_the_release_ballistic_crosses_a_
+        // segment_boundary_with_no_new_sample` below proves the opposite
+        // for a span long enough to matter, which is the whole point of
+        // this bead's fix.
+        let received_at = Instant::from_micros(1_000_000);
+        let view = nominal().with_out_level(Some(out_level_at(received_at)));
+        let t0 = RenderCtx::at(received_at);
+        let t1 = RenderCtx::at(received_at + Duration::from_millis(1));
+        assert_eq!(
+            view.paint_key(&t0),
+            view.paint_key(&t1),
+            "the paint key must not change purely from ctx.now() advancing by an amount too small to move any segment"
+        );
+    }
+
+    #[test]
+    fn paint_key_changes_exactly_when_the_out_level_crosses_the_stale_threshold() {
+        // The "folding nothing time-related freezes a time-driven widget"
+        // failure mode: the sample's `received_at` never changes, but the
+        // quantised stale boolean must flip once `ctx.now()` crosses
+        // `OUT_LEVEL_STALE_AFTER`, and the key must change with it -- this
+        // is what lets the meter actually go absent on schedule (design
+        // section 15) even with no new event.
+        let received_at = Instant::from_micros(1_000_000);
+        let view = nominal().with_out_level(Some(out_level_at(received_at)));
+        let just_before = RenderCtx::at(received_at + OUT_LEVEL_STALE_AFTER.checked_sub(Duration::from_millis(1)).expect("OUT_LEVEL_STALE_AFTER is well over 1ms"));
+        let just_after = RenderCtx::at(received_at + (OUT_LEVEL_STALE_AFTER + Duration::from_millis(1)));
+        assert_ne!(
+            view.paint_key(&just_before),
+            view.paint_key(&just_after),
+            "crossing the stale threshold with no new sample must still change the paint key"
+        );
+    }
+
+    #[test]
+    fn paint_key_changes_when_a_new_sample_arrives_even_at_the_same_instant() {
+        let ctx = test_ctx();
+        let a = nominal().with_out_level(Some(out_level_at(Instant::from_micros(0))));
+        let b = nominal().with_out_level(Some(out_level_at(Instant::from_micros(1))));
+        assert_ne!(a.paint_key(&ctx), b.paint_key(&ctx), "a new sample's received_at must change the key even under the same render instant");
+    }
+
+    #[test]
+    fn paint_key_changes_when_a_level_value_changes_but_received_at_does_not() {
+        // Mutates `attack_rms_l` (the ballistic anchor `render` actually
+        // decays and draws), not `peak_l`/`rms_l` -- `render` never reads
+        // the latter two at all, so folding them would test nothing about
+        // what's on screen. `test_ctx()` sits at the same instant as
+        // `received_at` (elapsed == 0), so `decay_rms` is a no-op here and
+        // the mutated value passes straight through to the segment count.
+        let received_at = Instant::from_micros(0);
+        let a = nominal().with_out_level(Some(out_level_at(received_at)));
+        let mut sample = out_level_at(received_at);
+        sample.attack_rms_l = 255;
+        let b = nominal().with_out_level(Some(sample));
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_the_hold_cap_moves_but_received_at_does_not() {
+        // `render` draws the peak-hold cap straight from `level.hold_l`/
+        // `hold_r` (no decay) -- pins that this key still folds it even
+        // though it needed no time term.
+        let received_at = Instant::from_micros(0);
+        let a = nominal().with_out_level(Some(out_level_at(received_at)));
+        let mut sample = out_level_at(received_at);
+        sample.hold_l = 255;
+        let b = nominal().with_out_level(Some(sample));
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+    }
+
+    /// THE DELIVERABLE for the coordinator's finding on this bead
+    /// (2026-09-06): the A4 property test
+    /// (`damage_rendered_frame_matches_a_full_frame_render_of_the_same_state_for_every_screen`)
+    /// cannot catch this bug class -- it only ever compares two renders of
+    /// the SAME `ctx.now()`. The actual failure is across two DIFFERENT
+    /// instants with the exact same `OutLevelSample`/`OutLevelDisplay`
+    /// (no new event, no new `received_at`): the release ballistic
+    /// (`crate::app::decay_rms` over `attack_rms_l`/`attack_rms_l_at`,
+    /// bead pico-link-ajj) keeps moving as `ctx.now()` advances, and
+    /// `Self::redraw_after` schedules exactly this kind of no-new-sample
+    /// repaint every `OUT_LEVEL_REFRESH_INTERVAL` while the reading is
+    /// live. If `paint_key` doesn't fold the decayed value's quantised
+    /// segment count, those scheduled repaints see an unchanged key, the
+    /// damage pass skips `render`, and the bar freezes between publishes
+    /// -- silently undoing the whole ballistic.
+    ///
+    /// `anchor = 200` and `elapsed = 1000ms` are chosen from the existing
+    /// `decay_rms_after_one_second_is_roughly_ten_percent` fixture
+    /// (200 -> ~20, comfortably crossing several of
+    /// `theme::VERTICAL_METER_DBFS_THRESHOLDS`' 16 segment boundaries, not
+    /// balanced on the edge of just one) so this test's premise -- that a
+    /// segment boundary is actually crossed -- is pinned by another test,
+    /// not asserted here on faith.
+    #[test]
+    fn paint_key_changes_as_the_release_ballistic_crosses_a_segment_boundary_with_no_new_sample() {
+        let received_at = Instant::from_micros(1_000_000);
+        let mut sample = out_level_at(received_at);
+        sample.attack_rms_l = 200;
+        sample.attack_rms_l_at = received_at;
+        let view = nominal().with_out_level(Some(sample));
+
+        // Same OutLevelDisplay both times -- only ctx.now() moves.
+        let t0 = RenderCtx::at(received_at);
+        let t1 = RenderCtx::at(received_at + Duration::from_millis(1000));
+
+        assert_ne!(
+            view.paint_key(&t0),
+            view.paint_key(&t1),
+            "the release ballistic decaying between publishes must change the paint key even though the OutLevelSample itself never changed -- otherwise the damage pass would freeze the bar mid-decay"
+        );
+    }
+
+    #[test]
+    fn paint_key_distinguishes_no_out_level_from_a_present_one() {
+        let without = nominal();
+        let with = nominal().with_out_level(Some(out_level_at(Instant::from_micros(0))));
+        assert_ne!(without.paint_key(&test_ctx()), with.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_with_the_codec_word_fallback_and_bitrate() {
+        let word_a = nominal();
+        let word_b = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+        );
+        assert_ne!(word_a.paint_key(&test_ctx()), word_b.paint_key(&test_ctx()), "a different codec word must change the key");
+
+        let fallback = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected {
+                word: String::from("LDAC"),
+                fallback: Some(String::from("reason")),
+                bitrate: BitrateStatus::Kbps(909),
+            },
+        );
+        assert_ne!(word_a.paint_key(&test_ctx()), fallback.paint_key(&test_ctx()), "a fallback reason must change the key");
+
+        let bitrate = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(328) },
+        );
+        assert_ne!(word_a.paint_key(&test_ctx()), bitrate.paint_key(&test_ctx()), "a different bitrate must change the key");
+
+        let no_link = HeroStatusView::new("Sony WH-1000XM5", CodecStatus::NoLink);
+        assert_ne!(word_a.paint_key(&test_ctx()), no_link.paint_key(&test_ctx()), "NoLink must differ from Connected");
+    }
+
+    #[test]
+    fn paint_key_changes_with_muted_and_stat_line() {
+        let base = nominal();
+        let muted = nominal().with_muted(true);
+        assert_ne!(base.paint_key(&test_ctx()), muted.paint_key(&test_ctx()));
+
+        let no_stat = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+        );
+        assert_ne!(no_stat.paint_key(&test_ctx()), base.paint_key(&test_ctx()), "a stat line vs none must change the key");
     }
 
     #[test]

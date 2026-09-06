@@ -45,8 +45,14 @@ use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::{name_top_offset, username_top_offset};
+use super::paint_key::PaintKey;
 use super::theme::{font, palette};
 use super::widget::Widget;
+
+/// Seed for [`MessageView::paint_key`] -- only needs to differ from other
+/// widgets' own seeds (each screen only ever compares a widget's key
+/// against its own previous frame, per [`PaintKey::fold`]'s doc comment).
+const MESSAGE_PAINT_KEY_SEED: u64 = 10;
 
 /// Extra top padding (beyond the label's own baseline offset) before the
 /// first line of the message, so it isn't glued to the chrome's title-bar
@@ -127,6 +133,23 @@ impl Widget for MessageView {
     fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         render_message(area, self.icon, self.icon_color, &self.headline, self.headline_color, self.subline.as_deref(), target);
         Ok(())
+    }
+
+    /// Folds everything [`render_message`] actually reads: the icon (and
+    /// its color), the headline (and its color), and the subline. Nothing
+    /// here is time-driven -- [`MessageView`] does not override
+    /// [`Widget::redraw_after`], so per the mechanical review rule this
+    /// `paint_key` must not fold time either, and it doesn't.
+    fn paint_key(&self, _ctx: &RenderCtx) -> PaintKey {
+        let key = PaintKey::of(MESSAGE_PAINT_KEY_SEED)
+            .fold(match self.icon {
+                Some(c) => u64::from(u32::from(c)) + 1,
+                None => 0,
+            })
+            .fold_color(self.icon_color)
+            .fold_str(&self.headline)
+            .fold_color(self.headline_color);
+        key.fold_opt_str(self.subline.as_deref())
     }
 }
 
@@ -225,6 +248,35 @@ mod tests {
         assert!(any_error_ink, "an overridden headline color should be visible");
         let any_default_ink = fb.pixels().any(|p| p.1 == palette::TEXT_PRIMARY);
         assert!(!any_default_ink, "the default headline color should not appear when overridden");
+    }
+
+    // --- paint_key (bead pico-link-7h5.5) ---
+
+    #[test]
+    fn paint_key_is_stable_across_calls_with_no_state_change() {
+        let view = MessageView::new("Waiting for sync...");
+        assert_eq!(view.paint_key(&test_ctx()), view.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_the_headline_changes() {
+        let a = MessageView::new("Waiting for sync...");
+        let b = MessageView::new("Sync error");
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_the_headline_color_changes() {
+        let a = MessageView::new("Sync error");
+        let b = MessageView::new("Sync error").with_headline_color(palette::STATUS_ERROR);
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_distinguishes_no_subline_from_an_empty_one() {
+        let a = MessageView::new("Nothing here yet");
+        let b = MessageView::new("Nothing here yet").with_subline("");
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
     }
 
     #[test]

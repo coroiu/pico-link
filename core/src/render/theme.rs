@@ -652,7 +652,14 @@ const VERTICAL_METER_DBFS_THRESHOLDS: [u8; VERTICAL_METER_SEGMENT_COUNT as usize
 /// cap (`hold_index`) in [`draw_vertical_level_meter`] so both read off one
 /// scale — see bead pico-link-ajj, which found the previous code split them
 /// (log-shaped intent, linear-shaped bar).
-fn vertical_level_dbfs_segment_count(level: u8) -> i32 {
+///
+/// `pub(crate)`, not private: [`super::hero::HeroStatusView::paint_key`]
+/// (bead pico-link-7h5.5) needs the exact same quantisation this function
+/// applies to the bar, to fold the *segment count* the release ballistic
+/// will actually paint rather than the raw continuously-decaying `u8` --
+/// exporting this one function keeps that one threshold table the single
+/// source of truth instead of a second copy drifting out of sync with it.
+pub(crate) fn vertical_level_dbfs_segment_count(level: u8) -> i32 {
     VERTICAL_METER_DBFS_THRESHOLDS.iter().filter(|&&threshold| level >= threshold).count() as i32
 }
 
