@@ -104,6 +104,29 @@ impl PaintKey {
             }
         }
     }
+
+    /// Chains a UTF-8 string into this key -- convenience over folding a
+    /// string's bytes a `u64` at a time by hand. Internally a plain FNV-1a
+    /// over the string's bytes: this project has no `std`/heap-hasher
+    /// dependency to reach for, and a `paint_key` is not a hash used for
+    /// anything security-sensitive, so a simple, well-known, allocation-free
+    /// hash is exactly the right amount of machinery.
+    #[must_use]
+    pub fn fold_str(self, s: &str) -> PaintKey {
+        self.fold(fnv1a(s.as_bytes()))
+    }
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 impl PartialEq for PaintKey {
@@ -161,6 +184,29 @@ mod tests {
         let a = PaintKey::of(0).fold(1).fold(2);
         let b = PaintKey::of(0).fold(2).fold(1);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fold_str_of_the_same_text_is_equal() {
+        let a = PaintKey::of(1).fold_str("hello");
+        let b = PaintKey::of(1).fold_str("hello");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fold_str_of_different_text_is_not_equal() {
+        assert_ne!(PaintKey::of(1).fold_str("hello"), PaintKey::of(1).fold_str("world"));
+    }
+
+    #[test]
+    fn fold_str_of_empty_and_absent_are_distinguishable() {
+        // Not a `fold_str` guarantee on its own -- folding a distinguishing
+        // presence tag before `fold_str` (as `screen::fold_opt_str` does)
+        // is what actually keeps `Some("")` from colliding with `None`.
+        // This test just proves `fold_str("")` is a stable, well-defined
+        // value in the first place (not e.g. a no-op equal to not folding
+        // at all).
+        assert_ne!(PaintKey::of(1).fold_str(""), PaintKey::of(1));
     }
 
     #[test]

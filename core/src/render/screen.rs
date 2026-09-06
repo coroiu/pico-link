@@ -11,6 +11,7 @@ use core::convert::Infallible;
 
 use embedded_graphics::{
     draw_target::DrawTargetExt,
+    geometry::OriginDimensions,
     prelude::{Point, Primitive, Size},
     primitives::{Circle, PrimitiveStyle, Rectangle},
     Drawable,
@@ -25,6 +26,7 @@ use crate::panel::Button;
 use super::chrome::ChromeLayout;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
+use super::paint_key::PaintKey;
 use super::rail::{draw_rail, ButtonLabel, ButtonLabels};
 use super::theme::{font, icon, palette};
 use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Verb, Widget};
@@ -100,6 +102,109 @@ fn draw_link_glyph(link_state: LinkState, right_cursor: i32, title_mid_y: i32, t
     right_cursor - link_width - TITLE_ELEMENT_GAP
 }
 
+/// One entry in [`Screen::paint_cache`]: what a chrome pseudo-region or
+/// widget looked like at the end of the last *painted* frame, per the
+/// damage pass design (`.planning/design/2026-09-06-damage-rect-render-
+/// and-partial-blit.md` section 3.3). Slot order is fixed and matches
+/// [`Screen::render`]'s own build order every frame: index 0 is the title
+/// bar pseudo-region, index 1 is the button rail pseudo-region, and index
+/// `2 + i` is `self.widgets[i]`. `damage_hint` is deliberately not part of
+/// this cache -- unlike `key`/`area`, it is cheap to recompute from the
+/// still-live widget the moment a slot turns out to be dirty (section
+/// 3.3 step 4), so there is nothing stale here to compare against.
+#[derive(Debug, Clone, Copy)]
+struct PaintSlot {
+    key: PaintKey,
+    area: Rectangle,
+}
+
+/// Seeds only need to differ from each other and from a widget's own seed
+/// space (widgets choose their own in bead `pico-link-7h5.5`) -- the exact
+/// values carry no meaning.
+const TITLE_PAINT_KEY_SEED: u64 = 1;
+const RAIL_PAINT_KEY_SEED: u64 = 2;
+
+/// Folds `text` into `key` if present, or a distinguishable "absent" tag if
+/// not -- so `Some("")` (an empty but present string) can never collide
+/// with `None`.
+fn fold_opt_str(key: PaintKey, text: Option<&str>) -> PaintKey {
+    match text {
+        None => key.fold(0),
+        Some(text) => key.fold(1).fold_str(text),
+    }
+}
+
+fn fold_button_label(key: PaintKey, label: &ButtonLabel) -> PaintKey {
+    match label {
+        ButtonLabel::Inert => key.fold(0),
+        ButtonLabel::Live(text) => key.fold(1).fold_str(text),
+    }
+}
+
+/// The title bar's own paint key -- everything [`Screen::render`]'s title
+/// bar drawing actually reads: the resolved title text, the readout, the
+/// status dot, and the link glyph. See the damage design's section 3.5:
+/// chrome is not exempt from paint keys just because it isn't a [`Widget`].
+fn title_paint_key(title_text: &str, readout_text: Option<&str>, status: Option<ChromeStatus>, link: Option<LinkState>) -> PaintKey {
+    let key = PaintKey::of(TITLE_PAINT_KEY_SEED).fold_str(title_text);
+    let key = fold_opt_str(key, readout_text);
+    let key = key.fold(match status {
+        None => 0,
+        Some(ChromeStatus::Success) => 1,
+        Some(ChromeStatus::Error) => 2,
+        Some(ChromeStatus::Neutral) => 3,
+    });
+    key.fold(match link {
+        None => 0,
+        Some(LinkState::Idle) => 1,
+        Some(LinkState::Scanning) => 2,
+        Some(LinkState::Connecting) => 3,
+        Some(LinkState::Connected) => 4,
+    })
+}
+
+/// The button rail's own paint key -- the four already-resolved
+/// [`ButtonLabel`]s, which already fold in the focused widget's
+/// [`ChromeContribution`], `can_go_back`, and the screen's static labels
+/// (see [`Screen::resolve_a`]/[`Screen::resolve_button`]), so nothing that
+/// can change the rail's pixels is missing from this key.
+fn rail_paint_key(labels: &ButtonLabels) -> PaintKey {
+    let key = PaintKey::of(RAIL_PAINT_KEY_SEED);
+    let key = fold_button_label(key, &labels.a);
+    let key = fold_button_label(key, &labels.b);
+    let key = fold_button_label(key, &labels.x);
+    fold_button_label(key, &labels.y)
+}
+
+/// The smallest rect containing both `a` and `b`. `embedded-graphics`'s
+/// `Rectangle` ships `intersection` but no `union`, so the damage pass
+/// grows its own. A zero-sized operand is the identity element (returns
+/// the other rect unchanged) -- load-bearing for a widget whose *old*
+/// cached area is `Rectangle::zero()` (never rendered last frame, per
+/// `Screen::render`'s layout pass): unioning that in must not corrupt the
+/// result with a spurious corner at the origin.
+fn union_rect(a: Rectangle, b: Rectangle) -> Rectangle {
+    if a.is_zero_sized() {
+        return b;
+    }
+    if b.is_zero_sized() {
+        return a;
+    }
+    let a_end = Point::new(a.top_left.x + a.size.width as i32, a.top_left.y + a.size.height as i32);
+    let b_end = Point::new(b.top_left.x + b.size.width as i32, b.top_left.y + b.size.height as i32);
+    let top_left = Point::new(a.top_left.x.min(b.top_left.x), a.top_left.y.min(b.top_left.y));
+    let end = Point::new(a_end.x.max(b_end.x), a_end.y.max(b_end.y));
+    Rectangle::new(top_left, Size::new((end.x - top_left.x).max(0) as u32, (end.y - top_left.y).max(0) as u32))
+}
+
+/// Whether `a` and `b` share any pixels -- the SKIP test itself (design
+/// section 1/3.3 step 7): a chrome pseudo-region or widget is drawn this
+/// frame exactly when its own area intersects the frame damage rect,
+/// regardless of whether *it* is the thing that changed.
+fn rects_intersect(a: Rectangle, b: Rectangle) -> bool {
+    !a.intersection(&b).is_zero_sized()
+}
+
 pub struct Screen {
     pub title: String,
     /// Static button-rail labels, e.g. control legends. Not a `Widget` —
@@ -111,6 +216,15 @@ pub struct Screen {
     pub buttons: ButtonLabels,
     widgets: Vec<Box<dyn Widget>>,
     focused_index: Option<usize>,
+    /// What every chrome pseudo-region and widget looked like at the end
+    /// of the last frame this screen actually painted -- the damage pass's
+    /// diff target (design section 3.3 step 3). Empty on a freshly built
+    /// `Screen`, which is itself a cache miss and therefore forces full
+    /// damage on this screen's first render -- no separate "first frame"
+    /// flag needed here (`Navigator` still forces it too, since a *pop*
+    /// reveals an already-primed `Screen` whose own cache would otherwise
+    /// see nothing dirty -- see `Navigator`'s `force_full_damage`).
+    paint_cache: Vec<PaintSlot>,
 }
 
 impl Screen {
@@ -121,6 +235,7 @@ impl Screen {
             buttons: ButtonLabels::default(),
             widgets,
             focused_index: None,
+            paint_cache: Vec::new(),
         }
     }
 
@@ -360,134 +475,254 @@ impl Screen {
     /// screen fact — see [`Screen::resolve_button`] and [`BACK_LABEL`]'s
     /// doc comments for why B is resolved outside the normal
     /// widget-then-screen fallback chain.
+    /// The frame damage pass (`.planning/design/2026-09-06-damage-rect-
+    /// render-and-partial-blit.md` section 3.3): lays out every widget
+    /// plus the two chrome pseudo-regions, diffs their [`PaintKey`]s and
+    /// areas against [`Self::paint_cache`], fills only the resulting
+    /// damage rect (replacing the old whole-framebuffer clear), redraws
+    /// every chrome region/widget whose area *intersects* that rect (not
+    /// just the ones that changed -- section 3.3's correctness rule, so an
+    /// unrelated widget overlapping a repainted region never goes stale),
+    /// commits the fresh cache, and returns the damage rect actually
+    /// painted -- `Rectangle::zero()` if nothing needed repainting.
+    ///
+    /// `force_full_damage` short-circuits the diff and damages the whole
+    /// framebuffer -- the caller ([`super::navigator::Navigator::render`])
+    /// sets this on the enumerated full-damage triggers (first frame,
+    /// push/pop/replace, resize, wake); an empty-or-mismatched
+    /// [`Self::paint_cache`] (this screen's own first render, or a
+    /// screen whose widget count somehow changed) forces it independently.
+    ///
+    /// `can_go_back` is a navigator fact (`Navigator::depth() > 1`), not a
+    /// screen fact — see [`Screen::resolve_button`] and [`BACK_LABEL`]'s
+    /// doc comments for why B is resolved outside the normal
+    /// widget-then-screen fallback chain.
+    #[allow(clippy::too_many_lines)] // the damage pass is one linear sequence of numbered steps (section 3.3) -- splitting it up would scatter, not shrink, the logic
     pub(super) fn render(
-        &self,
+        &mut self,
         chrome: &ChromeLayout,
         can_go_back: bool,
         ctx: &RenderCtx,
+        force_full_damage: bool,
         target: &mut FrameBuffer565,
-    ) -> Result<(), Infallible> {
-        chrome.title.into_styled(PrimitiveStyle::with_fill(palette::SURFACE)).draw(target)?;
-
-        // Hairline divider along the title bar's bottom edge — the same
-        // `palette::DIVIDER` hairline the list rows use between unfocused
-        // rows, so chrome and content read as one consistent visual
-        // language rather than content borrowing a rule chrome doesn't
-        // also follow. The rail draws its own hairlines (inner edge +
-        // between slots) in `draw_rail`.
-        if chrome.title.size.height > 0 {
-            let divider = Rectangle::new(
-                Point::new(chrome.title.top_left.x, chrome.title.top_left.y + chrome.title.size.height as i32 - 1),
-                Size::new(chrome.title.size.width, 1),
-            );
-            divider.into_styled(PrimitiveStyle::with_fill(palette::DIVIDER)).draw(target)?;
-        }
-
+    ) -> Result<Rectangle, Infallible> {
         let contribution = self.chrome_contribution(ctx);
         let title_text = contribution.as_ref().and_then(|c| c.title.as_deref()).unwrap_or(self.title.as_str());
         let readout_text = contribution.as_ref().and_then(|c| c.readout.as_deref());
         let status = contribution.as_ref().and_then(|c| c.status);
         let link = contribution.as_ref().and_then(|c| c.link);
 
-        // Vertically centered in the title bar via `VerticalPosition::Center`
-        // rather than a hand-picked baseline offset (the "+11" this
-        // retires) — `u8g2-fonts` derives the correct baseline from the
-        // font's own ascent/descent metrics for us.
-        let title_mid_y = chrome.title.top_left.y + chrome.title.size.height as i32 / 2;
+        let labels = ButtonLabels {
+            a: self.resolve_a(),
+            b: self.resolve_button(Button::B, contribution.as_ref(), can_go_back),
+            x: self.resolve_button(Button::X, contribution.as_ref(), can_go_back),
+            y: self.resolve_button(Button::Y, contribution.as_ref(), can_go_back),
+        };
 
-        // Title text starts directly on the left rule -- no shield mark
-        // (pico-link-d9y: the Bitwarden-era brand glyph is deleted, not
-        // replaced; see the design doc's section 5 for why nothing takes
-        // its place). This is also what fixes the 12px title/body
-        // misalignment (pico-link-nvj's D2): the title text and the
-        // device name directly beneath it now share one left edge.
-        let title_text_x = chrome.title.top_left.x + TITLE_SIDE_MARGIN;
-
-        // Right side, built right-to-left so the status dot and readout
-        // can each be omitted independently: status dot first (rightmost),
-        // then the readout to its left.
-        let mut right_cursor = chrome.title.top_left.x + chrome.title.size.width as i32 - TITLE_SIDE_MARGIN;
-
-        if let Some(status) = status {
-            let dot_color = match status {
-                ChromeStatus::Success => palette::STATUS_SUCCESS,
-                ChromeStatus::Error => palette::STATUS_ERROR,
-                ChromeStatus::Neutral => palette::TEXT_SECONDARY,
-            };
-            let dot_center = Point::new(right_cursor - STATUS_DOT_DIAMETER as i32 / 2, title_mid_y);
-            Circle::with_center(dot_center, STATUS_DOT_DIAMETER)
-                .into_styled(PrimitiveStyle::with_fill(dot_color))
-                .draw(target)?;
-            right_cursor -= STATUS_DOT_DIAMETER as i32 + TITLE_ELEMENT_GAP;
-        }
-
-        // Bluetooth glyph, immediately left of the status dot, per design
-        // spec. `link` being `None` omits the glyph entirely, rather than
-        // drawing it in some "definitely not connected" color: a widget
-        // with no link-state opinion at all has nothing meaningful to
-        // report here.
-        if let Some(link_state) = link {
-            right_cursor = draw_link_glyph(link_state, right_cursor, title_mid_y, target);
-        }
-
-        let readout_font = font::title();
-        if let Some(readout) = readout_text {
-            let _ = readout_font.render_aligned(
-                readout,
-                Point::new(right_cursor, title_mid_y),
-                VerticalPosition::Center,
-                HorizontalAlignment::Right,
-                FontColor::Transparent(palette::TEXT_SECONDARY),
-                target,
-            );
-            right_cursor -= text_width(&readout_font, readout) as i32 + TITLE_ELEMENT_GAP;
-        }
-
-        // Title text: clipped to `[title_text_x, right_cursor)` so a long
-        // title can never bleed into the readout/status dot — retiring the
-        // old un-clipped single-blob title draw this bead's description
-        // calls out.
-        let title_clip_width = (right_cursor - title_text_x).max(0) as u32;
-        let title_rect = Rectangle::new(
-            Point::new(title_text_x, chrome.title.top_left.y),
-            Size::new(title_clip_width, chrome.title.size.height),
-        );
-        let mut title_target = target.clipped(&title_rect);
-        let _ = font::title().render_aligned(
-            title_text,
-            Point::new(title_text_x, title_mid_y),
-            VerticalPosition::Center,
-            HorizontalAlignment::Left,
-            FontColor::Transparent(palette::TEXT_PRIMARY),
-            &mut title_target,
-        );
-
+        // --- Step 1: layout. One area per widget -- `Rectangle::zero()`
+        // for any widget the content region has already run out of
+        // vertical space for (the same early-exit the old single-pass
+        // loop used; those widgets are never measured or rendered,
+        // exactly as before this bead). ---
+        let mut widget_areas: Vec<Rectangle> = Vec::with_capacity(self.widgets.len());
         let mut y = chrome.content.top_left.y;
         let bottom = chrome.content.top_left.y + chrome.content.size.height as i32;
         for widget in &self.widgets {
             if y >= bottom {
-                break;
+                widget_areas.push(Rectangle::zero());
+                continue;
             }
             let available = Size::new(chrome.content.size.width, (bottom - y) as u32);
             let requested = widget.measure(available, ctx);
             let height = requested.height.min(available.height);
-
             let area = Rectangle::new(Point::new(chrome.content.top_left.x, y), Size::new(chrome.content.size.width, height));
-            widget.render(area, ctx, target)?;
+            widget_areas.push(area);
             y += height as i32;
         }
 
-        if chrome.rail.size.width > 0 {
-            let labels = ButtonLabels {
-                a: self.resolve_a(),
-                b: self.resolve_button(Button::B, contribution.as_ref(), can_go_back),
-                x: self.resolve_button(Button::X, contribution.as_ref(), can_go_back),
-                y: self.resolve_button(Button::Y, contribution.as_ref(), can_go_back),
-            };
+        // --- Step 2: collect keys. Chrome pseudo-regions first (indices
+        // 0/1) to match `Self::paint_cache`'s fixed slot order. A widget
+        // past the content region's bottom (zero-sized area, never
+        // rendered) gets `PaintKey::ALWAYS` rather than a real
+        // `paint_key()` call -- it contributes nothing to the damage rect
+        // either way (its area is zero-sized), so there is nothing to
+        // gain from actually invoking it, matching the "never measured"
+        // treatment above. ---
+        let title_key = title_paint_key(title_text, readout_text, status, link);
+        let rail_key = rail_paint_key(&labels);
+
+        let mut new_slots: Vec<PaintSlot> = Vec::with_capacity(2 + self.widgets.len());
+        new_slots.push(PaintSlot { key: title_key, area: chrome.title });
+        new_slots.push(PaintSlot { key: rail_key, area: chrome.rail });
+        for (widget, &area) in self.widgets.iter().zip(widget_areas.iter()) {
+            let key = if area.is_zero_sized() { PaintKey::ALWAYS } else { widget.paint_key(ctx) };
+            new_slots.push(PaintSlot { key, area });
+        }
+
+        // --- Steps 3-5: diff against the last painted frame, narrow via
+        // `damage_hint`, union into one frame damage rect. ---
+        let whole_frame = Rectangle::new(Point::zero(), target.size());
+        let cache_miss = self.paint_cache.len() != new_slots.len();
+        let mut damage = Rectangle::zero();
+
+        if force_full_damage || cache_miss {
+            damage = whole_frame;
+        } else {
+            for (index, new_slot) in new_slots.iter().enumerate() {
+                let old_slot = self.paint_cache[index];
+                let moved = old_slot.area != new_slot.area;
+                let key_changed = old_slot.key != new_slot.key;
+                if !moved && !key_changed {
+                    continue;
+                }
+                let region = if moved {
+                    // The slot itself relocated: the whole old-and-new
+                    // footprint is damaged (its old pixels must be
+                    // cleared too), not just a `damage_hint` narrowing of
+                    // the new position.
+                    union_rect(old_slot.area, new_slot.area)
+                } else if index >= 2 {
+                    // Only a real widget can narrow its own dirty area;
+                    // the two chrome pseudo-regions (index 0/1) have no
+                    // `damage_hint` of their own.
+                    match self.widgets[index - 2].damage_hint(new_slot.area, ctx) {
+                        Some(hint) => hint.intersection(&new_slot.area),
+                        None => new_slot.area,
+                    }
+                } else {
+                    new_slot.area
+                };
+                damage = union_rect(damage, region);
+            }
+        }
+
+        // Clamp to the framebuffer -- defensive against a stale cache
+        // entry from a since-shrunk screen size handing back a rect past
+        // its edge (`force_full_damage`/resize already covers the normal
+        // resize path; this is the belt).
+        damage = damage.intersection(&whole_frame);
+
+        // --- Step 8 (part 1): commit the cache for next frame, before any
+        // early return below -- a frame that painted nothing still needs
+        // its keys/areas recorded so the *next* frame's diff is correct.
+        self.paint_cache = new_slots;
+
+        if damage.is_zero_sized() {
+            return Ok(damage);
+        }
+
+        // --- Step 6: fill only the damage rect -- replaces
+        // `Navigator::render`'s old whole-framebuffer `target.clear(...)`.
+        damage.into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND)).draw(target)?;
+
+        let frame_ctx = ctx.with_damage(damage);
+
+        // --- Step 7: redraw every chrome pseudo-region/widget whose area
+        // intersects the damage rect -- a SKIP (the drawing code below is
+        // not called at all when it doesn't), never a clip. Title bar
+        // first, matching the original paint order. ---
+        if rects_intersect(chrome.title, damage) {
+            chrome.title.into_styled(PrimitiveStyle::with_fill(palette::SURFACE)).draw(target)?;
+
+            // Hairline divider along the title bar's bottom edge — the same
+            // `palette::DIVIDER` hairline the list rows use between unfocused
+            // rows, so chrome and content read as one consistent visual
+            // language rather than content borrowing a rule chrome doesn't
+            // also follow. The rail draws its own hairlines (inner edge +
+            // between slots) in `draw_rail`.
+            if chrome.title.size.height > 0 {
+                let divider = Rectangle::new(
+                    Point::new(chrome.title.top_left.x, chrome.title.top_left.y + chrome.title.size.height as i32 - 1),
+                    Size::new(chrome.title.size.width, 1),
+                );
+                divider.into_styled(PrimitiveStyle::with_fill(palette::DIVIDER)).draw(target)?;
+            }
+
+            // Vertically centered in the title bar via `VerticalPosition::Center`
+            // rather than a hand-picked baseline offset (the "+11" this
+            // retires) — `u8g2-fonts` derives the correct baseline from the
+            // font's own ascent/descent metrics for us.
+            let title_mid_y = chrome.title.top_left.y + chrome.title.size.height as i32 / 2;
+
+            // Title text starts directly on the left rule -- no shield mark
+            // (pico-link-d9y: the Bitwarden-era brand glyph is deleted, not
+            // replaced; see the design doc's section 5 for why nothing takes
+            // its place). This is also what fixes the 12px title/body
+            // misalignment (pico-link-nvj's D2): the title text and the
+            // device name directly beneath it now share one left edge.
+            let title_text_x = chrome.title.top_left.x + TITLE_SIDE_MARGIN;
+
+            // Right side, built right-to-left so the status dot and readout
+            // can each be omitted independently: status dot first (rightmost),
+            // then the readout to its left.
+            let mut right_cursor = chrome.title.top_left.x + chrome.title.size.width as i32 - TITLE_SIDE_MARGIN;
+
+            if let Some(status) = status {
+                let dot_color = match status {
+                    ChromeStatus::Success => palette::STATUS_SUCCESS,
+                    ChromeStatus::Error => palette::STATUS_ERROR,
+                    ChromeStatus::Neutral => palette::TEXT_SECONDARY,
+                };
+                let dot_center = Point::new(right_cursor - STATUS_DOT_DIAMETER as i32 / 2, title_mid_y);
+                Circle::with_center(dot_center, STATUS_DOT_DIAMETER)
+                    .into_styled(PrimitiveStyle::with_fill(dot_color))
+                    .draw(target)?;
+                right_cursor -= STATUS_DOT_DIAMETER as i32 + TITLE_ELEMENT_GAP;
+            }
+
+            // Bluetooth glyph, immediately left of the status dot, per design
+            // spec. `link` being `None` omits the glyph entirely, rather than
+            // drawing it in some "definitely not connected" color: a widget
+            // with no link-state opinion at all has nothing meaningful to
+            // report here.
+            if let Some(link_state) = link {
+                right_cursor = draw_link_glyph(link_state, right_cursor, title_mid_y, target);
+            }
+
+            let readout_font = font::title();
+            if let Some(readout) = readout_text {
+                let _ = readout_font.render_aligned(
+                    readout,
+                    Point::new(right_cursor, title_mid_y),
+                    VerticalPosition::Center,
+                    HorizontalAlignment::Right,
+                    FontColor::Transparent(palette::TEXT_SECONDARY),
+                    target,
+                );
+                right_cursor -= text_width(&readout_font, readout) as i32 + TITLE_ELEMENT_GAP;
+            }
+
+            // Title text: clipped to `[title_text_x, right_cursor)` so a long
+            // title can never bleed into the readout/status dot — retiring the
+            // old un-clipped single-blob title draw this bead's description
+            // calls out.
+            let title_clip_width = (right_cursor - title_text_x).max(0) as u32;
+            let title_rect = Rectangle::new(
+                Point::new(title_text_x, chrome.title.top_left.y),
+                Size::new(title_clip_width, chrome.title.size.height),
+            );
+            let mut title_target = target.clipped(&title_rect);
+            let _ = font::title().render_aligned(
+                title_text,
+                Point::new(title_text_x, title_mid_y),
+                VerticalPosition::Center,
+                HorizontalAlignment::Left,
+                FontColor::Transparent(palette::TEXT_PRIMARY),
+                &mut title_target,
+            );
+        }
+
+        for (widget, &area) in self.widgets.iter().zip(widget_areas.iter()) {
+            if rects_intersect(area, damage) {
+                widget.render(area, &frame_ctx, target)?;
+            }
+        }
+
+        if chrome.rail.size.width > 0 && rects_intersect(chrome.rail, damage) {
             draw_rail(chrome.rail, chrome.orientation, &labels, target)?;
         }
 
-        Ok(())
+        Ok(damage)
     }
 }
 
@@ -537,7 +772,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), true, &mut fb).unwrap();
         // Title bar was filled with its background color.
         assert_eq!(fb.pixel(Point::new(0, 0)), palette::SURFACE);
     }
@@ -580,53 +815,53 @@ mod tests {
     /// ahead of it, so it lands flush against the title bar's right
     /// margin. Narrow and right-aligned enough to never collide with the
     /// "T" title text, drawn from the left edge.
-    fn any_pixel_near_the_right_title_edge(screen: &Screen, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
+    fn any_pixel_near_the_right_title_edge(screen: &mut Screen, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), true, &mut fb).unwrap();
         (220..240).any(|x| (0..super::super::chrome::TITLE_BAR_HEIGHT as i32).any(|y| fb.pixel(Point::new(x, y)) == color))
     }
 
     #[test]
     fn connected_link_state_paints_the_glyph_in_the_brand_bright_color() {
-        let screen = link_screen(Some(LinkState::Connected));
+        let mut screen = link_screen(Some(LinkState::Connected));
         assert!(
-            any_pixel_near_the_right_title_edge(&screen, palette::BRAND_BRIGHT),
+            any_pixel_near_the_right_title_edge(&mut screen, palette::BRAND_BRIGHT),
             "a Connected link should paint the glyph in BRAND_BRIGHT near the title bar's right edge"
         );
     }
 
     #[test]
     fn scanning_link_state_paints_the_glyph_in_the_warning_color() {
-        let screen = link_screen(Some(LinkState::Scanning));
+        let mut screen = link_screen(Some(LinkState::Scanning));
         assert!(
-            any_pixel_near_the_right_title_edge(&screen, palette::STATUS_WARNING),
+            any_pixel_near_the_right_title_edge(&mut screen, palette::STATUS_WARNING),
             "a Scanning link should paint the glyph in STATUS_WARNING (shared with Connecting -- both are 'in progress')"
         );
     }
 
     #[test]
     fn idle_link_state_paints_the_glyph_in_the_muted_secondary_color() {
-        let screen = link_screen(Some(LinkState::Idle));
+        let mut screen = link_screen(Some(LinkState::Idle));
         assert!(
-            any_pixel_near_the_right_title_edge(&screen, palette::TEXT_SECONDARY),
+            any_pixel_near_the_right_title_edge(&mut screen, palette::TEXT_SECONDARY),
             "an Idle link should paint the glyph in TEXT_SECONDARY"
         );
     }
 
     #[test]
     fn no_link_state_omits_the_glyph_entirely() {
-        let connected = link_screen(Some(LinkState::Connected));
-        let none = link_screen(None);
+        let mut connected = link_screen(Some(LinkState::Connected));
+        let mut none = link_screen(None);
 
         assert!(
-            any_pixel_near_the_right_title_edge(&connected, palette::BRAND_BRIGHT),
+            any_pixel_near_the_right_title_edge(&mut connected, palette::BRAND_BRIGHT),
             "sanity check: Connected does paint something to compare against"
         );
         assert!(
-            !any_pixel_near_the_right_title_edge(&none, palette::BRAND_BRIGHT)
-                && !any_pixel_near_the_right_title_edge(&none, palette::STATUS_WARNING)
-                && !any_pixel_near_the_right_title_edge(&none, palette::TEXT_SECONDARY),
+            !any_pixel_near_the_right_title_edge(&mut none, palette::BRAND_BRIGHT)
+                && !any_pixel_near_the_right_title_edge(&mut none, palette::STATUS_WARNING)
+                && !any_pixel_near_the_right_title_edge(&mut none, palette::TEXT_SECONDARY),
             "link: None must omit the glyph -- no link-glyph color anywhere near the right edge"
         );
     }
@@ -697,7 +932,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome_for(Size::new(240, 240), orientation);
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), true, &mut fb).unwrap();
         (chrome, fb)
     }
 
@@ -779,7 +1014,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), true, &mut fb).unwrap();
 
         let x_rect = slot_rect(&chrome, Button::X);
         assert!(
@@ -802,7 +1037,7 @@ mod tests {
         screen.initialize_focus();
         let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
         let mut fb = FrameBuffer565::new(240, 240);
-        screen.render(&chrome, false, &test_ctx(), &mut fb).unwrap();
+        screen.render(&chrome, false, &test_ctx(), true, &mut fb).unwrap();
 
         let x_rect = slot_rect(&chrome, Button::X);
         assert!(
@@ -825,7 +1060,13 @@ mod tests {
         };
         let (chrome, fb) = render_buttons_screen(PanelOrientation::ButtonsRight, widget);
 
-        let background = embedded_graphics::pixelcolor::Rgb565::default();
+        // `palette::BACKGROUND`, not `Rgb565::default()` (pure black): as
+        // of this bead, `Screen::render` fills its own damage rect with
+        // the real background color (design section 3.3 step 6), which
+        // replaces the whole-framebuffer `Navigator::render` clear this
+        // test used to rely on implicitly by calling `Screen::render`
+        // directly on a freshly black `FrameBuffer565`.
+        let background = palette::BACKGROUND;
         let rail_left = chrome.rail.top_left.x;
         for y in chrome.rail.top_left.y..(chrome.rail.top_left.y + chrome.rail.size.height as i32) {
             for x in 0..rail_left {

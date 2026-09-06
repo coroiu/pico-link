@@ -45,7 +45,7 @@ fn row_top(index: i32) -> i32 {
 
 #[test]
 fn scene_renders_expected_chrome_colors() {
-    let navigator = build_scene();
+    let mut navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
@@ -105,7 +105,7 @@ const BOTTOM_PADDING_PX: i32 = 1;
 
 #[test]
 fn text_never_bleeds_past_a_rows_bottom_padding() {
-    let navigator = build_scene();
+    let mut navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
@@ -172,7 +172,7 @@ fn an_unselected_rows_pixels_do_not_depend_on_which_other_row_is_selected() {
 
 #[test]
 fn framebuffer_round_trips_through_a_real_png_encoder() {
-    let navigator = build_scene();
+    let mut navigator = build_scene();
     let mut framebuffer = FrameBuffer565::new(240, 240);
     navigator.render(&test_ctx(), &mut framebuffer).expect("core DrawTarget is Infallible");
 
