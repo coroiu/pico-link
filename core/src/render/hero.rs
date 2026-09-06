@@ -1135,7 +1135,7 @@ mod tests {
         // section 15) even with no new event.
         let received_at = Instant::from_micros(1_000_000);
         let view = nominal().with_out_level(Some(out_level_at(received_at)));
-        let just_before = RenderCtx::at(received_at + (OUT_LEVEL_STALE_AFTER - Duration::from_millis(1)));
+        let just_before = RenderCtx::at(received_at + OUT_LEVEL_STALE_AFTER.checked_sub(Duration::from_millis(1)).expect("OUT_LEVEL_STALE_AFTER is well over 1ms"));
         let just_after = RenderCtx::at(received_at + (OUT_LEVEL_STALE_AFTER + Duration::from_millis(1)));
         assert_ne!(
             view.paint_key(&just_before),
