@@ -325,6 +325,42 @@ int main(void) {
     }
 #endif
 
+#ifdef PL_DIAG_WINDOW_TEST
+    // Reusable diagnostic (off by default -- enable with a real CMake
+    // option, `cmake -B build -DPL_DIAG_WINDOW_TEST=ON`, see
+    // firmware/CMakeLists.txt; NOT via CMAKE_C_FLAGS -- pico-link-ukk).
+    // pico-link-7h5.1 (M-1, blocking hardware measurement for the
+    // damage-rect design, .planning/design/2026-09-06-damage-rect-render-
+    // and-partial-blit.md section 7.3): MADCTL is 0x60 (MV set), so
+    // CASET/RASET may address the PANEL's axes, not the framebuffer's --
+    // a framebuffer row band is not necessarily a RASET range. This paints
+    // ONE off-centre, NON-SQUARE band via an EXPLICIT raw CASET/RASET pair
+    // (st7789_diag_fill_window, bypassing the once-at-init window entirely)
+    // and halts so it can be photographed. A centred square would prove
+    // almost nothing; this rect is deliberately off-centre on both axes
+    // and non-square so an axis swap, a mirror, or an offset are all
+    // visually distinguishable in one photo.
+    //
+    // Intended framebuffer rect (raw values issued to CASET/RASET, NO
+    // MADCTL/axis correction applied -- that correction is the unknown
+    // this diagnostic measures): x in [160,209] (50px wide), y in [15,154]
+    // (140px tall) -- right-of-centre, upper-biased, tall-narrow. Rest of
+    // the panel is a contrasting dark navy so the band's edges are sharp.
+    const uint16_t band_x0 = 160, band_x1 = 209; // 50px wide
+    const uint16_t band_y0 = 15, band_y1 = 154;  // 140px tall
+    pl_log("PL_DIAG_WINDOW_TEST: full-panel fill 0x0010 (dark navy) via raw window [0,239]x[0,239]\r\n");
+    st7789_diag_fill_window(0, 0, PANEL_WIDTH - 1, PANEL_HEIGHT - 1, 0x0010);
+    pl_log("PL_DIAG_WINDOW_TEST: band fill 0xFFFF (white) via raw window "
+           "CASET=[%u,%u] RASET=[%u,%u] (framebuffer-rect intent: x0=%u w=%u y0=%u h=%u)\r\n",
+           band_x0, band_x1, band_y0, band_y1, band_x0, (unsigned)(band_x1 - band_x0 + 1), band_y0,
+           (unsigned)(band_y1 - band_y0 + 1));
+    st7789_diag_fill_window(band_x0, band_y0, band_x1, band_y1, 0xFFFF);
+    pl_log("PL_DIAG_WINDOW_TEST: halted for photograph\r\n");
+    while (true) {
+        tight_loop_contents();
+    }
+#endif
+
 #ifdef PL_DIAG_LDAC_BENCH
     // Reusable diagnostic (off by default -- enable with a real CMake
     // option, `cmake -B build -DPL_DIAG_LDAC_BENCH=ON`, see

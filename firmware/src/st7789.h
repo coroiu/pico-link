@@ -101,4 +101,16 @@ void st7789_reset_window(void);
 // Requires st7789_init to have run first (it owns GP13's init/direction).
 void st7789_set_backlight(bool on);
 
+// Diagnostic-only (pico-link-7h5.1, M-1): sets CASET/RASET to the RAW
+// [x0,x1]x[y0,y1] window (inclusive, no MADCTL/axis correction applied --
+// that correction is exactly the unknown this diagnostic exists to
+// measure) and blocking-fills it with `color`. Used to paint a single known
+// off-centre, non-square band and photograph where it actually lands on
+// the panel, to determine the framebuffer-rect -> panel-window transform
+// under MADCTL 0x60 (MV set: CASET/RASET may address the panel's axes, not
+// the framebuffer's). Not used by normal boot. Blocking, one SPI
+// byte-write at a time, matching st7789_init_and_fill's fill style --
+// clarity over speed for a one-shot diagnostic.
+void st7789_diag_fill_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color);
+
 #endif // PICO_LINK_ST7789_H
