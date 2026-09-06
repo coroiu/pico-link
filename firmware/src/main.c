@@ -624,8 +624,6 @@ int main(void) {
             PL_FORCED_REPAINT_MS != 0 && (dirty_gate_now_us - last_blit_us) >= (uint64_t)PL_FORCED_REPAINT_MS * 1000;
         bool needs_paint = pl_ui_dirty(ui) || forced_repaint_due;
 
-        const uint16_t *px = NULL;
-        uintptr_t px_len = 0;
         // Declared at this scope (not inside the `if (display_on &&
         // needs_paint)` block below) because the frame_report_phase print
         // further down references them unconditionally -- defaulted to
@@ -634,40 +632,85 @@ int main(void) {
         uint64_t render_start_us = frame_start_us;
         uint64_t render_end_us = frame_start_us;
         uint64_t blit_end_us = frame_start_us;
+        // Whether this iteration actually issued a blit -- used below to
+        // gate the PL_LOOP_PHASE_BLIT sample the same way the px != NULL
+        // check used to (pico-link-vxc), now that "did we blit" is a
+        // quantisation decision rather than just a null-pointer check.
+        bool blit_happened = false;
         // The dirty gate sits INSIDE the display-power gate, never beside
         // it (`display_on && needs_paint`, in that order): while blanked
         // we must skip render regardless of dirty, and critically must NOT
-        // call pl_ui_render, because that would clear the dirty flag for a
-        // frame nobody saw. This is the identical contract core's own
+        // call pl_ui_render_ex, because that would clear the dirty flag for
+        // a frame nobody saw. This is the identical contract core's own
         // Runner::step already encodes (run.rs) -- see the design doc's
         // §3.3 for the full ordering rationale, including why this
         // composes with pico-link-3uq's (unmerged) blit_wait/blit_start
         // split without needing any change there.
         if (display_on && needs_paint) {
+            // Bead pico-link-7h5.8: pl_ui_render_ex/PlRenderOut replace
+            // pl_ui_render's bare px/px_len pair so the frame's damage rect
+            // crosses the FFI seam too -- see design doc
+            // .planning/design/2026-09-06-damage-rect-render-and-partial-
+            // blit.md §6/§7. pl_ui_render itself is untouched and stays
+            // live until pico-link-7h5.10 retires it.
+            struct PlRenderOut render_out = {0};
             render_start_us = time_us_64();
             pl_wdt_mark(PL_WDT_CP_UI_RENDER);
-            pl_ui_render(ui, &px, &px_len);
+            pl_ui_render_ex(ui, &render_out);
             render_end_us = time_us_64();
             // Bead pico-link-p1r.
             pl_loop_prof_record(PL_LOOP_PHASE_UI_RENDER, render_end_us - render_start_us);
 
-            if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
-                // ui_tick()/pl_ui_render() must not be called again until this
-                // DMA completes (st7789_blit_framebuffer blocks until it does)
-                // -- Rust can never write while DMA reads, per the M1b design's
-                // no-tearing, no-double-buffering contract.
-                st7789_blit_framebuffer(spi1, px, (uint32_t)px_len);
+            const uint16_t *px = render_out.px;
+            bool px_len_ok =
+                px != NULL && render_out.px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT;
+
+            if (px_len_ok) {
+                if (render_out.version != PL_RENDER_ABI_VERSION) {
+                    // ABI mismatch: degrade to slow-and-correct, never
+                    // fast-and-wrong (design doc §6) -- blit the whole
+                    // frame rather than trust a `rects` shape this build
+                    // was not compiled to read.
+                    st7789_blit_framebuffer(spi1, px, (uint32_t)render_out.px_len);
+                    blit_happened = true;
+                } else if (render_out.rect_count == 0) {
+                    // Nothing to paint this frame (design doc §6) -- do
+                    // not blit at all, not even an empty rect. Reachable
+                    // only if pl_ui_dirty was stale; the dirty gate above
+                    // is the primary mechanism, this is the belt.
+                } else {
+                    // Phase 1 (pico-link-7h5.8/.7): quantise core's true
+                    // damage rect to a full-width row band -- x=0,
+                    // w=PANEL_WIDTH, keeping the reported y/h -- so the
+                    // source pixels stay contiguous (fb + y*stride, count
+                    // h*stride) and st7789_blit_rect's phase-1 assert
+                    // (x==0 && w==stride) holds. Column clipping is
+                    // pico-link-7h5.11. Only rects[0] is read: core reports
+                    // exactly one bounding rect in phase 1 (design doc
+                    // §5); rect_count > 0 here is therefore always 1.
+                    const struct PlDamageRect *rect = &render_out.rects[0];
+                    // ui_tick()/pl_ui_render_ex() must not be called again
+                    // until this DMA completes (st7789_blit_rect blocks
+                    // until it does) -- Rust can never write while DMA
+                    // reads, per the M1b design's no-tearing, no-double-
+                    // buffering contract.
+                    st7789_blit_rect(px, (uint16_t)PANEL_WIDTH, 0, rect->y, (uint16_t)PANEL_WIDTH, rect->h);
+                    blit_happened = true;
+                }
+            }
+            if (blit_happened) {
                 last_blit_us = time_us_64();
             }
             blit_end_us = time_us_64();
             // Bead pico-link-p1r: the pico-link-3uq blit-split candidate --
             // measured here as one blocking call, matching pico-link-14l's
-            // 38.6ms figure. Only recorded on the frame that actually blits
-            // (px non-NULL) -- a NULL-px frame does not call
-            // st7789_blit_framebuffer at all, so recording render_end..blit_end
-            // unconditionally would falsely attribute ~0us "blit" samples to
-            // frames that skipped it.
-            if (px != NULL && px_len == (uintptr_t)PANEL_WIDTH * (uintptr_t)PANEL_HEIGHT) {
+            // 38.6ms figure (full-frame baseline; pico-link-7h5.8 makes
+            // this a partial blit on most frames). Only recorded on the
+            // frame that actually blits -- a skipped frame did not call
+            // st7789_blit_rect/st7789_blit_framebuffer at all, so recording
+            // render_end..blit_end unconditionally would falsely attribute
+            // ~0us "blit" samples to frames that skipped it.
+            if (blit_happened) {
                 pl_loop_prof_record(PL_LOOP_PHASE_BLIT, blit_end_us - render_end_us);
             }
         }
