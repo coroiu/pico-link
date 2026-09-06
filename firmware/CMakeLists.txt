@@ -128,6 +128,7 @@ option(PL_DIAG_COLOR_TEST "Halt-forever colour exposure test (pico-link-14l)" OF
 option(PL_DIAG_MADCTL_TEST "Halt-forever MADCTL rotation/mirroring test (pico-link-zzq)" OFF)
 option(PL_DIAG_LDAC_BENCH "Run the LDAC encoder CPU/heap benchmark at boot, then continue (pico-link-cz0.5.4)" OFF)
 option(PL_DIAG_SKIP_BT "Skip cyw43_arch_init/pl_bt_init at boot (BT-free diagnostic builds)" OFF)
+option(PL_DIAG_WINDOW_TEST "Halt-forever CASET/RASET window transform test (pico-link-7h5.1, M-1)" OFF)
 
 # --- The Rust FFI seam (M1b, C-first pivot) ---
 #
@@ -416,6 +417,9 @@ if(PL_DIAG_LDAC_BENCH)
 endif()
 if(PL_DIAG_SKIP_BT)
     target_compile_definitions(pico_link PRIVATE PL_DIAG_SKIP_BT=1)
+endif()
+if(PL_DIAG_WINDOW_TEST)
+    target_compile_definitions(pico_link PRIVATE PL_DIAG_WINDOW_TEST=1)
 endif()
 
 # Bead pico-link-vxc: the dirty-gate backstop. `pl_ui_dirty()` lets main.c

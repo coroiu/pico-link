@@ -275,6 +275,25 @@ void st7789_reset_window(void) {
     st7789_command(ST7789_CMD_RASET, raset_params, sizeof(raset_params));
 }
 
+void st7789_diag_fill_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color) {
+    uint8_t caset_params[4] = {(uint8_t)(x0 >> 8), (uint8_t)(x0 & 0xff), (uint8_t)(x1 >> 8), (uint8_t)(x1 & 0xff)};
+    st7789_command(ST7789_CMD_CASET, caset_params, sizeof(caset_params));
+    uint8_t raset_params[4] = {(uint8_t)(y0 >> 8), (uint8_t)(y0 & 0xff), (uint8_t)(y1 >> 8), (uint8_t)(y1 & 0xff)};
+    st7789_command(ST7789_CMD_RASET, raset_params, sizeof(raset_params));
+
+    uint32_t count = (uint32_t)(x1 - x0 + 1) * (uint32_t)(y1 - y0 + 1);
+    cs_low();
+    dc_low();
+    uint8_t ramwr = ST7789_CMD_RAMWR;
+    spi_write_blocking(s_spi, &ramwr, 1);
+    dc_high();
+    uint8_t px[2] = {(uint8_t)(color >> 8), (uint8_t)(color & 0xff)};
+    for (uint32_t i = 0; i < count; i++) {
+        spi_write_blocking(s_spi, px, 2);
+    }
+    cs_high();
+}
+
 void st7789_set_backlight(bool on) {
     // A plain gpio_put -- see st7789.h's doc comment for why this is
     // deliberately not DISPOFF/SLPIN (out of band from SPI1, cannot race
