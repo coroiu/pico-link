@@ -15,6 +15,7 @@
 #include "pl_prio.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
+#include "volume.h"
 
 // Longest valid line is "NAV SHORTCUT" territory -- "NAV SELECT\n" (11
 // chars) or "NAV JUMP -32768" (15 chars) -- 32 leaves comfortable headroom
@@ -292,6 +293,24 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                     bool now_on = !pl_usb_audio_watch_enabled();
                     pl_usb_audio_set_watch(now_on);
                     pl_log("debug-remote: VOL WATCH -> %s\r\n", now_on ? "ON" : "OFF");
+                } else if (strncmp(s_line, "VOL SET", 7) == 0) {
+                    // Bead pico-link-4v2.2 (VT2): drives volume.c's
+                    // canonical value through the console, exercising the
+                    // loop rule and circuit breaker (design sec 4) without
+                    // any real USB/AVRCP producer wired yet. Applies and
+                    // LOGS what it would emit to each peer via pl_prio.h's
+                    // slot 4 -- it does not actually emit anything, since
+                    // nothing reads volume.c's outbound latches until
+                    // T3/T4. See volume.h's pl_volume_debug_set() doc
+                    // comment.
+                    const char *arg = s_line + 7;
+                    long n = (*arg == ' ') ? strtol(arg + 1, NULL, 10) : -1;
+                    if (n < 0 || n > 127) {
+                        pl_log("debug-remote: VOL SET requires 0..127, got \"%s\"\r\n", s_line + 8);
+                    } else {
+                        pl_log("debug-remote: VOL SET %ld -> dispatched\r\n", n);
+                        pl_volume_debug_set((uint8_t)n, time_us_64());
+                    }
                 } else if (strncmp(s_line, "VOL HOSTUP", 10) == 0 || strncmp(s_line, "VOL HOSTDOWN", 12) == 0) {
                     // Bead pico-link-4v2.1 (VT1): pushes n HID Consumer
                     // Volume Increment/Decrement taps through the

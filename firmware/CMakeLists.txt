@@ -230,6 +230,12 @@ add_executable(pico_link
     # debug_remote.c below) because T3's AVRCP handler is a second producer
     # into this module's ring, independent of PL_DEBUG_REMOTE.
     src/media_keys.c
+    # Bead pico-link-4v2.2 (VT2 of the volume-sync epic pico-link-4v2): the
+    # canonical volume state, loop-breaking rule and circuit breaker -- see
+    # volume.h's module doc. Compiled unconditionally (like media_keys.c
+    # above), not gated on PL_DEBUG_REMOTE: T3/T4's real USB/AVRCP
+    # producers will call into it independent of the debug console.
+    src/volume.c
     # Bead pico-link-cz0.5.4 (LDAC L0): temporary on-target benchmark, see
     # ldac_bench.h's module doc. Always compiled in (like codec_sbc.c);
     # pl_ldac_bench_run() is only ever CALLED under PL_DIAG_LDAC_BENCH

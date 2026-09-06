@@ -62,8 +62,15 @@
 //       measured unreliable under this firmware's background log-ring
 //       congestion (log_drops in the tens of thousands within seconds of
 //       boot -- the same problem this module exists to solve for the
-//       other four slots).
+//       other four slots). Only ever published to under PL_DEBUG_REMOTE
+//       (debug_remote.c is only compiled under that flag -- see
+//       CMakeLists.txt), so slot 4 is gated on it below: a release build
+//       does not statically allocate a slot it will never publish to.
+#ifdef PL_DEBUG_REMOTE
 #define PL_PRIO_SLOT_COUNT 5u
+#else
+#define PL_PRIO_SLOT_COUNT 4u
+#endif
 
 // Formats `fmt`/`...` into slot `slot_id`, right-padded with spaces to
 // PL_PRIO_SLOT_LEN - 2 and terminated with CRLF, then marks it fresh.
