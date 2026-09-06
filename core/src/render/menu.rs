@@ -46,8 +46,13 @@ use crate::input::NavIntent;
 
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
+use super::paint_key::PaintKey;
 use super::theme::{self, font, icon, palette};
 use super::widget::{Action, FocusEvent, Verb, Widget};
+
+/// Seed for [`MenuList::paint_key`] -- only needs to differ from other
+/// widgets' own seeds.
+const MENU_PAINT_KEY_SEED: u64 = 12;
 
 /// Row metrics — one per **list**, not per row: a list whose rows use
 /// different margins is not a list. Threaded through [`draw_row`] so
@@ -474,6 +479,33 @@ impl Widget for MenuList {
         }
     }
 
+    /// Folds everything [`MenuList::render`] actually reads: which row is
+    /// selected/focused (selection fill + caret gating), the item count,
+    /// and per item the label, its resolved text color, and its resolved
+    /// [`RowTrailing`] content (a caret draws no extra state of its own; a
+    /// label trailing folds its text and color; no trailing folds nothing
+    /// beyond its own discriminant).
+    ///
+    /// `MenuList` does not override [`Widget::redraw_after`], so per the
+    /// mechanical review rule this `paint_key` must not fold time either,
+    /// and it doesn't -- `_ctx` is unused.
+    fn paint_key(&self, _ctx: &RenderCtx) -> PaintKey {
+        let mut key = PaintKey::of(MENU_PAINT_KEY_SEED)
+            .fold(self.selected as u64)
+            .fold(u64::from(self.focused))
+            .fold(self.items.len() as u64);
+        for item in &self.items {
+            key = key.fold_str(&item.label);
+            key = key.fold_color(item.label_color);
+            key = match &item.trailing {
+                OwnedTrailing::Caret => key.fold(0),
+                OwnedTrailing::Label(text, color) => key.fold(1).fold_str(text).fold_color(*color),
+                OwnedTrailing::None => key.fold(2),
+            };
+        }
+        key
+    }
+
     fn on_intent(&mut self, intent: NavIntent) -> Action {
         match intent {
             NavIntent::Down => self.move_selection(1),
@@ -653,6 +685,53 @@ mod tests {
 
         let any_error_ink = fb.pixels().any(|p| p.1 == palette::STATUS_ERROR);
         assert!(any_error_ink, "a custom label color must actually be used when drawing the row's text");
+    }
+
+    // --- paint_key (bead pico-link-7h5.5) ---
+
+    #[test]
+    fn paint_key_is_stable_across_calls_with_no_state_change() {
+        let menu = MenuList::new(items(2));
+        assert_eq!(menu.paint_key(&test_ctx()), menu.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_selection_or_focus_changes() {
+        let mut menu = MenuList::new(items(2));
+        let before = menu.paint_key(&test_ctx());
+        menu.on_intent(NavIntent::Down);
+        assert_ne!(before, menu.paint_key(&test_ctx()), "moving the selection must change the paint key");
+
+        let mut menu = MenuList::new(items(2));
+        let before = menu.paint_key(&test_ctx());
+        menu.on_focus(FocusEvent::Gained);
+        assert_ne!(before, menu.paint_key(&test_ctx()), "gaining focus must change the paint key (selection fill/caret)");
+    }
+
+    #[test]
+    fn paint_key_changes_when_a_trailing_label_or_its_color_changes() {
+        let a = MenuList::new(vec![MenuItem::new("Screen sleep").with_trailing_label("On", palette::STATUS_SUCCESS)]);
+        let b = MenuList::new(vec![MenuItem::new("Screen sleep").with_trailing_label("Off", palette::STATUS_SUCCESS)]);
+        let c = MenuList::new(vec![MenuItem::new("Screen sleep").with_trailing_label("On", palette::STATUS_ERROR)]);
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()), "a different trailing label text must change the key");
+        assert_ne!(a.paint_key(&test_ctx()), c.paint_key(&test_ctx()), "a different trailing label color must change the key");
+    }
+
+    #[test]
+    fn paint_key_distinguishes_caret_label_and_no_trailing() {
+        let caret = MenuList::new(vec![MenuItem::new("Reveal")]);
+        let label = MenuList::new(vec![MenuItem::new("Reveal").with_trailing_label("On", palette::STATUS_SUCCESS)]);
+        let none = MenuList::new(vec![MenuItem::new("Reveal").with_no_trailing()]);
+        assert_ne!(caret.paint_key(&test_ctx()), label.paint_key(&test_ctx()));
+        assert_ne!(caret.paint_key(&test_ctx()), none.paint_key(&test_ctx()));
+        assert_ne!(label.paint_key(&test_ctx()), none.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_the_label_color_changes() {
+        let a = MenuList::new(vec![MenuItem::new("Clear everything")]);
+        let b = MenuList::new(vec![MenuItem::new("Clear everything").with_label_color(palette::STATUS_ERROR)]);
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
     }
 
     #[test]
