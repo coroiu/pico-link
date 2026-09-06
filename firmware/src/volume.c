@@ -27,6 +27,7 @@ static volatile bool s_sink_dirty;
 // sec "SCOPE OF THIS BEAD" in volume.h); writing them is inert today but
 // keeps the shape T3/T4 will wire into.
 static volatile int16_t s_fu_report;
+static volatile bool s_fu_dirty;
 static volatile uint8_t s_avrcp_desired;
 static volatile bool s_avrcp_dirty;
 
@@ -92,6 +93,7 @@ void pl_volume_init(void) {
     s_host_dirty = false;
     s_sink_dirty = false;
     s_avrcp_dirty = false;
+    s_fu_dirty = false;
     s_fu_report = level_to_cur(s_level);
     s_avrcp_desired = s_level;
     s_breaker_window_start_us = 0;
@@ -141,6 +143,7 @@ static void apply_and_propagate(uint8_t new_level, PlVolumeSource source, uint64
 
     if (emit) {
         s_fu_report = fu_cur;
+        s_fu_dirty = true; // T4 (pico-link-4v2.4): read-and-cleared by pl_volume_take_fu_report()
         s_avrcp_desired = avrcp_level;
         s_avrcp_dirty = true;
     }
@@ -204,13 +207,18 @@ void pl_volume_debug_set(uint8_t n, uint64_t now_us) {
 
 // T3 (pico-link-4v2.3): bt.c's heartbeat handler (cyw43 background IRQ
 // 0xFF) reads this once per 100ms tick to decide whether to send a fresh
-// AVRCP SET_ABSOLUTE_VOLUME. IRQ-safe both ways -- written by
-// apply_and_propagate (thread context, superloop) under
-// save_and_disable_interrupts, read-and-cleared here under the same
-// protection so a write from the superloop can never interleave with a
-// read from 0xFF and hand out a torn value. Coalescing, like every other
-// latch in this module: if two propagations land before the heartbeat
-// next runs, only the newest survives -- correct for a level.
+// AVRCP SET_ABSOLUTE_VOLUME. IRQ-safe on the READ side -- read-and-cleared
+// here under save_and_disable_interrupts, so a read from 0xFF can never
+// observe a torn (desired, dirty) pair. The WRITE side (apply_and_propagate,
+// thread-context superloop) is NOT under save_and_disable_interrupts --
+// pico-link-4v2.4's doc fix, correcting an earlier version of this comment
+// that claimed it was. It is race-free anyway: apply_and_propagate is the
+// only writer, s_avrcp_desired is stored before s_avrcp_dirty, and an IRQ
+// that preempts between the two either observes dirty=false (and the value
+// survives to the next heartbeat tick, not lost) or observes both writes
+// complete -- never a torn desired paired with dirty=true. Coalescing, like
+// every other latch in this module: if two propagations land before the
+// heartbeat next runs, only the newest survives -- correct for a level.
 bool pl_volume_take_avrcp_desired(uint8_t *out_level) {
     uint32_t irq_state = save_and_disable_interrupts();
     bool dirty = s_avrcp_dirty;
@@ -219,6 +227,25 @@ bool pl_volume_take_avrcp_desired(uint8_t *out_level) {
     restore_interrupts(irq_state);
     if (dirty && out_level != NULL) {
         *out_level = level;
+    }
+    return dirty;
+}
+
+// T4 (pico-link-4v2.4): main.c's superloop reads this once per frame
+// (right after pl_volume_service, same thread-context position
+// pl_a2dp_avrcp_volume_service occupies on the AVRCP side) to decide
+// whether to push a fresh UAC2 feature-unit status interrupt (design sec
+// 6, mechanism M1). IRQ-safe both ways for the same reason
+// pl_volume_take_avrcp_desired is, even though today's only caller is
+// thread context -- coalescing, like every other latch in this module.
+bool pl_volume_take_fu_report(int16_t *out_cur) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    bool dirty = s_fu_dirty;
+    int16_t cur = s_fu_report;
+    s_fu_dirty = false;
+    restore_interrupts(irq_state);
+    if (dirty && out_cur != NULL) {
+        *out_cur = cur;
     }
     return dirty;
 }
