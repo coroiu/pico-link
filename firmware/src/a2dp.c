@@ -2314,6 +2314,29 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // left over from a previous connection attempt.
             memset(&s_ctx.discovered, 0, sizeof(s_ctx.discovered));
             pl_log("a2dp: signaling connected, cid=0x%02x\r\n", cid);
+            // T3 (pico-link-4v2.3) finding, verified on hardware: a2dp.h's
+            // module doc assumed "many real sinks open an AVRCP channel
+            // unprompted right after A2DP connects" and this file never
+            // called avrcp_connect() itself. Against Andreas's own
+            // headphones that assumption is FALSE -- A2DP connected and
+            // streamed fine for 30+ seconds with no AVRCP_SUBEVENT_
+            // CONNECTION_ESTABLISHED ever arriving, which also explains
+            // pico-link-wnk (HID media keys, direction B's AVRCP_SUBEVENT_
+            // OPERATION path, not working on this headset -- same missing
+            // channel). Initiate it ourselves; if the sink also opens it
+            // independently, avrcp_connect() on an already-connecting/
+            // connected cid returns a benign non-success status here and
+            // s_avrcp_cid is still set exactly once, from the
+            // CONNECTION_ESTABLISHED event handler below (single source of
+            // truth, unchanged).
+            {
+                uint16_t requested_avrcp_cid = 0;
+                uint8_t avrcp_connect_status = avrcp_connect(s_ctx.connect_addr, &requested_avrcp_cid);
+                pl_log(
+                    "avrcp: connect requested status=0x%02x requested_cid=%u\r\n", avrcp_connect_status,
+                    requested_avrcp_cid
+                );
+            }
             break;
         }
 
