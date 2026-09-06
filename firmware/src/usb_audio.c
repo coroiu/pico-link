@@ -93,6 +93,11 @@ static volatile uint32_t s_rx_bytes_total; // D7: sum of n_bytes_received, EVERY
 static volatile uint32_t s_rx_short_packets; // D7: packets where n_bytes_received != 192 (one full 1ms 48kHz/16-bit/stereo UAC2 packet)
 static volatile uint32_t s_ep_out_busy_at_alt1_entry; // D9: usbd_edpt_busy(EP1 OUT) was already true the moment alt 1 was selected -- non-fatal capture of the panic precondition
 
+// --- Instrumentation (bead pico-link-2ue, VT4a): UAC2 status interrupt EP
+// risk gate. Plain counters, same convention as the rest of this file.
+static volatile uint32_t s_int_sent;  // tud_audio_int_n_write() accepted the send
+static volatile uint32_t s_int_done;  // tud_audio_int_done_cb fired -- confirmed on the wire
+
 //--------------------------------------------------------------------+
 // Clock entity (UAC2_ENTITY_CLOCK)
 //--------------------------------------------------------------------+
@@ -595,4 +600,62 @@ void pl_usb_audio_set_watch(bool enabled) {
 
 bool pl_usb_audio_watch_enabled(void) {
     return s_watch_enabled;
+}
+
+//--------------------------------------------------------------------+
+// UAC2 status interrupt endpoint (bead pico-link-2ue, VT4a risk gate)
+//--------------------------------------------------------------------+
+// Fires once the interrupt EP transfer this file scheduled has actually
+// gone out on the wire -- confirms the packet was sent, not just accepted
+// into TinyUSB's buffer. Called from inside the 0xC0 worker IRQ (TinyUSB's
+// device task), same context as every other weak-callback override in this
+// file -- plain volatile increment only.
+void tud_audio_int_done_cb(uint8_t rhport) {
+    (void)rhport;
+    s_int_done++;
+}
+
+bool pl_usb_audio_send_fu_status_interrupt(void) {
+    // NO pl_usb_lock_try() here -- this is called ONLY from
+    // debug_remote.c's pl_debug_remote_poll(), which already holds
+    // pl_usb_mutex for its ENTIRE body (see that file's "Held for the
+    // WHOLE poll" doc comment). pl_usb_mutex is pico-sdk's plain
+    // (non-recursive) mutex_t: a second mutex_try_enter() from the same
+    // thread context without an intervening exit fails every time, not
+    // just under real contention -- this file's first revision did exactly
+    // that and every call reported accepted=0 (measured, this bead). The
+    // outer lock already excludes the 0xC0 worker for the duration of this
+    // call, so re-entering it here would only ever deadlock-by-false, not
+    // add safety. If a future caller invokes this from OUTSIDE the console
+    // poll's locked region, it must take pl_usb_lock_try() itself first.
+    //
+    // UAC2 spec 6.1 "Interrupt Data Message Format": bInfo=0 (device
+    // originated), bAttribute=AUDIO_CS_REQ_CUR ("current value of the
+    // addressed Control has changed"). wValue selects the control on the
+    // feature unit: channel 0 (master) + AUDIO_FU_CTRL_VOLUME. wIndex
+    // identifies WHERE: low byte is the interface number (the audio
+    // control interface owns this endpoint), high byte is the entity ID
+    // that changed (UAC2_ENTITY_FEATURE_UNIT) -- this is what tells the
+    // host WHICH unit/control to re-GET, per spec.
+    audio_interrupt_data_t status = {
+        .bInfo = 0,
+        .bAttribute = (uint8_t)AUDIO_CS_REQ_CUR,
+        .wValue_cn_or_mcn = 0, // master channel
+        .wValue_cs = AUDIO_FU_CTRL_VOLUME,
+        .wIndex_ep_or_int = ITF_NUM_AUDIO_CONTROL,
+        .wIndex_entity_id = UAC2_ENTITY_FEATURE_UNIT,
+    };
+    bool sent = tud_audio_int_n_write(0, &status);
+    if (sent) {
+        s_int_sent++;
+    }
+    return sent;
+}
+
+uint32_t pl_usb_audio_int_sent(void) {
+    return s_int_sent;
+}
+
+uint32_t pl_usb_audio_int_done(void) {
+    return s_int_done;
 }

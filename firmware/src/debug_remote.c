@@ -311,6 +311,30 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                         pl_log("debug-remote: VOL SET %ld -> dispatched\r\n", n);
                         pl_volume_debug_set((uint8_t)n, time_us_64());
                     }
+                } else if (strcmp(s_line, "VOL INT") == 0) {
+                    // Bead pico-link-2ue (VT4a): sends ONE UAC2
+                    // feature-unit-volume-changed status packet on the AC
+                    // interrupt endpoint (design doc sec 6, mechanism M1)
+                    // and reports whether TinyUSB accepted/confirmed the
+                    // send. Whether macOS's OWN slider then moves, or it
+                    // follows up with a GET (pl_usb_audio_fu_get_calls()),
+                    // is observed externally (AppleScript/afplay + a "VOL
+                    // GET" afterward) -- this command only proves the
+                    // packet left the device.
+                    // Published via pl_prio.h's slot 4 (reusing log_vol_snapshot's
+                    // slot -- both are one-shot VOL-family measurement commands
+                    // from this same locked context, never concurrent), NOT
+                    // pl_log(), for the same reliability reason as VOL GET/WATCH
+                    // above: this result must survive this firmware's
+                    // background log-ring congestion.
+                    bool accepted = pl_usb_audio_send_fu_status_interrupt();
+                    pl_prio_publish(
+                        4,
+                        "vol-int accepted=%d sent=%lu done=%lu",
+                        (int)accepted,
+                        (unsigned long)pl_usb_audio_int_sent(),
+                        (unsigned long)pl_usb_audio_int_done()
+                    );
                 } else if (strncmp(s_line, "VOL HOSTUP", 10) == 0 || strncmp(s_line, "VOL HOSTDOWN", 12) == 0) {
                     // Bead pico-link-4v2.1 (VT1): pushes n HID Consumer
                     // Volume Increment/Decrement taps through the

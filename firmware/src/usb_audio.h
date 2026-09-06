@@ -192,4 +192,29 @@ uint8_t pl_usb_audio_fu_channel_count(void);
 void pl_usb_audio_set_watch(bool enabled);
 bool pl_usb_audio_watch_enabled(void);
 
+// --- Bead pico-link-2ue (VT4a): UAC2 status interrupt endpoint risk gate ---
+// debug_remote.c's "VOL INT" console command calls this directly (thread
+// context) to send ONE feature-unit-volume-changed status packet on the AC
+// interrupt endpoint and observe whether macOS reacts (its own output
+// slider moving, and/or a GET_CUR/GET_RANGE follow-up bumping
+// pl_usb_audio_fu_get_calls()). Does NOT take pl_usb_lock_try() itself --
+// its only caller (pl_debug_remote_poll()) already holds pl_usb_mutex for
+// its whole body, and pl_usb_mutex is non-recursive, so a second
+// mutex_try_enter() from the same thread context would deadlock-by-false
+// every time (measured on this bead's first revision). A future caller
+// OUTSIDE that locked region must take the lock itself first. Returns
+// false if TinyUSB rejected the send (endpoint not ready / already has a
+// transfer pending) -- never blocks.
+bool pl_usb_audio_send_fu_status_interrupt(void);
+
+// Cumulative count of pl_usb_audio_send_fu_status_interrupt() calls that
+// TinyUSB actually accepted (tud_audio_int_n_write() returned true), for
+// "VOL INT" to report back to the console.
+uint32_t pl_usb_audio_int_sent(void);
+
+// Cumulative count of tud_audio_int_done_cb firings -- confirms the status
+// packet was actually transmitted on the wire, not just accepted into
+// TinyUSB's endpoint buffer.
+uint32_t pl_usb_audio_int_done(void);
+
 #endif // PICO_LINK_USB_AUDIO_H

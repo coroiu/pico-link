@@ -90,6 +90,11 @@ enum {
 // the Bluetooth/LDAC side, out of scope for M3, but the endpoint topology
 // has to be right from the start since it can't change without breaking
 // host enumeration caches).
+// Bead pico-link-2ue (VT4a): + TUD_AUDIO_DESC_STD_AC_INT_EP_LEN for the AC
+// interrupt IN endpoint (see CFG_TUD_AUDIO_ENABLE_INTERRUPT_EP in
+// tusb_config.h). 7 bytes, TinyUSB's own fixed-size macro
+// (usbd.h:418-420) -- no local reproduction needed, unlike the two
+// PROVENANCE items at the top of this file.
 #define TUD_AUDIO_SPEAKER_STEREO_FB_DESC_LEN (TUD_AUDIO_DESC_IAD_LEN\
     + TUD_AUDIO_DESC_STD_AC_LEN\
     + TUD_AUDIO_DESC_CS_AC_LEN\
@@ -97,6 +102,7 @@ enum {
     + TUD_AUDIO_DESC_INPUT_TERM_LEN\
     + TUD_AUDIO_DESC_OUTPUT_TERM_LEN\
     + TUD_AUDIO_DESC_FEATURE_UNIT_TWO_CHANNEL_LEN\
+    + TUD_AUDIO_DESC_STD_AC_INT_EP_LEN\
     + TUD_AUDIO_DESC_STD_AS_INT_LEN\
     + TUD_AUDIO_DESC_STD_AS_INT_LEN\
     + TUD_AUDIO_DESC_CS_AS_INT_LEN\
@@ -105,11 +111,18 @@ enum {
     + TUD_AUDIO_DESC_CS_AS_ISO_EP_LEN\
     + TUD_AUDIO_DESC_STD_AS_ISO_FB_EP_LEN)
 
-#define TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR(_itfnum, _stridx, _nBytesPerSample, _nBitsUsedPerSample, _epout, _epoutsize, _epfb, _epfbsize) \
+// Bead pico-link-2ue (VT4a): _epint added. _nEPs on the AC interface goes
+// 0x00 -> 0x01 (audiod_open() requires exactly this: bNumEndpoints==1 iff
+// CFG_TUD_AUDIO_ENABLE_INTERRUPT_EP, audio_device.c:1017-1019/1649), and
+// the interrupt EP descriptor is appended right after the last AC unit
+// descriptor (Feature Unit), before the AS interfaces -- same position
+// TinyUSB's own uac2_headset example uses (the only upstream example that
+// enables this EP).
+#define TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR(_itfnum, _stridx, _nBytesPerSample, _nBitsUsedPerSample, _epout, _epoutsize, _epfb, _epfbsize, _epint) \
     /* Standard Interface Association Descriptor (IAD) */\
     TUD_AUDIO_DESC_IAD(/*_firstitf*/ _itfnum, /*_nitfs*/ 0x02, /*_stridx*/ 0x00),\
     /* Standard AC Interface Descriptor(4.7.1) */\
-    TUD_AUDIO_DESC_STD_AC(/*_itfnum*/ _itfnum, /*_nEPs*/ 0x00, /*_stridx*/ _stridx),\
+    TUD_AUDIO_DESC_STD_AC(/*_itfnum*/ _itfnum, /*_nEPs*/ 0x01, /*_stridx*/ _stridx),\
     /* Class-Specific AC Interface Header Descriptor(4.7.2) */\
     TUD_AUDIO_DESC_CS_AC(/*_bcdADC*/ 0x0200, /*_category*/ AUDIO_FUNC_DESKTOP_SPEAKER, /*_totallen*/ TUD_AUDIO_DESC_CLK_SRC_LEN+TUD_AUDIO_DESC_INPUT_TERM_LEN+TUD_AUDIO_DESC_OUTPUT_TERM_LEN+TUD_AUDIO_DESC_FEATURE_UNIT_TWO_CHANNEL_LEN, /*_ctrl*/ AUDIO_CS_AS_INTERFACE_CTRL_LATENCY_POS),\
     /* Clock Source Descriptor(4.7.2.1) */\
@@ -120,6 +133,8 @@ enum {
     TUD_AUDIO_DESC_OUTPUT_TERM(/*_termid*/ UAC2_ENTITY_OUTPUT_TERMINAL, /*_termtype*/ AUDIO_TERM_TYPE_OUT_DESKTOP_SPEAKER, /*_assocTerm*/ UAC2_ENTITY_INPUT_TERMINAL, /*_srcid*/ UAC2_ENTITY_FEATURE_UNIT, /*_clkid*/ UAC2_ENTITY_CLOCK, /*_ctrl*/ 0x0000, /*_stridx*/ 0x00),\
     /* Feature Unit Descriptor(4.7.2.8) */\
     TUD_AUDIO_DESC_FEATURE_UNIT_TWO_CHANNEL(/*_unitid*/ UAC2_ENTITY_FEATURE_UNIT, /*_srcid*/ UAC2_ENTITY_INPUT_TERMINAL, /*_ctrlch0master*/ AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_MUTE_POS | AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_VOLUME_POS, /*_ctrlch1*/ AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_MUTE_POS | AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_VOLUME_POS, /*_ctrlch2*/ AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_MUTE_POS | AUDIO_CTRL_RW << AUDIO_FEATURE_UNIT_CTRL_VOLUME_POS,/*_stridx*/ 0x00),\
+    /* Standard AC Interrupt Endpoint Descriptor(4.8.2.1) -- bead pico-link-2ue (VT4a) */\
+    TUD_AUDIO_DESC_STD_AC_INT_EP(/*_ep*/ _epint, /*_interval*/ 0x01),\
     /* Standard AS Interface Descriptor(4.9.1) */\
     /* Interface 1, Alternate 0 - default alternate setting with 0 bandwidth */\
     TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ (uint8_t)((_itfnum) + 1), /*_altset*/ 0x00, /*_nEPs*/ 0x00, /*_stridx*/ 0x00),\

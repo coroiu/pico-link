@@ -39,6 +39,9 @@
 // HID consumer-control (media keys), interrupt IN only -- see bead
 // pico-link-47z.1 / .planning/design/2026-09-02-media-keys.md.
 #define EPNUM_HID_IN    (0x84)
+// UAC2 feature-unit status interrupt endpoint (AC interface, not HID) --
+// bead pico-link-2ue (VT4a). EP5 IN: the next free address after HID's EP4.
+#define EPNUM_AUDIO_INT (0x85)
 
 //--------------------------------------------------------------------+
 // Device Descriptor
@@ -128,7 +131,7 @@ static const uint8_t usbd_desc_cfg[] = {
     TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, STRID_AUDIO,
         CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX,
         EPNUM_AUDIO_OUT, CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX, EPNUM_AUDIO_FB,
-        (TUD_OPT_HIGH_SPEED ? 4 : 3)),
+        (TUD_OPT_HIGH_SPEED ? 4 : 3), EPNUM_AUDIO_INT),
 
     // CDC: interface number, string index, EP notif addr & size, EP data out/in addr & size.
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
