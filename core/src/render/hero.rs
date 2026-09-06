@@ -245,12 +245,12 @@ pub struct OutLevelDisplay {
     /// Release-ballistic attack anchor (bead pico-link-ajj, design
     /// requirement C) -- a field-for-field carry of
     /// `crate::app::OutLevelSample`'s own anchor fields; see
-    /// [`crate::app::decay_rms`]'s doc comment for what this widget does
+    /// [`crate::app::decay_peak`]'s doc comment for what this widget does
     /// with it at render time.
-    pub attack_rms_l: u8,
-    pub attack_rms_r: u8,
-    pub attack_rms_l_at: Instant,
-    pub attack_rms_r_at: Instant,
+    pub attack_peak_l: u8,
+    pub attack_peak_r: u8,
+    pub attack_peak_l_at: Instant,
+    pub attack_peak_r_at: Instant,
 }
 
 /// Which persistent banner (if any) is currently showing — resolved by
@@ -717,14 +717,15 @@ impl Widget for HeroStatusView {
                         &mut clipped,
                     );
                     // Release-ballistic decay (bead pico-link-ajj, design
-                    // requirement C): the bar draws the attack anchor decayed
-                    // to *now* -- NO floor against `level.rms_l`/`rms_r`. An
-                    // earlier version floored at the latest raw sample,
-                    // reasoning that it was a better estimate of "the level
-                    // right now" than continuing to decay past it -- that
-                    // reasoning was wrong and defeats the whole ballistic
-                    // (code review on this bead, confirmed by the
-                    // orchestrator): between publishes `rms_l`/`rms_r` are
+                    // requirement C; anchored on peak rather than rms as of
+                    // bead pico-link-53c): the bar draws the attack anchor
+                    // decayed to *now* -- NO floor against `level.peak_l`/
+                    // `peak_r`. An earlier version floored at the latest raw
+                    // sample, reasoning that it was a better estimate of
+                    // "the level right now" than continuing to decay past it
+                    // -- that reasoning was wrong and defeats the whole
+                    // ballistic (code review on this bead, confirmed by the
+                    // orchestrator): between publishes `peak_l`/`peak_r` are
                     // frozen at whatever the last event reported, so the
                     // `.max()` pinned the displayed value to that constant
                     // for the sample's entire life, making the release only
@@ -740,12 +741,12 @@ impl Widget for HeroStatusView {
                     // hold a stale anchor), and a genuinely stale reading is
                     // never rendered at all -- see the `OUT_LEVEL_STALE_AFTER`
                     // check just above this block. See `crate::app::
-                    // decay_rms`'s doc comment for why this is computed here,
+                    // decay_peak`'s doc comment for why this is computed here,
                     // at render time, rather than mutated on a schedule.
-                    let displayed_rms_l = crate::app::decay_rms(level.attack_rms_l, ctx.now().saturating_duration_since(level.attack_rms_l_at));
-                    let displayed_rms_r = crate::app::decay_rms(level.attack_rms_r, ctx.now().saturating_duration_since(level.attack_rms_r_at));
-                    theme::draw_vertical_level_meter(&mut clipped, l_block, displayed_rms_l, level.hold_l)?;
-                    theme::draw_vertical_level_meter(&mut clipped, r_block, displayed_rms_r, level.hold_r)?;
+                    let displayed_peak_l = crate::app::decay_peak(level.attack_peak_l, ctx.now().saturating_duration_since(level.attack_peak_l_at));
+                    let displayed_peak_r = crate::app::decay_peak(level.attack_peak_r, ctx.now().saturating_duration_since(level.attack_peak_r_at));
+                    theme::draw_vertical_level_meter(&mut clipped, l_block, displayed_peak_l, level.hold_l)?;
+                    theme::draw_vertical_level_meter(&mut clipped, r_block, displayed_peak_r, level.hold_r)?;
                 }
             }
         }
@@ -768,8 +769,8 @@ impl Widget for HeroStatusView {
     ///
     /// CORRECTED 2026-09-06 (coordinator finding, bead pico-link-7h5.5):
     /// an earlier version of this method reasoned that the continuously-
-    /// decaying release ballistic `render` computes from `attack_rms_*`/
-    /// `attack_rms_*_at` (bead pico-link-ajj) didn't need folding, on the
+    /// decaying release ballistic `render` computes from `attack_peak_*`/
+    /// `attack_peak_*_at` (bead pico-link-ajj) didn't need folding, on the
     /// theory that a fresh sample arrives on every `Event::LevelsChanged`
     /// and that alone drives the visible motion. That reasoning was
     /// backwards: `Self::redraw_after` schedules a repaint every
@@ -784,11 +785,11 @@ impl Widget for HeroStatusView {
     /// pico-link-ajj was written to eliminate).
     ///
     /// The fix: recompute the same decayed value `render` does from
-    /// `ctx.elapsed_since(attack_rms_*_at)`, then quantise it through
+    /// `ctx.elapsed_since(attack_peak_*_at)`, then quantise it through
     /// [`theme::vertical_level_dbfs_segment_count`] -- the exact mapping
     /// [`theme::draw_vertical_level_meter`] uses to choose how many of the
-    /// 16 segments light up. That segment count (0..=16 per channel, 17
-    /// possible values) *is* the quantised visual consequence: it changes
+    /// segments light up. That segment count (0..=`VERTICAL_METER_SEGMENT_COUNT`
+    /// per channel) *is* the quantised visual consequence: it changes
     /// only at the instant a segment actually lights or extinguishes on
     /// screen, never merely because `ctx.now()` advanced. The peak-hold
     /// cap gets the same treatment for scale consistency, though it needs
@@ -818,12 +819,12 @@ impl Widget for HeroStatusView {
                 let stale = ctx.elapsed_since(level.received_at) >= OUT_LEVEL_STALE_AFTER;
                 // The bar's actually-drawn value (coordinator finding on
                 // this bead, 2026-09-06): `render` does not draw
-                // `level.rms_l`/`rms_r` at all -- it draws
-                // `crate::app::decay_rms` applied to `attack_rms_*` and
-                // `attack_rms_*_at`, a value that changes continuously
+                // `level.peak_l`/`peak_r` at all -- it draws
+                // `crate::app::decay_peak` applied to `attack_peak_*` and
+                // `attack_peak_*_at`, a value that changes continuously
                 // between publishes purely as `ctx.now()` advances (the
                 // release ballistic, bead pico-link-ajj). Folding the raw,
-                // publish-cadence `rms_l`/`rms_r` fields (as this key used
+                // publish-cadence `peak_l`/`peak_r` fields (as this key used
                 // to) folds a value the widget never paints, and folds
                 // nothing that actually tracks the bar's motion between
                 // samples -- exactly the "folding nothing time-related
@@ -839,15 +840,15 @@ impl Widget for HeroStatusView {
                 // value `render` computes through
                 // `theme::vertical_level_dbfs_segment_count`, the exact
                 // mapping `draw_vertical_level_meter` uses to choose how
-                // many of the 16 segments light up. That count only has
-                // 17 possible values (0..=16) and only changes at the
-                // instant a segment actually lights or extinguishes on
-                // screen -- an honest, cheap total summary of what the eye
-                // can see, not a proxy for "time passed".
-                let displayed_rms_l = crate::app::decay_rms(level.attack_rms_l, ctx.elapsed_since(level.attack_rms_l_at));
-                let displayed_rms_r = crate::app::decay_rms(level.attack_rms_r, ctx.elapsed_since(level.attack_rms_r_at));
-                let segments_l = theme::vertical_level_dbfs_segment_count(displayed_rms_l);
-                let segments_r = theme::vertical_level_dbfs_segment_count(displayed_rms_r);
+                // many of the segments light up. That count only has
+                // `VERTICAL_METER_SEGMENT_COUNT + 1` possible values and
+                // only changes at the instant a segment actually lights or
+                // extinguishes on screen -- an honest, cheap total summary
+                // of what the eye can see, not a proxy for "time passed".
+                let displayed_peak_l = crate::app::decay_peak(level.attack_peak_l, ctx.elapsed_since(level.attack_peak_l_at));
+                let displayed_peak_r = crate::app::decay_peak(level.attack_peak_r, ctx.elapsed_since(level.attack_peak_r_at));
+                let segments_l = theme::vertical_level_dbfs_segment_count(displayed_peak_l);
+                let segments_r = theme::vertical_level_dbfs_segment_count(displayed_peak_r);
                 // The peak-hold cap (`draw_vertical_level_meter`'s `hold`
                 // parameter) is drawn straight from `level.hold_l`/
                 // `hold_r` with no decay applied -- its on-screen position
@@ -1256,10 +1257,10 @@ mod tests {
             hold_l: 150,
             hold_r: 140,
             received_at,
-            attack_rms_l: 120,
-            attack_rms_r: 100,
-            attack_rms_l_at: received_at,
-            attack_rms_r_at: received_at,
+            attack_peak_l: 120,
+            attack_peak_r: 100,
+            attack_peak_l_at: received_at,
+            attack_peak_r_at: received_at,
         }
     }
 
@@ -1285,9 +1286,9 @@ mod tests {
     fn paint_key_does_not_change_from_ctx_now_alone_while_the_out_level_is_still_fresh() {
         // Same `OutLevelDisplay`, same `received_at` -- only `ctx.now()`
         // moves, by an amount too small for the release ballistic to
-        // cross even one of `theme::VERTICAL_METER_DBFS_THRESHOLDS`' 16
+        // cross even one of `theme::VERTICAL_METER_DBFS_THRESHOLDS`' 32
         // segment boundaries (1ms of decay is well under 1% of any
-        // starting value -- see `decay_rms`'s own doc comment for the
+        // starting value -- see `decay_peak`'s own doc comment for the
         // decay curve). This is the "folding raw now() makes the widget
         // permanently dirty" failure mode this test exists to rule out --
         // NOT a claim that no time span ever changes the key while
@@ -1335,16 +1336,16 @@ mod tests {
 
     #[test]
     fn paint_key_changes_when_a_level_value_changes_but_received_at_does_not() {
-        // Mutates `attack_rms_l` (the ballistic anchor `render` actually
+        // Mutates `attack_peak_l` (the ballistic anchor `render` actually
         // decays and draws), not `peak_l`/`rms_l` -- `render` never reads
         // the latter two at all, so folding them would test nothing about
         // what's on screen. `test_ctx()` sits at the same instant as
-        // `received_at` (elapsed == 0), so `decay_rms` is a no-op here and
+        // `received_at` (elapsed == 0), so `decay_peak` is a no-op here and
         // the mutated value passes straight through to the segment count.
         let received_at = Instant::from_micros(0);
         let a = nominal().with_out_level(Some(out_level_at(received_at)));
         let mut sample = out_level_at(received_at);
-        sample.attack_rms_l = 255;
+        sample.attack_peak_l = 255;
         let b = nominal().with_out_level(Some(sample));
         assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
     }
@@ -1369,7 +1370,7 @@ mod tests {
     /// the SAME `ctx.now()`. The actual failure is across two DIFFERENT
     /// instants with the exact same `OutLevelSample`/`OutLevelDisplay`
     /// (no new event, no new `received_at`): the release ballistic
-    /// (`crate::app::decay_rms` over `attack_rms_l`/`attack_rms_l_at`,
+    /// (`crate::app::decay_peak` over `attack_peak_l`/`attack_peak_l_at`,
     /// bead pico-link-ajj) keeps moving as `ctx.now()` advances, and
     /// `Self::redraw_after` schedules exactly this kind of no-new-sample
     /// repaint every `OUT_LEVEL_REFRESH_INTERVAL` while the reading is
@@ -1379,9 +1380,9 @@ mod tests {
     /// -- silently undoing the whole ballistic.
     ///
     /// `anchor = 200` and `elapsed = 1000ms` are chosen from the existing
-    /// `decay_rms_after_one_second_is_roughly_ten_percent` fixture
+    /// `decay_peak_after_one_second_is_roughly_ten_percent` fixture
     /// (200 -> ~20, comfortably crossing several of
-    /// `theme::VERTICAL_METER_DBFS_THRESHOLDS`' 16 segment boundaries, not
+    /// `theme::VERTICAL_METER_DBFS_THRESHOLDS`' 32 segment boundaries, not
     /// balanced on the edge of just one) so this test's premise -- that a
     /// segment boundary is actually crossed -- is pinned by another test,
     /// not asserted here on faith.
@@ -1389,8 +1390,8 @@ mod tests {
     fn paint_key_changes_as_the_release_ballistic_crosses_a_segment_boundary_with_no_new_sample() {
         let received_at = Instant::from_micros(1_000_000);
         let mut sample = out_level_at(received_at);
-        sample.attack_rms_l = 200;
-        sample.attack_rms_l_at = received_at;
+        sample.attack_peak_l = 200;
+        sample.attack_peak_l_at = received_at;
         let view = nominal().with_out_level(Some(sample));
 
         // Same OutLevelDisplay both times -- only ctx.now() moves.
@@ -1439,8 +1440,8 @@ mod tests {
 
         let received_at = Instant::from_micros(1_000_000);
         let mut sample = out_level_at(received_at);
-        sample.attack_rms_l = 200;
-        sample.attack_rms_l_at = received_at;
+        sample.attack_peak_l = 200;
+        sample.attack_peak_l_at = received_at;
         let view = nominal().with_out_level(Some(sample));
 
         let t0 = RenderCtx::at(received_at);
