@@ -20,7 +20,7 @@ use embedded_graphics::prelude::{Point, Primitive, RgbColor, Size};
 use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::Drawable;
 use pico_link_core::platform::Instant;
-use pico_link_core::render::hero::{BitrateStatus, CodecStatus, HeroStatusView};
+use pico_link_core::render::hero::{BitrateStatus, CodecStatus, HeroStatusView, HeroVolume, HeroVolumeSource};
 use pico_link_core::render::{compute_chrome, FrameBuffer565, RenderCtx, Widget};
 
 const SCALE: u32 = 4;
@@ -108,7 +108,7 @@ fn main() {
                 bitrate: BitrateStatus::Kbps(328),
             },
         )
-        .with_muted(true)
+        .with_volume(Some(HeroVolume { percent: 42, muted: true, source: HeroVolumeSource::Host }))
         .with_stat_line("USB 48k 24-bit"),
     );
 
