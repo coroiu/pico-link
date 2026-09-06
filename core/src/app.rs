@@ -3306,4 +3306,92 @@ mod tests {
         assert_eq!(app.poll_command(), Some(Command::PersistDevice { addr }));
         assert_eq!(app.poll_command(), None);
     }
+
+    // --- decay_rms / vertical OUT meter release ballistics (bead
+    // pico-link-ajj): code review found the render-side floor
+    // (`.max(level.rms_l)` in `render::hero`) pinned the displayed value
+    // to the last raw reading for a sample's whole life, defeating the
+    // release entirely -- these tests exercise decay over elapsed time
+    // WITHOUT a new sample arriving, which is exactly the case that bug
+    // was invisible to (no prior test drove `decay_rms` at all). ---
+
+    #[test]
+    fn decay_rms_at_zero_elapsed_is_unchanged() {
+        assert_eq!(decay_rms(200, Duration::from_millis(0)), 200);
+    }
+
+    #[test]
+    // `at_0ms`/`at_100ms`/`at_500ms`/`at_1000ms` are deliberately parallel
+    // names for a set of samples along one timeline -- clippy's
+    // similar-names lint false-positives on this the same way the
+    // existing L/R channel bindings do elsewhere in this file.
+    #[allow(clippy::similar_names)]
+    fn decay_rms_falls_strictly_over_time_with_no_new_sample() {
+        // The exact regression the review caught: sampling decay_rms at
+        // increasing elapsed times (no new LevelsChanged in between) must
+        // show a strictly decreasing sequence, not a value pinned at the
+        // anchor.
+        let anchor = 200;
+        let at_0ms = decay_rms(anchor, Duration::from_millis(0));
+        let at_100ms = decay_rms(anchor, Duration::from_millis(100));
+        let at_500ms = decay_rms(anchor, Duration::from_millis(500));
+        let at_1000ms = decay_rms(anchor, Duration::from_millis(1000));
+        assert!(at_0ms > at_100ms, "200 -> {at_100ms} after 100ms: must have started falling");
+        assert!(at_100ms > at_500ms, "{at_100ms} -> {at_500ms} after 500ms: must keep falling");
+        assert!(at_500ms > at_1000ms, "{at_500ms} -> {at_1000ms} after 1000ms: must keep falling");
+    }
+
+    #[test]
+    fn decay_rms_after_one_second_is_roughly_ten_percent() {
+        // ~20 dB/s release (design requirement C) means amplitude falls
+        // to roughly 10% after one second of continuous release.
+        let decayed = decay_rms(200, Duration::from_millis(1000));
+        assert!((15..=25).contains(&decayed), "expected ~20 (10% of 200), got {decayed}");
+    }
+
+    #[test]
+    fn decay_rms_eventually_reaches_zero_and_stays_there() {
+        let decayed = decay_rms(255, Duration::from_secs(10));
+        assert_eq!(decayed, 0);
+        // u64::MAX elapsed must not panic or wrap -- `App::on_levels_changed`
+        // can hand this an arbitrarily large gap (e.g. the very first
+        // reading, decayed from a zero anchor at `Instant::from_micros(0)`).
+        assert_eq!(decay_rms(255, Duration::from_micros(u64::MAX)), 0);
+    }
+
+    #[test]
+    fn out_level_ballistic_decays_between_ticks_with_no_new_levels_changed_event() {
+        // End-to-end version of the same regression: a single loud
+        // LevelsChanged reading, then ONLY `tick()` calls (no further
+        // events) -- the model's own anchor must show a falling value as
+        // time passes, not a value frozen at the original rms sample.
+        let mut app = App::new(240, 240);
+        app.tick(1);
+        app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 200, rms_l: 200, rms_r: 200 });
+        let sample_at_fold = app.model().out_level.expect("a reading was just folded in");
+        assert_eq!(sample_at_fold.attack_rms_l, 200, "an empty prior anchor means the first sample is an instantaneous attack");
+
+        // No new Event::LevelsChanged from here -- only the clock moves.
+        app.tick(1 + 300_000); // +300ms
+        let decayed_300ms = decay_rms(
+            sample_at_fold.attack_rms_l,
+            Instant::from_micros(app.now_us()).saturating_duration_since(sample_at_fold.attack_rms_l_at),
+        );
+        assert!(decayed_300ms < 200, "300ms after the last event with no new sample, the ballistic must have started releasing, got {decayed_300ms}");
+
+        app.tick(1 + 550_000); // +550ms from the event (still under the 600ms staleness window)
+        let decayed_550ms = decay_rms(
+            sample_at_fold.attack_rms_l,
+            Instant::from_micros(app.now_us()).saturating_duration_since(sample_at_fold.attack_rms_l_at),
+        );
+        assert!(decayed_550ms < decayed_300ms, "the release must keep falling as more time passes with still no new sample: {decayed_300ms} -> {decayed_550ms}");
+
+        // The stored anchor and its timestamp themselves must NOT have
+        // been mutated by tick() -- decay is a pure render-time
+        // computation off a fixed fold-time anchor, never a value ticked
+        // down in place.
+        let sample_after_ticks = app.model().out_level.expect("no event cleared it");
+        assert_eq!(sample_after_ticks.attack_rms_l, sample_at_fold.attack_rms_l);
+        assert_eq!(sample_after_ticks.attack_rms_l_at, sample_at_fold.attack_rms_l_at);
+    }
 }
