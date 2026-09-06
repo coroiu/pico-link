@@ -23,9 +23,9 @@
 //!   borrowed for the call only and copied immediately, with invalid UTF-8
 //!   replaced lossily rather than panicking -- see [`pl_ui_panic_hook`] for
 //!   the one place this crate currently receives a string.
-//! - The pixel pointer [`pl_ui_render`] hands back is borrowed until the
-//!   next mutating call (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render` again) --
-//!   C must copy out (e.g. into a DMA source) before calling back in.
+//! - The pixel pointer [`pl_ui_render_ex`] hands back is borrowed until the
+//!   next mutating call (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render_ex` again)
+//!   -- C must copy out (e.g. into a DMA source) before calling back in.
 //! - No Rust allocation is ever freed by C, and no C allocation is ever
 //!   freed by Rust.
 //! - [`PlUi`] is not `Sync`: every call for one instance must come from one
@@ -630,7 +630,7 @@ pub unsafe extern "C" fn pl_ui_display_power(ui: *mut PlUi) -> PlDisplayPower {
     ui.idle.display_power().into()
 }
 
-/// Whether [`pl_ui_render`] would currently draw something different from
+/// Whether [`pl_ui_render_ex`] would currently draw something different from
 /// the last time it was called -- `pico_link_core::app::App::dirty()`
 /// exposed across the seam (pico-link-vxc). **A level, not an edge**, read
 /// once per superloop iteration and, like [`pl_ui_display_power`],
@@ -638,9 +638,9 @@ pub unsafe extern "C" fn pl_ui_display_power(ui: *mut PlUi) -> PlDisplayPower {
 /// `Widget::redraw_after` into a dirty flag, so reading this before the
 /// tick would delay every time-driven repaint by one frame.
 ///
-/// **Cleared only by [`pl_ui_render`].** If C decides to skip a render this
-/// iteration, the flag simply persists to the next one -- there is no other
-/// way to clear it, so a skipped render can never be silently lost.
+/// **Cleared only by [`pl_ui_render_ex`].** If C decides to skip a render
+/// this iteration, the flag simply persists to the next one -- there is no
+/// other way to clear it, so a skipped render can never be silently lost.
 ///
 /// Returns `true` if `ui` is null -- every degenerate case here fails
 /// toward *painting*, never toward a screen that looks clean when it is
@@ -652,7 +652,7 @@ pub unsafe extern "C" fn pl_ui_display_power(ui: *mut PlUi) -> PlDisplayPower {
 ///
 /// C is expected to gate the render+blit on `display_on && pl_ui_dirty(ui)`,
 /// in that order -- the dirty check must sit *inside* the display-power
-/// gate, never beside it, because calling [`pl_ui_render`] while the panel
+/// gate, never beside it, because calling [`pl_ui_render_ex`] while the panel
 /// is blanked would clear the dirty flag for a frame nobody saw. See
 /// `.planning/design/2026-09-02-dirty-gate-across-the-ffi-seam.md` §3.3.
 ///
@@ -670,72 +670,16 @@ pub unsafe extern "C" fn pl_ui_dirty(ui: *const PlUi) -> bool {
     ui.app.dirty()
 }
 
-/// Renders the current screen -- unconditionally, every call, regardless of
-/// `App::dirty()` (unlike `pico_link_core::run::Runner::step`'s dirty gate,
-/// which this FFI surface does NOT mirror: `App::render` itself has no
-/// dirty check, only `Runner`/`run` do, and neither is in the M1 FFI
-/// surface). Idempotent -- calling it twice with no intervening
-/// `pl_ui_input`/`pl_ui_tick` produces the identical frame both times -- but
-/// C should not assume a cheap early-out here; skipping a redundant render
-/// (and the blit that would follow it) when nothing changed is C's own call
-/// to make, not something this function does for it -- see [`pl_ui_dirty`],
-/// added for exactly that call (pico-link-vxc). This function is what
-/// clears the dirty flag [`pl_ui_dirty`] reports, so C must not call this
-/// while the panel is blanked (it would clear dirty for a frame nobody
-/// saw). Hands back a borrowed pointer to the raw RGB565
-/// pixel data plus its length in pixels
-/// (not bytes). Native CPU (little-endian) `u16` values, one per pixel, row
-/// major -- **not** the panel's big-endian wire format; C's DMA blit is
-/// expected to byte-swap in hardware on the way out (see
-/// `FrameBuffer565::as_raw_u16`'s doc comment).
-///
-/// Sets `*out_px`/`*out_len` to null/0 if `ui` is null. Always sets both
-/// (never leaves them uninitialized) when `ui`, `out_px`, and `out_len` are
-/// all non-null.
-///
-/// # Safety
-///
-/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
-/// destroyed. `out_px`/`out_len`, if non-null, must point to valid,
-/// writable `*const u16`/`usize` storage. The pixel pointer written to
-/// `*out_px` is borrowed until the next call that mutates `ui`
-/// (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render` again) -- C must have copied
-/// out (e.g. into a DMA source) before making that next call.
-#[no_mangle]
-pub unsafe extern "C" fn pl_ui_render(ui: *mut PlUi, out_px: *mut *const u16, out_len: *mut usize) {
-    if out_px.is_null() || out_len.is_null() {
-        return;
-    }
-    if ui.is_null() {
-        // SAFETY: caller contract -- both pointers are valid, writable
-        // storage per the null checks above.
-        unsafe {
-            *out_px = core::ptr::null();
-            *out_len = 0;
-        }
-        return;
-    }
-    // SAFETY: caller contract above.
-    let ui = &mut *ui;
-    let framebuffer = ui.app.render();
-    let raw = framebuffer.as_raw_u16();
-    // SAFETY: caller contract -- both pointers are valid, writable storage.
-    unsafe {
-        *out_px = raw.as_ptr();
-        *out_len = raw.len();
-    }
-}
-
 // --- The versioned render-out seam (pico-link-7h5.6) ---
 //
-// `pl_ui_render` above hands back only the pixel pointer/length -- there is
-// no way across that surface to say "you only need to blit rows 60..119."
-// `pl_ui_render_ex` adds exactly that, carrying the frame damage rect
-// `App::render`'s `RenderOutput` (`pico-link-7h5.4`) already computes, without
-// touching `pl_ui_render` itself: both are live until `pl_ui_render` is
-// retired in `pico-link-7h5.10`, once the partial-blit path
-// (`pico-link-7h5.8`) is proven on hardware. Same ABI-version-guard
-// discipline as `PlEvent`/`PL_EVENT_ABI_VERSION` above (module section doc,
+// `pl_ui_render_ex` carries the frame damage rect `App::render`'s
+// `RenderOutput` (`pico-link-7h5.4`) computes. It replaced the older
+// unversioned `pl_ui_render` (bare `out_px`/`out_len` pair, no damage rect),
+// which was kept alive alongside it only until the partial-blit path
+// (`pico-link-7h5.8`) was proven on hardware, then deleted in
+// `pico-link-7h5.10`. `pl_ui_render_ex` is now the single render entry
+// point. Same ABI-version-guard discipline as
+// `PlEvent`/`PL_EVENT_ABI_VERSION` above (module section doc,
 // `pl_ui_push_event`'s doc comment) -- a `version` field the consumer
 // checks before reading anything else in the struct.
 
@@ -767,9 +711,8 @@ pub struct PlDamageRect {
 pub const PL_RENDER_ABI_VERSION: u32 = 1;
 
 /// The versioned render-out payload [`pl_ui_render_ex`] fills in. `px`
-/// always points at the **whole** framebuffer (same contract as
-/// [`pl_ui_render`]'s `out_px`) -- `rects` narrows which part of it is
-/// worth transferring to the panel, it never repackages the pixels
+/// always points at the **whole** framebuffer -- `rects` narrows which part
+/// of it is worth transferring to the panel, it never repackages the pixels
 /// themselves.
 ///
 /// `rect_count == 0` means "nothing to paint this frame" and C must not
@@ -778,10 +721,9 @@ pub const PL_RENDER_ABI_VERSION: u32 = 1;
 /// are expected to keep gating on that as today; this is a belt, not the
 /// primary mechanism.
 ///
-/// Same borrow lifetime as [`pl_ui_render`]'s `out_px`/`out_len`: `px` and
-/// `rects` are both valid only until the next call that mutates `ui`
-/// (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render`/`pl_ui_render_ex` again). C
-/// must copy out (e.g. into a DMA source) before making that next call.
+/// `px`/`rects` are both valid only until the next call that mutates `ui`
+/// (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render_ex` again). C must copy out
+/// (e.g. into a DMA source) before making that next call.
 #[repr(C)]
 pub struct PlRenderOut {
     pub version: u32,
@@ -792,17 +734,24 @@ pub struct PlRenderOut {
     pub rects: *const PlDamageRect,
 }
 
-/// Renders the current screen, same unconditional/idempotent contract as
-/// [`pl_ui_render`] (see its doc comment -- everything there about *when*
-/// to call this and the dirty-flag interaction applies unchanged), but
-/// additionally reports the frame damage rect via `out`.
+/// Renders the current screen -- unconditionally, every call, regardless of
+/// `App::dirty()` (unlike `pico_link_core::run::Runner::step`'s dirty gate,
+/// which this FFI surface does NOT mirror). Idempotent -- calling it twice
+/// with no intervening `pl_ui_input`/`pl_ui_tick` produces the identical
+/// frame both times -- but C should not assume a cheap early-out here;
+/// skipping a redundant render (and the blit that would follow it) when
+/// nothing changed is C's own call to make, not something this function
+/// does for it -- see [`pl_ui_dirty`], added for exactly that call
+/// (pico-link-vxc). This function is what clears the dirty flag
+/// [`pl_ui_dirty`] reports, so C must not call this while the panel is
+/// blanked (it would clear dirty for a frame nobody saw). Additionally
+/// reports the frame damage rect via `out`.
 ///
 /// Writes `*out` unconditionally when `ui` and `out` are both non-null:
 /// on a null `ui`, `out->version` is still set to [`PL_RENDER_ABI_VERSION`]
 /// but `px` is null, `px_len`/`rect_count` are `0`, and `rects` is null --
-/// mirroring [`pl_ui_render`]'s null-`ui` behaviour rather than leaving the
-/// struct uninitialized. A no-op (does not touch `*out` at all) if `out`
-/// itself is null.
+/// never leaving the struct uninitialized. A no-op (does not touch `*out`
+/// at all) if `out` itself is null.
 ///
 /// `out->rect_count` is `0` when the just-rendered frame changed nothing
 /// visible (`App::render`'s reported damage rect was empty) -- C must treat
@@ -814,9 +763,8 @@ pub struct PlRenderOut {
 /// destroyed. `out`, if non-null, must point to valid, writable
 /// [`PlRenderOut`] storage. The `px`/`rects` pointers written into `*out`
 /// are borrowed until the next call that mutates `ui`
-/// (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render`/`pl_ui_render_ex` again) -- C
-/// must have copied out (e.g. into a DMA source) before making that next
-/// call.
+/// (`pl_ui_input`/`pl_ui_tick`/`pl_ui_render_ex` again) -- C must have
+/// copied out (e.g. into a DMA source) before making that next call.
 #[no_mangle]
 pub unsafe extern "C" fn pl_ui_render_ex(ui: *mut PlUi, out: *mut PlRenderOut) {
     if out.is_null() {
@@ -2004,6 +1952,24 @@ mod tests {
         ui
     }
 
+    /// Renders once through the real FFI entry point purely to reach a
+    /// known-clean (`!App::dirty()`) baseline before exercising input/tick
+    /// behaviour -- the render-out payload itself is not asserted on here.
+    /// Used in place of the old unversioned `pl_ui_render` (retired in
+    /// `pico-link-7h5.10`); `pl_ui_render_ex` is the only render entry
+    /// point now.
+    fn render_ex_once(ui: *mut PlUi) {
+        let mut out = PlRenderOut {
+            version: 0,
+            px: core::ptr::null(),
+            px_len: 0,
+            stride: 0,
+            rect_count: 0,
+            rects: core::ptr::null(),
+        };
+        unsafe { pl_ui_render_ex(ui, &mut out) };
+    }
+
     #[test]
     fn pl_ui_render_ex_null_ui_degrades_to_zeroed_output_with_version_set() {
         let mut out = PlRenderOut {
@@ -2114,9 +2080,7 @@ mod tests {
         // be root today. A fresh `App` starts dirty (it hasn't rendered its
         // initial screen yet), so render once through the real FFI entry
         // point first to get to a known-clean baseline.
-        let mut out_px = core::ptr::null();
-        let mut out_len = 0usize;
-        unsafe { pl_ui_render(ui, &mut out_px, &mut out_len) };
+        render_ex_once(ui);
         assert!(!unsafe { (*ui).app.dirty() }, "PlUi should be clean immediately after a render");
         let mixed = [
             PlIntent { tag: PlIntentTag::Down as u32, jump_by: 0 },
@@ -2205,9 +2169,7 @@ mod tests {
         // forwarded to the navigator" -- same pattern as
         // `pico_link_core::run::tests::waking_input_is_swallowed_but_the_
         // next_input_reaches_the_app`.
-        let mut out_px = core::ptr::null();
-        let mut out_len = 0usize;
-        unsafe { pl_ui_render(ui, &mut out_px, &mut out_len) };
+        render_ex_once(ui);
         assert!(!unsafe { (*ui).app.dirty() }, "PlUi should be clean immediately after a render");
 
         let down = [PlIntent { tag: PlIntentTag::Down as u32, jump_by: 0 }];
