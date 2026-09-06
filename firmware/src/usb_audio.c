@@ -590,6 +590,20 @@ int8_t pl_usb_audio_fu_mute(uint8_t ch) {
     return fu_mute[ch];
 }
 
+// Bead pico-link-rmp (VT4a.1). See usb_audio.h's doc comment.
+void pl_usb_audio_fu_set_volume(uint8_t ch, int16_t raw) {
+    if (ch >= CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1) {
+        return;
+    }
+    if (raw < -12700) {
+        raw = -12700;
+    }
+    if (raw > 0) {
+        raw = 0;
+    }
+    fu_volume[ch] = raw;
+}
+
 uint8_t pl_usb_audio_fu_channel_count(void) {
     return CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1;
 }
