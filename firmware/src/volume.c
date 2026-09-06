@@ -2,6 +2,7 @@
 
 #include "hardware/sync.h"
 
+#include "bt.h" // pl_bt_push_volume_changed -- bead pico-link-4v2.5 (VT5), design section 7
 #ifdef PL_DEBUG_REMOTE
 #include "pl_prio.h"
 #endif
@@ -146,6 +147,13 @@ static void apply_and_propagate(uint8_t new_level, PlVolumeSource source, uint64
         s_fu_dirty = true; // T4 (pico-link-4v2.4): read-and-cleared by pl_volume_take_fu_report()
         s_avrcp_desired = avrcp_level;
         s_avrcp_dirty = true;
+        // Bead pico-link-4v2.5 (VT5), design section 7: cross the new
+        // canonical value to Rust over bt.c's UI ring. Only on a real
+        // edge (`emit == true`) -- T2's debug-console "VOL SET" path
+        // passes `emit == false` and has no representable source in this
+        // event (PL_VOLUME_SOURCE_CONSOLE isn't one of design section 7's
+        // three values), same reasoning as the WOULD-EMIT log line below.
+        pl_bt_push_volume_changed(s_level, s_muted, (uint8_t)source);
     }
 
     // pico-link-4v2.3 (VT3) code-review fix, inherited from VT2's review:

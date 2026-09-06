@@ -333,6 +333,40 @@ pub enum StoreStatus {
     VersionMismatch,
 }
 
+/// Who most recently drove [`BtModel::volume`] (design
+/// `.planning/design/2026-09-02-volume-sync.md` section 7) -- carried
+/// through purely for display/diagnostics, matching `firmware/src/
+/// volume.h`'s `PlVolumeSource` doc comment ("NOT used by the loop-
+/// breaking rule"). `core` does not act on this today: it is stored so
+/// VT6 (the screensaver question, bead pico-link-4v2.6) can read it
+/// without a second reshape of this seam -- see [`Event::VolumeChanged`]'s
+/// doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeSource {
+    /// The USB host's feature-unit volume (macOS's output slider).
+    Host,
+    /// The connected A2DP/AVRCP sink (the headphones themselves).
+    Sink,
+    /// A future on-device volume control (design section 8, out of scope
+    /// until that bead lands) -- representable now so this enum doesn't
+    /// need a second non-additive reshape when it arrives.
+    Device,
+}
+
+/// One canonical volume reading (design section 7) -- `level` is always in
+/// the AVRCP absolute-volume domain (0..127), which `firmware/src/
+/// volume.c`'s canonical state already uses as ITS native domain (no
+/// mapping needed here, unlike the USB feature-unit's dB*100 domain that
+/// module maps on ingest). `muted` mirrors `firmware/src/volume.c`'s
+/// `s_muted`, currently always `false` -- no mute source is wired yet
+/// (see `volume.h`'s "MUTE" doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeState {
+    pub level: u8,
+    pub muted: bool,
+    pub source: VolumeSource,
+}
+
 impl ConnectFailureReason {
     /// Whether a retry of the *same* device could plausibly succeed.
     /// `false` for [`Self::NoA2dpSink`] (a fixed capability of that
@@ -481,6 +515,19 @@ pub enum Event {
         peak_r: u8,
         rms_l: u8,
         rms_r: u8,
+    },
+    /// One canonical volume reading (bead pico-link-4v2.5, VT5, design
+    /// `.planning/design/2026-09-02-volume-sync.md` section 7) -- pushed by
+    /// `firmware/src/bt.c`'s `pl_bt_push_volume_changed` whenever
+    /// `volume.c`'s loop rule actually applies a new canonical level (never
+    /// on an absorbed no-op, and never for `volume.c`'s debug-console-only
+    /// `PL_VOLUME_SOURCE_CONSOLE` origin, which design section 7 excludes
+    /// from this event). Folds into [`BtModel::volume`]. `source` is
+    /// carried, not acted on -- see [`VolumeSource`]'s doc comment.
+    VolumeChanged {
+        level: u8,
+        muted: bool,
+        source: VolumeSource,
     },
 }
 
@@ -727,6 +774,15 @@ pub struct BtModel {
     /// [`App::set_link_state`] on the same lifecycle as `connected_codec`.
     /// Bead pico-link-du0.
     pub out_level: Option<OutLevelSample>,
+    /// The most recent canonical volume reading, if any -- `None` until
+    /// the first [`Event::VolumeChanged`] arrives (design section 7).
+    /// Unlike `out_level`/`connected_codec`, this is NOT cleared by
+    /// [`App::set_link_state`] on disconnect: the host feature-unit
+    /// volume this most commonly reflects is a USB-side concept, not an
+    /// A2DP-link-lifetime one (design section 7 names no such clearing
+    /// rule, unlike `out_level`/`connected_codec`'s explicit ones).
+    /// Populated by [`App::on_volume_changed`]. Bead pico-link-4v2.5 (VT5).
+    pub volume: Option<VolumeState>,
 }
 
 /// One [`Event::LevelsChanged`] reading, timestamped and peak-held at the
@@ -1400,6 +1456,7 @@ impl App {
             Event::PairedDeviceForgotten { addr } => self.on_paired_device_forgotten(addr),
             Event::PairedStoreFull => self.on_paired_store_full(),
             Event::LevelsChanged { peak_l, peak_r, rms_l, rms_r } => self.on_levels_changed(peak_l, peak_r, rms_l, rms_r),
+            Event::VolumeChanged { level, muted, source } => self.on_volume_changed(level, muted, source),
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -1632,6 +1689,17 @@ impl App {
     /// data rather than deriving them from codec identity itself.
     pub fn set_connected_codec(&mut self, codec: ConnectedCodec) {
         self.model.connected_codec = Some(codec);
+        self.rebuild_root();
+    }
+
+    /// Folds one [`Event::VolumeChanged`] reading into [`BtModel::volume`]
+    /// (bead pico-link-4v2.5, VT5, design section 7). No screen reads this
+    /// yet -- `rebuild_root` is called anyway, matching every other
+    /// `BtModel`-mutating fold in this file, so a future screen can rely
+    /// on that convention rather than each one deciding for itself whether
+    /// a redraw is warranted.
+    pub fn on_volume_changed(&mut self, level: u8, muted: bool, source: VolumeSource) {
+        self.model.volume = Some(VolumeState { level, muted, source });
         self.rebuild_root();
     }
 

@@ -110,6 +110,14 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
 // handler (a2dp.c), never from the media timer path.
 void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t name_len, uint32_t nominal_bitrate_bps);
 
+// Pushes Event::VolumeChanged{level, muted, source} (bead pico-link-4v2.5,
+// VT5, design section 7). `level` is volume.c's canonical 0..127 AVRCP-
+// domain value, `source` is volume.h's PlVolumeSource raw value
+// (0=host/1=sink/2=device -- never PL_VOLUME_SOURCE_CONSOLE=3, design
+// section 7 excludes it). Call only from volume.c's apply_and_propagate,
+// and only when `emit` is true.
+void pl_bt_push_volume_changed(uint8_t level, bool muted, uint8_t source);
+
 // pl_bt_push_levels_changed used to live here (bead pico-link-du0). Deleted
 // by pico-link-nli.5 (G4) -- see a2dp.c's pl_a2dp_poll_levels and
 // s_level_snapshot doc comments for the seqlock that replaced this ring
