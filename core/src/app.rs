@@ -757,18 +757,20 @@ pub struct OutLevelSample {
     hold_r_at: Instant,
     pub received_at: Instant,
     /// Release-ballistic attack anchor (bead pico-link-ajj, design
-    /// requirement C): the `rms_l`/`rms_r` value in effect at the moment it
-    /// was last set by an instantaneous attack, i.e. the last time a fresh
-    /// reading was at or above the then-current decayed value. `crate::
-    /// render::hero`'s render function decays *from* this anchor at render
-    /// time (via [`decay_rms`]) to get the bar's actually-displayed level —
-    /// see [`App::on_levels_changed`] for how the anchor is updated, and
-    /// [`decay_rms`]'s doc comment for why this is a pure render-time
+    /// requirement C; switched from rms to peak by bead pico-link-53c so the
+    /// ballistic anchors on the same quantity the bar now draws): the
+    /// `peak_l`/`peak_r` value in effect at the moment it was last set by an
+    /// instantaneous attack, i.e. the last time a fresh reading was at or
+    /// above the then-current decayed value. `crate::render::hero`'s render
+    /// function decays *from* this anchor at render time (via
+    /// [`decay_peak`]) to get the bar's actually-displayed level — see
+    /// [`App::on_levels_changed`] for how the anchor is updated, and
+    /// [`decay_peak`]'s doc comment for why this is a pure render-time
     /// computation rather than a value mutated on a timer.
-    pub(crate) attack_rms_l: u8,
-    pub(crate) attack_rms_r: u8,
-    pub(crate) attack_rms_l_at: Instant,
-    pub(crate) attack_rms_r_at: Instant,
+    pub(crate) attack_peak_l: u8,
+    pub(crate) attack_peak_r: u8,
+    pub(crate) attack_peak_l_at: Instant,
+    pub(crate) attack_peak_r_at: Instant,
 }
 
 /// Exponential-release rate for the vertical OUT meter's ballistics (bead
@@ -778,7 +780,7 @@ pub struct OutLevelSample {
 /// millisecond (`10^(-1/1000)`, precomputed offline as a constant) rather
 /// than a runtime `powf`/`log10` call: `core` is `no_std` with no `libm`
 /// (same constraint [`crate::render::theme::VERTICAL_METER_DBFS_THRESHOLDS`]
-/// documents), so [`decay_rms`] raises this ratio to the elapsed
+/// documents), so [`decay_peak`] raises this ratio to the elapsed
 /// millisecond count via integer exponentiation-by-squaring instead.
 const RELEASE_RATIO_PER_MS_Q16: u32 = 65384;
 
@@ -814,7 +816,7 @@ const fn q16_pow(base: u32, mut exp: u64) -> u32 {
     result
 }
 
-/// Decays `anchor` (a linear 0-255 rms reading, same scale as
+/// Decays `anchor` (a linear 0-255 peak reading, same scale as
 /// [`Event::LevelsChanged`]'s payload) by `elapsed`, at
 /// [`RELEASE_RATIO_PER_MS_Q16`]'s ~20 dB/s release rate. Pure and safe to
 /// call at render time: both [`App::on_levels_changed`] (to decide whether
@@ -831,7 +833,7 @@ const fn q16_pow(base: u32, mut exp: u64) -> u32 {
 // post-shift result is always `<= anchor`, i.e. `<= 255` and safe to
 // narrow to `u8`.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn decay_rms(anchor: u8, elapsed: Duration) -> u8 {
+pub(crate) fn decay_peak(anchor: u8, elapsed: Duration) -> u8 {
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     let ratio = q16_pow(RELEASE_RATIO_PER_MS_Q16, elapsed_ms);
     ((u32::from(anchor) * ratio) >> 16) as u8
@@ -1664,24 +1666,27 @@ impl App {
             (prev_hold_r, prev_hold_r_at)
         };
         // Release-ballistic attack anchor (bead pico-link-ajj, design
-        // requirement C): decay the previous anchor to "now" and compare
-        // against the fresh rms sample. If the fresh sample is at or above
-        // that decayed value, this is a rise -- attack is instantaneous,
-        // so the anchor jumps straight to the new sample. Otherwise the
-        // anchor is left exactly as it was, so the render-time decay in
+        // requirement C; anchors on peak, not rms, as of bead pico-link-53c
+        // -- the bar itself now draws peak, so the ballistic must decay the
+        // same quantity it draws or the displayed bar and its decay drift
+        // apart): decay the previous anchor to "now" and compare against
+        // the fresh peak sample. If the fresh sample is at or above that
+        // decayed value, this is a rise -- attack is instantaneous, so the
+        // anchor jumps straight to the new sample. Otherwise the anchor is
+        // left exactly as it was, so the render-time decay in
         // `crate::render::hero` continues gliding down from the same
         // point instead of re-anchoring (and thus flattening the release
         // curve) on every quieter sample.
         let (prev_anchor_l, prev_anchor_l_at, prev_anchor_r, prev_anchor_r_at) = match &self.model.out_level {
-            Some(sample) => (sample.attack_rms_l, sample.attack_rms_l_at, sample.attack_rms_r, sample.attack_rms_r_at),
+            Some(sample) => (sample.attack_peak_l, sample.attack_peak_l_at, sample.attack_peak_r, sample.attack_peak_r_at),
             None => (0, now, 0, now),
         };
-        let decayed_l = decay_rms(prev_anchor_l, now.saturating_duration_since(prev_anchor_l_at));
-        let (attack_rms_l, attack_rms_l_at) =
-            if rms_l >= decayed_l { (rms_l, now) } else { (prev_anchor_l, prev_anchor_l_at) };
-        let decayed_r = decay_rms(prev_anchor_r, now.saturating_duration_since(prev_anchor_r_at));
-        let (attack_rms_r, attack_rms_r_at) =
-            if rms_r >= decayed_r { (rms_r, now) } else { (prev_anchor_r, prev_anchor_r_at) };
+        let decayed_l = decay_peak(prev_anchor_l, now.saturating_duration_since(prev_anchor_l_at));
+        let (attack_peak_l, attack_peak_l_at) =
+            if peak_l >= decayed_l { (peak_l, now) } else { (prev_anchor_l, prev_anchor_l_at) };
+        let decayed_r = decay_peak(prev_anchor_r, now.saturating_duration_since(prev_anchor_r_at));
+        let (attack_peak_r, attack_peak_r_at) =
+            if peak_r >= decayed_r { (peak_r, now) } else { (prev_anchor_r, prev_anchor_r_at) };
         self.model.out_level = Some(OutLevelSample {
             peak_l,
             peak_r,
@@ -1692,10 +1697,10 @@ impl App {
             hold_l_at,
             hold_r_at,
             received_at: now,
-            attack_rms_l,
-            attack_rms_r,
-            attack_rms_l_at,
-            attack_rms_r_at,
+            attack_peak_l,
+            attack_peak_r,
+            attack_peak_l_at,
+            attack_peak_r_at,
         });
         self.rebuild_root();
     }
@@ -3425,17 +3430,17 @@ mod tests {
         assert_eq!(app.poll_command(), None);
     }
 
-    // --- decay_rms / vertical OUT meter release ballistics (bead
+    // --- decay_peak / vertical OUT meter release ballistics (bead
     // pico-link-ajj): code review found the render-side floor
     // (`.max(level.rms_l)` in `render::hero`) pinned the displayed value
     // to the last raw reading for a sample's whole life, defeating the
     // release entirely -- these tests exercise decay over elapsed time
     // WITHOUT a new sample arriving, which is exactly the case that bug
-    // was invisible to (no prior test drove `decay_rms` at all). ---
+    // was invisible to (no prior test drove `decay_peak` at all). ---
 
     #[test]
-    fn decay_rms_at_zero_elapsed_is_unchanged() {
-        assert_eq!(decay_rms(200, Duration::from_millis(0)), 200);
+    fn decay_peak_at_zero_elapsed_is_unchanged() {
+        assert_eq!(decay_peak(200, Duration::from_millis(0)), 200);
     }
 
     #[test]
@@ -3444,37 +3449,37 @@ mod tests {
     // similar-names lint false-positives on this the same way the
     // existing L/R channel bindings do elsewhere in this file.
     #[allow(clippy::similar_names)]
-    fn decay_rms_falls_strictly_over_time_with_no_new_sample() {
-        // The exact regression the review caught: sampling decay_rms at
+    fn decay_peak_falls_strictly_over_time_with_no_new_sample() {
+        // The exact regression the review caught: sampling decay_peak at
         // increasing elapsed times (no new LevelsChanged in between) must
         // show a strictly decreasing sequence, not a value pinned at the
         // anchor.
         let anchor = 200;
-        let at_0ms = decay_rms(anchor, Duration::from_millis(0));
-        let at_100ms = decay_rms(anchor, Duration::from_millis(100));
-        let at_500ms = decay_rms(anchor, Duration::from_millis(500));
-        let at_1000ms = decay_rms(anchor, Duration::from_millis(1000));
+        let at_0ms = decay_peak(anchor, Duration::from_millis(0));
+        let at_100ms = decay_peak(anchor, Duration::from_millis(100));
+        let at_500ms = decay_peak(anchor, Duration::from_millis(500));
+        let at_1000ms = decay_peak(anchor, Duration::from_millis(1000));
         assert!(at_0ms > at_100ms, "200 -> {at_100ms} after 100ms: must have started falling");
         assert!(at_100ms > at_500ms, "{at_100ms} -> {at_500ms} after 500ms: must keep falling");
         assert!(at_500ms > at_1000ms, "{at_500ms} -> {at_1000ms} after 1000ms: must keep falling");
     }
 
     #[test]
-    fn decay_rms_after_one_second_is_roughly_ten_percent() {
+    fn decay_peak_after_one_second_is_roughly_ten_percent() {
         // ~20 dB/s release (design requirement C) means amplitude falls
         // to roughly 10% after one second of continuous release.
-        let decayed = decay_rms(200, Duration::from_millis(1000));
+        let decayed = decay_peak(200, Duration::from_millis(1000));
         assert!((15..=25).contains(&decayed), "expected ~20 (10% of 200), got {decayed}");
     }
 
     #[test]
-    fn decay_rms_eventually_reaches_zero_and_stays_there() {
-        let decayed = decay_rms(255, Duration::from_secs(10));
+    fn decay_peak_eventually_reaches_zero_and_stays_there() {
+        let decayed = decay_peak(255, Duration::from_secs(10));
         assert_eq!(decayed, 0);
         // u64::MAX elapsed must not panic or wrap -- `App::on_levels_changed`
         // can hand this an arbitrarily large gap (e.g. the very first
         // reading, decayed from a zero anchor at `Instant::from_micros(0)`).
-        assert_eq!(decay_rms(255, Duration::from_micros(u64::MAX)), 0);
+        assert_eq!(decay_peak(255, Duration::from_micros(u64::MAX)), 0);
     }
 
     #[test]
@@ -3487,20 +3492,20 @@ mod tests {
         app.tick(1);
         app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 200, rms_l: 200, rms_r: 200 });
         let sample_at_fold = app.model().out_level.expect("a reading was just folded in");
-        assert_eq!(sample_at_fold.attack_rms_l, 200, "an empty prior anchor means the first sample is an instantaneous attack");
+        assert_eq!(sample_at_fold.attack_peak_l, 200, "an empty prior anchor means the first sample is an instantaneous attack");
 
         // No new Event::LevelsChanged from here -- only the clock moves.
         app.tick(1 + 300_000); // +300ms
-        let decayed_300ms = decay_rms(
-            sample_at_fold.attack_rms_l,
-            Instant::from_micros(app.now_us()).saturating_duration_since(sample_at_fold.attack_rms_l_at),
+        let decayed_300ms = decay_peak(
+            sample_at_fold.attack_peak_l,
+            Instant::from_micros(app.now_us()).saturating_duration_since(sample_at_fold.attack_peak_l_at),
         );
         assert!(decayed_300ms < 200, "300ms after the last event with no new sample, the ballistic must have started releasing, got {decayed_300ms}");
 
         app.tick(1 + 550_000); // +550ms from the event (still under the 600ms staleness window)
-        let decayed_550ms = decay_rms(
-            sample_at_fold.attack_rms_l,
-            Instant::from_micros(app.now_us()).saturating_duration_since(sample_at_fold.attack_rms_l_at),
+        let decayed_550ms = decay_peak(
+            sample_at_fold.attack_peak_l,
+            Instant::from_micros(app.now_us()).saturating_duration_since(sample_at_fold.attack_peak_l_at),
         );
         assert!(decayed_550ms < decayed_300ms, "the release must keep falling as more time passes with still no new sample: {decayed_300ms} -> {decayed_550ms}");
 
@@ -3509,7 +3514,7 @@ mod tests {
         // computation off a fixed fold-time anchor, never a value ticked
         // down in place.
         let sample_after_ticks = app.model().out_level.expect("no event cleared it");
-        assert_eq!(sample_after_ticks.attack_rms_l, sample_at_fold.attack_rms_l);
-        assert_eq!(sample_after_ticks.attack_rms_l_at, sample_at_fold.attack_rms_l_at);
+        assert_eq!(sample_after_ticks.attack_peak_l, sample_at_fold.attack_peak_l);
+        assert_eq!(sample_after_ticks.attack_peak_l_at, sample_at_fold.attack_peak_l_at);
     }
 }

@@ -613,18 +613,46 @@ where
 
 /// Number of segments in one [`draw_vertical_level_meter`] channel column —
 /// `.planning/design/2026-09-03-vertical-out-meter.md` section 5: 16, up
-/// from [`METER_SEGMENT_COUNT`]'s 8. The horizontal meter's 8 segments in a
-/// 174px-tall column would read as a crude three-state light; 16 stay
-/// individually resolvable at 30-50cm.
-const VERTICAL_METER_SEGMENT_COUNT: i32 = 16;
-/// Height (px) of a single vertical-meter segment.
-const VERTICAL_METER_SEGMENT_HEIGHT: i32 = 9;
-/// Gap (px) between adjacent vertical-meter segments.
-const VERTICAL_METER_SEGMENT_GAP: i32 = 2;
-/// Total footprint (px) of one full vertical meter column —
-/// `16*9 + 15*2 = 174`, exactly the design's meter-block height (section 4).
-pub const VERTICAL_METER_GLYPH_HEIGHT: u32 = (VERTICAL_METER_SEGMENT_COUNT * VERTICAL_METER_SEGMENT_HEIGHT
-    + (VERTICAL_METER_SEGMENT_COUNT - 1) * VERTICAL_METER_SEGMENT_GAP) as u32;
+/// from [`METER_SEGMENT_COUNT`]'s 8, doubled again to 32 by bead
+/// pico-link-53c once the smoothed damage pass made the meter worth
+/// judging at finer resolution. The horizontal meter's 8 segments in a
+/// 174px-tall column would read as a crude three-state light; 32 stay
+/// individually resolvable at 30-50cm and halve the dBFS step to 1.5dB
+/// (see [`VERTICAL_METER_DBFS_THRESHOLDS`]).
+const VERTICAL_METER_SEGMENT_COUNT: i32 = 32;
+/// Height (px) of a single vertical-meter segment. 32*9 + 31*2 would no
+/// longer fit the fixed 174px footprint the 16-segment geometry used, so
+/// bead pico-link-53c shrank this (and [`VERTICAL_METER_SEGMENT_GAP`])
+/// instead of changing [`VERTICAL_METER_GLYPH_HEIGHT`], which the
+/// surrounding layout depends on. 32*4 + 31*1 = 159px, 15px short of the
+/// 174px footprint; the drawn column is centred inside it via
+/// [`VERTICAL_METER_TOP_PAD`] rather than flush to the top or bottom edge.
+const VERTICAL_METER_SEGMENT_HEIGHT: i32 = 4;
+/// Gap (px) between adjacent vertical-meter segments — see
+/// [`VERTICAL_METER_SEGMENT_HEIGHT`]'s doc comment for how this and the
+/// segment height were chosen to fit inside the fixed footprint.
+const VERTICAL_METER_SEGMENT_GAP: i32 = 1;
+/// Height (px) of the actually-drawn column: 32 segments of
+/// [`VERTICAL_METER_SEGMENT_HEIGHT`] separated by 31 gaps of
+/// [`VERTICAL_METER_SEGMENT_GAP`]. Strictly less than
+/// [`VERTICAL_METER_GLYPH_HEIGHT`] as of bead pico-link-53c — see that
+/// constant's doc comment for why the two are no longer equal.
+const VERTICAL_METER_DRAWN_HEIGHT: i32 =
+    VERTICAL_METER_SEGMENT_COUNT * VERTICAL_METER_SEGMENT_HEIGHT + (VERTICAL_METER_SEGMENT_COUNT - 1) * VERTICAL_METER_SEGMENT_GAP;
+/// Total footprint (px) of one full vertical meter column — fixed at 174,
+/// exactly the design's meter-block height (section 4). Held fixed rather
+/// than recomputed from the segment geometry (as it was before the
+/// 16-to-32 segment bump, bead pico-link-53c) because the surrounding
+/// layout is built against this exact number; 32 segments do not divide
+/// 174 evenly, so [`VERTICAL_METER_DRAWN_HEIGHT`] (159px) is centred inside
+/// this footprint instead via [`VERTICAL_METER_TOP_PAD`].
+pub const VERTICAL_METER_GLYPH_HEIGHT: u32 = 174;
+/// Padding (px) above the drawn column within [`VERTICAL_METER_GLYPH_HEIGHT`]'s
+/// footprint: half of the `174 - `[`VERTICAL_METER_DRAWN_HEIGHT`]` = 15`px
+/// of slack, so the column sits centred rather than flush to the top edge
+/// (bead pico-link-53c). Integer division rounds down, so any odd leftover
+/// pixel goes to the bottom pad instead — arbitrary but deterministic.
+const VERTICAL_METER_TOP_PAD: i32 = (VERTICAL_METER_GLYPH_HEIGHT as i32 - VERTICAL_METER_DRAWN_HEIGHT) / 2;
 
 /// dBFS threshold, per vertical-meter segment, that `level` (linear 0-255,
 /// see [`draw_vertical_level_meter`]'s doc comment) must meet or exceed for
@@ -638,15 +666,25 @@ pub const VERTICAL_METER_GLYPH_HEIGHT: u32 = (VERTICAL_METER_SEGMENT_COUNT * VER
 ///
 /// `core` is `no_std` with no `libm`, so this is a precomputed const table
 /// rather than a `log10` call at render time. Each entry is
-/// `round(255 * 10^((-48 + 3*(i+1)) / 20))` for `i` in `0..16` — a 3
-/// dB-per-segment scale spanning -48 dBFS (segment 1 lit) to 0 dBFS
-/// (full scale, all 16 lit). Segment `i`'s threshold is this array's `i`-th
-/// entry (0-indexed, quietest/bottom-most first, same convention as
+/// `round(255 * 10^((-48 + 1.5*(i+1)) / 20))` for `i` in `0..32` — a 1.5
+/// dB-per-segment scale (halved from 3dB by bead pico-link-53c, doubling
+/// the segment count from 16 to 32) spanning -48 dBFS (segment 1 lit) to
+/// 0 dBFS (full scale, all 32 lit). Segment `i`'s threshold is this array's
+/// `i`-th entry (0-indexed, quietest/bottom-most first, same convention as
 /// [`vertical_level_segment_color`]).
-const VERTICAL_METER_DBFS_THRESHOLDS: [u8; VERTICAL_METER_SEGMENT_COUNT as usize] =
-    [1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 90, 128, 181, 255];
+///
+/// Several of the lowest entries round to the same `u8` (`1, 1, 2, 2, 2, 3,
+/// 3, ...`) — unavoidable once a 1.5dB step is quantised onto a linear 0-255
+/// input at the quiet end of the scale, where consecutive dB steps are only
+/// a couple of linear units apart. The practical effect is that the bottom
+/// few segments light together rather than strictly one at a time; this was
+/// called out and accepted when the segment count was doubled, not an
+/// oversight.
+const VERTICAL_METER_DBFS_THRESHOLDS: [u8; VERTICAL_METER_SEGMENT_COUNT as usize] = [
+    1, 1, 2, 2, 2, 3, 3, 4, 5, 6, 7, 8, 10, 11, 14, 16, 19, 23, 27, 32, 38, 45, 54, 64, 76, 90, 108, 128, 152, 181, 215, 255,
+];
 
-/// Maps a linear 0-255 level to a segment *count* (0..=16) via
+/// Maps a linear 0-255 level to a segment *count* (0..=32) via
 /// [`VERTICAL_METER_DBFS_THRESHOLDS`]: the number of thresholds `level`
 /// meets or exceeds. Shared by the moving bar (`filled`) and the peak-hold
 /// cap (`hold_index`) in [`draw_vertical_level_meter`] so both read off one
@@ -668,12 +706,17 @@ pub(crate) fn vertical_level_dbfs_segment_count(level: u8) -> i32 {
 /// proportions* as the horizontal meter (green bottom 5/8, amber next 2/8,
 /// red top 1/8), not the literal indices, since porting the indices from
 /// [`level_segment_color`] verbatim would halve the red zone at 16
-/// segments. At 16: green bottom 10/16 (indices 0-9), amber next 4/16
-/// (indices 10-13), red top 2/16 (indices 14-15).
+/// segments. At 16 (before bead pico-link-53c doubled the segment count):
+/// green bottom 10/16 (indices 0-9), amber next 4/16 (indices 10-13), red
+/// top 2/16 (indices 14-15). At 32, the same proportions become green
+/// bottom 20/32 (indices 0-19), amber next 8/32 (indices 20-27), red top
+/// 4/32 (indices 28-31) — this is exactly the trap this doc comment already
+/// warned about: porting the *indices* (`-2`/`-6`) instead of recomputing
+/// them from the proportions would have halved the red zone again.
 fn vertical_level_segment_color(index: i32) -> Rgb565 {
-    if index >= VERTICAL_METER_SEGMENT_COUNT - 2 {
+    if index >= VERTICAL_METER_SEGMENT_COUNT - 4 {
         palette::STATUS_ERROR
-    } else if index >= VERTICAL_METER_SEGMENT_COUNT - 6 {
+    } else if index >= VERTICAL_METER_SEGMENT_COUNT - 12 {
         palette::STATUS_WARNING
     } else {
         palette::TEXT_PRIMARY
@@ -717,21 +760,26 @@ where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
     // dBFS-scaled segment count (bead pico-link-ajj) -- NOT a linear
-    // level*16/256 mapping. See `vertical_level_dbfs_segment_count`'s doc
-    // comment for why: linear made typical music RMS light 1-3 of 16
-    // segments.
+    // level*32/256 mapping. See `vertical_level_dbfs_segment_count`'s doc
+    // comment for why: linear made typical music RMS light only a handful
+    // of segments.
     let filled = vertical_level_dbfs_segment_count(level);
     let hold_index = if hold == 0 {
         None
     } else {
-        // Same dBFS scale as `filled`, converted from a 0..=16 count to a
+        // Same dBFS scale as `filled`, converted from a 0..=32 count to a
         // 0-based index -- a nonzero hold always shows at least segment 0,
         // and the cap lands on the same segment the bar would if it were
         // at this level (one shared scale, not one log and one linear).
         Some((vertical_level_dbfs_segment_count(hold) - 1).clamp(0, VERTICAL_METER_SEGMENT_COUNT - 1))
     };
 
-    let bottom = rect.top_left.y + VERTICAL_METER_GLYPH_HEIGHT as i32;
+    // The drawn column (`VERTICAL_METER_DRAWN_HEIGHT`, 159px) is shorter
+    // than the fixed footprint (`VERTICAL_METER_GLYPH_HEIGHT`, 174px) as of
+    // bead pico-link-53c, so its bottom edge sits `VERTICAL_METER_TOP_PAD`
+    // px up from the footprint's own bottom edge, centring the column
+    // rather than anchoring it flush to the bottom.
+    let bottom = rect.top_left.y + VERTICAL_METER_TOP_PAD + VERTICAL_METER_DRAWN_HEIGHT;
 
     for i in 0..VERTICAL_METER_SEGMENT_COUNT {
         // i=0 is the bottom-most (quietest) segment; growth is upward, so
@@ -952,7 +1000,7 @@ mod tests {
     // indices instead of its proportions would halve the red zone) -------
 
     fn vertical_meter_segment_color_at(fb: &FrameBuffer565, rect: Rectangle, index_from_bottom: i32) -> Rgb565 {
-        let bottom = rect.top_left.y + VERTICAL_METER_GLYPH_HEIGHT as i32;
+        let bottom = rect.top_left.y + VERTICAL_METER_TOP_PAD + VERTICAL_METER_DRAWN_HEIGHT;
         let y = bottom
             - (index_from_bottom + 1) * VERTICAL_METER_SEGMENT_HEIGHT
             - index_from_bottom * VERTICAL_METER_SEGMENT_GAP
@@ -984,26 +1032,28 @@ mod tests {
         let mut fb = FrameBuffer565::new(20, 180);
         let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
         draw_vertical_level_meter(&mut fb, rect, 255, 0).unwrap();
-        // Bottom 10/16 segments (indices 0-9) are the green zone.
-        for i in 0..10 {
+        // Bottom 20/32 segments (indices 0-19) are the green zone -- same
+        // 5/8 proportion as the 16-segment geometry, doubled by bead
+        // pico-link-53c.
+        for i in 0..20 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::TEXT_PRIMARY,
                 "segment {i} from the bottom must be in the green (TEXT_PRIMARY) zone"
             );
         }
-        // Next 4/16 (indices 10-13) are the amber zone.
-        for i in 10..14 {
+        // Next 8/32 (indices 20-27) are the amber zone.
+        for i in 20..28 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::STATUS_WARNING,
                 "segment {i} from the bottom must be in the amber (STATUS_WARNING) zone"
             );
         }
-        // Top 2/16 (indices 14-15) are the red zone -- porting the
+        // Top 4/32 (indices 28-31) are the red zone -- porting the
         // horizontal meter's literal indices (top 1/8) instead of the
-        // proportion would wrongly leave index 14 amber.
-        for i in 14..16 {
+        // proportion would wrongly leave index 28 amber.
+        for i in 28..32 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::STATUS_ERROR,
@@ -1013,23 +1063,25 @@ mod tests {
     }
 
     #[test]
-    fn draw_vertical_level_meter_half_linear_scale_fills_14_of_16_on_the_dbfs_scale() {
+    fn draw_vertical_level_meter_half_linear_scale_fills_28_of_32_on_the_dbfs_scale() {
         // 128/255 linear is -6 dBFS, not -infinity-to-0's midpoint -- on a
         // log scale that is loud, not "half". This replaces a pre-pico-
-        // link-ajj test that expected a linear 8-of-16 split; the dBFS
-        // mapping is the point of this bead, so the old expectation would
-        // be testing the bug.
+        // link-ajj test that expected a linear split; the dBFS mapping is
+        // the point of this bead, so the old expectation would be testing
+        // the bug. 28/32 (bead pico-link-53c's 1.5dB-per-segment scale)
+        // lands -6 dBFS's 28-segment fill exactly at the green/amber/red
+        // boundary the top 4-segment red zone starts at.
         let mut fb = FrameBuffer565::new(20, 180);
         let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
         draw_vertical_level_meter(&mut fb, rect, 128, 0).unwrap();
-        for i in 0..14 {
+        for i in 0..28 {
             assert_ne!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::DIVIDER,
                 "segment {i} from the bottom should be filled at level=128 (-6 dBFS)"
             );
         }
-        for i in 14..16 {
+        for i in 28..32 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::DIVIDER,
@@ -1039,8 +1091,8 @@ mod tests {
     }
 
     #[test]
-    fn vertical_level_dbfs_segment_count_full_scale_fills_16() {
-        assert_eq!(vertical_level_dbfs_segment_count(255), 16);
+    fn vertical_level_dbfs_segment_count_full_scale_fills_32() {
+        assert_eq!(vertical_level_dbfs_segment_count(255), 32);
     }
 
     #[test]
@@ -1049,13 +1101,15 @@ mod tests {
     }
 
     #[test]
-    fn vertical_level_dbfs_segment_count_typical_music_rms_lands_around_segment_10() {
+    fn vertical_level_dbfs_segment_count_typical_music_rms_lands_around_segment_18() {
         // 0.1 linear RMS (-20 dBFS) is squarely in typical-music territory
         // (bead pico-link-ajj) -- the linear mapping this replaces put it
-        // at 1-3 of 16 segments; a dBFS mapping must land it well up the
-        // column instead.
+        // at only a handful of segments; a dBFS mapping must land it well
+        // up the column instead. At the 1.5dB-per-segment, 32-segment scale
+        // (bead pico-link-53c doubled from 16 at 3dB/segment), -20 dBFS is
+        // `(-20 - -48) / 1.5 = 18.67` segments up from the floor.
         let filled = vertical_level_dbfs_segment_count(26); // round(0.1 * 255)
-        assert!((9..=11).contains(&filled), "expected ~segment 10, got {filled}");
+        assert!((17..=19).contains(&filled), "expected ~segment 18, got {filled}");
     }
 
     #[test]
