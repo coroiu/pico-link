@@ -585,6 +585,38 @@ int main(void) {
         // independent of the debug console; only the "VOL SET" producer
         // is debug-only today.
         pl_volume_service(frame_start_us);
+        // T4 (pico-link-4v2.4), design sec 6 mechanism M1: the outbound
+        // half of direction B (headphones -> host). volume.c's loop rule
+        // (run just above) sets this latch on ANY accepted change --
+        // host-origin or sink-origin alike, design sec 3's outbound
+        // latches are keyed on "canonical changed", not on which peer
+        // caused it. Pushing a host-origin echo back at the host is
+        // harmless (it is already on-grid, rule (a) absorbs it on the
+        // host's own next SET if any). Both calls MUST happen under
+        // pl_usb_mutex -- see pl_usb_audio_send_fu_status_interrupt's own
+        // doc comment (usb_audio.c) for why a caller that does not already
+        // hold it gets a silent accepted=false, not an error.
+        int16_t fu_cur;
+        if (pl_volume_take_fu_report(&fu_cur)) {
+            if (pl_usb_lock_try()) {
+                pl_usb_audio_fu_set_volume(0, fu_cur);
+                bool sent = pl_usb_audio_send_fu_status_interrupt();
+                pl_usb_unlock();
+                if (!sent) {
+                    pl_log("volume: FU status interrupt NOT accepted (TinyUSB busy), cur=%d\r\n", (int)fu_cur);
+                }
+            } else {
+                // 0xC0 worker holds pl_usb_mutex this iteration -- the
+                // latch was already cleared by pl_volume_take_fu_report,
+                // so this specific report is dropped, not retried. Not a
+                // correctness problem: the next accepted volume change (of
+                // which there WILL be one the moment either peer moves
+                // again) re-latches and this consumer runs every frame, so
+                // in practice the lock is free well before the next real
+                // edge fires.
+                pl_log("volume: FU status interrupt SKIPPED (pl_usb_mutex busy), cur=%d\r\n", (int)fu_cur);
+            }
+        }
 #ifndef PL_DIAG_SKIP_BT
         // Drains events the BTstack packet handler queued from IRQ context
         // (pico-link-6o2) and makes the real pl_ui_push_event calls here, in

@@ -205,6 +205,16 @@ send pre_mute`. An inbound sink level of 0 does **not** set `muted`.
 
 ## 6. Direction B: how the host learns (the real risk)
 
+**SUPERSEDED 2026-09-06 (VT4a, `pico-link-2ue`, and its 2026-09-06 code
+review; measurement confirmed by VT4a.1, `pico-link-rmp`): the
+recommendation below is OUT OF DATE. VT4a measured that macOS's
+`AppleUSBAudio` DOES act on the UAC2 status interrupt endpoint -- it
+re-GETs the feature unit and its slider follows the reported value exactly,
+non-linear curve and all (section 5 below now carries the verified
+bijective RANGE). VT4 (`pico-link-4v2.4`) therefore implements M1, not M2.
+The two mechanisms below and the "let T1 decide" framing are kept for
+historical record; do not build M2's HID tap-burst path.**
+
 Two candidate mechanisms.
 
 **M1 — UAC2 status interrupt endpoint.** The specification-correct answer.

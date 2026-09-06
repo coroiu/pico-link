@@ -123,4 +123,22 @@ bool pl_volume_muted(void);
 // (out_level untouched) if nothing changed since the last call.
 bool pl_volume_take_avrcp_desired(uint8_t *out_level);
 
+// T4 (pico-link-4v2.4, direction B: headphones -> host, design sec 6
+// mechanism M1): reads and clears the outbound UAC2 feature-unit latch,
+// IRQ-safe -- callable from ANY context (design sec 2). Set whenever
+// EITHER edge's change is accepted by the loop rule (not just the sink
+// edge) -- design sec 3's outbound latches are keyed on "canonical
+// changed", not on which peer caused it. Returns true and fills
+// `out_cur` (the RANGE-descriptor dB*100 domain -- see this header's
+// domain-mapping doc comment) iff a new value is pending; false
+// (out_cur untouched) if nothing changed since the last call. The
+// caller must write it into usb_audio.c's feature unit
+// (pl_usb_audio_fu_set_volume) and then call
+// pl_usb_audio_send_fu_status_interrupt() to make macOS re-GET it --
+// under pl_usb_mutex, held for BOTH calls (usb_audio.h's calling
+// contract; see pl_usb_audio_send_fu_status_interrupt's own doc
+// comment for why a nested pl_usb_lock_try() silently reports
+// accepted=0 instead of erroring).
+bool pl_volume_take_fu_report(int16_t *out_cur);
+
 #endif // PICO_LINK_VOLUME_H

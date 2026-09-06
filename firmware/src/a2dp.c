@@ -105,7 +105,7 @@
 #include "pl_prio.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
-#include "volume.h" // pl_volume_take_avrcp_desired -- T3 (pico-link-4v2.3)
+#include "volume.h" // pl_volume_take_avrcp_desired (T3) / pl_volume_notify_sink, pl_volume_take_fu_report (T4, pico-link-4v2.4)
 #include "watchdog_sup.h"
 
 #ifdef PL_ENCODER_ON_CORE1
@@ -939,6 +939,21 @@ static bool s_avrcp_volume_set_in_flight;
 static uint64_t s_avrcp_volume_set_deadline_us;
 #define PL_AVRCP_VOLUME_SET_TIMEOUT_US (1500ull * 1000ull)
 
+// T4 (pico-link-4v2.4), design sec 6/9: whether the connected sink actually
+// supports AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED, learned from the
+// AVRCP_SUBEVENT_NOTIFICATION_STATE response to our
+// avrcp_controller_enable_notification() call below.
+// PL_AVRCP_VOLUME_NOTIFY_UNKNOWN until that response (or a fresh connect)
+// says otherwise -- a rejection is a SUPPORTED outcome per the design, not
+// a bug: direction A still works, direction B is silently absent. 0xFF
+// context only, same reasoning as s_avrcp_cid above.
+typedef enum {
+    PL_AVRCP_VOLUME_NOTIFY_UNKNOWN = 0,
+    PL_AVRCP_VOLUME_NOTIFY_SUPPORTED,
+    PL_AVRCP_VOLUME_NOTIFY_UNSUPPORTED,
+} PlAvrcpVolumeNotifySupport;
+static PlAvrcpVolumeNotifySupport s_avrcp_volume_notify_support = PL_AVRCP_VOLUME_NOTIFY_UNKNOWN;
+
 static void pl_a2dp_avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -952,11 +967,21 @@ static void pl_a2dp_avrcp_packet_handler(uint8_t packet_type, uint16_t channel, 
         case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED:
             s_avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
             pl_log("avrcp: connection established, cid=%u\r\n", s_avrcp_cid);
+            // T4 (pico-link-4v2.4), design sec 9: register for
+            // AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED as soon as the
+            // signaling connection exists -- this is direction B's only
+            // entry point. Outcome (supported/rejected) arrives later as
+            // AVRCP_SUBEVENT_NOTIFICATION_STATE in the controller packet
+            // handler below.
+            s_avrcp_volume_notify_support = PL_AVRCP_VOLUME_NOTIFY_UNKNOWN;
+            uint8_t enable_status = avrcp_controller_enable_notification(s_avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+            pl_log("avrcp: enable VOLUME_CHANGED notification -> status=0x%02x cid=%u\r\n", enable_status, s_avrcp_cid);
             break;
         case AVRCP_SUBEVENT_CONNECTION_RELEASED:
             pl_log("avrcp: connection released, cid=%u\r\n", s_avrcp_cid);
             s_avrcp_cid = 0;
             s_avrcp_volume_set_in_flight = false;
+            s_avrcp_volume_notify_support = PL_AVRCP_VOLUME_NOTIFY_UNKNOWN;
             break;
         default:
             break;
@@ -1036,9 +1061,12 @@ static void pl_a2dp_avrcp_target_packet_handler(uint8_t packet_type, uint16_t ch
 // T3 (pico-link-4v2.3), design sec 9: the response side of
 // avrcp_controller_set_absolute_volume, sent from
 // pl_a2dp_avrcp_volume_service() below. Clears the in-flight gate so the
-// next SET can go out. Also where a future T4 would register for
-// AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED -- not wired here, that's
-// direction B's bead.
+// next SET can go out.
+//
+// T4 (pico-link-4v2.4), design sec 9: also handles direction B --
+// AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED (the sink telling us its
+// volume moved) and AVRCP_SUBEVENT_NOTIFICATION_STATE (the
+// enable_notification response, which is where a rejection surfaces).
 static void pl_a2dp_avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -1048,13 +1076,65 @@ static void pl_a2dp_avrcp_controller_packet_handler(uint8_t packet_type, uint16_
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) {
         return;
     }
-    if (packet[2] != AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE) {
-        return;
+    switch (packet[2]) {
+        case AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE: {
+            uint16_t cid = avrcp_subevent_set_absolute_volume_response_get_avrcp_cid(packet);
+            uint8_t applied = avrcp_subevent_set_absolute_volume_response_get_absolute_volume(packet);
+            pl_log("avrcp: SET_ABSOLUTE_VOLUME response cid=%u applied=%u\r\n", cid, applied);
+            s_avrcp_volume_set_in_flight = false;
+            break;
+        }
+        case AVRCP_SUBEVENT_NOTIFICATION_STATE: {
+            // Bead pico-link-2ue/rmp's design sec 6 M1 verdict made this
+            // path real: does the sink support
+            // AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED at all? A rejection
+            // here (status != SUCCESS) is a SUPPORTED outcome (design sec
+            // 4.3's table, sec 9's T4 doc) -- direction A keeps working,
+            // direction B is silently absent. Not scoped to any other
+            // event_id: this device only ever registers for
+            // VOLUME_CHANGED, but check anyway rather than assume.
+            uint8_t event_id = avrcp_subevent_notification_state_get_event_id(packet);
+            if (event_id != (uint8_t)AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED) {
+                break;
+            }
+            uint8_t status = avrcp_subevent_notification_state_get_status(packet);
+            uint8_t enabled = avrcp_subevent_notification_state_get_enabled(packet);
+            if (status == ERROR_CODE_SUCCESS) {
+                s_avrcp_volume_notify_support = PL_AVRCP_VOLUME_NOTIFY_SUPPORTED;
+                pl_log("avrcp: VOLUME_CHANGED notification state -> enabled=%u (supported)\r\n", enabled);
+            } else {
+                s_avrcp_volume_notify_support = PL_AVRCP_VOLUME_NOTIFY_UNSUPPORTED;
+                pl_log("avrcp: VOLUME_CHANGED notification REJECTED status=0x%02x -- sink does not support direction B\r\n", status);
+            }
+            break;
+        }
+        case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED: {
+            // Direction B (design sec 9, T4): the sink is telling us its
+            // volume changed. `absolute_volume` is already 0..127, the
+            // canonical AVRCP domain -- design sec 5, no mapping needed.
+            // Feed it through the SAME loop rule host SETs go through
+            // (volume.c's pl_volume_notify_sink); it is what decides
+            // whether this is actually new or an echo to be absorbed.
+            uint8_t volume = avrcp_subevent_notification_volume_changed_get_absolute_volume(packet);
+            pl_log("avrcp: VOLUME_CHANGED notification -> absolute_volume=%u\r\n", volume);
+            pl_volume_notify_sink(volume);
+            // AVRCP notifications are one-shot per the spec's
+            // INTERIM/CHANGED lifecycle -- BTstack's avrcp_controller.c
+            // (avrcp_controller_handle_notification, CHANGED_STABLE case)
+            // already re-arms internally unless we ask it to deregister,
+            // but re-registering here too is cheap, idempotent per
+            // avrcp_controller_register_notification's own early-return
+            // guards, and removes any dependence on that internal
+            // behaviour continuing to hold -- see this bead's comment log
+            // for the source read that found it.
+            if (s_avrcp_cid != 0) {
+                avrcp_controller_enable_notification(s_avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+            }
+            break;
+        }
+        default:
+            break;
     }
-    uint16_t cid = avrcp_subevent_set_absolute_volume_response_get_avrcp_cid(packet);
-    uint8_t applied = avrcp_subevent_set_absolute_volume_response_get_absolute_volume(packet);
-    pl_log("avrcp: SET_ABSOLUTE_VOLUME response cid=%u applied=%u\r\n", cid, applied);
-    s_avrcp_volume_set_in_flight = false;
 }
 
 // T3 (pico-link-4v2.3): called once per pl_bt_wdt_heartbeat_handler tick
