@@ -25,6 +25,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use core::cell::Cell;
 use core::convert::Infallible;
 use core::time::Duration;
 
@@ -282,12 +283,42 @@ pub struct HeroStatusView {
     muted: bool,
     stat_line: Option<String>,
     out_level: Option<OutLevelDisplay>,
+    /// Bead `pico-link-7h5.9`: the "body" (everything [`Self::body_paint_
+    /// key`] folds -- device name, codec status, muted, stat line, i.e.
+    /// everything this widget paints EXCEPT the OUT meter) paint key as of
+    /// the last time it was observed, kept in a `Cell` for the same reason
+    /// `list.rs`'s `top_index`/`fields.rs`'s `top_index` are `Cell`s:
+    /// [`Widget::damage_hint`] takes `&self`, not `&mut self`, but still
+    /// needs to remember something across calls.
+    ///
+    /// [`Self::damage_hint`] is `Screen`'s only caller of this, and only
+    /// when this widget's overall `paint_key` has already changed
+    /// frame-to-frame (`screen.rs`'s diff) -- so an unchanged body key at
+    /// that point means the OUT-sample part is the only thing that could
+    /// have moved the overall key, which is exactly the "when only the
+    /// OUT-sample part of its key changed" test the design (section 8)
+    /// calls for. Kept correct across the builder chain by [`Self::new`],
+    /// [`Self::with_muted`] and [`Self::with_stat_line`] -- the three
+    /// places that can change a body-affecting field -- each
+    /// recomputing and storing it immediately; [`Self::with_out_level`]
+    /// does not touch it, since the OUT sample is deliberately excluded
+    /// from the body key.
+    last_body_key: Cell<Option<PaintKey>>,
 }
 
 impl HeroStatusView {
     #[must_use]
     pub fn new(device_name: impl Into<String>, status: CodecStatus) -> Self {
-        Self { device_name: device_name.into(), status, muted: false, stat_line: None, out_level: None }
+        let view = Self {
+            device_name: device_name.into(),
+            status,
+            muted: false,
+            stat_line: None,
+            out_level: None,
+            last_body_key: Cell::new(None),
+        };
+        view.last_body_key.set(Some(view.body_paint_key()));
+        view
     }
 
     /// Design section 6.3: device-side volume at zero with the host
@@ -298,6 +329,12 @@ impl HeroStatusView {
     #[must_use]
     pub fn with_muted(mut self, muted: bool) -> Self {
         self.muted = muted;
+        // `muted` is folded into the body key (`Self::active_banner`'s
+        // priority rule makes it part of what the non-meter body paints) --
+        // recompute immediately so `last_body_key` reflects the fully-built
+        // widget's actual body, not the pre-`with_muted` snapshot `Self::
+        // new` took.
+        self.last_body_key.set(Some(self.body_paint_key()));
         self
     }
 
@@ -314,6 +351,9 @@ impl HeroStatusView {
     #[must_use]
     pub fn with_stat_line(mut self, line: impl Into<String>) -> Self {
         self.stat_line = Some(line.into());
+        // Same reason as `Self::with_muted` above: `stat_line` is part of
+        // the body key, so the cache must be recomputed here too.
+        self.last_body_key.set(Some(self.body_paint_key()));
         self
     }
 
@@ -356,6 +396,53 @@ impl HeroStatusView {
     pub fn is_fallback(&self) -> bool {
         matches!(&self.status, CodecStatus::Connected { fallback: Some(_), .. })
     }
+
+    /// Folds everything [`Self::render`] paints EXCEPT the OUT meter --
+    /// device name, codec status (word/fallback/bitrate), muted, stat
+    /// line. This is [`Self::paint_key`] minus its OUT-sample fold (see
+    /// that method, which now builds on this), factored out so
+    /// [`Self::damage_hint`] can ask "did anything other than the meter
+    /// change?" without duplicating the fold sequence, and so
+    /// [`Self::new`]/[`Self::with_muted`]/[`Self::with_stat_line`] can
+    /// keep [`Self::last_body_key`] primed correctly across the builder
+    /// chain (see that field's doc comment for why priming matters).
+    fn body_paint_key(&self) -> PaintKey {
+        let key = PaintKey::of(HERO_PAINT_KEY_SEED).fold_str(&self.device_name);
+        let key = match &self.status {
+            CodecStatus::NoLink => key.fold(0),
+            CodecStatus::Connected { word, fallback, bitrate } => {
+                let key = key.fold(1).fold_str(word);
+                let key = key.fold_opt_str(fallback.as_deref());
+                match bitrate {
+                    BitrateStatus::Idle => key.fold(0),
+                    BitrateStatus::Kbps(kbps) => key.fold(1).fold(u64::from(*kbps)),
+                }
+            }
+        };
+        let key = key.fold(u64::from(self.muted));
+        key.fold_opt_str(self.stat_line.as_deref())
+    }
+}
+
+/// The OUT meter's own footprint within `area`, as ONE bounding rectangle
+/// (design section 5, section 8) -- shared by [`HeroStatusView::render`]
+/// (as the `ctx.needs(..)` gate for the meter's legend+columns) and
+/// [`HeroStatusView::damage_hint`] (as the narrowed hint it reports), so
+/// the two can never disagree about what the meter actually paints.
+///
+/// It is the meter strip's x-span, carved off `PANEL.button_edge()`
+/// immediately inboard of the button rail exactly as `render` does, but
+/// the FULL height of `area` -- not just the two channel columns' own
+/// y-range below `NAME_BAND_HEIGHT`. That widening is deliberate: the
+/// "OUT" legend renders in the *name row* (see `render`'s legend comment),
+/// sharing the device-name line's y but the meter's x-position, above the
+/// columns' own block. A single rect covering both keeps this hint honest
+/// about everything the meter paints, with no meter-specific carve
+/// anywhere outside this module.
+fn meter_footprint(area: Rectangle) -> Rectangle {
+    let (_name_band, rest) = carve_edge(area, Edge::Top, NAME_BAND_HEIGHT);
+    let (strip, _hero_body) = carve_edge(rest, PANEL.button_edge(), METER_STRIP_WIDTH);
+    Rectangle::new(Point::new(strip.top_left.x, area.top_left.y), Size::new(strip.size.width, area.size.height))
 }
 
 /// Same "Agjpqy" worst-case single-line probe `menu.rs`/`confirm.rs`'s
@@ -461,147 +548,173 @@ impl Widget for HeroStatusView {
         // strip spans content-rel y40..224).
         let (_l_bottom_pad, l_block) = carve_edge(l_col, Edge::Bottom, METER_BLOCK_BOTTOM_INSET);
         let (_r_bottom_pad, r_block) = carve_edge(r_col, Edge::Bottom, METER_BLOCK_BOTTOM_INSET);
-
-        // --- Device name: truncates with an ellipsis, never a marquee.
-        // Uses `name_band`'s full width -- protected alongside the hero
-        // word by the same "if it crowds, it loses" ruling, per section 3.
-        // ---
-        let name_font = font::name();
-        let name_line_h = line_height(&name_font);
-        let name_max_width = (name_band.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
-        let name_text = truncate_to_width(&name_font, &self.device_name, name_max_width);
+        let meter_area = meter_footprint(area);
+        // Shared between the `hero_body`-gated block below and the OUT
+        // meter's own "OUT" legend, which renders at this same row (see
+        // `meter_footprint`'s doc comment) -- hoisted out of the gated
+        // block so both can read it regardless of which `ctx.needs(..)`
+        // fired this frame.
         let name_y = name_band.top_left.y + TOP_PADDING;
-        let name_rect = Rectangle::new(
-            Point::new(name_band.top_left.x + LEFT_MARGIN, name_y),
-            Size::new(name_max_width, name_line_h as u32),
-        );
-        let mut name_target = clipped.clipped(&name_rect);
-        let _ = name_font.render_aligned(
-            name_text.as_str(),
-            Point::new(name_band.top_left.x + LEFT_MARGIN, name_y),
-            VerticalPosition::Top,
-            HorizontalAlignment::Left,
-            FontColor::Transparent(palette::TEXT_PRIMARY),
-            &mut name_target,
-        );
 
-        // --- Hero codec word: the fixed 32px slot, regardless of word.
-        // Left-aligned on `LEFT_MARGIN`, not centered — design doc section
-        // 3.1: a centred hero moves both its edges the moment the codec
-        // changes, exactly when the change most needs to be noticed.
-        // Narrowed to `hero_body`'s width now that the meter strip sits
-        // beside it, not under it. ---
-        let hero_font = font::hero();
-        let hero_y = name_y + name_line_h + GAP_NAME_TO_HERO;
-        let (hero_text, hero_color) = match &self.status {
-            CodecStatus::NoLink => (String::from("NO LINK"), palette::STATUS_ERROR),
-            CodecStatus::Connected { word, fallback, .. } => {
-                let color = if fallback.is_some() { palette::STATUS_WARNING } else { palette::TEXT_PRIMARY };
-                (word.clone(), color)
-            }
-        };
-        let _ = hero_font.render_aligned(
-            hero_text.as_str(),
-            Point::new(hero_body.top_left.x + LEFT_MARGIN, hero_y),
-            VerticalPosition::Top,
-            HorizontalAlignment::Left,
-            FontColor::Transparent(hero_color),
-            &mut clipped,
-        );
-
-        // --- Bitrate line: fixed slot, cleared to BACKGROUND, left-
-        // aligned to `LEFT_MARGIN` (Andreas's ruling, 2026-09-02, overrides
-        // the design doc's original right-aligned/anti-jitter rule — see
-        // .planning/design/2026-09-01-home-alignment-grid.md section 3) —
-        // absent entirely for NoLink, never a faked/frozen number. ---
-        let value_font = font::value();
-        let value_line_h = line_height(&value_font);
-        let bitrate_y = hero_y + HERO_SLOT_HEIGHT + GAP_HERO_TO_BITRATE;
-        if let CodecStatus::Connected { bitrate, .. } = &self.status {
-            let bitrate_text = match bitrate {
-                BitrateStatus::Idle => String::from("idle"),
-                BitrateStatus::Kbps(kbps) => format!("{kbps} kbps"),
-            };
-            let slot_rect = Rectangle::new(
-                Point::new(hero_body.top_left.x + LEFT_MARGIN, bitrate_y),
-                Size::new(BITRATE_SLOT_WIDTH, value_line_h as u32),
+        // --- Everything below is the widget's "body" -- device name,
+        // hero codec word, bitrate, banner, stat strip -- i.e. everything
+        // [`Self::body_paint_key`] folds and the OUT meter does not touch
+        // (bead pico-link-7h5.9, design section 4/8). Gated on
+        // `ctx.needs(hero_body)` so a meter-only repaint (the release
+        // ballistic decaying between publishes with no new sample, or a
+        // fresh publish that only moved the meter) SKIPS rasterising all
+        // of this text -- not merely clips its writes -- which is where
+        // this bead's win actually lives: phase 1's blit is still a
+        // full-width row band (design section 7.1), so nothing here saves
+        // SPI time, only CPU. `hero_body`'s x-range is disjoint from the
+        // meter strip's, so this gate is unaffected by whether the meter
+        // also changed this frame; when the body itself changed,
+        // `Self::damage_hint` returns `None` and `Screen` damages the
+        // whole widget area, so this `needs` call is trivially true. ---
+        if ctx.needs(hero_body) {
+            // --- Device name: truncates with an ellipsis, never a
+            // marquee. Uses `name_band`'s full width -- protected
+            // alongside the hero word by the same "if it crowds, it
+            // loses" ruling, per section 3. ---
+            let name_font = font::name();
+            let name_line_h = line_height(&name_font);
+            let name_max_width = (name_band.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
+            let name_text = truncate_to_width(&name_font, &self.device_name, name_max_width);
+            let name_rect = Rectangle::new(
+                Point::new(name_band.top_left.x + LEFT_MARGIN, name_y),
+                Size::new(name_max_width, name_line_h as u32),
             );
-            slot_rect.into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND)).draw(&mut clipped)?;
-            let _ = value_font.render_aligned(
-                bitrate_text.as_str(),
-                Point::new(slot_rect.top_left.x, bitrate_y),
+            let mut name_target = clipped.clipped(&name_rect);
+            let _ = name_font.render_aligned(
+                name_text.as_str(),
+                Point::new(name_band.top_left.x + LEFT_MARGIN, name_y),
                 VerticalPosition::Top,
                 HorizontalAlignment::Left,
                 FontColor::Transparent(palette::TEXT_PRIMARY),
-                &mut clipped,
+                &mut name_target,
             );
-        }
 
-        // --- Persistent banner slot: at most one, MUTED outranks
-        // FALLBACK (design section 6.2/6.3). Not a toast: no timer, no
-        // auto-dismiss, drawn every render exactly like everything else
-        // on this widget. Fixed y (`BANNER_TOP`, relative to `area`, not
-        // `hero_body` -- it does not move), not cursor-derived, so
-        // showing/hiding it never moves the stat strip below it. Narrowed
-        // to `hero_body`'s width now that the meter strip sits beside it —
-        // measured to still fit: the MUTED text is 128px, `hero_body`'s
-        // text budget is 158 - 2*12 = 134px, 6px slack. ---
-        if let Some(banner) = self.active_banner() {
-            let banner_y = area.top_left.y + BANNER_TOP;
-            let (text, color) = match banner {
-                ActiveBanner::Muted => (String::from("MUTED  Press Up to raise"), palette::STATUS_WARNING),
-                ActiveBanner::Fallback(reason) => (String::from(reason), palette::STATUS_WARNING),
+            // --- Hero codec word: the fixed 32px slot, regardless of
+            // word. Left-aligned on `LEFT_MARGIN`, not centered — design
+            // doc section 3.1: a centred hero moves both its edges the
+            // moment the codec changes, exactly when the change most
+            // needs to be noticed. Narrowed to `hero_body`'s width now
+            // that the meter strip sits beside it, not under it. ---
+            let hero_font = font::hero();
+            let hero_y = name_y + name_line_h + GAP_NAME_TO_HERO;
+            let (hero_text, hero_color) = match &self.status {
+                CodecStatus::NoLink => (String::from("NO LINK"), palette::STATUS_ERROR),
+                CodecStatus::Connected { word, fallback, .. } => {
+                    let color = if fallback.is_some() { palette::STATUS_WARNING } else { palette::TEXT_PRIMARY };
+                    (word.clone(), color)
+                }
             };
-            let banner_rect = Rectangle::new(
-                Point::new(hero_body.top_left.x, banner_y),
-                Size::new(hero_body.size.width, BANNER_HEIGHT as u32),
-            );
-            banner_rect.into_styled(PrimitiveStyle::with_fill(palette::SURFACE_ELEVATED)).draw(&mut clipped)?;
-            let banner_text_max_width = (hero_body.size.width as i32 - 2 * BANNER_TEXT_INSET).max(0) as u32;
-            let label_font = font::label();
-            let banner_text = truncate_to_width(&label_font, &text, banner_text_max_width);
-            let banner_mid_y = banner_y + BANNER_HEIGHT / 2;
-            let _ = label_font.render_aligned(
-                banner_text.as_str(),
-                Point::new(hero_body.top_left.x + BANNER_TEXT_INSET, banner_mid_y),
-                VerticalPosition::Center,
-                HorizontalAlignment::Left,
-                FontColor::Transparent(color),
-                &mut clipped,
-            );
-        }
-
-        // --- Bottom stat strip. Whatever fields the design's data-
-        // dependency table (section 13) says survive Tier 1 — the
-        // LINK/SIGNAL bars are still CUT entirely, not dashed, so they
-        // are simply not part of `stat_line` at all. Fixed y
-        // (`STAT_TOP`, relative to `area`, not `hero_body` -- it does not
-        // move) — occupies the same rows whether or not a banner is
-        // showing; this is the whole point of the fixed grid. Narrowed to
-        // `hero_body`'s width for the same reason the banner is. **This
-        // is also where the OUT meter's old collision with this slot gets
-        // resolved**: the horizontal meter used to share this exact grid
-        // slot with `stat_line` (a latent collision this module's own
-        // prior comment admitted, papered over only because nothing
-        // populated `stat_line` with live data yet). The vertical meter
-        // now lives entirely inside its own strip beside the rail, a
-        // disjoint rectangle from every text element on Home -- there is
-        // no longer anything to collide with here. ---
-        if let Some(stat_line) = &self.stat_line {
-            let stat_y = area.top_left.y + STAT_TOP;
-            let label_font = font::label();
-            let stat_max_width = (hero_body.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
-            let upper = stat_line.to_uppercase();
-            let stat_text = truncate_to_width(&label_font, &upper, stat_max_width);
-            let _ = label_font.render_aligned(
-                stat_text.as_str(),
-                Point::new(hero_body.top_left.x + LEFT_MARGIN, stat_y),
+            let _ = hero_font.render_aligned(
+                hero_text.as_str(),
+                Point::new(hero_body.top_left.x + LEFT_MARGIN, hero_y),
                 VerticalPosition::Top,
                 HorizontalAlignment::Left,
-                FontColor::Transparent(palette::TEXT_SECONDARY),
+                FontColor::Transparent(hero_color),
                 &mut clipped,
             );
-        }
+
+            // --- Bitrate line: fixed slot, cleared to BACKGROUND, left-
+            // aligned to `LEFT_MARGIN` (Andreas's ruling, 2026-09-02,
+            // overrides the design doc's original right-aligned/anti-
+            // jitter rule — see .planning/design/2026-09-01-home-
+            // alignment-grid.md section 3) — absent entirely for NoLink,
+            // never a faked/frozen number. ---
+            let value_font = font::value();
+            let value_line_h = line_height(&value_font);
+            let bitrate_y = hero_y + HERO_SLOT_HEIGHT + GAP_HERO_TO_BITRATE;
+            if let CodecStatus::Connected { bitrate, .. } = &self.status {
+                let bitrate_text = match bitrate {
+                    BitrateStatus::Idle => String::from("idle"),
+                    BitrateStatus::Kbps(kbps) => format!("{kbps} kbps"),
+                };
+                let slot_rect = Rectangle::new(
+                    Point::new(hero_body.top_left.x + LEFT_MARGIN, bitrate_y),
+                    Size::new(BITRATE_SLOT_WIDTH, value_line_h as u32),
+                );
+                slot_rect.into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND)).draw(&mut clipped)?;
+                let _ = value_font.render_aligned(
+                    bitrate_text.as_str(),
+                    Point::new(slot_rect.top_left.x, bitrate_y),
+                    VerticalPosition::Top,
+                    HorizontalAlignment::Left,
+                    FontColor::Transparent(palette::TEXT_PRIMARY),
+                    &mut clipped,
+                );
+            }
+
+            // --- Persistent banner slot: at most one, MUTED outranks
+            // FALLBACK (design section 6.2/6.3). Not a toast: no timer,
+            // no auto-dismiss, drawn every render exactly like everything
+            // else on this widget. Fixed y (`BANNER_TOP`, relative to
+            // `area`, not `hero_body` -- it does not move), not cursor-
+            // derived, so showing/hiding it never moves the stat strip
+            // below it. Narrowed to `hero_body`'s width now that the
+            // meter strip sits beside it — measured to still fit: the
+            // MUTED text is 128px, `hero_body`'s text budget is
+            // 158 - 2*12 = 134px, 6px slack. ---
+            if let Some(banner) = self.active_banner() {
+                let banner_y = area.top_left.y + BANNER_TOP;
+                let (text, color) = match banner {
+                    ActiveBanner::Muted => (String::from("MUTED  Press Up to raise"), palette::STATUS_WARNING),
+                    ActiveBanner::Fallback(reason) => (String::from(reason), palette::STATUS_WARNING),
+                };
+                let banner_rect = Rectangle::new(
+                    Point::new(hero_body.top_left.x, banner_y),
+                    Size::new(hero_body.size.width, BANNER_HEIGHT as u32),
+                );
+                banner_rect.into_styled(PrimitiveStyle::with_fill(palette::SURFACE_ELEVATED)).draw(&mut clipped)?;
+                let banner_text_max_width = (hero_body.size.width as i32 - 2 * BANNER_TEXT_INSET).max(0) as u32;
+                let label_font = font::label();
+                let banner_text = truncate_to_width(&label_font, &text, banner_text_max_width);
+                let banner_mid_y = banner_y + BANNER_HEIGHT / 2;
+                let _ = label_font.render_aligned(
+                    banner_text.as_str(),
+                    Point::new(hero_body.top_left.x + BANNER_TEXT_INSET, banner_mid_y),
+                    VerticalPosition::Center,
+                    HorizontalAlignment::Left,
+                    FontColor::Transparent(color),
+                    &mut clipped,
+                );
+            }
+
+            // --- Bottom stat strip. Whatever fields the design's data-
+            // dependency table (section 13) says survive Tier 1 — the
+            // LINK/SIGNAL bars are still CUT entirely, not dashed, so
+            // they are simply not part of `stat_line` at all. Fixed y
+            // (`STAT_TOP`, relative to `area`, not `hero_body` -- it does
+            // not move) — occupies the same rows whether or not a banner
+            // is showing; this is the whole point of the fixed grid.
+            // Narrowed to `hero_body`'s width for the same reason the
+            // banner is. **This is also where the OUT meter's old
+            // collision with this slot gets resolved**: the horizontal
+            // meter used to share this exact grid slot with `stat_line`
+            // (a latent collision this module's own prior comment
+            // admitted, papered over only because nothing populated
+            // `stat_line` with live data yet). The vertical meter now
+            // lives entirely inside its own strip beside the rail, a
+            // disjoint rectangle from every text element on Home -- there
+            // is no longer anything to collide with here. ---
+            if let Some(stat_line) = &self.stat_line {
+                let stat_y = area.top_left.y + STAT_TOP;
+                let label_font = font::label();
+                let stat_max_width = (hero_body.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
+                let upper = stat_line.to_uppercase();
+                let stat_text = truncate_to_width(&label_font, &upper, stat_max_width);
+                let _ = label_font.render_aligned(
+                    stat_text.as_str(),
+                    Point::new(hero_body.top_left.x + LEFT_MARGIN, stat_y),
+                    VerticalPosition::Top,
+                    HorizontalAlignment::Left,
+                    FontColor::Transparent(palette::TEXT_SECONDARY),
+                    &mut clipped,
+                );
+            }
+        } // end `if ctx.needs(hero_body)` (bead pico-link-7h5.9)
 
         // --- Stereo OUT level meter (design section 21 E17/C8, bead
         // pico-link-du0; moved to the vertical strip beside the rail per
@@ -619,49 +732,58 @@ impl Widget for HeroStatusView {
         // as broken, not as silent. See `OUT_LEVEL_STALE_AFTER`'s doc
         // comment for the staleness window and `HeroStatusView::
         // redraw_after` for how this widget schedules its own repaint to
-        // *notice* staleness with no new event to trigger a rebuild. ---
-        if let Some(level) = &self.out_level {
-            if ctx.now().saturating_duration_since(level.received_at) <= OUT_LEVEL_STALE_AFTER {
-                let label_font = font::label();
-                let legend_center_x = pair.top_left.x + pair.size.width as i32 / 2;
-                let _ = label_font.render_aligned(
-                    "OUT",
-                    Point::new(legend_center_x, name_y),
-                    VerticalPosition::Top,
-                    HorizontalAlignment::Center,
-                    FontColor::Transparent(palette::TEXT_SECONDARY),
-                    &mut clipped,
-                );
-                // Release-ballistic decay (bead pico-link-ajj, design
-                // requirement C): the bar draws the attack anchor decayed
-                // to *now* -- NO floor against `level.rms_l`/`rms_r`. An
-                // earlier version floored at the latest raw sample,
-                // reasoning that it was a better estimate of "the level
-                // right now" than continuing to decay past it -- that
-                // reasoning was wrong and defeats the whole ballistic
-                // (code review on this bead, confirmed by the
-                // orchestrator): between publishes `rms_l`/`rms_r` are
-                // frozen at whatever the last event reported, so the
-                // `.max()` pinned the displayed value to that constant
-                // for the sample's entire life, making the release only
-                // ever move at publish events -- exactly the quantized-to-
-                // cadence behaviour this bead exists to fix, and worse in
-                // the loud-then-silence case (silence publishes nothing
-                // at all, per the deliberate empty-window skip, so the
-                // bar would sit frozen at the last loud reading until the
-                // staleness cutoff hides it outright). No floor is
-                // actually needed: `on_levels_changed` already
-                // re-anchors correctly from an arbitrarily large gap (its
-                // own fold-time decay saturates toward 0, it does not
-                // hold a stale anchor), and a genuinely stale reading is
-                // never rendered at all -- see the `OUT_LEVEL_STALE_AFTER`
-                // check just above this block. See `crate::app::
-                // decay_rms`'s doc comment for why this is computed here,
-                // at render time, rather than mutated on a schedule.
-                let displayed_rms_l = crate::app::decay_rms(level.attack_rms_l, ctx.now().saturating_duration_since(level.attack_rms_l_at));
-                let displayed_rms_r = crate::app::decay_rms(level.attack_rms_r, ctx.now().saturating_duration_since(level.attack_rms_r_at));
-                theme::draw_vertical_level_meter(&mut clipped, l_block, displayed_rms_l, level.hold_l)?;
-                theme::draw_vertical_level_meter(&mut clipped, r_block, displayed_rms_r, level.hold_r)?;
+        // *notice* staleness with no new event to trigger a rebuild.
+        //
+        // Gated on `ctx.needs(meter_area)` (bead pico-link-7h5.9, design
+        // section 4/8): the SKIP that makes a meter-only repaint actually
+        // cheap, not just narrowly reported. `meter_area` is the exact
+        // rect `Self::damage_hint` reports for this same change, via the
+        // shared `meter_footprint` helper, so the two can never disagree
+        // about what this block paints. ---
+        if ctx.needs(meter_area) {
+            if let Some(level) = &self.out_level {
+                if ctx.now().saturating_duration_since(level.received_at) <= OUT_LEVEL_STALE_AFTER {
+                    let label_font = font::label();
+                    let legend_center_x = pair.top_left.x + pair.size.width as i32 / 2;
+                    let _ = label_font.render_aligned(
+                        "OUT",
+                        Point::new(legend_center_x, name_y),
+                        VerticalPosition::Top,
+                        HorizontalAlignment::Center,
+                        FontColor::Transparent(palette::TEXT_SECONDARY),
+                        &mut clipped,
+                    );
+                    // Release-ballistic decay (bead pico-link-ajj, design
+                    // requirement C): the bar draws the attack anchor decayed
+                    // to *now* -- NO floor against `level.rms_l`/`rms_r`. An
+                    // earlier version floored at the latest raw sample,
+                    // reasoning that it was a better estimate of "the level
+                    // right now" than continuing to decay past it -- that
+                    // reasoning was wrong and defeats the whole ballistic
+                    // (code review on this bead, confirmed by the
+                    // orchestrator): between publishes `rms_l`/`rms_r` are
+                    // frozen at whatever the last event reported, so the
+                    // `.max()` pinned the displayed value to that constant
+                    // for the sample's entire life, making the release only
+                    // ever move at publish events -- exactly the quantized-to-
+                    // cadence behaviour this bead exists to fix, and worse in
+                    // the loud-then-silence case (silence publishes nothing
+                    // at all, per the deliberate empty-window skip, so the
+                    // bar would sit frozen at the last loud reading until the
+                    // staleness cutoff hides it outright). No floor is
+                    // actually needed: `on_levels_changed` already
+                    // re-anchors correctly from an arbitrarily large gap (its
+                    // own fold-time decay saturates toward 0, it does not
+                    // hold a stale anchor), and a genuinely stale reading is
+                    // never rendered at all -- see the `OUT_LEVEL_STALE_AFTER`
+                    // check just above this block. See `crate::app::
+                    // decay_rms`'s doc comment for why this is computed here,
+                    // at render time, rather than mutated on a schedule.
+                    let displayed_rms_l = crate::app::decay_rms(level.attack_rms_l, ctx.now().saturating_duration_since(level.attack_rms_l_at));
+                    let displayed_rms_r = crate::app::decay_rms(level.attack_rms_r, ctx.now().saturating_duration_since(level.attack_rms_r_at));
+                    theme::draw_vertical_level_meter(&mut clipped, l_block, displayed_rms_l, level.hold_l)?;
+                    theme::draw_vertical_level_meter(&mut clipped, r_block, displayed_rms_r, level.hold_r)?;
+                }
             }
         }
 
@@ -721,20 +843,12 @@ impl Widget for HeroStatusView {
     /// -- see `PaintKey`'s doc comment); folding nothing time-related at
     /// all is exactly the bug described above.
     fn paint_key(&self, ctx: &RenderCtx) -> PaintKey {
-        let key = PaintKey::of(HERO_PAINT_KEY_SEED).fold_str(&self.device_name);
-        let key = match &self.status {
-            CodecStatus::NoLink => key.fold(0),
-            CodecStatus::Connected { word, fallback, bitrate } => {
-                let key = key.fold(1).fold_str(word);
-                let key = key.fold_opt_str(fallback.as_deref());
-                match bitrate {
-                    BitrateStatus::Idle => key.fold(0),
-                    BitrateStatus::Kbps(kbps) => key.fold(1).fold(u64::from(*kbps)),
-                }
-            }
-        };
-        let key = key.fold(u64::from(self.muted));
-        let key = key.fold_opt_str(self.stat_line.as_deref());
+        // Bead pico-link-7h5.9: the non-OUT-meter fold sequence now lives
+        // in `Self::body_paint_key` (identical order and values to what
+        // this method folded inline before this bead -- a pure factor-out,
+        // not a behaviour change), shared with `Self::damage_hint`'s "did
+        // only the meter change?" test.
+        let key = self.body_paint_key();
         match &self.out_level {
             None => key.fold(0),
             Some(level) => {
@@ -788,6 +902,30 @@ impl Widget for HeroStatusView {
                     .fold(u64::try_from(hold_segments_r).expect("segment count is in 0..=16"))
                     .fold(u64::from(stale))
             }
+        }
+    }
+
+    /// Bead `pico-link-7h5.9` (design section 4/8): narrows this widget's
+    /// own damage to the OUT meter's footprint when only the OUT-sample
+    /// part of [`Self::paint_key`] changed -- otherwise `None`, so
+    /// `Screen` damages this widget's whole `area` (the correct, safe
+    /// fallback for any change to the device name, codec status, muted
+    /// flag or stat line).
+    ///
+    /// `Screen` only calls this once it has already established that this
+    /// widget's overall `paint_key` differs from last frame's (see
+    /// `screen.rs`'s diff) -- so an UNCHANGED [`Self::body_paint_key`] at
+    /// that point can only mean the OUT-sample fold is what moved the
+    /// overall key. [`Self::last_body_key`]'s doc comment explains how
+    /// that comparison stays correct across the widget's own lifetime
+    /// despite `&self`.
+    fn damage_hint(&self, area: Rectangle, _ctx: &RenderCtx) -> Option<Rectangle> {
+        let body_key = self.body_paint_key();
+        let unchanged_body = self.last_body_key.replace(Some(body_key)) == Some(body_key);
+        if unchanged_body {
+            Some(meter_footprint(area))
+        } else {
+            None
         }
     }
 
@@ -1291,6 +1429,77 @@ mod tests {
             view.paint_key(&t0),
             view.paint_key(&t1),
             "the release ballistic decaying between publishes must change the paint key even though the OutLevelSample itself never changed -- otherwise the damage pass would freeze the bar mid-decay"
+        );
+    }
+
+    // --- damage_hint (bead pico-link-7h5.9) -----------------------------
+
+    /// The deliverable for THIS bead, not `7h5.5`'s: the test above proves
+    /// the *key* changes across the segment boundary; it says nothing
+    /// about whether a render actually driven through `damage_hint` +
+    /// `ctx.needs` -- the real production pipeline `Screen::render` uses
+    /// -- still updates the meter's pixels. The A4 property test
+    /// (`damage_rendered_frame_matches_a_full_frame_render_of_the_same_
+    /// state_for_every_screen`, `core/src/app.rs`) only ever compares two
+    /// renders at the SAME final instant (its "damage-path" and
+    /// "full-render comparator" both tick forward by the identical
+    /// duration before rendering), so a `damage_hint`/`ctx.needs` bug that
+    /// wrongly narrows or wrongly skips rasterising the meter is exactly
+    /// the class of bug this test exists to catch and A4 cannot: it
+    /// renders at t0, computes the real `damage_hint` for t1, refills the
+    /// hinted rect's background (`Screen`'s own job, done here by hand so
+    /// this test can call `Widget::render` directly without a whole
+    /// `Screen`), renders at t1 through that narrowed `RenderCtx`, and
+    /// checks the result against an independent full render at t1.
+    #[test]
+    fn damage_narrowed_render_still_updates_the_meter_across_a_segment_boundary_with_no_new_sample() {
+        // `Screen::render` always fills BACKGROUND under the damage rect
+        // before calling `Widget::render` (step 6 of the design's damage
+        // pass) -- for a first frame that damage rect is the whole
+        // framebuffer, so this widget never has to self-clear its own
+        // area, only the specific slots it owns (bitrate/banner). Every
+        // `render` call below reproduces that pre-fill by hand so this
+        // widget-level test matches what production actually hands
+        // `render`, rather than a raw, un-filled `FrameBuffer565::new`.
+        fn background_fill(fb: &mut FrameBuffer565, rect: Rectangle) {
+            rect.into_styled(PrimitiveStyle::with_fill(palette::BACKGROUND)).draw(fb).unwrap();
+        }
+
+        let received_at = Instant::from_micros(1_000_000);
+        let mut sample = out_level_at(received_at);
+        sample.attack_rms_l = 200;
+        sample.attack_rms_l_at = received_at;
+        let view = nominal().with_out_level(Some(sample));
+
+        let t0 = RenderCtx::at(received_at);
+        let t1 = RenderCtx::at(received_at + Duration::from_millis(1000));
+        assert_ne!(view.paint_key(&t0), view.paint_key(&t1), "test premise: the key must actually change between t0 and t1");
+
+        // Frame 0: a full render, exactly like `Screen` gives every widget
+        // on its first frame (`force_full_damage`).
+        let mut fb = FrameBuffer565::new(240, 206);
+        background_fill(&mut fb, AREA);
+        view.render(AREA, &t0, &mut fb).unwrap();
+
+        // `Screen`'s diff, reproduced by hand: key changed, area did not
+        // move -> consult `damage_hint`.
+        let hint = view
+            .damage_hint(AREA, &t1)
+            .expect("a change driven purely by the OUT sample must narrow to the meter strip, not None");
+        background_fill(&mut fb, hint);
+        let ctx1 = t1.with_damage(hint);
+        view.render(AREA, &ctx1, &mut fb).unwrap();
+
+        // Ground truth: an independent, fully undamaged render at t1.
+        let mut fb_full = FrameBuffer565::new(240, 206);
+        background_fill(&mut fb_full, AREA);
+        view.render(AREA, &t1, &mut fb_full).unwrap();
+
+        let damaged_pixels: alloc::vec::Vec<_> = fb.pixels().collect();
+        let full_pixels: alloc::vec::Vec<_> = fb_full.pixels().collect();
+        assert_eq!(
+            damaged_pixels, full_pixels,
+            "a damage-narrowed render at t1 must be pixel-identical to a full render at t1 -- the meter must not freeze mid-decay just because damage_hint narrowed the repaint"
         );
     }
 
