@@ -46,7 +46,7 @@ static volatile uint32_t packet_count = 0;
 // log-ring congestion (log_drops in the tens of thousands within seconds
 // of boot, pl_prio.h's module doc measured the same thing for other
 // counters). Polling fu_set_calls()'s counter from thread context and
-// publishing through pl_prio.h's spare slot 3 (thread-context-only by
+// publishing through pl_prio.h's spare slot 4 (thread-context-only by
 // that module's own contract) is the reliable path -- see debug_remote.c.
 static volatile bool s_watch_enabled = false;
 

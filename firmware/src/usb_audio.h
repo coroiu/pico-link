@@ -185,7 +185,7 @@ uint8_t pl_usb_audio_fu_channel_count(void);
 // debug_remote.c's poll (thread context, once per superloop iteration)
 // checks this flag and, when set, watches pl_usb_audio_fu_set_calls() for
 // changes and publishes the current fu_volume[]/fu_mute[] snapshot via
-// pl_prio.h's non-starvable slot 3 when it does. See usb_audio.c's doc
+// pl_prio.h's non-starvable slot 4 when it does. See usb_audio.c's doc
 // comment on s_watch_enabled for why logging directly from this file's
 // 0xC0 IRQ callbacks via pl_log() was tried first and rejected (measured
 // unreliable under log-ring congestion).

@@ -64,9 +64,16 @@
 //                        dumps usb_audio.c's stored fu_volume[]/fu_mute[]
 //                        per channel plus fu_set_calls/fu_get_calls.
 //   VOL WATCH        -- toggles logging of every feature-unit SET (channel,
-//                        selector, raw value) as it happens, from inside
-//                        the 0xC0 worker IRQ (pl_log() is IRQ-safe). Second
-//                        call turns it back off.
+//                        selector, raw value). Polled from this file's
+//                        thread-context superloop call, which watches
+//                        usb_audio.c's fu_set_calls() counter and publishes
+//                        the fu_volume[]/fu_mute[] snapshot via pl_prio.h's
+//                        slot 4 -- logging directly from the 0xC0 worker
+//                        IRQ via plain pl_log() was tried first and found
+//                        unreliable under this firmware's background
+//                        log-ring congestion (see VT1's LEARNED comment on
+//                        bead pico-link-4v2.1). Second call turns it back
+//                        off.
 //   VOL HOSTUP [n]   -- pushes n (default 1, max 100) HID Consumer Volume
 //   VOL HOSTDOWN [n]    Increment/Decrement taps via media_keys.c's
 //                        already-proven ring, to measure whether it moves
