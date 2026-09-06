@@ -25,7 +25,6 @@
 
 use alloc::format;
 use alloc::string::String;
-use core::cell::Cell;
 use core::convert::Infallible;
 use core::time::Duration;
 
@@ -283,42 +282,12 @@ pub struct HeroStatusView {
     muted: bool,
     stat_line: Option<String>,
     out_level: Option<OutLevelDisplay>,
-    /// Bead `pico-link-7h5.9`: the "body" (everything [`Self::body_paint_
-    /// key`] folds -- device name, codec status, muted, stat line, i.e.
-    /// everything this widget paints EXCEPT the OUT meter) paint key as of
-    /// the last time it was observed, kept in a `Cell` for the same reason
-    /// `list.rs`'s `top_index`/`fields.rs`'s `top_index` are `Cell`s:
-    /// [`Widget::damage_hint`] takes `&self`, not `&mut self`, but still
-    /// needs to remember something across calls.
-    ///
-    /// [`Self::damage_hint`] is `Screen`'s only caller of this, and only
-    /// when this widget's overall `paint_key` has already changed
-    /// frame-to-frame (`screen.rs`'s diff) -- so an unchanged body key at
-    /// that point means the OUT-sample part is the only thing that could
-    /// have moved the overall key, which is exactly the "when only the
-    /// OUT-sample part of its key changed" test the design (section 8)
-    /// calls for. Kept correct across the builder chain by [`Self::new`],
-    /// [`Self::with_muted`] and [`Self::with_stat_line`] -- the three
-    /// places that can change a body-affecting field -- each
-    /// recomputing and storing it immediately; [`Self::with_out_level`]
-    /// does not touch it, since the OUT sample is deliberately excluded
-    /// from the body key.
-    last_body_key: Cell<Option<PaintKey>>,
 }
 
 impl HeroStatusView {
     #[must_use]
     pub fn new(device_name: impl Into<String>, status: CodecStatus) -> Self {
-        let view = Self {
-            device_name: device_name.into(),
-            status,
-            muted: false,
-            stat_line: None,
-            out_level: None,
-            last_body_key: Cell::new(None),
-        };
-        view.last_body_key.set(Some(view.body_paint_key()));
-        view
+        Self { device_name: device_name.into(), status, muted: false, stat_line: None, out_level: None }
     }
 
     /// Design section 6.3: device-side volume at zero with the host
@@ -329,12 +298,6 @@ impl HeroStatusView {
     #[must_use]
     pub fn with_muted(mut self, muted: bool) -> Self {
         self.muted = muted;
-        // `muted` is folded into the body key (`Self::active_banner`'s
-        // priority rule makes it part of what the non-meter body paints) --
-        // recompute immediately so `last_body_key` reflects the fully-built
-        // widget's actual body, not the pre-`with_muted` snapshot `Self::
-        // new` took.
-        self.last_body_key.set(Some(self.body_paint_key()));
         self
     }
 
@@ -351,9 +314,6 @@ impl HeroStatusView {
     #[must_use]
     pub fn with_stat_line(mut self, line: impl Into<String>) -> Self {
         self.stat_line = Some(line.into());
-        // Same reason as `Self::with_muted` above: `stat_line` is part of
-        // the body key, so the cache must be recomputed here too.
-        self.last_body_key.set(Some(self.body_paint_key()));
         self
     }
 
@@ -400,12 +360,15 @@ impl HeroStatusView {
     /// Folds everything [`Self::render`] paints EXCEPT the OUT meter --
     /// device name, codec status (word/fallback/bitrate), muted, stat
     /// line. This is [`Self::paint_key`] minus its OUT-sample fold (see
-    /// that method, which now builds on this), factored out so
-    /// [`Self::damage_hint`] can ask "did anything other than the meter
-    /// change?" without duplicating the fold sequence, and so
-    /// [`Self::new`]/[`Self::with_muted`]/[`Self::with_stat_line`] can
-    /// keep [`Self::last_body_key`] primed correctly across the builder
-    /// chain (see that field's doc comment for why priming matters).
+    /// that method, which now builds on this), factored out so it can
+    /// also serve as [`Self::damage_region_key`] -- the "did anything
+    /// other than the meter change?" question `Screen` asks by comparing
+    /// THIS across frames in its own cache. This method itself holds no
+    /// memory of its own (bead `pico-link-7h5.9`'s postmortem: a widget
+    /// instance does not survive frames, so a widget-local comparison
+    /// would be comparing a freshly-built instance's key against itself
+    /// -- see [`Widget::damage_region_key`]'s doc comment for the full
+    /// reasoning).
     fn body_paint_key(&self) -> PaintKey {
         let key = PaintKey::of(HERO_PAINT_KEY_SEED).fold_str(&self.device_name);
         let key = match &self.status {
@@ -905,28 +868,37 @@ impl Widget for HeroStatusView {
         }
     }
 
-    /// Bead `pico-link-7h5.9` (design section 4/8): narrows this widget's
-    /// own damage to the OUT meter's footprint when only the OUT-sample
-    /// part of [`Self::paint_key`] changed -- otherwise `None`, so
-    /// `Screen` damages this widget's whole `area` (the correct, safe
-    /// fallback for any change to the device name, codec status, muted
-    /// flag or stat line).
+    /// Bead `pico-link-7h5.9` (design section 4/8): the OUT meter's own
+    /// footprint (via the shared `meter_footprint` helper), unconditionally.
     ///
-    /// `Screen` only calls this once it has already established that this
-    /// widget's overall `paint_key` differs from last frame's (see
-    /// `screen.rs`'s diff) -- so an UNCHANGED [`Self::body_paint_key`] at
-    /// that point can only mean the OUT-sample fold is what moved the
-    /// overall key. [`Self::last_body_key`]'s doc comment explains how
-    /// that comparison stays correct across the widget's own lifetime
-    /// despite `&self`.
+    /// This is trustworthy ONLY because `Screen` never narrows to this
+    /// rectangle unless [`Self::damage_region_key`] (below) also proved,
+    /// against `Screen`'s OWN cache, that nothing outside the meter could
+    /// have changed -- see that method's doc comment, and
+    /// [`Widget::damage_hint`]'s, for why that check cannot live here and
+    /// why `Screen` falls back to this widget's whole `area` whenever it
+    /// hasn't been established.
     fn damage_hint(&self, area: Rectangle, _ctx: &RenderCtx) -> Option<Rectangle> {
-        let body_key = self.body_paint_key();
-        let unchanged_body = self.last_body_key.replace(Some(body_key)) == Some(body_key);
-        if unchanged_body {
-            Some(meter_footprint(area))
-        } else {
-            None
-        }
+        Some(meter_footprint(area))
+    }
+
+    /// The "did anything other than the meter change?" half of
+    /// [`Self::damage_hint`]'s contract (bead `pico-link-7h5.9`) -- see
+    /// [`Widget::damage_region_key`]'s doc comment for why this value must
+    /// be diffed by `Screen` itself, against its own cache, rather than by
+    /// this widget remembering its own previous value: a `HeroStatusView`
+    /// instance is routinely rebuilt from fresh `BtModel` data far more
+    /// often than once per render, so any widget-local "last frame" memory
+    /// would in practice be comparing a freshly-built instance's key
+    /// against itself.
+    ///
+    /// Exactly [`Self::body_paint_key`] -- the identical value
+    /// [`Self::paint_key`] folds the OUT-sample part onto, so "only the
+    /// OUT-sample part changed" is precisely "this value is unchanged from
+    /// last frame while `paint_key` is not", which is exactly the
+    /// condition `Screen`'s diff evaluates.
+    fn damage_region_key(&self, _ctx: &RenderCtx) -> PaintKey {
+        self.body_paint_key()
     }
 
     /// Exposes the fallback state (design section 6.2, link 3: the X-rail
@@ -1500,6 +1472,106 @@ mod tests {
         assert_eq!(
             damaged_pixels, full_pixels,
             "a damage-narrowed render at t1 must be pixel-identical to a full render at t1 -- the meter must not freeze mid-decay just because damage_hint narrowed the repaint"
+        );
+    }
+
+    // --- damage_region_key / Screen integration (coordinator finding,
+    // bead pico-link-7h5.9): the tests above prove `damage_hint`'s
+    // rectangle and the `ctx.needs`-gated render are correct IN
+    // ISOLATION; they say nothing about whether the mechanism stays safe
+    // once a genuine BODY change (not the OUT sample) is driven through
+    // the real `Screen` diff. A widget-local memory of "my own body key
+    // last frame" cannot answer that soundly, because a `HeroStatusView`
+    // instance does not survive frames in production (`HomeView::new` is
+    // called fresh from `App::rebuild_root`, which every
+    // `Event::LevelsChanged` triggers) -- see `Widget::damage_region_key`'s
+    // doc comment. This test drives the real `Screen::render` with
+    // `force_full_damage: false` on frame 2, deliberately NOT leaning on
+    // `Navigator::replace_root`'s own full-damage flag (which happens to
+    // paper over this exact bug in the shipped app today, but must not be
+    // what makes the MECHANISM itself correct).
+
+    /// Delegates every `Widget` method this test needs to a shared, swappable
+    /// `HeroStatusView` -- `Rc<RefCell<_>>` so the test can hold its own
+    /// handle to swap the widget's content between frames while `Screen`
+    /// keeps the SAME widget slot identity, exactly reproducing the
+    /// "reconstructed-but-in-the-same-slot" shape `App::rebuild_root`
+    /// produces via `Navigator::replace_root` in production.
+    struct HeroSlot(alloc::rc::Rc<core::cell::RefCell<HeroStatusView>>);
+
+    impl Widget for HeroSlot {
+        fn measure(&self, constraints: Size, ctx: &RenderCtx) -> Size {
+            self.0.borrow().measure(constraints, ctx)
+        }
+        fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+            self.0.borrow().render(area, ctx, target)
+        }
+        fn paint_key(&self, ctx: &RenderCtx) -> PaintKey {
+            self.0.borrow().paint_key(ctx)
+        }
+        fn damage_hint(&self, area: Rectangle, ctx: &RenderCtx) -> Option<Rectangle> {
+            self.0.borrow().damage_hint(area, ctx)
+        }
+        fn damage_region_key(&self, ctx: &RenderCtx) -> PaintKey {
+            self.0.borrow().damage_region_key(ctx)
+        }
+    }
+
+    #[test]
+    fn a_genuine_body_change_damages_the_whole_widget_not_just_the_meter_strip() {
+        let received_at = Instant::from_micros(0);
+        let level = out_level_at(received_at);
+
+        let frame1 = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+        )
+        .with_out_level(Some(level));
+
+        let inner = alloc::rc::Rc::new(core::cell::RefCell::new(frame1));
+        let slot = HeroSlot(alloc::rc::Rc::clone(&inner));
+        let mut screen = super::super::screen::Screen::new("T", alloc::vec![Box::new(slot) as Box<dyn Widget>]);
+
+        let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
+        let mut fb = FrameBuffer565::new(240, 240);
+
+        // Frame 1: a real first render -- `Screen`'s own cache is empty,
+        // so this is unconditionally full damage (`cache_miss`) regardless
+        // of the `force_full_damage: true` passed here, matching what
+        // production's very first render of any screen always does. This
+        // is what primes `Screen`'s cache with frame 1's REAL
+        // `damage_region_key`, the value frame 2 below must be diffed
+        // against.
+        screen.render(&chrome, false, &test_ctx(), true, &mut fb).unwrap();
+
+        // Frame 2: ONLY the codec word changes -- a genuine BODY change,
+        // not the OUT sample -- via the shared `Rc<RefCell<_>>`, so
+        // `Screen` sees the SAME widget slot (same index, same area) it
+        // cached frame 1 against, exactly like a `Navigator::replace_at`
+        // that swaps a screen's content in place. `force_full_damage:
+        // false` this time: nothing external should be required to make
+        // this correct.
+        let frame2 = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps(328) },
+        )
+        .with_out_level(Some(level));
+        inner.replace(frame2);
+
+        let damage = screen.render(&chrome, false, &test_ctx(), false, &mut fb).unwrap();
+
+        // The bug this test exists to catch: a widget-local "did only the
+        // meter change?" check that is comparing a freshly-built
+        // instance's key against itself would say "yes" here too (it was
+        // seeded from THIS instance's own construction), wrongly narrowing
+        // `damage` down to `meter_footprint`'s ~48px-wide strip at the
+        // content's button-edge side and leaving the OLD codec word's
+        // stale ink on screen. The correct damage rect must extend into
+        // the hero body's text region, near the content's LEFT edge.
+        assert!(
+            damage.top_left.x <= chrome.content.top_left.x + 20,
+            "a genuine body change (codec word) must damage the hero body's text region near the content's left edge, not just the meter strip -- got damage {damage:?} against content {:?}",
+            chrome.content
         );
     }
 
