@@ -158,6 +158,16 @@ extern "C" {
 
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 1
 
+// Bead pico-link-2ue (VT4a): the UAC2 feature-unit status interrupt
+// endpoint, OFF at the top of this bead and measured here. Adds the AC
+// interrupt IN endpoint (audiod_open() asserts this is 1 whenever the AC
+// interface descriptor declares bNumEndpoints==1 -- audio_device.c:1649)
+// and the tud_audio_int_n_write() API used to send a feature-unit
+// value-changed status packet. See usb_descriptors.h/.c for the descriptor
+// side and usb_audio.c's pl_usb_audio_send_fu_status_interrupt() for the
+// console-triggered send this bead uses to measure whether macOS reacts.
+#define CFG_TUD_AUDIO_ENABLE_INTERRUPT_EP 1
+
 // Number of Standard AS Interface Descriptors (one alt-streaming interface
 // here: alt 0 = idle/zero-bandwidth, alt 1 = streaming).
 #define CFG_TUD_AUDIO_FUNC_1_N_AS_INT 1
