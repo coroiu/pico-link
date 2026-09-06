@@ -189,9 +189,10 @@ int main(void) {
     // dropped the RGB staging fills entirely, on the mistaken assumption
     // they were purely a bring-up diagnostic -- they are NOT. st7789_init()
     // only brings up the GPIO/SPI peripheral; the actual panel bring-up
-    // (hardware reset, SLPOUT, COLMOD, MADCTL, INVON, the one-time CASET/
-    // RASET address window st7789_blit_framebuffer's own doc comment
-    // depends on, DISPON, and turning the backlight on) all lives inside
+    // (hardware reset, SLPOUT, COLMOD, MADCTL, INVON, the initial CASET/
+    // RASET address window (now set via st7789_set_window on every blit,
+    // not once -- see st7789_blit_rect, pico-link-7h5.7), DISPON, and
+    // turning the backlight on) all lives inside
     // st7789_init_and_fill -- see st7789.c. Dropping that call left the
     // panel held in reset with the backlight off: st7789_blit_framebuffer
     // was still dutifully DMA'ing pixels, just into a panel that was never
