@@ -1,0 +1,7 @@
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/CMakeFiles/pioasm.dir
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/CMakeFiles/edit_cache.dir
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/CMakeFiles/rebuild_cache.dir
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/CMakeFiles/list_install_components.dir
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/CMakeFiles/install.dir
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/CMakeFiles/install/local.dir
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/CMakeFiles/install/strip.dir

@@ -2,7 +2,9 @@
 
 #include "hardware/sync.h"
 
+#ifdef PL_DEBUG_REMOTE
 #include "pl_prio.h"
+#endif
 #include "usb_pump.h" // pl_log() -- only for the circuit-breaker trip line, thread context
 
 // --- Canonical state (thread context only -- design sec 2/3) ---
@@ -143,15 +145,30 @@ static void apply_and_propagate(uint8_t new_level, PlVolumeSource source, uint64
         s_avrcp_dirty = true;
     }
 
+    // pico-link-4v2.3 (VT3) code-review fix, inherited from VT2's review:
+    // the format string used to hardcode the literal "WOULD-EMIT"
+    // regardless of `emit`, while ALSO printing "emit"/"wouldemit" as a
+    // separate field -- self-contradictory the moment a real edge sets
+    // emit=true (this bead's own T3 wiring does exactly that). The %s
+    // already carries the emit/wouldemit distinction; just log it once.
+    //
+    // Also gated under PL_DEBUG_REMOTE (matches pl_prio.h's own slot-4
+    // gating, PL_PRIO_SLOT_COUNT is 4 in release / 5 with debug) -- this
+    // call used to run unconditionally even though slot 4 only exists
+    // under PL_DEBUG_REMOTE, so a release build silently dropped every
+    // real-edge propagation log via pl_prio_publish's bounds check
+    // (pl_prio.c) rather than never calling it at all.
+#ifdef PL_DEBUG_REMOTE
     pl_prio_publish(
         4,
-        "vol %s src=%d lvl=%u WOULD-EMIT host_cur=%d avrcp=%u",
+        "vol %s src=%d lvl=%u host_cur=%d avrcp=%u",
         emit ? "emit" : "wouldemit",
         (int)source,
         (unsigned)s_level,
         (int)fu_cur,
         (unsigned)avrcp_level
     );
+#endif
 }
 
 void pl_volume_service(uint64_t now_us) {
@@ -183,6 +200,27 @@ void pl_volume_service(uint64_t now_us) {
 void pl_volume_debug_set(uint8_t n, uint64_t now_us) {
     uint8_t level = clamp_level(n);
     apply_and_propagate(level, PL_VOLUME_SOURCE_CONSOLE, now_us, false);
+}
+
+// T3 (pico-link-4v2.3): bt.c's heartbeat handler (cyw43 background IRQ
+// 0xFF) reads this once per 100ms tick to decide whether to send a fresh
+// AVRCP SET_ABSOLUTE_VOLUME. IRQ-safe both ways -- written by
+// apply_and_propagate (thread context, superloop) under
+// save_and_disable_interrupts, read-and-cleared here under the same
+// protection so a write from the superloop can never interleave with a
+// read from 0xFF and hand out a torn value. Coalescing, like every other
+// latch in this module: if two propagations land before the heartbeat
+// next runs, only the newest survives -- correct for a level.
+bool pl_volume_take_avrcp_desired(uint8_t *out_level) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    bool dirty = s_avrcp_dirty;
+    uint8_t level = s_avrcp_desired;
+    s_avrcp_dirty = false;
+    restore_interrupts(irq_state);
+    if (dirty && out_level != NULL) {
+        *out_level = level;
+    }
+    return dirty;
 }
 
 uint8_t pl_volume_level(void) {

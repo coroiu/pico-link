@@ -1,0 +1,5 @@
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm-install/pioasm/pioasm
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm-install/pioasm/pioasmTargets.cmake
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm-install/pioasm/pioasmTargets-release.cmake
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm-install/pioasm/pioasmConfig.cmake
+/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm-install/pioasm/pioasmConfigVersion.cmake

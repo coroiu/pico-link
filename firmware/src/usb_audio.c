@@ -17,6 +17,7 @@
 #include "pcm_ring.h"
 #include "usb_audio.h"
 #include "usb_descriptors.h"
+#include "volume.h" // pl_volume_notify_host_raw -- T3 (pico-link-4v2.3)
 
 // EP1 OUT, the isochronous audio endpoint -- matches usb_descriptors.c's
 // EPNUM_AUDIO_OUT and usb_pump.c's PL_EP_AUDIO_OUT (bead pico-link-okx D9).
@@ -200,6 +201,17 @@ static bool feature_unit_set_request(uint8_t rhport, audio_control_request_t con
     }
     if (request->bControlSelector == AUDIO_FU_CTRL_VOLUME && request->wLength == sizeof(audio_control_cur_2_t)) {
         fu_volume[ch] = ((audio_control_cur_2_t const *)buf)->bCur;
+        // T3 (pico-link-4v2.3), design sec 2/9: the real host->volume.c
+        // edge. Only channel 0 (master) -- VT4a.1 (pico-link-rmp) measured
+        // macOS writing fu_volume[0] on a host slider move, never a
+        // per-channel index; volume.c's canonical value is a single
+        // number, not per-channel. This callback runs inside
+        // tud_task()/pl_usb_pump_worker_irq, the 0xC0 worker IRQ
+        // (design sec 2's context table) -- pl_volume_notify_host_raw is
+        // IRQ-safe by contract (volume.h).
+        if (ch == 0) {
+            pl_volume_notify_host_raw(fu_volume[0]);
+        }
         return true;
     }
     return false;

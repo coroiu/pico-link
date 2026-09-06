@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/andreas/code/esp32-bluetooth-tx/.worktrees/bd-pico-link-4v2.3/firmware/build-release/pioasm/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

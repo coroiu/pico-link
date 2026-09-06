@@ -116,4 +116,11 @@ void pl_volume_debug_set(uint8_t n, uint64_t now_us);
 uint8_t pl_volume_level(void);
 bool pl_volume_muted(void);
 
+// T3 (not yet wired to a real caller besides bt.c's heartbeat handler):
+// reads and clears the outbound AVRCP latch, IRQ-safe -- callable from
+// ANY context (design sec 2), specifically the cyw43 background IRQ 0xFF.
+// Returns true and fills `out_level` iff a new value is pending; false
+// (out_level untouched) if nothing changed since the last call.
+bool pl_volume_take_avrcp_desired(uint8_t *out_level);
+
 #endif // PICO_LINK_VOLUME_H
