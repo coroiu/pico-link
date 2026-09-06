@@ -183,6 +183,10 @@ impl HomeView {
                     hold_l: level.hold_l,
                     hold_r: level.hold_r,
                     received_at: level.received_at,
+                    attack_rms_l: level.attack_rms_l,
+                    attack_rms_r: level.attack_rms_r,
+                    attack_rms_l_at: level.attack_rms_l_at,
+                    attack_rms_r_at: level.attack_rms_r_at,
                 });
                 HeroStatusView::new(
                     device_name,

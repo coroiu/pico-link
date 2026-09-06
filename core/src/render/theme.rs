@@ -626,6 +626,36 @@ const VERTICAL_METER_SEGMENT_GAP: i32 = 2;
 pub const VERTICAL_METER_GLYPH_HEIGHT: u32 = (VERTICAL_METER_SEGMENT_COUNT * VERTICAL_METER_SEGMENT_HEIGHT
     + (VERTICAL_METER_SEGMENT_COUNT - 1) * VERTICAL_METER_SEGMENT_GAP) as u32;
 
+/// dBFS threshold, per vertical-meter segment, that `level` (linear 0-255,
+/// see [`draw_vertical_level_meter`]'s doc comment) must meet or exceed for
+/// that segment to be considered "lit" — bead pico-link-ajj.
+///
+/// A linear `level*16/256` mapping (the previous behaviour) put typical
+/// music RMS (-10..-20 dBFS, i.e. 0.1-0.3 linear) at only 1-3 of 16
+/// segments: a level meter reads amplitude on a log scale, not a linear
+/// one, so a linear segment count is wrong on any real program material,
+/// not just quiet ones.
+///
+/// `core` is `no_std` with no `libm`, so this is a precomputed const table
+/// rather than a `log10` call at render time. Each entry is
+/// `round(255 * 10^((-48 + 3*(i+1)) / 20))` for `i` in `0..16` — a 3
+/// dB-per-segment scale spanning -48 dBFS (segment 1 lit) to 0 dBFS
+/// (full scale, all 16 lit). Segment `i`'s threshold is this array's `i`-th
+/// entry (0-indexed, quietest/bottom-most first, same convention as
+/// [`vertical_level_segment_color`]).
+const VERTICAL_METER_DBFS_THRESHOLDS: [u8; VERTICAL_METER_SEGMENT_COUNT as usize] =
+    [1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 90, 128, 181, 255];
+
+/// Maps a linear 0-255 level to a segment *count* (0..=16) via
+/// [`VERTICAL_METER_DBFS_THRESHOLDS`]: the number of thresholds `level`
+/// meets or exceeds. Shared by the moving bar (`filled`) and the peak-hold
+/// cap (`hold_index`) in [`draw_vertical_level_meter`] so both read off one
+/// scale — see bead pico-link-ajj, which found the previous code split them
+/// (log-shaped intent, linear-shaped bar).
+fn vertical_level_dbfs_segment_count(level: u8) -> i32 {
+    VERTICAL_METER_DBFS_THRESHOLDS.iter().filter(|&&threshold| level >= threshold).count() as i32
+}
+
 /// Which colour segment `index` (0-based, quietest/bottom-most first) draws
 /// in when filled — design section 5: the colour zones keep the *same
 /// proportions* as the horizontal meter (green bottom 5/8, amber next 2/8,
@@ -679,12 +709,19 @@ pub fn draw_vertical_level_meter<D>(target: &mut D, rect: Rectangle, level: u8, 
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
 {
-    // Round-to-nearest segment count, same reasoning as `draw_level_meter`.
-    let filled = (i32::from(level) * VERTICAL_METER_SEGMENT_COUNT + 127) / 256;
+    // dBFS-scaled segment count (bead pico-link-ajj) -- NOT a linear
+    // level*16/256 mapping. See `vertical_level_dbfs_segment_count`'s doc
+    // comment for why: linear made typical music RMS light 1-3 of 16
+    // segments.
+    let filled = vertical_level_dbfs_segment_count(level);
     let hold_index = if hold == 0 {
         None
     } else {
-        Some((i32::from(hold) * VERTICAL_METER_SEGMENT_COUNT / 256).min(VERTICAL_METER_SEGMENT_COUNT - 1))
+        // Same dBFS scale as `filled`, converted from a 0..=16 count to a
+        // 0-based index -- a nonzero hold always shows at least segment 0,
+        // and the cap lands on the same segment the bar would if it were
+        // at this level (one shared scale, not one log and one linear).
+        Some((vertical_level_dbfs_segment_count(hold) - 1).clamp(0, VERTICAL_METER_SEGMENT_COUNT - 1))
     };
 
     let bottom = rect.top_left.y + VERTICAL_METER_GLYPH_HEIGHT as i32;
@@ -969,25 +1006,49 @@ mod tests {
     }
 
     #[test]
-    fn draw_vertical_level_meter_half_scale_fills_only_the_bottom_half() {
+    fn draw_vertical_level_meter_half_linear_scale_fills_14_of_16_on_the_dbfs_scale() {
+        // 128/255 linear is -6 dBFS, not -infinity-to-0's midpoint -- on a
+        // log scale that is loud, not "half". This replaces a pre-pico-
+        // link-ajj test that expected a linear 8-of-16 split; the dBFS
+        // mapping is the point of this bead, so the old expectation would
+        // be testing the bug.
         let mut fb = FrameBuffer565::new(20, 180);
         let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
-        // 128/256 -> filled = (128*16+127)/256 = 8 segments from the bottom.
         draw_vertical_level_meter(&mut fb, rect, 128, 0).unwrap();
-        for i in 0..8 {
+        for i in 0..14 {
             assert_ne!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::DIVIDER,
-                "segment {i} from the bottom should be filled at half scale"
+                "segment {i} from the bottom should be filled at level=128 (-6 dBFS)"
             );
         }
-        for i in 8..16 {
+        for i in 14..16 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::DIVIDER,
-                "segment {i} from the bottom should still be unfilled at half scale"
+                "segment {i} from the bottom should still be unfilled at level=128 (-6 dBFS)"
             );
         }
+    }
+
+    #[test]
+    fn vertical_level_dbfs_segment_count_full_scale_fills_16() {
+        assert_eq!(vertical_level_dbfs_segment_count(255), 16);
+    }
+
+    #[test]
+    fn vertical_level_dbfs_segment_count_silence_fills_0() {
+        assert_eq!(vertical_level_dbfs_segment_count(0), 0);
+    }
+
+    #[test]
+    fn vertical_level_dbfs_segment_count_typical_music_rms_lands_around_segment_10() {
+        // 0.1 linear RMS (-20 dBFS) is squarely in typical-music territory
+        // (bead pico-link-ajj) -- the linear mapping this replaces put it
+        // at 1-3 of 16 segments; a dBFS mapping must land it well up the
+        // column instead.
+        let filled = vertical_level_dbfs_segment_count(26); // round(0.1 * 255)
+        assert!((9..=11).contains(&filled), "expected ~segment 10, got {filled}");
     }
 
     #[test]

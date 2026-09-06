@@ -756,6 +756,85 @@ pub struct OutLevelSample {
     hold_l_at: Instant,
     hold_r_at: Instant,
     pub received_at: Instant,
+    /// Release-ballistic attack anchor (bead pico-link-ajj, design
+    /// requirement C): the `rms_l`/`rms_r` value in effect at the moment it
+    /// was last set by an instantaneous attack, i.e. the last time a fresh
+    /// reading was at or above the then-current decayed value. `crate::
+    /// render::hero`'s render function decays *from* this anchor at render
+    /// time (via [`decay_rms`]) to get the bar's actually-displayed level —
+    /// see [`App::on_levels_changed`] for how the anchor is updated, and
+    /// [`decay_rms`]'s doc comment for why this is a pure render-time
+    /// computation rather than a value mutated on a timer.
+    pub(crate) attack_rms_l: u8,
+    pub(crate) attack_rms_r: u8,
+    pub(crate) attack_rms_l_at: Instant,
+    pub(crate) attack_rms_r_at: Instant,
+}
+
+/// Exponential-release rate for the vertical OUT meter's ballistics (bead
+/// pico-link-ajj, design requirement C): approximately 20 dB per second —
+/// amplitude falls to roughly 10% of its value after one second of
+/// continuous release. Expressed as a Q16.16 fixed-point ratio-per-
+/// millisecond (`10^(-1/1000)`, precomputed offline as a constant) rather
+/// than a runtime `powf`/`log10` call: `core` is `no_std` with no `libm`
+/// (same constraint [`crate::render::theme::VERTICAL_METER_DBFS_THRESHOLDS`]
+/// documents), so [`decay_rms`] raises this ratio to the elapsed
+/// millisecond count via integer exponentiation-by-squaring instead.
+const RELEASE_RATIO_PER_MS_Q16: u32 = 65384;
+
+/// Multiplies two Q16.16 fixed-point values, truncating the low bits
+/// (consistent rounding-down bias, negligible at these magnitudes).
+///
+/// `clippy::cast_possible_truncation` is silenced deliberately: every
+/// caller in this module keeps both operands `<= 1<<16` (a ratio `<= 1.0`
+/// in this fixed-point representation), so the widened product is always
+/// `<= 1<<32` and the post-shift result always fits `u32` with headroom —
+/// see [`q16_pow`]'s doc comment for why that invariant holds across
+/// repeated squaring too.
+#[allow(clippy::cast_possible_truncation)]
+const fn q16_mul(a: u32, b: u32) -> u32 {
+    ((a as u64 * b as u64) >> 16) as u32
+}
+
+/// Raises a Q16.16 fixed-point `base` (expected `<= 1<<16`, i.e. a ratio
+/// `<= 1.0`) to the integer power `exp` via exponentiation-by-squaring —
+/// O(log2(exp)) fixed-point multiplies, no float/libm. Terminates for any
+/// `exp` because `base <= 1<<16` means repeated squaring monotonically
+/// shrinks towards zero once `exp` is large enough to matter.
+const fn q16_pow(base: u32, mut exp: u64) -> u32 {
+    let mut result: u32 = 1 << 16;
+    let mut b = base;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = q16_mul(result, b);
+        }
+        b = q16_mul(b, b);
+        exp >>= 1;
+    }
+    result
+}
+
+/// Decays `anchor` (a linear 0-255 rms reading, same scale as
+/// [`Event::LevelsChanged`]'s payload) by `elapsed`, at
+/// [`RELEASE_RATIO_PER_MS_Q16`]'s ~20 dB/s release rate. Pure and safe to
+/// call at render time: both [`App::on_levels_changed`] (to decide whether
+/// a fresh sample counts as a rise, i.e. an instantaneous attack) and
+/// `crate::render::hero::HeroStatusView::render` (to get today's actually-
+/// displayed bar level between events) derive "the level right now" from a
+/// stored `(anchor, anchor_at)` pair plus a current clock reading, never by
+/// mutating a running average on a timer — see [`OutLevelSample`]'s doc
+/// comment above (and its `hold_l`/`hold_r` fields' own precedent) for why
+/// a `&self`-rendered widget tree has no other way to do this.
+// `clippy::cast_possible_truncation`: `ratio <= 1<<16` always (base
+// `<= 1<<16`, exponentiation-by-squaring of a fraction only shrinks it),
+// so `u32::from(anchor) * ratio` fits comfortably before the shift and the
+// post-shift result is always `<= anchor`, i.e. `<= 255` and safe to
+// narrow to `u8`.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn decay_rms(anchor: u8, elapsed: Duration) -> u8 {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let ratio = q16_pow(RELEASE_RATIO_PER_MS_Q16, elapsed_ms);
+    ((u32::from(anchor) * ratio) >> 16) as u8
 }
 
 /// A Bluetooth device address, aliased for readability at call sites that
@@ -1584,8 +1663,40 @@ impl App {
         } else {
             (prev_hold_r, prev_hold_r_at)
         };
-        self.model.out_level =
-            Some(OutLevelSample { peak_l, peak_r, rms_l, rms_r, hold_l, hold_r, hold_l_at, hold_r_at, received_at: now });
+        // Release-ballistic attack anchor (bead pico-link-ajj, design
+        // requirement C): decay the previous anchor to "now" and compare
+        // against the fresh rms sample. If the fresh sample is at or above
+        // that decayed value, this is a rise -- attack is instantaneous,
+        // so the anchor jumps straight to the new sample. Otherwise the
+        // anchor is left exactly as it was, so the render-time decay in
+        // `crate::render::hero` continues gliding down from the same
+        // point instead of re-anchoring (and thus flattening the release
+        // curve) on every quieter sample.
+        let (prev_anchor_l, prev_anchor_l_at, prev_anchor_r, prev_anchor_r_at) = match &self.model.out_level {
+            Some(sample) => (sample.attack_rms_l, sample.attack_rms_l_at, sample.attack_rms_r, sample.attack_rms_r_at),
+            None => (0, now, 0, now),
+        };
+        let decayed_l = decay_rms(prev_anchor_l, now.saturating_duration_since(prev_anchor_l_at));
+        let (attack_rms_l, attack_rms_l_at) =
+            if rms_l >= decayed_l { (rms_l, now) } else { (prev_anchor_l, prev_anchor_l_at) };
+        let decayed_r = decay_rms(prev_anchor_r, now.saturating_duration_since(prev_anchor_r_at));
+        let (attack_rms_r, attack_rms_r_at) =
+            if rms_r >= decayed_r { (rms_r, now) } else { (prev_anchor_r, prev_anchor_r_at) };
+        self.model.out_level = Some(OutLevelSample {
+            peak_l,
+            peak_r,
+            rms_l,
+            rms_r,
+            hold_l,
+            hold_r,
+            hold_l_at,
+            hold_r_at,
+            received_at: now,
+            attack_rms_l,
+            attack_rms_r,
+            attack_rms_l_at,
+            attack_rms_r_at,
+        });
         self.rebuild_root();
     }
 

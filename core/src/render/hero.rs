@@ -235,6 +235,15 @@ pub struct OutLevelDisplay {
     pub hold_l: u8,
     pub hold_r: u8,
     pub received_at: Instant,
+    /// Release-ballistic attack anchor (bead pico-link-ajj, design
+    /// requirement C) -- a field-for-field carry of
+    /// `crate::app::OutLevelSample`'s own anchor fields; see
+    /// [`crate::app::decay_rms`]'s doc comment for what this widget does
+    /// with it at render time.
+    pub attack_rms_l: u8,
+    pub attack_rms_r: u8,
+    pub attack_rms_l_at: Instant,
+    pub attack_rms_r_at: Instant,
 }
 
 /// Which persistent banner (if any) is currently showing — resolved by
@@ -616,8 +625,20 @@ impl Widget for HeroStatusView {
                     FontColor::Transparent(palette::TEXT_SECONDARY),
                     &mut clipped,
                 );
-                theme::draw_vertical_level_meter(&mut clipped, l_block, level.rms_l, level.hold_l)?;
-                theme::draw_vertical_level_meter(&mut clipped, r_block, level.rms_r, level.hold_r)?;
+                // Release-ballistic decay (bead pico-link-ajj, design
+                // requirement C): the bar draws the anchor decayed to
+                // *now*, floored at the latest raw rms sample -- the floor
+                // matters because the publish cadence can leave the anchor
+                // stale between events; once the decayed value would fall
+                // below the last known raw reading, the raw reading is a
+                // better estimate of "the level right now" than continuing
+                // to decay past it. See `crate::app::decay_rms`'s doc
+                // comment for why this is computed here, at render time,
+                // rather than mutated on a schedule.
+                let displayed_rms_l = crate::app::decay_rms(level.attack_rms_l, ctx.now().saturating_duration_since(level.attack_rms_l_at)).max(level.rms_l);
+                let displayed_rms_r = crate::app::decay_rms(level.attack_rms_r, ctx.now().saturating_duration_since(level.attack_rms_r_at)).max(level.rms_r);
+                theme::draw_vertical_level_meter(&mut clipped, l_block, displayed_rms_l, level.hold_l)?;
+                theme::draw_vertical_level_meter(&mut clipped, r_block, displayed_rms_r, level.hold_r)?;
             }
         }
 
