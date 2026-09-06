@@ -41,8 +41,13 @@ use crate::platform::Instant;
 use super::chrome::carve_edge;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
+use super::paint_key::PaintKey;
 use super::theme::{self, font, palette};
 use super::widget::{ChromeContribution, Widget};
+
+/// Seed for [`HeroStatusView::paint_key`] -- only needs to differ from
+/// other widgets' own seeds.
+const HERO_PAINT_KEY_SEED: u64 = 14;
 
 /// Left rule `L` (px, area-relative) — shared by the device-name line, the
 /// hero codec word, the banner text and the stat strip. Design
@@ -663,6 +668,66 @@ impl Widget for HeroStatusView {
         Ok(())
     }
 
+    /// Folds everything [`HeroStatusView::render`] actually reads: the
+    /// device name, the codec status (word/fallback reason/bitrate), the
+    /// muted flag (together with `fallback` this fully determines
+    /// [`Self::active_banner`] -- see that method's own priority rule, so
+    /// there is nothing left of the banner to fold separately), the stat
+    /// line, and the OUT-meter sample.
+    ///
+    /// **THE TIME-FOLDING TRAP** (design section 3.2, this widget's own
+    /// worked example in section 8): [`Self::redraw_after`] overrides the
+    /// default, so per the mechanical review rule this `paint_key` MUST
+    /// fold the *quantised visual consequence* of time -- never
+    /// `ctx.now()` itself. It folds `level.received_at` (a sample
+    /// timestamp, not the render instant -- it only changes when a new
+    /// reading actually arrives) and the already-computed boolean `age >=
+    /// OUT_LEVEL_STALE_AFTER` (the same comparison `render` and
+    /// `redraw_after` both make). The continuously-decaying ballistic
+    /// value `render` computes from `attack_rms_*_at` (via
+    /// `crate::app::decay_rms`) is deliberately NOT folded here: while
+    /// streaming, a fresh `OutLevelDisplay` (and therefore a new
+    /// `received_at`) arrives on every `Event::LevelsChanged`, which is
+    /// what actually drives the visible ballistic motion frame to frame;
+    /// this `paint_key` only needs to additionally catch the "stream went
+    /// silent" transition, which the quantised stale boolean does. Folding
+    /// `ctx.now()` directly would make this widget permanently dirty (a
+    /// silent no-op -- see `PaintKey`'s doc comment); folding nothing
+    /// time-related at all would freeze the meter mid-decay the moment
+    /// samples stop arriving instead of letting it go absent (design
+    /// section 15).
+    fn paint_key(&self, ctx: &RenderCtx) -> PaintKey {
+        let key = PaintKey::of(HERO_PAINT_KEY_SEED).fold_str(&self.device_name);
+        let key = match &self.status {
+            CodecStatus::NoLink => key.fold(0),
+            CodecStatus::Connected { word, fallback, bitrate } => {
+                let key = key.fold(1).fold_str(word);
+                let key = key.fold_opt_str(fallback.as_deref());
+                match bitrate {
+                    BitrateStatus::Idle => key.fold(0),
+                    BitrateStatus::Kbps(kbps) => key.fold(1).fold(u64::from(*kbps)),
+                }
+            }
+        };
+        let key = key.fold(u64::from(self.muted));
+        let key = key.fold_opt_str(self.stat_line.as_deref());
+        match &self.out_level {
+            None => key.fold(0),
+            Some(level) => {
+                let stale = ctx.elapsed_since(level.received_at) >= OUT_LEVEL_STALE_AFTER;
+                key.fold(1)
+                    .fold(level.received_at.as_micros())
+                    .fold(u64::from(level.peak_l))
+                    .fold(u64::from(level.peak_r))
+                    .fold(u64::from(level.rms_l))
+                    .fold(u64::from(level.rms_r))
+                    .fold(u64::from(level.hold_l))
+                    .fold(u64::from(level.hold_r))
+                    .fold(u64::from(stale))
+            }
+        }
+    }
+
     /// Exposes the fallback state (design section 6.2, link 3: the X-rail
     /// label switches from "link" to "why?" under fallback) via
     /// [`ChromeContribution::fallback`] rather than painting the rail
@@ -1005,6 +1070,145 @@ mod tests {
             rows_without, rows_with,
             "the stat strip must occupy the SAME rows whether or not the banner is showing -- its y is a fixed grid slot (STAT_TOP), not derived from a cursor that the banner also advances"
         );
+    }
+
+    // --- paint_key (bead pico-link-7h5.5): the time-folding trap -------
+
+    fn out_level_at(received_at: Instant) -> OutLevelDisplay {
+        OutLevelDisplay {
+            peak_l: 200,
+            peak_r: 180,
+            rms_l: 120,
+            rms_r: 100,
+            hold_l: 150,
+            hold_r: 140,
+            received_at,
+            attack_rms_l: 120,
+            attack_rms_r: 100,
+            attack_rms_l_at: received_at,
+            attack_rms_r_at: received_at,
+        }
+    }
+
+    #[test]
+    fn paint_key_is_stable_across_calls_with_no_state_change() {
+        let view = nominal();
+        assert_eq!(view.paint_key(&test_ctx()), view.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_does_not_change_from_ctx_now_alone_with_no_out_level() {
+        // No `out_level` at all: this widget's own appearance has nothing
+        // time-driven left to fold (`redraw_after` returns `None` in this
+        // case too -- see that method), so advancing the clock alone must
+        // not change the key.
+        let view = nominal();
+        let t0 = RenderCtx::at(Instant::from_micros(0));
+        let t1 = RenderCtx::at(Instant::from_micros(10_000_000));
+        assert_eq!(view.paint_key(&t0), view.paint_key(&t1), "advancing the clock alone must not dirty a widget with no live OUT sample");
+    }
+
+    #[test]
+    fn paint_key_does_not_change_from_ctx_now_alone_while_the_out_level_is_still_fresh() {
+        // Same `OutLevelDisplay`, same `received_at` -- only `ctx.now()`
+        // moves, and stays well under `OUT_LEVEL_STALE_AFTER`. This is the
+        // "folding raw now() makes the widget permanently dirty" failure
+        // mode this test exists to rule out.
+        let received_at = Instant::from_micros(1_000_000);
+        let view = nominal().with_out_level(Some(out_level_at(received_at)));
+        let t0 = RenderCtx::at(received_at);
+        let t1 = RenderCtx::at(received_at + Duration::from_millis(50));
+        assert_eq!(
+            view.paint_key(&t0),
+            view.paint_key(&t1),
+            "the paint key must not change purely from ctx.now() advancing while the sample is still fresh"
+        );
+    }
+
+    #[test]
+    fn paint_key_changes_exactly_when_the_out_level_crosses_the_stale_threshold() {
+        // The "folding nothing time-related freezes a time-driven widget"
+        // failure mode: the sample's `received_at` never changes, but the
+        // quantised stale boolean must flip once `ctx.now()` crosses
+        // `OUT_LEVEL_STALE_AFTER`, and the key must change with it -- this
+        // is what lets the meter actually go absent on schedule (design
+        // section 15) even with no new event.
+        let received_at = Instant::from_micros(1_000_000);
+        let view = nominal().with_out_level(Some(out_level_at(received_at)));
+        let just_before = RenderCtx::at(received_at + (OUT_LEVEL_STALE_AFTER - Duration::from_millis(1)));
+        let just_after = RenderCtx::at(received_at + (OUT_LEVEL_STALE_AFTER + Duration::from_millis(1)));
+        assert_ne!(
+            view.paint_key(&just_before),
+            view.paint_key(&just_after),
+            "crossing the stale threshold with no new sample must still change the paint key"
+        );
+    }
+
+    #[test]
+    fn paint_key_changes_when_a_new_sample_arrives_even_at_the_same_instant() {
+        let ctx = test_ctx();
+        let a = nominal().with_out_level(Some(out_level_at(Instant::from_micros(0))));
+        let b = nominal().with_out_level(Some(out_level_at(Instant::from_micros(1))));
+        assert_ne!(a.paint_key(&ctx), b.paint_key(&ctx), "a new sample's received_at must change the key even under the same render instant");
+    }
+
+    #[test]
+    fn paint_key_changes_when_a_level_value_changes_but_received_at_does_not() {
+        let received_at = Instant::from_micros(0);
+        let a = nominal().with_out_level(Some(out_level_at(received_at)));
+        let mut sample = out_level_at(received_at);
+        sample.peak_l = 255;
+        let b = nominal().with_out_level(Some(sample));
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_distinguishes_no_out_level_from_a_present_one() {
+        let without = nominal();
+        let with = nominal().with_out_level(Some(out_level_at(Instant::from_micros(0))));
+        assert_ne!(without.paint_key(&test_ctx()), with.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_with_the_codec_word_fallback_and_bitrate() {
+        let word_a = nominal();
+        let word_b = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+        );
+        assert_ne!(word_a.paint_key(&test_ctx()), word_b.paint_key(&test_ctx()), "a different codec word must change the key");
+
+        let fallback = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected {
+                word: String::from("LDAC"),
+                fallback: Some(String::from("reason")),
+                bitrate: BitrateStatus::Kbps(909),
+            },
+        );
+        assert_ne!(word_a.paint_key(&test_ctx()), fallback.paint_key(&test_ctx()), "a fallback reason must change the key");
+
+        let bitrate = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(328) },
+        );
+        assert_ne!(word_a.paint_key(&test_ctx()), bitrate.paint_key(&test_ctx()), "a different bitrate must change the key");
+
+        let no_link = HeroStatusView::new("Sony WH-1000XM5", CodecStatus::NoLink);
+        assert_ne!(word_a.paint_key(&test_ctx()), no_link.paint_key(&test_ctx()), "NoLink must differ from Connected");
+    }
+
+    #[test]
+    fn paint_key_changes_with_muted_and_stat_line() {
+        let base = nominal();
+        let muted = nominal().with_muted(true);
+        assert_ne!(base.paint_key(&test_ctx()), muted.paint_key(&test_ctx()));
+
+        let no_stat = HeroStatusView::new(
+            "Sony WH-1000XM5",
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+        );
+        assert_ne!(no_stat.paint_key(&test_ctx()), base.paint_key(&test_ctx()), "a stat line vs none must change the key");
     }
 
     #[test]
