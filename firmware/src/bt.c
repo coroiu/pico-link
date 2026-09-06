@@ -381,6 +381,26 @@ void pl_bt_push_codec_changed(const uint8_t *addr, const char *name, uint8_t nam
     pl_bt_ring_push(event, NULL, 0);
 }
 
+// Bead pico-link-4v2.5 (VT5), design section 7: pushes Event::VolumeChanged.
+// Called from volume.c's apply_and_propagate, thread context, only when
+// `emit` is true (the two real host/sink edges -- never T2's debug-console
+// "VOL SET" path, whose PL_VOLUME_SOURCE_CONSOLE has no representable
+// value in this event, design section 7). Unlike Event::LevelsChanged
+// (deleted from this ring by pico-link-nli.5, G4, because a continuous
+// ~4Hz sample is not "an event"), a volume change really is discrete and
+// rare -- the ring's drop-newest-on-full policy is the right one here, so
+// this stays on the ring rather than growing a second seqlock. `source` is
+// volume.h's PlVolumeSource raw value (0=host/1=sink/2=device), matching
+// this crate's PlVolumeSource discriminants exactly.
+void pl_bt_push_volume_changed(uint8_t level, bool muted, uint8_t source) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_VOLUME_CHANGED,
+        .payload = {.volume_changed = {.level = level, .muted = (uint8_t)(muted ? 1 : 0), .source = source}},
+    };
+    pl_bt_ring_push(event, NULL, 0);
+}
+
 // Bead pico-link-du0 (design section 21 E17/C8) originally put
 // Event::LevelsChanged through this ring. Deleted by pico-link-nli.5 (G4):
 // a level is not an event, and this ring's drop-newest-on-full policy is

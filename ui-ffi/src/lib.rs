@@ -56,7 +56,7 @@ use pico_link_core::platform::DisplayPower;
 use pico_link_core::run::IdlePolicy;
 use pico_link_core::{
     App, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, NavIntent, PairedDevice,
-    StoreStatus, DEFAULT_IDLE_TIMEOUT,
+    StoreStatus, VolumeSource, DEFAULT_IDLE_TIMEOUT,
 };
 
 // --- critical-section implementation ---
@@ -1167,6 +1167,67 @@ pub struct PlLevelsChangedPayload {
     pub rms_r: u8,
 }
 
+/// Mirrors `firmware/src/volume.h`'s `PlVolumeSource` enum values 0/1/2
+/// exactly (design `.planning/design/2026-09-02-volume-sync.md` section 7)
+/// -- both sides are pinned independently rather than one generating the
+/// other, same convention as [`PlStoreStatus`]'s doc comment explains for
+/// `persist.h`. `volume.h`'s fourth value, `PL_VOLUME_SOURCE_CONSOLE = 3`
+/// (T2's debug-only origin), is deliberately NOT a member here -- design
+/// section 7 excludes it from this event, and `firmware/src/volume.c`'s
+/// `apply_and_propagate` only calls `pl_bt_push_volume_changed` on the two
+/// real edges (`emit == true`), never on the debug-console path.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlVolumeSource {
+    Host = 0,
+    Sink = 1,
+    Device = 2,
+}
+
+impl core::convert::TryFrom<u8> for PlVolumeSource {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- same hazard/fix as
+    /// [`PlStoreStatus`]'s `TryFrom` impl (pico-link-ptu): a garbage
+    /// `source` byte must be rejected, never matched-on or transmuted.
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlVolumeSource::Host),
+            1 => Ok(PlVolumeSource::Sink),
+            2 => Ok(PlVolumeSource::Device),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<PlVolumeSource> for VolumeSource {
+    fn from(source: PlVolumeSource) -> Self {
+        match source {
+            PlVolumeSource::Host => VolumeSource::Host,
+            PlVolumeSource::Sink => VolumeSource::Sink,
+            PlVolumeSource::Device => VolumeSource::Device,
+        }
+    }
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::VolumeChanged`. Bead
+/// pico-link-4v2.5 (VT5), design section 7: `level` is always in the
+/// AVRCP absolute-volume domain (0..127) -- `firmware/src/volume.c`'s
+/// canonical state's native domain, no mapping needed here. `muted` is a
+/// plain `u8` boolean (0/1), not `bool`, matching this crate's C-repr
+/// convention elsewhere (cbindgen emits `bool` fine, but the wider fields
+/// around it here are already byte-sized, so this keeps the struct's
+/// layout obviously flat). `source` is [`PlVolumeSource`]'s raw wire
+/// value -- checked via `TryFrom` in [`pl_ui_push_event`], never
+/// transmuted, same discipline as `PlStoreLoadedPayload::status`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlVolumeChangedPayload {
+    pub level: u8,
+    pub muted: u8,
+    pub source: u8,
+}
+
 /// Mirrors [`pico_link_core::StoreStatus`]'s four variants 1:1 (bead
 /// pico-link-cz0.6, M5 persistence). Explicit discriminants pinned for the
 /// same reason as [`PlLinkState`]'s -- see [`PlStoreLoadedPayload::status`]'s
@@ -1360,6 +1421,12 @@ pub enum PlEventTag {
     /// doc comment; [`PL_EVENT_ABI_VERSION`] is unchanged by this tag's
     /// addition, same as [`Self::CodecChanged`]'s own addition was.
     LevelsChanged = 13,
+    /// Bead pico-link-4v2.5 (VT5), design section 7: one canonical volume
+    /// reading. Purely additive -- see [`PlVolumeChangedPayload`]'s doc
+    /// comment; [`PL_EVENT_ABI_VERSION`] is unchanged by this tag's
+    /// addition, same discipline `LevelsChanged` (tag 13, bead
+    /// pico-link-du0) used for its own additive tag.
+    VolumeChanged = 14,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1384,6 +1451,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             11 => Ok(PlEventTag::PairedDeviceForgotten),
             12 => Ok(PlEventTag::PairedStoreFull),
             13 => Ok(PlEventTag::LevelsChanged),
+            14 => Ok(PlEventTag::VolumeChanged),
             _ => Err(()),
         }
     }
@@ -1418,6 +1486,9 @@ pub union PlEventPayload {
     // for that tag, so no placeholder member is needed.
     /// Bead pico-link-du0. See [`PlLevelsChangedPayload`]'s doc comment.
     pub levels_changed: PlLevelsChangedPayload,
+    /// Bead pico-link-4v2.5 (VT5). See [`PlVolumeChangedPayload`]'s doc
+    /// comment.
+    pub volume_changed: PlVolumeChangedPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -1650,6 +1721,22 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                 rms_l: payload.rms_l,
                 rms_r: payload.rms_r,
             }
+        }
+        PlEventTag::VolumeChanged => {
+            // SAFETY: `tag` says this union currently holds
+            // `volume_changed`. Reading it is sound regardless of field
+            // values -- every field is a plain `u8` with no validity
+            // invariant to violate (see `PlVolumeChangedPayload`'s doc
+            // comment); `source` is range-checked below before use.
+            let payload = unsafe { event.payload.volume_changed };
+            let source = match PlVolumeSource::try_from(payload.source) {
+                Ok(source) => source,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            Event::VolumeChanged { level: payload.level, muted: payload.muted != 0, source: source.into() }
         }
     };
     ui.app.handle_event(core_event);
@@ -2187,10 +2274,10 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past LevelsChanged = 13, the highest legal PlEventTag as
-            // of bead pico-link-du0 -- moved from 13 (one past the old
-            // highest, PairedStoreFull = 12) when this bead added tag 13.
-            tag: 14,
+            // One past VolumeChanged = 14, the highest legal PlEventTag as
+            // of bead pico-link-4v2.5 -- moved from 14 (one past the old
+            // highest, LevelsChanged = 13) when this bead added tag 14.
+            tag: 15,
             payload: bogus_payload,
         };
         unsafe {
@@ -2374,6 +2461,91 @@ mod tests {
                 (*ui).app.model().out_level.is_none(),
                 "disconnecting must clear the OUT level, never leave it stale (design section 15)"
             );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_volume_changed_populates_bt_model_volume() {
+        // Bead pico-link-4v2.5 (VT5), design section 7: a `VolumeChanged`
+        // event's `level`/`muted`/`source` round-trip into
+        // `BtModel::volume`. `PlVolumeSource::Sink` (1) is used here
+        // specifically to prove `source` survives the fold -- not just
+        // whichever value happens to be the enum's zero discriminant.
+        let ui = new_ui();
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::VolumeChanged as u32,
+            payload: PlEventPayload { volume_changed: PlVolumeChangedPayload { level: 42, muted: 1, source: PlVolumeSource::Sink as u8 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+            let volume = (*ui).app.model().volume.expect("volume should be populated");
+            assert_eq!(volume.level, 42);
+            assert!(volume.muted);
+            assert_eq!(volume.source, pico_link_core::VolumeSource::Sink);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_volume_changed_survives_disconnect() {
+        // Design section 7 names no clearing rule for `BtModel::volume` on
+        // disconnect (unlike `out_level`/`connected_codec`, which
+        // explicitly do) -- the host feature-unit volume this most
+        // commonly reflects is a USB-side concept, not an A2DP-link-
+        // lifetime one. Prove it's NOT cleared, the opposite of
+        // `pl_ui_push_event_levels_changed_populates_out_level_and_clears_
+        // on_disconnect` above.
+        let ui = new_ui();
+        let link_connected = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Connected as u32 } },
+        };
+        let volume_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::VolumeChanged as u32,
+            payload: PlEventPayload { volume_changed: PlVolumeChangedPayload { level: 64, muted: 0, source: PlVolumeSource::Host as u8 } },
+        };
+        let link_idle = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, link_connected);
+            pl_ui_push_event(ui, volume_event);
+            pl_ui_push_event(ui, link_idle);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+            assert_eq!(
+                (*ui).app.model().volume.map(|v| v.level),
+                Some(64),
+                "volume must survive a disconnect -- it is not link-lifetime state (design section 7)"
+            );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_volume_source() {
+        // Bead pico-link-4v2.5 (VT5): an out-of-range `source` byte (3 is
+        // `PL_VOLUME_SOURCE_CONSOLE` in `firmware/src/volume.h`, which
+        // design section 7 deliberately excludes from ever reaching this
+        // event) must be counted as malformed, not matched-on or
+        // defaulted -- same discipline as `PlStoreStatus`'s malformed-tag
+        // test above.
+        let ui = new_ui();
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::VolumeChanged as u32,
+            payload: PlEventPayload { volume_changed: PlVolumeChangedPayload { level: 10, muted: 0, source: 3 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range volume source should be counted, not matched-on");
+            assert!((*ui).app.model().volume.is_none(), "a malformed event must not fold into the model");
             pl_ui_destroy(ui);
         }
     }
@@ -2599,13 +2771,14 @@ mod tests {
             PlEventTag::PairedDeviceForgotten,
             PlEventTag::PairedStoreFull,
             PlEventTag::LevelsChanged,
+            PlEventTag::VolumeChanged,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 14 -- one past LevelsChanged = 13, the highest legal PlEventTag
-        // as of bead pico-link-du0.
-        assert!(PlEventTag::try_from(14u32).is_err());
+        // 15 -- one past VolumeChanged = 14, the highest legal PlEventTag
+        // as of bead pico-link-4v2.5.
+        assert!(PlEventTag::try_from(15u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
