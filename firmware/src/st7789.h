@@ -53,16 +53,49 @@ void st7789_init(spi_inst_t *spi);
 // wire format.
 void st7789_init_and_fill(spi_inst_t *spi, uint16_t color);
 
-// Blits `pixel_count` native-endian (little-endian on this target) RGB565
-// pixels from `px` to the panel via DMA, byte-swapping to the panel's
-// big-endian wire format in hardware on the way out (channel_config_set_
-// bswap) -- this is what removes the need for a 115KB byte-swapped staging
-// buffer; see ui-ffi's FrameBuffer565::as_raw_u16 doc comment. Assumes
-// st7789_init_and_fill already ran (window set once at init, per the M1b
-// design) and blocks until the DMA transfer completes -- callers must not
+// One-line wrapper over st7789_blit_rect (pico-link-7h5.7): blits the WHOLE
+// `pixel_count`-pixel framebuffer at `px` via st7789_blit_rect(px,
+// ST7789_WIDTH, 0, 0, ST7789_WIDTH, ST7789_HEIGHT). Kept as a separate
+// entry point (rather than inlining the call at every caller) so the
+// full-frame case reads as its own named operation, but it is deliberately
+// NOT a separate code path -- see st7789_blit_rect's doc comment for why
+// that matters. `pixel_count` must equal ST7789_WIDTH * ST7789_HEIGHT
+// (asserted). Blocks until the DMA transfer completes -- callers must not
 // call into the Rust side again (pl_ui_render etc, which would overwrite
 // the framebuffer memory this DMA is reading from) until this returns.
 void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel_count);
+
+// Blits an `w`x`h` rect of native-endian (little-endian on this target)
+// RGB565 pixels, starting at framebuffer offset (`x`,`y`) in a buffer whose
+// row stride is `stride` pixels, to the panel via DMA. Byte-swaps to the
+// panel's big-endian wire format in hardware on the way out
+// (channel_config_set_bswap) -- this is what removes the need for a 115KB
+// byte-swapped staging buffer; see ui-ffi's FrameBuffer565::as_raw_u16 doc
+// comment.
+//
+// SETS THE WINDOW ITSELF (st7789_set_window) on every call -- this is the
+// ONE path to the panel's address window, replacing the retired M1b
+// "set the window once at init, rely on write-pointer wraparound"
+// contract. st7789_blit_framebuffer is a thin wrapper over this function
+// for exactly that reason: the full-frame case must exercise the same
+// window code as every partial blit, so a window bug can't hide behind the
+// path that never re-addresses the panel.
+//
+// PHASE 1 RESTRICTION (pico-link-7h5.7): asserts `x == 0 && w == stride`,
+// i.e. full-width row bands only, so the source pixels stay contiguous
+// (`fb + y*stride`, count `h*stride`) and the blit is one DMA transfer with
+// CASET fixed and only RASET varying. Column-clipped (per-row chained DMA)
+// blits are pico-link-7h5.11, not yet implemented.
+//
+// Applies pico-link-7h5.1's measured framebuffer-rect -> panel-window
+// transform (IDENTITY under MADCTL 0x60 -- no axis swap, no mirror, no
+// offset); the caller passes framebuffer coordinates, not panel ones.
+//
+// Assumes st7789_init_and_fill already ran and blocks until the DMA
+// transfer completes -- callers must not call into the Rust side again
+// (pl_ui_render etc, which would overwrite the framebuffer memory this DMA
+// is reading from) until this returns.
+void st7789_blit_rect(const uint16_t *fb, uint16_t stride, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
 // Re-issues the MADCTL command with a new parameter byte after init. Used
 // by the PL_DIAG_MADCTL_TEST diagnostic (main.c) to cycle candidates

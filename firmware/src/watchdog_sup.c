@@ -21,7 +21,9 @@
 //   Term                                              ms
 //   Flash sector erase, IRQs off (cz0.6.1)            400  (worst case)
 //   16 x 256B page programs @ 3ms worst                48
-//   pl_ui_render + st7789_blit_framebuffer             60  (blit measured 38.6ms, pico-link-14l, rounded up)
+//   pl_ui_render + st7789_blit_framebuffer             60  (38.6ms measured TOTAL frame time, pico-link-14l --
+//                                                            render ~25.1ms + blit ~13.4ms, not blit alone --
+//                                                            rounded up)
 //   Console output: ~6 pl_log lines x 2ms timeout      12  (CMakeLists.txt PICO_STDIO_USB_STDOUT_TIMEOUT_US)
 //   Frame pacing sleep                                 16  (main.c)
 //   Worst legitimate iteration                        536

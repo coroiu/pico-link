@@ -7,6 +7,7 @@
 #include "st7789.h"
 #include "watchdog_sup.h"
 
+#include <assert.h>
 #include <stdio.h>
 
 #include "hardware/dma.h"
@@ -48,6 +49,23 @@ static void st7789_command(uint8_t cmd, const uint8_t *params, size_t len) {
         spi_write_blocking(s_spi, params, len);
     }
     cs_high();
+}
+
+// Sets the panel's CASET/RASET address window, inclusive on both ends
+// (x1/y1 are the LAST column/row painted, not one-past-the-end -- see the
+// comment this superseded in st7789_init_and_fill for why that off-by-one
+// matters on a 240px axis). This is the ONE path to the panel's address
+// window; every blit (st7789_blit_rect, and the init solid fill) goes
+// through it, replacing the retired M1b "set the window once at init"
+// contract. Per pico-link-7h5.1's measured transform under MADCTL 0x60,
+// the framebuffer rect -> panel window mapping is IDENTITY -- no axis
+// swap, no mirror, no offset, despite MV being set -- so (x0,y0,x1,y1) are
+// passed straight through to CASET/RASET with no correction term.
+static void st7789_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    uint8_t caset_params[4] = {(uint8_t)(x0 >> 8), (uint8_t)(x0 & 0xff), (uint8_t)(x1 >> 8), (uint8_t)(x1 & 0xff)};
+    st7789_command(ST7789_CMD_CASET, caset_params, sizeof(caset_params));
+    uint8_t raset_params[4] = {(uint8_t)(y0 >> 8), (uint8_t)(y0 & 0xff), (uint8_t)(y1 >> 8), (uint8_t)(y1 & 0xff)};
+    st7789_command(ST7789_CMD_RASET, raset_params, sizeof(raset_params));
 }
 
 void st7789_init(spi_inst_t *spi) {
@@ -147,18 +165,14 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color) {
     // fixed, so it goes in now.
     st7789_command(ST7789_CMD_INVON, NULL, 0);
 
-    // CASET/RASET addresses are INCLUSIVE start/end column and row, so the
-    // end value for a 240px axis is 239 (0x00EF), not 240 -- 240 (0x00F0)
-    // programs a 241px window on a 240px panel. Set once here; every
-    // subsequent blit (st7789_blit_framebuffer) just reissues RAMWR and
-    // relies on the panel's own write-pointer wraparound, per the M1b
-    // design.
-    const uint16_t x_end = ST7789_WIDTH - 1;
-    const uint16_t y_end = ST7789_HEIGHT - 1;
-    uint8_t caset_params[4] = {0x00, 0x00, (uint8_t)(x_end >> 8), (uint8_t)(x_end & 0xff)};
-    st7789_command(ST7789_CMD_CASET, caset_params, sizeof(caset_params));
-    uint8_t raset_params[4] = {0x00, 0x00, (uint8_t)(y_end >> 8), (uint8_t)(y_end & 0xff)};
-    st7789_command(ST7789_CMD_RASET, raset_params, sizeof(raset_params));
+    // RETIRED M1b CONTRACT: this used to set CASET/RASET ONCE HERE, full
+    // 0..239 on both axes, and every subsequent blit (st7789_blit_
+    // framebuffer) just reissued a bare RAMWR and relied on the panel's own
+    // write-pointer wraparound. Superseded by st7789_blit_rect
+    // (pico-link-7h5.7): every blit now sets its own window via
+    // st7789_set_window, including this init fill, so a window bug can't
+    // hide behind a full-frame path that never re-addresses the panel.
+    st7789_set_window(0, 0, ST7789_WIDTH - 1, ST7789_HEIGHT - 1);
 
     // RAMWR's pixel stream is itself parameter data to the command, so it
     // must stay inside the same CS-low window as the command byte too --
@@ -184,15 +198,30 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color) {
     gpio_put(ST7789_PIN_BL, 1);
 }
 
-void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel_count) {
+void st7789_blit_rect(const uint16_t *fb, uint16_t stride, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     pl_wdt_mark(PL_WDT_CP_BLIT_ENTER);
-    (void)spi;
+
+    // Phase 1 (pico-link-7h5.7): full-width row bands only. Restricting to
+    // x==0, w==stride keeps the source pixels contiguous in the
+    // framebuffer (fb + y*stride, count h*stride) so this stays ONE DMA
+    // transfer with CASET fixed and only RASET varying -- no per-row DMA,
+    // no chaining. Column-clipped blit is pico-link-7h5.11, explicitly out
+    // of scope here; the assert below is the boundary of what this
+    // function is allowed to do until that bead lands.
+    assert(x == 0 && w == stride);
+
+    const uint16_t x1 = (uint16_t)(x + w - 1);
+    const uint16_t y1 = (uint16_t)(y + h - 1);
+    st7789_set_window(x, y, x1, y1);
+
+    const uint16_t *px = fb + (uint32_t)y * stride;
+    uint32_t pixel_count = (uint32_t)h * stride;
 
     // RAMWR in 8-bit mode (a single command byte), matching every other
-    // command write -- the panel's internal write pointer was already
-    // wrapped back to the window's start by the previous full-window fill,
-    // per the M1b design's "set the window once at init" contract, so no
-    // CASET/RASET here, just RAMWR to (re)arm the write.
+    // command write. st7789_set_window above just reprogrammed CASET/RASET
+    // and left the panel's internal write pointer at the window's start,
+    // so a bare RAMWR (re)arms the write -- no separate address-counter
+    // reset needed.
     cs_low();
     dc_low();
     uint8_t ramwr = ST7789_CMD_RAMWR;
@@ -254,6 +283,20 @@ void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel
     // silently get sent as a 16-bit frame.
     spi_set_format(s_spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     pl_wdt_mark(PL_WDT_CP_BLIT_EXIT);
+}
+
+void st7789_blit_framebuffer(spi_inst_t *spi, const uint16_t *px, uint32_t pixel_count) {
+    (void)spi; // already stashed by st7789_init; see st7789_init_and_fill's
+               // matching comment.
+    // One-line wrapper over st7789_blit_rect (pico-link-7h5.7), DELIBERATELY,
+    // so the full-frame path exercises the exact same window-setting code as
+    // every future partial blit, on every single frame -- a window bug
+    // cannot hide until the day a partial-rect blit (e.g. the OUT meter)
+    // first draws. pixel_count is always ST7789_WIDTH * ST7789_HEIGHT for
+    // this call; assert it rather than silently truncating/overrunning if a
+    // caller ever passes something else.
+    assert(pixel_count == (uint32_t)ST7789_WIDTH * (uint32_t)ST7789_HEIGHT);
+    st7789_blit_rect(px, ST7789_WIDTH, 0, 0, ST7789_WIDTH, ST7789_HEIGHT);
 }
 
 void st7789_set_madctl(uint8_t madctl_param) {
