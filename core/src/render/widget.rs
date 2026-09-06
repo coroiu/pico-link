@@ -35,6 +35,7 @@ use crate::platform::OutputRequest;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::ListItemKey;
+use super::paint_key::PaintKey;
 use super::rail::ButtonLabel;
 use super::screen::Screen;
 
@@ -272,6 +273,46 @@ pub trait Widget {
         ctx: &RenderCtx,
         target: &mut FrameBuffer565,
     ) -> Result<(), Infallible>;
+
+    /// A cheap, total summary of everything that affects this widget's
+    /// pixels this frame -- see [`PaintKey`]'s doc comment for the full
+    /// contract, the SKIP-not-CLIP framing, and the time trap that must be
+    /// respected by any override.
+    ///
+    /// Defaults to [`PaintKey::ALWAYS`], which compares unequal to
+    /// everything (including another `ALWAYS`): this is the entire
+    /// migration strategy for the damage-rect render pass (bead
+    /// `pico-link-7h5`) -- every widget is repainted every frame, exactly
+    /// as today, until it opts in to a real key one widget at a time (bead
+    /// `pico-link-7h5.5`). **There is no caller of this method yet**; this
+    /// bead (`pico-link-7h5.3`) only adds the vocabulary.
+    ///
+    /// **Mechanical review rule** (see [`PaintKey`]'s doc comment): every
+    /// widget that overrides [`Self::redraw_after`] must fold time into
+    /// its `paint_key`, and no widget that does not override
+    /// `redraw_after` should fold time into its `paint_key`.
+    fn paint_key(&self, _ctx: &RenderCtx) -> PaintKey {
+        PaintKey::ALWAYS
+    }
+
+    /// For a widget whose `paint_key` has changed, which sub-rectangle of
+    /// its own `_area` actually needs repainting -- `None` (the default)
+    /// means "all of it". Composite widgets that internally cover only
+    /// part of their area on a given change (e.g. only the OUT meter's
+    /// two columns, not its whole hero region) can narrow this to shrink
+    /// the frame damage rect their change contributes (design section 4).
+    ///
+    /// **There is no caller of this method yet** (bead `pico-link-7h5.3`
+    /// is additive-only) -- the frame damage pass that reads it lands in
+    /// `pico-link-7h5.4`. A widget that returns `Some(r)` here still must
+    /// itself consult `ctx.needs(..)` inside its own `render` if it wants
+    /// to actually *skip* rasterising the untouched part; returning
+    /// `Some(r)` only narrows what the *caller* considers damaged, it does
+    /// not, by itself, skip anything -- see [`RenderCtx::needs`] and the
+    /// module-level SKIP-not-CLIP note on [`PaintKey`].
+    fn damage_hint(&self, _area: Rectangle, _ctx: &RenderCtx) -> Option<Rectangle> {
+        None
+    }
 
     /// Whether this widget can receive focus. Defaults to `false` (e.g.
     /// static labels, dividers).

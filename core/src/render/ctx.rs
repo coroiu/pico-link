@@ -15,6 +15,9 @@
 
 use core::time::Duration;
 
+use embedded_graphics::prelude::Size;
+use embedded_graphics::primitives::Rectangle;
+
 use crate::platform::Instant;
 
 /// Frame-scoped facts every widget may read while drawing.
@@ -27,13 +30,73 @@ use crate::platform::Instant;
 #[non_exhaustive]
 pub struct RenderCtx {
     now: Instant,
+    /// The frame damage rect, or `None` for "no clip declared, draw
+    /// everything". See [`Self::with_damage`] / [`Self::damage`] /
+    /// [`Self::needs`] and
+    /// `.planning/design/2026-09-06-damage-rect-render-and-partial-blit.md`
+    /// section 4. **There is no producer of `Some` yet** (bead
+    /// `pico-link-7h5.3` is additive-only); [`Self::at`] always leaves
+    /// this `None`, which is what keeps every existing widget and test
+    /// unaffected.
+    ///
+    /// This field is a hint for widgets to SKIP drawing sub-regions that
+    /// cannot have changed -- it is not a clip rectangle to hand to
+    /// `embedded_graphics::draw_target::DrawTargetExt::clipped()`.
+    /// `clipped()` still shapes and rasterises everything upstream of the
+    /// `DrawTarget` boundary and only discards the resulting writes, so it
+    /// saves memory stores and essentially none of the CPU that motivates
+    /// this design (see design doc section 1). A widget should use
+    /// [`Self::needs`] to decide whether to call into its own drawing code
+    /// at all, not merely to narrow what a drawing call clips to.
+    damage: Option<Rectangle>,
 }
 
 impl RenderCtx {
-    /// Builds a `RenderCtx` for a frame rendered at `now`.
+    /// Builds a `RenderCtx` for a frame rendered at `now`, with no damage
+    /// rect declared (`damage: None`, meaning "draw everything"). This is
+    /// deliberate: it is what keeps the ~250 existing tests, and every
+    /// widget that does not yet consult `damage()`/`needs()`, compiling
+    /// and passing unchanged.
     #[must_use]
     pub const fn at(now: Instant) -> Self {
-        Self { now }
+        Self { now, damage: None }
+    }
+
+    /// Returns a copy of this `RenderCtx` with its damage rect set to `r`.
+    /// No producer exists yet (bead `pico-link-7h5.3` is additive-only);
+    /// the frame damage pass that calls this lands in `pico-link-7h5.4`.
+    #[must_use]
+    pub const fn with_damage(self, r: Rectangle) -> Self {
+        Self {
+            damage: Some(r),
+            ..self
+        }
+    }
+
+    /// The current frame's damage rect, if one has been declared. `None`
+    /// means no clip was declared for this frame -- treat the whole
+    /// widget as needing a redraw, exactly like today's behaviour.
+    #[must_use]
+    pub const fn damage(&self) -> Option<Rectangle> {
+        self.damage
+    }
+
+    /// True when `area` could contribute visible pixels this frame --
+    /// i.e. no damage rect is declared (`None` => always `true`, matching
+    /// today's "redraw everything" behaviour) or `area` intersects the
+    /// declared damage rect.
+    ///
+    /// This is the SKIP primitive the design calls for (section 1, section
+    /// 4): a widget calls this to decide whether to run its own drawing
+    /// code for a sub-region at all, rather than running it unconditionally
+    /// and relying on `DrawTargetExt::clipped()` to discard the writes --
+    /// the latter still pays for rasterising everything it discards.
+    #[must_use]
+    pub fn needs(&self, area: Rectangle) -> bool {
+        match self.damage {
+            None => true,
+            Some(rect) => rect.intersection(&area).size != Size::zero(),
+        }
     }
 
     /// The instant this frame is being rendered at.
