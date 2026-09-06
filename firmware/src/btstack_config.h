@@ -83,7 +83,19 @@
 // target shape.
 #define MAX_NR_AVDTP_STREAM_ENDPOINTS 2
 #define MAX_NR_AVDTP_CONNECTIONS 1
-#define MAX_NR_AVRCP_CONNECTIONS 1
+// pico-link-4v2.3 (T3), root-caused on hardware: raised from 1 -- one
+// `avrcp_connect()` to a SINGLE peer allocates TWO avrcp_connection_t
+// objects from this ONE shared pool (avrcp.c's avrcp_connection_storage,
+// sized by this macro) -- one for AVRCP_CONTROLLER, one for AVRCP_TARGET
+// (avrcp.c:1213-1220, both roles are plumbed per a2dp.h's module doc).
+// With the pool at capacity 1, avrcp_connect() ALWAYS returned
+// BTSTACK_MEMORY_ALLOC_FAILED (0x56) on this hardware -- measured directly,
+// not inferred -- which explains both this bead's own AVRCP volume path
+// and the pre-existing pico-link-wnk (HID media keys silently not working
+// on Andreas's headphones): AVRCP never connected in either direction. 2
+// is exactly enough for one peer using both roles; still bounded (no
+// dynamic growth), still O(1) memory.
+#define MAX_NR_AVRCP_CONNECTIONS 2
 
 // SDP: four service records at boot (A2DP Source, AVRCP Target, AVRCP
 // Controller, Device ID -- matching a2dp_source_demo.c's

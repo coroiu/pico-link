@@ -122,6 +122,16 @@ void pl_a2dp_publish_counters(void);
 // sentinel is read as "nothing yet").
 void pl_a2dp_poll_levels(struct PlUi *ui);
 
+// T3 (pico-link-4v2.3), design sec 9 (host -> headphones over AVRCP):
+// consumes volume.c's outbound AVRCP latch and, if a connection exists and
+// no SET_ABSOLUTE_VOLUME is already awaiting a response, sends one via
+// avrcp_controller_set_absolute_volume. Call once per
+// pl_bt_wdt_heartbeat_handler tick (bt.c) -- MUST run on the cyw43
+// background IRQ (0xFF), the only context permitted to call BTstack
+// (pico-link-ouw); do not call this from the superloop. `now_us` is the
+// caller's time_us_64(), used for the in-flight timeout.
+void pl_a2dp_avrcp_volume_service(uint64_t now_us);
+
 // Raw wire values of ui-ffi's PlConnectStep enum (Connecting=0, Pairing=1,
 // SettingUpAudio=2, NegotiatingCodec=3 -- see ui-ffi/src/lib.rs). Not
 // emitted by cbindgen into pico_link_ui.h because no FFI struct field is

@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "hardware/sync.h"
+#include "pico/time.h" // time_us_64 -- pl_a2dp_avrcp_volume_service's deadline arg (T3, pico-link-4v2.3)
 
 #include "btstack.h"
 
@@ -853,6 +854,11 @@ static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_add_timer(ts);
     pl_wdt_kick(PL_WDT_BTSTACK);
     pl_bt_pending_service();
+    // T3 (pico-link-4v2.3), design sec 9: the "-> pl_bt_wdt_heartbeat_handler
+    // (0xFF) -> avrcp_controller_set_absolute_volume" hop. Same context as
+    // pl_bt_pending_service above, so it's safe to call a2dp.c's AVRCP API
+    // from right here.
+    pl_a2dp_avrcp_volume_service(time_us_64());
 }
 
 void pl_bt_init(struct PlUi *ui) {

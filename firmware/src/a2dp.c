@@ -105,6 +105,7 @@
 #include "pl_prio.h"
 #include "usb_audio.h"
 #include "usb_pump.h"
+#include "volume.h" // pl_volume_take_avrcp_desired -- T3 (pico-link-4v2.3)
 #include "watchdog_sup.h"
 
 #ifdef PL_ENCODER_ON_CORE1
@@ -919,6 +920,25 @@ void pl_a2dp_poll_levels(struct PlUi *ui) {
     pl_ui_push_event(ui, event);
 }
 
+// T3 (pico-link-4v2.3), design sec 9: the AVRCP connection's cid, tracked
+// here because this is the one handler that sees both
+// CONNECTION_ESTABLISHED and CONNECTION_RELEASED. 0 is BTstack's "no
+// connection" sentinel (cids are allocated starting at 1) -- matches
+// volume.c's own convention of a dirty flag rather than a magic value.
+// Read from pl_a2dp_avrcp_volume_service() below, which runs on the SAME
+// cyw43 background IRQ (0xFF) this handler runs on, so no synchronization
+// is needed between the two -- both are BTstack packet-handler/timer
+// callbacks on one run loop, never preempted by each other.
+static uint16_t s_avrcp_cid;
+
+// T3: gates "one SET_ABSOLUTE_VOLUME in flight at a time" (design sec 9's
+// explicit constraint -- AVCTP shares the link with A2DP media and this
+// project has a documented crackle history from flooding it). Also 0xFF
+// context only, same reasoning as s_avrcp_cid above.
+static bool s_avrcp_volume_set_in_flight;
+static uint64_t s_avrcp_volume_set_deadline_us;
+#define PL_AVRCP_VOLUME_SET_TIMEOUT_US (1500ull * 1000ull)
+
 static void pl_a2dp_avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -930,10 +950,13 @@ static void pl_a2dp_avrcp_packet_handler(uint8_t packet_type, uint16_t channel, 
     }
     switch (packet[2]) {
         case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED:
-            pl_log("avrcp: connection established\r\n");
+            s_avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
+            pl_log("avrcp: connection established, cid=%u\r\n", s_avrcp_cid);
             break;
         case AVRCP_SUBEVENT_CONNECTION_RELEASED:
-            pl_log("avrcp: connection released\r\n");
+            pl_log("avrcp: connection released, cid=%u\r\n", s_avrcp_cid);
+            s_avrcp_cid = 0;
+            s_avrcp_volume_set_in_flight = false;
             break;
         default:
             break;
@@ -1010,11 +1033,66 @@ static void pl_a2dp_avrcp_target_packet_handler(uint8_t packet_type, uint16_t ch
     }
 }
 
+// T3 (pico-link-4v2.3), design sec 9: the response side of
+// avrcp_controller_set_absolute_volume, sent from
+// pl_a2dp_avrcp_volume_service() below. Clears the in-flight gate so the
+// next SET can go out. Also where a future T4 would register for
+// AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED -- not wired here, that's
+// direction B's bead.
 static void pl_a2dp_avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
-    (void)packet_type;
     (void)channel;
-    (void)packet;
     (void)size;
+    if (packet_type != HCI_EVENT_PACKET) {
+        return;
+    }
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) {
+        return;
+    }
+    if (packet[2] != AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE) {
+        return;
+    }
+    uint16_t cid = avrcp_subevent_set_absolute_volume_response_get_avrcp_cid(packet);
+    uint8_t applied = avrcp_subevent_set_absolute_volume_response_get_absolute_volume(packet);
+    pl_log("avrcp: SET_ABSOLUTE_VOLUME response cid=%u applied=%u\r\n", cid, applied);
+    s_avrcp_volume_set_in_flight = false;
+}
+
+// T3 (pico-link-4v2.3): called once per pl_bt_wdt_heartbeat_handler tick
+// (bt.c, cyw43 background IRQ 0xFF -- design sec 2/9's "-> heartbeat (0xFF)
+// -> avrcp_controller_set_absolute_volume" path). Consumes volume.c's
+// outbound AVRCP latch and sends AT MOST one SET_ABSOLUTE_VOLUME, gated on
+// the previous one's response (or a timeout) -- design sec 9's explicit
+// "one SET in flight at a time" constraint, since AVCTP shares the link
+// with A2DP media (this project's crackle history).
+void pl_a2dp_avrcp_volume_service(uint64_t now_us) {
+    if (s_avrcp_volume_set_in_flight) {
+        if (now_us < s_avrcp_volume_set_deadline_us) {
+            return; // still waiting for AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE
+        }
+        pl_log("avrcp: SET_ABSOLUTE_VOLUME timed out waiting for response, cid=%u\r\n", s_avrcp_cid);
+        s_avrcp_volume_set_in_flight = false;
+    }
+
+    uint8_t level;
+    if (!pl_volume_take_avrcp_desired(&level)) {
+        return; // nothing new since the last tick
+    }
+    if (s_avrcp_cid == 0) {
+        // No AVRCP connection right now -- the value is dropped, not
+        // queued (design sec 8/9 doesn't call for a retry-on-reconnect;
+        // the next real host/sink edge will re-propagate once a
+        // connection exists). Logged so this is visible, not silent.
+        pl_log("avrcp: volume SET dropped, no AVRCP connection, level=%u\r\n", level);
+        return;
+    }
+    uint8_t status = avrcp_controller_set_absolute_volume(s_avrcp_cid, level);
+    if (status != ERROR_CODE_SUCCESS) {
+        pl_log("avrcp: avrcp_controller_set_absolute_volume failed status=%u level=%u cid=%u\r\n", status, level, s_avrcp_cid);
+        return;
+    }
+    s_avrcp_volume_set_in_flight = true;
+    s_avrcp_volume_set_deadline_us = now_us + PL_AVRCP_VOLUME_SET_TIMEOUT_US;
+    pl_log("avrcp: SET_ABSOLUTE_VOLUME sent level=%u cid=%u\r\n", level, s_avrcp_cid);
 }
 
 // Bead pico-link-pbv ROUND 3 (R3-4): the one true usable-payload
@@ -2236,6 +2314,29 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // left over from a previous connection attempt.
             memset(&s_ctx.discovered, 0, sizeof(s_ctx.discovered));
             pl_log("a2dp: signaling connected, cid=0x%02x\r\n", cid);
+            // T3 (pico-link-4v2.3) finding, verified on hardware: a2dp.h's
+            // module doc assumed "many real sinks open an AVRCP channel
+            // unprompted right after A2DP connects" and this file never
+            // called avrcp_connect() itself. Against Andreas's own
+            // headphones that assumption is FALSE -- A2DP connected and
+            // streamed fine for 30+ seconds with no AVRCP_SUBEVENT_
+            // CONNECTION_ESTABLISHED ever arriving, which also explains
+            // pico-link-wnk (HID media keys, direction B's AVRCP_SUBEVENT_
+            // OPERATION path, not working on this headset -- same missing
+            // channel). Initiate it ourselves; if the sink also opens it
+            // independently, avrcp_connect() on an already-connecting/
+            // connected cid returns a benign non-success status here and
+            // s_avrcp_cid is still set exactly once, from the
+            // CONNECTION_ESTABLISHED event handler below (single source of
+            // truth, unchanged).
+            {
+                uint16_t requested_avrcp_cid = 0;
+                uint8_t avrcp_connect_status = avrcp_connect(s_ctx.connect_addr, &requested_avrcp_cid);
+                pl_log(
+                    "avrcp: connect requested status=0x%02x requested_cid=%u\r\n", avrcp_connect_status,
+                    requested_avrcp_cid
+                );
+            }
             break;
         }
 
