@@ -166,10 +166,26 @@ void pl_usb_audio_fb_reset(void);
 // -- safe to call from thread context, same convention as every other
 // accessor in this header.
 
-// Current stored volume (raw UAC2 1/256 dB units, i.e. the range this
-// device declares: bMin=-12800, bMax=0, bRes=256) for channel `ch` (0 =
-// master, 1..N = per-channel). Returns 0 if `ch` is out of range.
+// Current stored volume (raw UAC2 units, i.e. the range this device
+// declares: bMin=-12700, bMax=0, bRes=100 -- 128 steps, a bijection with
+// AVRCP's 0..127 domain, design sec 5/VT2) for channel `ch` (0 = master,
+// 1..N = per-channel). Returns 0 if `ch` is out of range. NOTE: this
+// header previously documented bMin=-12800/bRes=256 (51 steps); that was
+// the PRE-VT2 range and is stale -- see usb_audio.c's GET_RANGE comment
+// for the current declared range, which is authoritative.
 int16_t pl_usb_audio_fu_volume(uint8_t ch);
+
+// Bead pico-link-rmp (VT4a.1): directly overwrites the stored feature-unit
+// volume for channel `ch`, bypassing the normal FU SET request path --
+// i.e. simulates the DEVICE deciding a new volume (as VT4/AVRCP will),
+// not the host writing one. Does not itself notify the host; pair with
+// pl_usb_audio_send_fu_status_interrupt() to make macOS re-read it. No-op
+// if `ch` is out of range. `raw` is clamped to the declared GET_RANGE
+// (-12700..0); out-of-range values would make GET_CUR report something
+// GET_RANGE says is impossible, which is exactly the kind of
+// self-contradictory device state this bead is trying to avoid asking
+// macOS to react to.
+void pl_usb_audio_fu_set_volume(uint8_t ch, int16_t raw);
 
 // Current stored mute flag (host's raw bCur: 0 or 1, per
 // audio_control_cur_1_t) for channel `ch`. Returns 0 if `ch` is out of

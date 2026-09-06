@@ -311,6 +311,29 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                         pl_log("debug-remote: VOL SET %ld -> dispatched\r\n", n);
                         pl_volume_debug_set((uint8_t)n, time_us_64());
                     }
+                } else if (strncmp(s_line, "VOL FUSET", 9) == 0) {
+                    // Bead pico-link-rmp (VT4a.1): unlike "VOL SET" above
+                    // (which drives volume.c's canonical AVRCP-domain
+                    // value and does not touch the feature unit at all --
+                    // nothing reads its outbound latches pre-T3/T4), this
+                    // OVERWRITES fu_volume[0] (master channel) directly --
+                    // simulates the device itself deciding a new volume,
+                    // which is what VT4/AVRCP will eventually do. Takes
+                    // the same 0..127 AVRCP-domain input as "VOL SET" and
+                    // maps it through the bijection declared in
+                    // feature_unit_get_request's GET_RANGE (bMin=-12700,
+                    // bRes=100): raw = n*100 - 12700. Does NOT notify the
+                    // host -- pair with "VOL INT" to do that, so the two
+                    // steps can be measured independently.
+                    const char *arg = s_line + 9;
+                    long n = (*arg == ' ') ? strtol(arg + 1, NULL, 10) : -1;
+                    if (n < 0 || n > 127) {
+                        pl_log("debug-remote: VOL FUSET requires 0..127, got \"%s\"\r\n", s_line + 10);
+                    } else {
+                        int16_t raw = (int16_t)(n * 100 - 12700);
+                        pl_usb_audio_fu_set_volume(0, raw);
+                        pl_log("debug-remote: VOL FUSET %ld -> fu_volume[0]=%d\r\n", n, (int)raw);
+                    }
                 } else if (strcmp(s_line, "VOL INT") == 0) {
                     // Bead pico-link-2ue (VT4a): sends ONE UAC2
                     // feature-unit-volume-changed status packet on the AC
