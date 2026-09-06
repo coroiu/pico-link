@@ -37,8 +37,13 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::list::{reconcile_top_index, ListItemKey};
 use super::menu::{draw_row, row_height, RowStyle, RowTrailing, RowValue};
+use super::paint_key::PaintKey;
 use super::theme::{font, palette};
 use super::widget::{Action, FocusEvent, Verb, Widget};
+
+/// Seed for [`FieldList::paint_key`] -- only needs to differ from other
+/// widgets' own seeds.
+const FIELD_PAINT_KEY_SEED: u64 = 13;
 
 /// A field row's kind — TWO, not three, and collapsing Uma's `Info` and
 /// `Disabled` kinds into one variant IS the finding the field-list ruling
@@ -370,7 +375,51 @@ impl Widget for FieldList {
 
     // `redraw_after` is deliberately NOT overridden here -- the default
     // `None` is correct: nothing on a field list is time-driven (field-
-    // list ruling §6.1).
+    // list ruling §6.1). Per the mechanical review rule (`PaintKey`'s doc
+    // comment), `paint_key` below must therefore NOT fold time either --
+    // it doesn't.
+
+    /// Folds everything [`FieldList::render`] actually reads: which row is
+    /// selected/focused, the scroll-top row, the row style in use (`FIELD`
+    /// vs `FIELD_GUTTERED` -- differ only in `leading_gutter`, but every
+    /// margin is folded so a future style tweak can't silently go
+    /// unnoticed), the row count, and per row its label, kind (bears on
+    /// caret-while-selected gating and the resolved label color), resolved
+    /// label color, value text + color, value font face, and leading
+    /// glyph. `verb`/`key` are excluded -- neither is a pixel this widget
+    /// draws.
+    #[allow(clippy::cast_sign_loss)] // RowStyle's fields are all small non-negative layout constants; see the type's own doc comment.
+    fn paint_key(&self, _ctx: &RenderCtx) -> PaintKey {
+        let mut key = PaintKey::of(FIELD_PAINT_KEY_SEED)
+            .fold(self.selected as u64)
+            .fold(u64::from(self.focused))
+            .fold(self.top_index.get() as u64)
+            .fold(self.style.left_margin as u64)
+            .fold(self.style.value_right_margin as u64)
+            .fold(self.style.caret_right_margin as u64)
+            .fold(self.style.leading_gutter as u64)
+            .fold(self.style.vertical_padding as u64)
+            .fold(self.rows.len() as u64);
+        for row in &self.rows {
+            key = key.fold_str(&row.label);
+            key = key.fold(match row.kind {
+                FieldKind::Action => 0,
+                FieldKind::Readonly => 1,
+            });
+            key = key.fold_color(row.resolved_label_color());
+            key = key.fold_opt_str(row.value.as_deref());
+            key = key.fold_color(row.value_color);
+            key = key.fold(match row.value_font {
+                ValueFont::Normal => 0,
+                ValueFont::Small => 1,
+            });
+            key = key.fold(match row.leading {
+                Some(c) => u64::from(u32::from(c)) + 1,
+                None => 0,
+            });
+        }
+        key
+    }
 
     fn render(&self, area: Rectangle, _ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         let mut clipped = target.clipped(&area);
@@ -626,6 +675,66 @@ mod tests {
         let mut fb2 = FrameBuffer565::new(220, 100);
         rebuilt.render(area, &test_ctx(), &mut fb2).unwrap();
         assert_eq!(rebuilt.scroll_top(), Some(scroll_top_before), "carrying scroll_top forward must survive a render unchanged");
+    }
+
+    // --- paint_key (bead pico-link-7h5.5) ---
+
+    #[test]
+    fn paint_key_is_stable_across_calls_with_no_state_change() {
+        let list = FieldList::new(rows(3));
+        assert_eq!(list.paint_key(&test_ctx()), list.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_selection_or_focus_changes() {
+        let mut list = FieldList::new(rows(3));
+        let before = list.paint_key(&test_ctx());
+        list.on_intent(NavIntent::Down);
+        assert_ne!(before, list.paint_key(&test_ctx()), "moving the selection must change the paint key");
+
+        let mut list = FieldList::new(rows(3));
+        let before = list.paint_key(&test_ctx());
+        list.on_focus(FocusEvent::Gained);
+        assert_ne!(before, list.paint_key(&test_ctx()), "gaining focus must change the paint key");
+    }
+
+    #[test]
+    fn paint_key_changes_when_a_rows_value_or_value_color_changes() {
+        let a = FieldList::new(vec![FieldRow::readonly("A2DP").with_value("Streaming", palette::STATUS_SUCCESS)]);
+        let b = FieldList::new(vec![FieldRow::readonly("A2DP").with_value("Idle", palette::STATUS_SUCCESS)]);
+        let c = FieldList::new(vec![FieldRow::readonly("A2DP").with_value("Streaming", palette::STATUS_ERROR)]);
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+        assert_ne!(a.paint_key(&test_ctx()), c.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_when_the_value_font_changes() {
+        let a = FieldList::new(vec![FieldRow::readonly("ADDRESS").with_value("94:DB:56:54:7C:F2", palette::TEXT_PRIMARY)]);
+        let b = FieldList::new(vec![
+            FieldRow::readonly("ADDRESS").with_value("94:DB:56:54:7C:F2", palette::TEXT_PRIMARY).with_small_value(),
+        ]);
+        assert_ne!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_distinguishes_action_from_readonly_kind() {
+        let action = FieldList::new(vec![FieldRow::action("CODEC")]);
+        let readonly = FieldList::new(vec![FieldRow::readonly("CODEC")]);
+        assert_ne!(action.paint_key(&test_ctx()), readonly.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_changes_with_the_leading_gutter_style() {
+        let plain = FieldList::new(vec![FieldRow::readonly("SAMPLE RATE")]);
+        let guttered = FieldList::new(vec![FieldRow::readonly("SAMPLE RATE")]).with_leading_gutter();
+        assert_ne!(plain.paint_key(&test_ctx()), guttered.paint_key(&test_ctx()));
+    }
+
+    #[test]
+    fn paint_key_ignores_the_identity_key_and_verb_since_neither_is_a_pixel() {
+        let a = FieldList::new(vec![FieldRow::action("CODEC").with_key(ListItemKey::from_u64(1))]);
+        let b = FieldList::new(vec![FieldRow::action("CODEC").with_key(ListItemKey::from_u64(2))]);
+        assert_eq!(a.paint_key(&test_ctx()), b.paint_key(&test_ctx()));
     }
 
     #[test]
