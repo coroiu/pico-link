@@ -43,7 +43,7 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::paint_key::PaintKey;
 use super::theme::{self, font, palette};
-use super::widget::{ChromeContribution, Widget};
+use super::widget::{ChromeContribution, VolumeChrome, Widget};
 
 /// Seed for [`HeroStatusView::paint_key`] -- only needs to differ from
 /// other widgets' own seeds.
@@ -195,8 +195,8 @@ pub enum CodecStatus {
     /// instead of green ([`palette::TEXT_PRIMARY`]) — this is link 1 of
     /// the design's five-link fallback chain (section 6.2) — and doubles
     /// as the persistent fallback banner's reason text, which is link 2
-    /// (unless a MUTED banner outranks it — see
-    /// [`HeroStatusView::with_muted`]).
+    /// (unless a MUTED or VOLUME 0 banner outranks it — see
+    /// [`HeroStatusView::with_volume`]).
     Connected {
         word: String,
         fallback: Option<String>,
@@ -253,17 +253,61 @@ pub struct OutLevelDisplay {
     pub attack_peak_r_at: Instant,
 }
 
+/// Who most recently drove [`HeroVolume`]'s reading -- a hero-local
+/// two-way collapse of [`crate::app::VolumeSource`]'s three-way domain
+/// enum (design `.planning/design/2026-09-07-volume-on-display.md`
+/// section 4.2), deliberately not `crate::app::VolumeSource` directly:
+/// same "the widget stays decoupled from `BtModel`" shape
+/// [`OutLevelDisplay`]'s doc comment already establishes. This widget's
+/// only use for the source is picking the MUTED banner's remedy text
+/// (section 4.2's table), which only ever distinguishes "the host did
+/// this" from everything else -- `Sink`/`Device` read identically here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeroVolumeSource {
+    /// The USB host's feature-unit volume (macOS's output slider) --
+    /// drives the `"MUTED  Unmute on Mac"` remedy (see
+    /// `HeroStatusView::render`'s banner match for why it differs
+    /// slightly from the design doc's literal string).
+    Host,
+    /// Anything else (the headphones' own dial today; a future on-device
+    /// control) -- drives the bare `"MUTED"` banner, with no remedy this
+    /// widget can name.
+    Other,
+}
+
+/// One live volume reading, as this widget renders it -- `percent` is
+/// already in the 0..100 display domain (see
+/// [`crate::app::VolumeState::percent`]; this widget never sees the raw
+/// 0..127 AVRCP level, matching design section 3's "never leak the
+/// transport domain onto the screen" rule). Feeds both the title-bar
+/// element (via [`HeroStatusView::chrome_contribution`]) and this
+/// widget's own MUTED/`VolumeZero` banner logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeroVolume {
+    pub percent: u8,
+    pub muted: bool,
+    pub source: HeroVolumeSource,
+}
+
 /// Which persistent banner (if any) is currently showing — resolved by
-/// [`HeroStatusView::active_banner`] from `muted`/`CodecStatus::fallback`
+/// [`HeroStatusView::active_banner`] from `volume`/`CodecStatus::fallback`
 /// per the design's priority rule: **at most one banner, MUTED outranks
-/// FALLBACK** (section 6.2/6.3). Not a toast — the entire point, per the
-/// design, is that it persists: glance an hour later and the answer is
-/// still there.
+/// VOLUME 0 outranks FALLBACK** (design
+/// `.planning/design/2026-09-07-volume-on-display.md` section 4.1,
+/// superseding the old 2026-08-28 design's two-tier MUTED/FALLBACK
+/// ordering). Not a toast — the entire point, per the design, is that it
+/// persists: glance an hour later and the answer is still there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveBanner<'a> {
-    /// Design section 6.3: device-side volume at zero with the host
-    /// slider unaware. Renders "MUTED  Press Up to raise".
-    Muted,
+    /// Design section 4: volume muted, from whichever source `HeroVolumeSource`
+    /// carries -- the remedy text depends on it (section 4.2's table).
+    Muted(HeroVolumeSource),
+    /// Design section 4.3: not muted, but at 0% -- reachable essentially
+    /// only from the headphones' own dial (macOS sends `muted` and `0%`
+    /// together, so a host-originated zero is already caught by `Muted`
+    /// above), which is why the remedy names the headphones rather than
+    /// the source that's actually carried.
+    VolumeZero,
     /// Design section 6.2, link 2 of the fallback chain: states what
     /// happened and why, so a glance an hour later still explains the
     /// amber hero word.
@@ -279,7 +323,7 @@ enum ActiveBanner<'a> {
 pub struct HeroStatusView {
     device_name: String,
     status: CodecStatus,
-    muted: bool,
+    volume: Option<HeroVolume>,
     stat_line: Option<String>,
     out_level: Option<OutLevelDisplay>,
 }
@@ -287,17 +331,21 @@ pub struct HeroStatusView {
 impl HeroStatusView {
     #[must_use]
     pub fn new(device_name: impl Into<String>, status: CodecStatus) -> Self {
-        Self { device_name: device_name.into(), status, muted: false, stat_line: None, out_level: None }
+        Self { device_name: device_name.into(), status, volume: None, stat_line: None, out_level: None }
     }
 
-    /// Design section 6.3: device-side volume at zero with the host
-    /// slider unaware. Drives the MUTED banner, which outranks a
-    /// simultaneous codec fallback banner (the fallback amber hero word
-    /// stays visible underneath regardless — only the *banner text*
-    /// changes).
+    /// The live volume reading (design
+    /// `.planning/design/2026-09-07-volume-on-display.md`), if any --
+    /// `None` (section 6) means nothing connected, or connected but no
+    /// reading has arrived yet, or the sink has no AVRCP absolute volume
+    /// at all; all three render identically (absent). Drives the
+    /// title-bar element (via [`Self::chrome_contribution`]) and the
+    /// MUTED/`VolumeZero` banners, which outrank a simultaneous codec
+    /// fallback banner (the fallback amber hero word stays visible
+    /// underneath regardless — only the *banner text* changes).
     #[must_use]
-    pub fn with_muted(mut self, muted: bool) -> Self {
-        self.muted = muted;
+    pub fn with_volume(mut self, volume: Option<HeroVolume>) -> Self {
+        self.volume = volume;
         self
     }
 
@@ -333,13 +381,20 @@ impl HeroStatusView {
         self
     }
 
-    /// Resolves the design's banner-priority rule (section 6.2/6.3): at
-    /// most one banner, MUTED outranks FALLBACK. The fallback banner's
-    /// text is [`CodecStatus::Connected::fallback`]'s reason, so it can
-    /// never show without the hero word also being amber.
+    /// Resolves the design's banner-priority rule (design
+    /// `.planning/design/2026-09-07-volume-on-display.md` section 4.1): at
+    /// most one banner, MUTED outranks VOLUME 0 outranks FALLBACK. The
+    /// fallback banner's text is [`CodecStatus::Connected::fallback`]'s
+    /// reason, so it can never show without the hero word also being
+    /// amber.
     fn active_banner(&self) -> Option<ActiveBanner<'_>> {
-        if self.muted {
-            return Some(ActiveBanner::Muted);
+        if let Some(volume) = &self.volume {
+            if volume.muted {
+                return Some(ActiveBanner::Muted(volume.source));
+            }
+            if volume.percent == 0 {
+                return Some(ActiveBanner::VolumeZero);
+            }
         }
         if let CodecStatus::Connected { fallback: Some(reason), .. } = &self.status {
             return Some(ActiveBanner::Fallback(reason));
@@ -382,7 +437,35 @@ impl HeroStatusView {
                 }
             }
         };
-        let key = key.fold(u64::from(self.muted));
+        // Folds ONLY the banner-relevant bool (`muted || percent == 0`)
+        // plus `source` -- NOT the raw `percent`. This is
+        // `damage_region_key`'s value too (see that method below), which
+        // `Screen` diffs to decide whether a frame can narrow to
+        // `damage_hint`'s meter-only rect or must repaint the WHOLE hero
+        // widget area. The hero body never draws the percent -- only the
+        // title bar does (`Screen::render`, via `ChromeContribution::
+        // volume`) -- so folding it here would make an ordinary,
+        // banner-irrelevant tick (e.g. 40% -> 41%, still unmuted and
+        // nonzero) change this key and force a full hero repaint on every
+        // single volume tick, exactly the ~60/sec-during-a-slider-drag
+        // cost design section 9.2 rejected a hero-body VOL row FOR and
+        // section 2.4/7 sold the title-bar placement as avoiding (a
+        // code-review defect caught by a temporary probe test: percent-only
+        // 40->41 unmuted/nonzero gave `body_paint_key` `equal=false` before
+        // this fix). `source` still must fold -- unlike `Screen`'s
+        // `title_paint_key` (which never shows it), THIS widget's own
+        // banner text depends on it (the MUTED remedy differs by source --
+        // design section 4.2).
+        let key = match &self.volume {
+            None => key.fold(0),
+            Some(volume) => key
+                .fold(1)
+                .fold(u64::from(volume.muted || volume.percent == 0))
+                .fold(match volume.source {
+                    HeroVolumeSource::Host => 0,
+                    HeroVolumeSource::Other => 1,
+                }),
+        };
         key.fold_opt_str(self.stat_line.as_deref())
     }
 }
@@ -623,7 +706,38 @@ impl Widget for HeroStatusView {
             if let Some(banner) = self.active_banner() {
                 let banner_y = area.top_left.y + BANNER_TOP;
                 let (text, color) = match banner {
-                    ActiveBanner::Muted => (String::from("MUTED  Press Up to raise"), palette::STATUS_WARNING),
+                    // The old "MUTED  Press Up to raise" string is deleted
+                    // here (bead pico-link-31ey, design section 4.2): Up is
+                    // unbound on Home in Tier 1 (`app.rs`'s
+                    // `home_up_down_are_unbound_on_status_face` test), so it
+                    // promised a remedy that did nothing. Source-selected
+                    // instead -- when Tier 2 device-side volume ships, ALL
+                    // THREE arms below collapse back to
+                    // "... Press Up to raise", because then the remedy
+                    // really is here (design section 4.2's note).
+                    //
+                    // DEVIATION FROM THE DESIGN DOC, measured (design
+                    // section 4.2 explicitly requires measuring rather than
+                    // assuming from character count -- this is that
+                    // measurement): Uma's exact strings both exceed the
+                    // 134px budget in `font::label()` --
+                    // "MUTED  Unmute on the Mac" measures 138px and
+                    // "HEADPHONE VOLUME AT 0" measures 138px, both over by
+                    // 4px (measured via `get_rendered_dimensions_aligned`,
+                    // not estimated). Per the design's own fallback rule
+                    // ("drop the remedy clause before dropping the state
+                    // word"), the two below are the smallest edits that fit:
+                    // dropping "the" from the MUTED remedy (119px) keeps the
+                    // source-selected distinction the whole `HeroVolumeSource`
+                    // plumbing exists for -- collapsing straight to bare
+                    // "MUTED" per the design's literal fallback would have
+                    // thrown that away entirely for a 4px overflow. Dropping
+                    // "AT" from VOLUME 0 (120px) is the same move -- there is
+                    // no separate remedy clause to drop from a one-clause
+                    // banner, so the state word itself is trimmed instead.
+                    ActiveBanner::Muted(HeroVolumeSource::Host) => (String::from("MUTED  Unmute on Mac"), palette::STATUS_WARNING),
+                    ActiveBanner::Muted(HeroVolumeSource::Other) => (String::from("MUTED"), palette::STATUS_WARNING),
+                    ActiveBanner::VolumeZero => (String::from("HEADPHONE VOLUME 0"), palette::STATUS_WARNING),
                     ActiveBanner::Fallback(reason) => (String::from(reason), palette::STATUS_WARNING),
                 };
                 let banner_rect = Rectangle::new(
@@ -906,9 +1020,18 @@ impl Widget for HeroStatusView {
     /// label switches from "link" to "why?" under fallback) via
     /// [`ChromeContribution::fallback`] rather than painting the rail
     /// itself — the rail lives in `ChromeContribution`'s a/b/x/y fields,
-    /// which is `pico-link-znb.5` (E2)'s job, not this widget's.
+    /// which is `pico-link-znb.5` (E2)'s job, not this widget's. Also
+    /// exposes the title-bar volume element (design
+    /// `.planning/design/2026-09-07-volume-on-display.md` section 10) --
+    /// `None` when this widget has no volume reading, which
+    /// `Screen::render` treats as "draw nothing, reserve no width" per
+    /// that design's section 6.
     fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
-        Some(ChromeContribution { fallback: self.is_fallback(), ..Default::default() })
+        Some(ChromeContribution {
+            fallback: self.is_fallback(),
+            volume: self.volume.map(|volume| VolumeChrome { percent: volume.percent, muted: volume.muted }),
+            ..Default::default()
+        })
     }
 
     /// Requests another render before this widget's OUT-meter reading
@@ -1072,18 +1195,38 @@ mod tests {
         assert_eq!(view.active_banner(), Some(ActiveBanner::Fallback("Headphones don't support LDAC")));
     }
 
-    #[test]
-    fn muted_alone_shows_the_muted_banner() {
-        let view = nominal().with_muted(true);
-        assert_eq!(view.active_banner(), Some(ActiveBanner::Muted));
+    /// A muted [`HeroVolume`] reading from `source` -- `percent` is
+    /// nonzero and irrelevant here (MUTED outranks VOLUME 0, so a muted
+    /// reading's percent never reaches the banner logic).
+    fn muted_volume(source: HeroVolumeSource) -> HeroVolume {
+        HeroVolume { percent: 42, muted: true, source }
     }
 
     #[test]
-    fn muted_outranks_a_simultaneous_fallback() {
+    fn muted_alone_shows_the_muted_banner() {
+        let view = nominal().with_volume(Some(muted_volume(HeroVolumeSource::Host)));
+        assert_eq!(view.active_banner(), Some(ActiveBanner::Muted(HeroVolumeSource::Host)));
+    }
+
+    #[test]
+    fn muted_from_a_non_host_source_shows_the_bare_muted_banner() {
+        let view = nominal().with_volume(Some(muted_volume(HeroVolumeSource::Other)));
+        assert_eq!(view.active_banner(), Some(ActiveBanner::Muted(HeroVolumeSource::Other)));
+    }
+
+    #[test]
+    fn zero_percent_unmuted_shows_the_volume_zero_banner() {
+        let view = nominal().with_volume(Some(HeroVolume { percent: 0, muted: false, source: HeroVolumeSource::Other }));
+        assert_eq!(view.active_banner(), Some(ActiveBanner::VolumeZero));
+    }
+
+    #[test]
+    fn muted_outranks_a_simultaneous_volume_zero_and_fallback() {
         // The design is explicit: at most one banner, MUTED outranks
-        // FALLBACK, and the codec word stays amber underneath regardless
-        // -- so both signals can be true at once, and only the *banner*
-        // must resolve to Muted; the hero word's own colour is untouched.
+        // VOLUME 0 outranks FALLBACK, and the codec word stays amber
+        // underneath regardless -- so all three signals can be true at
+        // once, and only the *banner* must resolve to Muted; the hero
+        // word's own colour is untouched.
         let view = HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected {
@@ -1092,14 +1235,18 @@ mod tests {
                 bitrate: BitrateStatus::Kbps(328),
             },
         )
-        .with_muted(true);
-        assert_eq!(view.active_banner(), Some(ActiveBanner::Muted), "MUTED must outrank a simultaneous FALLBACK");
+        .with_volume(Some(HeroVolume { percent: 0, muted: true, source: HeroVolumeSource::Host }));
+        assert_eq!(
+            view.active_banner(),
+            Some(ActiveBanner::Muted(HeroVolumeSource::Host)),
+            "MUTED must outrank a simultaneous VOLUME 0 and FALLBACK"
+        );
         assert!(view.is_fallback(), "the hero word must stay amber underneath a MUTED banner");
     }
 
     #[test]
     fn muted_banner_renders_surface_elevated_and_warning_ink() {
-        let view = nominal().with_muted(true);
+        let view = nominal().with_volume(Some(muted_volume(HeroVolumeSource::Host)));
         let fb = render(&view);
         assert!(fb.pixels().any(|p| p.1 == palette::SURFACE_ELEVATED), "the banner bar itself should paint SURFACE_ELEVATED");
         assert!(fb.pixels().any(|p| p.1 == palette::STATUS_WARNING), "the banner text and the hero word both use STATUS_WARNING");
@@ -1615,14 +1762,59 @@ mod tests {
     #[test]
     fn paint_key_changes_with_muted_and_stat_line() {
         let base = nominal();
-        let muted = nominal().with_muted(true);
+        let muted = nominal().with_volume(Some(muted_volume(HeroVolumeSource::Host)));
         assert_ne!(base.paint_key(&test_ctx()), muted.paint_key(&test_ctx()));
+
+        let same_muted_different_source = nominal().with_volume(Some(muted_volume(HeroVolumeSource::Other)));
+        assert_ne!(
+            muted.paint_key(&test_ctx()),
+            same_muted_different_source.paint_key(&test_ctx()),
+            "a different source must change the key even with percent/muted unchanged -- the MUTED banner's remedy clause depends on source (design section 4.2)"
+        );
 
         let no_stat = HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
         );
         assert_ne!(no_stat.paint_key(&test_ctx()), base.paint_key(&test_ctx()), "a stat line vs none must change the key");
+    }
+
+    // --- Code-review regression: `body_paint_key`/`damage_region_key` must
+    // NOT fold the raw percent, only the banner-relevant bool -- folding
+    // the raw percent would force a full hero repaint on every ordinary
+    // volume tick (~60/sec during a slider drag), exactly what design
+    // section 9.2 rejected a hero-body VOL row for and section 2.4/7 sold
+    // the title-bar placement as avoiding. `damage_region_key` is the
+    // value `Screen` actually diffs to decide whether it can narrow to
+    // `damage_hint`'s meter-only rect (bead pico-link-7h5.9) -- see that
+    // method's doc comment. ---
+
+    #[test]
+    fn damage_region_key_is_unchanged_by_a_percent_only_change_with_no_banner_state_change() {
+        let ctx = test_ctx();
+        let at_40 = nominal().with_volume(Some(HeroVolume { percent: 40, muted: false, source: HeroVolumeSource::Host }));
+        let at_41 = nominal().with_volume(Some(HeroVolume { percent: 41, muted: false, source: HeroVolumeSource::Host }));
+        assert_eq!(
+            at_40.damage_region_key(&ctx),
+            at_41.damage_region_key(&ctx),
+            "an ordinary percent-only tick (both unmuted, both nonzero) must NOT change damage_region_key --              folding the raw percent here would force a full hero repaint on every volume tick"
+        );
+        // The same must hold for `paint_key`/`body_paint_key` (what
+        // `damage_region_key` is defined to equal) -- checked directly too
+        // so a future refactor that breaks that equality is caught here,
+        // not only via `damage_region_key`.
+        assert_eq!(at_40.paint_key(&ctx), at_41.paint_key(&ctx));
+    }
+
+    #[test]
+    fn damage_region_key_changes_when_crossing_into_or_out_of_the_banner_state() {
+        let ctx = test_ctx();
+        let normal = nominal().with_volume(Some(HeroVolume { percent: 41, muted: false, source: HeroVolumeSource::Host }));
+        let zero = nominal().with_volume(Some(HeroVolume { percent: 0, muted: false, source: HeroVolumeSource::Host }));
+        let muted = nominal().with_volume(Some(HeroVolume { percent: 41, muted: true, source: HeroVolumeSource::Host }));
+
+        assert_ne!(normal.damage_region_key(&ctx), zero.damage_region_key(&ctx), "crossing into VOLUME 0 must change the key -- the banner appears");
+        assert_ne!(normal.damage_region_key(&ctx), muted.damage_region_key(&ctx), "crossing into MUTED must change the key -- the banner appears");
     }
 
     #[test]

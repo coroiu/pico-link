@@ -79,12 +79,12 @@ use core::convert::Infallible;
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
-use crate::app::{build_devices_screen, build_settings_screen, BtModel, Command, DeviceEntry, HomeFace, LinkState, WizardPhase};
+use crate::app::{build_devices_screen, build_settings_screen, BtModel, Command, DeviceEntry, HomeFace, LinkState, VolumeSource, WizardPhase};
 use crate::input::NavIntent;
 
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
-use super::hero::{BitrateStatus, CodecStatus, HeroStatusView, OutLevelDisplay};
+use super::hero::{BitrateStatus, CodecStatus, HeroStatusView, HeroVolume, HeroVolumeSource, OutLevelDisplay};
 use super::menu::{MenuItem, MenuList};
 use super::paint_key::PaintKey;
 use super::rail::ButtonLabel;
@@ -162,6 +162,25 @@ impl HomeView {
         // lesser one (design section 6.2's amber banner) doesn't exist in
         // `BtModel` yet; that's a separate, later bead, and `None` here is
         // the honest "no reason recorded" value, not a guess.
+        //
+        // Volume (design `.planning/design/2026-09-07-volume-on-display.md`
+        // section 10, bead pico-link-4v2.6/VT6): built from `model.volume`
+        // directly, OUTSIDE the `connected_codec` match below and applied
+        // to `hero` regardless of which arm produced it. `BtModel::volume`
+        // is deliberately NOT cleared on disconnect (see its own doc
+        // comment: the host feature-unit volume it most commonly reflects
+        // is a USB-side concept, not an A2DP-link-lifetime one), so tying
+        // the title-bar volume element to `connected_codec` would be
+        // wrong, not just simpler -- the two are independent axes exactly
+        // like `readout`/`volume` are on `ChromeContribution`.
+        let hero_volume = model.volume.map(|volume| HeroVolume {
+            percent: volume.percent(),
+            muted: volume.muted,
+            source: match volume.source {
+                VolumeSource::Host => HeroVolumeSource::Host,
+                VolumeSource::Sink | VolumeSource::Device => HeroVolumeSource::Other,
+            },
+        });
         let hero = match &model.connected_codec {
             Some(codec) => {
                 // Bead pico-link-4vb.4 (T4): reads `paired` (the remembered
@@ -200,7 +219,8 @@ impl HomeView {
                 .with_out_level(out_level)
             }
             None => HeroStatusView::new("", CodecStatus::NoLink),
-        };
+        }
+        .with_volume(hero_volume);
         let link_state = model.link_state;
 
         let model = model.clone();

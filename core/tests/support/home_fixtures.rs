@@ -25,15 +25,25 @@
 use std::path::Path;
 
 use embedded_graphics::prelude::RgbColor;
-use pico_link_core::{App, ConnectedCodec, DeviceEntry, Event, LinkState, PairedDevice};
+use pico_link_core::{App, ConnectedCodec, DeviceEntry, Event, LinkState, PairedDevice, VolumeSource};
 
 pub const ZOOM: u32 = 3;
 
 /// Names of the fixtures `generate` writes, in the order it writes them --
 /// also the base filenames (without `.png`) under `home-screenshots/` at
-/// the repo root.
-pub const FIXTURE_NAMES: [&str; 4] =
-    ["01_no_link", "02_connected_ldac", "03_disconnected_after_ldac", "04_connected_with_out_level"];
+/// the repo root. `05`-`08` are VT6 (bead pico-link-4v2.6, design
+/// `.planning/design/2026-09-07-volume-on-display.md`): the title-bar
+/// volume element and its exceptional-state banners.
+pub const FIXTURE_NAMES: [&str; 8] = [
+    "01_no_link",
+    "02_connected_ldac",
+    "03_disconnected_after_ldac",
+    "04_connected_with_out_level",
+    "05_volume_62_percent",
+    "06_volume_zero_banner",
+    "07_muted_banner_host",
+    "08_muted_with_out_level_still_swinging",
+];
 
 pub fn save_zoomed_png(app: &mut App, out_dir: &Path, name: &str) {
     let framebuffer = app.render();
@@ -119,4 +129,47 @@ pub fn generate(out_dir: &Path) {
     app.tick(1);
     app.handle_event(Event::LevelsChanged { peak_l: 90, peak_r: 45, rms_l: 26, rms_r: 40 });
     save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[3]);
+
+    // --- VT6 (design `.planning/design/2026-09-07-volume-on-display.md`):
+    // a normal, unmuted, nonzero volume reading -- level 79 maps to
+    // exactly 62% via `VolumeState::percent`'s formula, matching the
+    // design's own worked example ("62%") so the fixture is directly
+    // comparable to the design doc's ASCII sketch (section 8). ---
+    let mut app = App::new(240, 240);
+    let addr = [0xEE; 6];
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1 }));
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 909_000 }));
+    app.handle_event(Event::VolumeChanged { level: 79, muted: false, source: VolumeSource::Sink });
+    save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[4]);
+
+    // --- VT6: unmuted but at 0% -- the VOLUME 0 banner ("HEADPHONE VOLUME
+    // AT 0"), reachable in practice only from the headphones' own dial
+    // (design section 4.3: macOS sends `muted` and 0% together, so a
+    // host-originated zero is caught by the MUTED banner instead). The
+    // OUT meter is deliberately absent here (no `LevelsChanged` event) --
+    // fixture 08 below is where "the meter keeps moving while muted/zero"
+    // is proven, so this one stays focused on the banner/title-bar text
+    // alone. ---
+    app.handle_event(Event::VolumeChanged { level: 0, muted: false, source: VolumeSource::Sink });
+    save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[5]);
+
+    // --- VT6: MUTED from the host -- title bar reads amber "MUTE", banner
+    // reads "MUTED  Unmute on Mac" (the source-selected remedy that
+    // replaces the old, defective "Press Up to raise" string -- bead
+    // pico-link-31ey; the exact wording is trimmed slightly from the
+    // design doc's literal string -- see `HeroStatusView::render`'s banner
+    // match for the measured reason). ---
+    app.handle_event(Event::VolumeChanged { level: 0, muted: true, source: VolumeSource::Host });
+    save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[6]);
+
+    // --- VT6: MUTED, but the OUT meter is STILL SWINGING -- design section
+    // 2.1's central claim, pinned as a diffable artefact so a future
+    // reviewer cannot quietly "fix" it by scaling the meter down to zero
+    // when muted. The meter reads PCM entering the LDAC encoder, upstream
+    // of the sink's own gain -- volume 0/muted changes nothing about how
+    // much audio is reaching the encoder. ---
+    app.tick(1);
+    app.handle_event(Event::LevelsChanged { peak_l: 90, peak_r: 45, rms_l: 26, rms_r: 40 });
+    save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[7]);
 }

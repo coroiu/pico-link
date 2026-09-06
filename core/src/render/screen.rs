@@ -155,12 +155,34 @@ fn fold_button_label(key: PaintKey, label: &ButtonLabel) -> PaintKey {
 }
 
 /// The title bar's own paint key -- everything [`Screen::render`]'s title
-/// bar drawing actually reads: the resolved title text, the readout, the
-/// status dot, and the link glyph. See the damage design's section 3.5:
-/// chrome is not exempt from paint keys just because it isn't a [`Widget`].
-fn title_paint_key(title_text: &str, readout_text: Option<&str>, status: Option<ChromeStatus>, link: Option<LinkState>) -> PaintKey {
+/// bar drawing actually reads: the resolved title text, the volume text,
+/// whether it's muted, the readout, the status dot, and the link glyph.
+/// See the damage design's section 3.5: chrome is not exempt from paint
+/// keys just because it isn't a [`Widget`].
+///
+/// `volume_muted` is folded SEPARATELY from `volume_text` (design
+/// `.planning/design/2026-09-07-volume-on-display.md` section 7) --
+/// `"0%"` and `"62%"` are both just strings, but one renders
+/// `STATUS_WARNING` and the other `TEXT_PRIMARY`. A key folding only the
+/// text would let that colour change through unpainted (a real bug this
+/// module's own `paint_key` contract exists to prevent: a widget/chrome
+/// region whose key doesn't change is never redrawn, so a stale colour
+/// would sit on screen with no way to notice from pixels alone). Despite
+/// its name, `volume_muted` is `true` whenever the WARNING colour applies
+/// -- muted OR at exactly 0%, i.e. it mirrors `Screen::render`'s own
+/// colour decision below, not literally `VolumeChrome::muted` alone.
+fn title_paint_key(
+    title_text: &str,
+    readout_text: Option<&str>,
+    volume_text: Option<&str>,
+    volume_muted: bool,
+    status: Option<ChromeStatus>,
+    link: Option<LinkState>,
+) -> PaintKey {
     let key = PaintKey::of(TITLE_PAINT_KEY_SEED).fold_str(title_text);
     let key = fold_opt_str(key, readout_text);
+    let key = fold_opt_str(key, volume_text);
+    let key = key.fold(u64::from(volume_muted));
     let key = key.fold(match status {
         None => 0,
         Some(ChromeStatus::Success) => 1,
@@ -524,6 +546,17 @@ impl Screen {
         let readout_text = contribution.as_ref().and_then(|c| c.readout.as_deref());
         let status = contribution.as_ref().and_then(|c| c.status);
         let link = contribution.as_ref().and_then(|c| c.link);
+        // The title-bar volume element (design
+        // `.planning/design/2026-09-07-volume-on-display.md` section 3):
+        // `MUTE` in amber when muted, otherwise the percent, amber only at
+        // exactly 0% -- computed once here so the same `String` backs both
+        // `title_paint_key`'s fold and the actual draw below, rather than
+        // formatting twice. `None` (section 6) draws nothing and consumes
+        // zero width -- there is simply no `volume_text`/`right_cursor`
+        // reservation for it in that case.
+        let volume = contribution.as_ref().and_then(|c| c.volume);
+        let volume_text = volume.map(|v| if v.muted { String::from("MUTE") } else { alloc::format!("{}%", v.percent) });
+        let volume_muted_or_zero = volume.is_some_and(|v| v.muted || v.percent == 0);
 
         let labels = ButtonLabels {
             a: self.resolve_a(),
@@ -561,7 +594,7 @@ impl Screen {
         // either way (its area is zero-sized), so there is nothing to
         // gain from actually invoking it, matching the "never measured"
         // treatment above. ---
-        let title_key = title_paint_key(title_text, readout_text, status, link);
+        let title_key = title_paint_key(title_text, readout_text, volume_text.as_deref(), volume_muted_or_zero, status, link);
         let rail_key = rail_paint_key(&labels);
 
         let mut new_slots: Vec<PaintSlot> = Vec::with_capacity(2 + self.widgets.len());
@@ -706,6 +739,26 @@ impl Screen {
                 right_cursor = draw_link_glyph(link_state, right_cursor, title_mid_y, target);
             }
 
+            // Volume, inboard of the link glyph/status dot and outboard of
+            // the readout (design section 3: the fixed-width anchors stay
+            // fixed; only this variable-width element floats). `helvB10`
+            // (`font::title()`), `TEXT_PRIMARY` normally, `STATUS_WARNING`
+            // when muted or at exactly 0% -- section 3's states table.
+            // `None` (section 6) draws nothing and reserves no width.
+            if let Some(text) = volume_text.as_deref() {
+                let volume_color = if volume_muted_or_zero { palette::STATUS_WARNING } else { palette::TEXT_PRIMARY };
+                let volume_font = font::title();
+                let _ = volume_font.render_aligned(
+                    text,
+                    Point::new(right_cursor, title_mid_y),
+                    VerticalPosition::Center,
+                    HorizontalAlignment::Right,
+                    FontColor::Transparent(volume_color),
+                    target,
+                );
+                right_cursor -= text_width(&volume_font, text) as i32 + TITLE_ELEMENT_GAP;
+            }
+
             let readout_font = font::title();
             if let Some(readout) = readout_text {
                 let _ = readout_font.render_aligned(
@@ -756,7 +809,7 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::widget::Verb;
+    use super::super::widget::{Verb, VolumeChrome};
     use crate::platform::Instant;
     use crate::render::list::{ListItem, VerticalList};
 
@@ -891,6 +944,150 @@ mod tests {
                 && !any_pixel_near_the_right_title_edge(&mut none, palette::TEXT_SECONDARY),
             "link: None must omit the glyph -- no link-glyph color anywhere near the right edge"
         );
+    }
+
+    // --- Volume title-bar element (design
+    // `.planning/design/2026-09-07-volume-on-display.md`, bead
+    // pico-link-4v2.6/VT6) ---
+
+    /// A single-purpose focusable widget reporting a caller-settable
+    /// `ChromeContribution::volume` (and, for the coexistence test below,
+    /// `readout`) -- same shape as `LinkOnlyWidget` above.
+    struct VolumeOnlyWidget {
+        volume: Option<VolumeChrome>,
+        readout: Option<&'static str>,
+    }
+
+    impl Widget for VolumeOnlyWidget {
+        fn measure(&self, _constraints: Size, _ctx: &RenderCtx) -> Size {
+            Size::zero()
+        }
+        fn render(&self, _area: Rectangle, _ctx: &RenderCtx, _target: &mut FrameBuffer565) -> Result<(), Infallible> {
+            Ok(())
+        }
+        fn is_focusable(&self) -> bool {
+            true
+        }
+        fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
+            Some(ChromeContribution { volume: self.volume, readout: self.readout.map(String::from), ..Default::default() })
+        }
+    }
+
+    fn volume_screen(volume: Option<VolumeChrome>, readout: Option<&'static str>) -> Screen {
+        let mut screen = Screen::new("T", vec![Box::new(VolumeOnlyWidget { volume, readout })]);
+        screen.initialize_focus();
+        screen
+    }
+
+    fn render_screen(screen: &mut Screen) -> FrameBuffer565 {
+        let chrome = super::super::chrome::compute_chrome(Size::new(240, 240));
+        let mut fb = FrameBuffer565::new(240, 240);
+        screen.render(&chrome, false, &test_ctx(), true, &mut fb).unwrap();
+        fb
+    }
+
+    fn any_pixel_in_the_title_bar(fb: &FrameBuffer565, color: embedded_graphics::pixelcolor::Rgb565) -> bool {
+        (0..240).any(|x| (0..super::super::chrome::TITLE_BAR_HEIGHT as i32).any(|y| fb.pixel(Point::new(x, y)) == color))
+    }
+
+    #[test]
+    fn some_volume_paints_primary_ink_in_the_title_bar_when_unmuted_and_nonzero() {
+        let mut screen = volume_screen(Some(VolumeChrome { percent: 62, muted: false }), None);
+        let fb = render_screen(&mut screen);
+        assert!(any_pixel_in_the_title_bar(&fb, palette::TEXT_PRIMARY), "a normal volume reading must paint TEXT_PRIMARY");
+    }
+
+    #[test]
+    fn muted_volume_paints_warning_ink_not_primary() {
+        let mut screen = volume_screen(Some(VolumeChrome { percent: 62, muted: true }), None);
+        let fb = render_screen(&mut screen);
+        assert!(any_pixel_in_the_title_bar(&fb, palette::STATUS_WARNING), "a muted volume reading must paint STATUS_WARNING");
+    }
+
+    #[test]
+    fn zero_percent_unmuted_also_paints_warning_ink() {
+        let mut screen = volume_screen(Some(VolumeChrome { percent: 0, muted: false }), None);
+        let fb = render_screen(&mut screen);
+        assert!(any_pixel_in_the_title_bar(&fb, palette::STATUS_WARNING), "0% must paint STATUS_WARNING, matching the design's states table");
+    }
+
+    #[test]
+    fn none_volume_draws_nothing_extra_and_does_not_shift_the_readout() {
+        // Section 6's "absent, never faked" rule: `None` must not draw a
+        // placeholder, and must not reserve any width either -- proven
+        // here by checking a readout-bearing screen renders identically
+        // whether or not a sibling widget's `volume` field is `None` (it
+        // always is here -- there's only one widget -- but this pins that
+        // `render`'s volume branch is a true no-op for `None`, not just
+        // "draws nothing visible by coincidence").
+        let mut with_readout_no_volume = volume_screen(None, Some("2 / 5"));
+        let fb = render_screen(&mut with_readout_no_volume);
+        assert!(any_pixel_in_the_title_bar(&fb, palette::TEXT_SECONDARY), "the readout itself must still render");
+    }
+
+    #[test]
+    fn volume_and_readout_coexist_without_overlapping_the_link_glyph() {
+        // A list screen's position readout and Home's volume percent are
+        // independent axes (design section 9.3) that must be able to
+        // share a title bar -- proven by rendering both plus a link glyph
+        // together and checking all three colors appear (not overlap-
+        // checking pixel-for-pixel, but proving neither element silently
+        // failed to draw when the other/a third element is also present).
+        struct VolumeReadoutLinkWidget;
+        impl Widget for VolumeReadoutLinkWidget {
+            fn measure(&self, _c: Size, _ctx: &RenderCtx) -> Size {
+                Size::zero()
+            }
+            fn render(&self, _area: Rectangle, _ctx: &RenderCtx, _target: &mut FrameBuffer565) -> Result<(), Infallible> {
+                Ok(())
+            }
+            fn is_focusable(&self) -> bool {
+                true
+            }
+            fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
+                Some(ChromeContribution {
+                    volume: Some(VolumeChrome { percent: 62, muted: false }),
+                    readout: Some(String::from("2 / 5")),
+                    link: Some(LinkState::Connected),
+                    ..Default::default()
+                })
+            }
+        }
+        let mut screen = Screen::new("T", vec![Box::new(VolumeReadoutLinkWidget)]);
+        screen.initialize_focus();
+        let fb = render_screen(&mut screen);
+        assert!(any_pixel_in_the_title_bar(&fb, palette::TEXT_PRIMARY), "the volume element must render");
+        assert!(any_pixel_in_the_title_bar(&fb, palette::TEXT_SECONDARY), "the readout must still render");
+        assert!(any_pixel_in_the_title_bar(&fb, palette::BRAND_BRIGHT), "the link glyph must still render");
+    }
+
+    #[test]
+    fn title_paint_key_changes_when_volume_muted_flag_changes_with_identical_text() {
+        // The exact contract this bead's design calls out (section 7): a
+        // mute-state change that happens to render the SAME text (e.g. an
+        // upstream caller reusing a formatted string across a mute
+        // toggle) must still produce a different key, because the
+        // rendered COLOR differs. Calling `title_paint_key` directly
+        // (rather than through a widget) isolates exactly this: identical
+        // `title_text`/`readout_text`/`volume_text`, only `volume_muted`
+        // differs.
+        let unmuted = title_paint_key("T", None, Some("0%"), false, None, None);
+        let muted = title_paint_key("T", None, Some("0%"), true, None, None);
+        assert_ne!(unmuted, muted, "identical volume_text but a different volume_muted must still change the key");
+    }
+
+    #[test]
+    fn title_paint_key_changes_when_volume_text_changes() {
+        let a = title_paint_key("T", None, Some("50%"), false, None, None);
+        let b = title_paint_key("T", None, Some("62%"), false, None, None);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn title_paint_key_distinguishes_no_volume_from_a_present_one() {
+        let none = title_paint_key("T", None, None, false, None, None);
+        let some = title_paint_key("T", None, Some("0%"), false, None, None);
+        assert_ne!(none, some);
     }
 
     // --- Button rail (pico-link-znb.5 / E2) ---

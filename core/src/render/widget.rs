@@ -106,6 +106,19 @@ pub enum ChromeStatus {
     Neutral,
 }
 
+/// A title-bar volume reading, in the display's own 0..100 percent domain
+/// (see [`crate::app::VolumeState::percent`] -- never the raw 0..127
+/// AVRCP level, per design section 3). `muted` is carried separately from
+/// `percent` rather than folded into it (e.g. as a sentinel) because it
+/// changes the rendered *colour*, not just the text -- see
+/// `super::screen::title_paint_key`'s doc comment for why a paint key must
+/// fold it independently too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeChrome {
+    pub percent: u8,
+    pub muted: bool,
+}
+
 /// What a focused widget wants the chrome (title bar + button rail) to
 /// show on its behalf, for the current frame. Returned fresh from
 /// [`Widget::chrome_contribution`] on every render rather than pushed/
@@ -129,6 +142,18 @@ pub struct ChromeContribution {
     /// A right-aligned position readout (e.g. `"2 / 5"`), if this widget
     /// has a meaningful position/count to report.
     pub readout: Option<String>,
+    /// The title-bar volume readout, if this widget has a live volume
+    /// reading to show (design
+    /// `.planning/design/2026-09-07-volume-on-display.md` section 2/3) --
+    /// deliberately a separate field from `readout` rather than sharing
+    /// it, per that design's section 9.3: a list screen's position readout
+    /// and Home's volume percent are independent axes that must be able to
+    /// coexist on any screen that wants both. `None` omits the element
+    /// entirely and consumes zero width (section 6, the `None` rule) --
+    /// never a `--` placeholder. Text and colour are the chrome's to
+    /// derive from `percent`/`muted` (see `Screen::render`), not this
+    /// widget's, matching the `status`/`link` fields' own division below.
+    pub volume: Option<VolumeChrome>,
     /// Overrides the screen's static B-button rail label, if set. **B's
     /// text is always the constant "back"** — only `Navigator` (via
     /// `Screen::render`'s `can_go_back` parameter) decides B's

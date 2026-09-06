@@ -367,6 +367,37 @@ pub struct VolumeState {
     pub source: VolumeSource,
 }
 
+impl VolumeState {
+    /// `level` (0..127, the AVRCP absolute-volume domain) converted to the
+    /// 0..100 percent domain the display shows (design
+    /// `.planning/design/2026-09-07-volume-on-display.md` section 3,
+    /// "Percent, 0..100, never the raw 0..127" -- both peers speak percent,
+    /// and 0..127 is an implementation detail that must not leak onto the
+    /// screen). Rounds half-up; checked to map the two endpoints exactly
+    /// (`0 -> 0`, `127 -> 100`) since those are the only two values a user
+    /// can act on ("0% must mean silent, 100% must mean maximum").
+    // `level` is a `u8` (0..=127), so `level * 100 + 63` is at most
+    // 12763 and `/ 127` caps the result at 100 -- always in-range for a
+    // `u8`, but clippy can't see that from the arithmetic alone.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn percent(&self) -> u8 {
+        ((u32::from(self.level) * 100 + 63) / 127) as u8
+    }
+
+    /// Whether this reading, on its own, should wake the display to full
+    /// and extend the idle timer (design section 5.1/5.3) -- true only for
+    /// a non-host source that isn't itself muted or at 0%. Section 5.4
+    /// deliberately outranks 5.3 here: a sink-originated mute/zero must
+    /// NOT "wake to full" (that would flash the panel bright at the exact
+    /// moment the user asked for quiet) -- it only ever satisfies
+    /// [`App::volume_requires_dim_floor`]'s never-fully-blank floor.
+    #[must_use]
+    pub fn wakes_idle(&self) -> bool {
+        self.source != VolumeSource::Host && !self.muted && self.level > 0
+    }
+}
+
 impl ConnectFailureReason {
     /// Whether a retry of the *same* device could plausibly succeed.
     /// `false` for [`Self::NoA2dpSink`] (a fixed capability of that
@@ -1826,6 +1857,19 @@ impl App {
         &self.model
     }
 
+    /// Whether the current volume reading means the display must never go
+    /// fully blank (design section 5.4/6.1): muted, or at 0%, from ANY
+    /// source. `None` (nothing connected, or no reading yet) is `false` --
+    /// there is no banner to protect a floor for. Read every idle tick by
+    /// both [`crate::run::Runner::step`] and `ui-ffi`'s `pl_ui_tick` (via
+    /// `IdlePolicy::tick`'s `mute_or_zero` parameter), which is what makes
+    /// this rule apply on the real target and not just the emulator -- see
+    /// `IdlePolicy::tick`'s doc comment for the mechanism.
+    #[must_use]
+    pub fn volume_requires_dim_floor(&self) -> bool {
+        self.model.volume.is_some_and(|volume| volume.muted || volume.level == 0)
+    }
+
     /// Pops the oldest queued user command, if any
     /// (`pl_ui_poll_command`'s core-side implementation). `core` never acts
     /// on these itself -- see [`Command`]'s doc comment.
@@ -2101,6 +2145,83 @@ mod tests {
     fn open_wizard(app: &mut App) {
         open_devices(app);
         app.handle_input(vec![NavIntent::Select]); // "Pair new headphones" row -> pushes the wizard
+    }
+
+    // --- VT6, design `.planning/design/2026-09-07-volume-on-display.md`
+    // section 3: the percent formula, pinned at both endpoints ---
+
+    #[test]
+    fn volume_percent_pins_the_two_endpoints_exactly() {
+        // Design section 3: "100% must mean maximum and 0% must mean
+        // silent, with no other level able to render as either" -- so the
+        // endpoints are checked exactly, not just "close enough".
+        let silent = VolumeState { level: 0, muted: false, source: VolumeSource::Host };
+        assert_eq!(silent.percent(), 0);
+        let max = VolumeState { level: 127, muted: false, source: VolumeSource::Host };
+        assert_eq!(max.percent(), 100);
+    }
+
+    #[test]
+    fn volume_percent_matches_the_designs_worked_examples() {
+        // Design section 3's worked examples: `1 -> 1`, `126 -> 99`.
+        assert_eq!(VolumeState { level: 1, muted: false, source: VolumeSource::Host }.percent(), 1);
+        assert_eq!(VolumeState { level: 126, muted: false, source: VolumeSource::Host }.percent(), 99);
+    }
+
+    #[test]
+    fn volume_percent_never_exceeds_100_or_underflows() {
+        // Exhaustive over the whole legal 0..=127 domain -- cheap, and it's
+        // the one property a rounding-formula regression could quietly
+        // violate at an untested value in the middle of the range.
+        for level in 0..=127u8 {
+            let percent = VolumeState { level, muted: false, source: VolumeSource::Host }.percent();
+            assert!(percent <= 100, "level {level} produced out-of-range percent {percent}");
+        }
+    }
+
+    // --- VT6 design section 5.1/5.3/5.4: `VolumeState::wakes_idle` ---
+
+    #[test]
+    fn wakes_idle_is_false_for_host_regardless_of_level_or_muted() {
+        assert!(!VolumeState { level: 80, muted: false, source: VolumeSource::Host }.wakes_idle());
+        assert!(!VolumeState { level: 0, muted: false, source: VolumeSource::Host }.wakes_idle());
+        assert!(!VolumeState { level: 80, muted: true, source: VolumeSource::Host }.wakes_idle());
+    }
+
+    #[test]
+    fn wakes_idle_is_true_for_sink_or_device_when_not_muted_and_above_zero() {
+        assert!(VolumeState { level: 80, muted: false, source: VolumeSource::Sink }.wakes_idle());
+        assert!(VolumeState { level: 80, muted: false, source: VolumeSource::Device }.wakes_idle());
+    }
+
+    #[test]
+    fn wakes_idle_is_false_for_sink_or_device_when_muted_or_at_zero() {
+        // Design section 5.4 outranks 5.3: a sink-originated mute/zero
+        // must never "wake to full".
+        assert!(!VolumeState { level: 80, muted: true, source: VolumeSource::Sink }.wakes_idle());
+        assert!(!VolumeState { level: 0, muted: false, source: VolumeSource::Sink }.wakes_idle());
+        assert!(!VolumeState { level: 0, muted: true, source: VolumeSource::Device }.wakes_idle());
+    }
+
+    // --- VT6 design section 5.4/6.1: `App::volume_requires_dim_floor` ---
+
+    #[test]
+    fn volume_requires_dim_floor_is_false_with_no_volume_reading() {
+        let app = App::new(240, 240);
+        assert!(!app.volume_requires_dim_floor());
+    }
+
+    #[test]
+    fn volume_requires_dim_floor_is_true_when_muted_or_zero_from_any_source() {
+        let mut app = App::new(240, 240);
+        app.on_volume_changed(80, true, VolumeSource::Host);
+        assert!(app.volume_requires_dim_floor(), "muted must require the dim floor");
+
+        app.on_volume_changed(0, false, VolumeSource::Sink);
+        assert!(app.volume_requires_dim_floor(), "0% must require the dim floor regardless of source");
+
+        app.on_volume_changed(80, false, VolumeSource::Sink);
+        assert!(!app.volume_requires_dim_floor(), "an ordinary non-zero unmuted reading must not require the floor");
     }
 
     // --- pico-link-vxc, design doc §6.1: the freshness invariant ---

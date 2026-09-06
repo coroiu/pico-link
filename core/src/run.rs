@@ -304,16 +304,31 @@ impl IdlePolicy {
     /// The arm half. Call exactly once per frame with `now` (this frame's
     /// clock reading), `had_input` (whether a non-empty batch arrived this
     /// frame -- and, if so, whether [`IdlePolicy::on_input`] was already
-    /// called for it), `at_home_root` (`App::is_at_home_root()`), and
-    /// `on_external_power` (`PowerControl::on_external_power()`).
+    /// called for it), `at_home_root` (`App::is_at_home_root()`),
+    /// `on_external_power` (`PowerControl::on_external_power()`), and
+    /// `mute_or_zero` (`App::volume_requires_dim_floor()` -- design
+    /// `.planning/design/2026-09-07-volume-on-display.md` section 5.4's
+    /// third tier).
     ///
     /// Lazily initializes `last_input` to `now` on the very first call
     /// (see the type doc). Any frame with `had_input == true` resets
     /// `last_input` to `now`, mirroring the module doc's "Idle/wake"
-    /// pseudocode. A frame with no input evaluates, in order:
+    /// pseudocode. Every frame first evaluates the `mute_or_zero` floor
+    /// (see below), independent of `had_input` -- a volume event is never
+    /// itself routed through the `had_input`/[`IdlePolicy::on_input`] path
+    /// (see [`crate::app::VolumeState::wakes_idle`]'s doc comment for why
+    /// that's a *separate*, event-driven wake), so a mute/zero reading
+    /// that arrived between ticks must still surface here rather than
+    /// waiting for the next real input. A frame with no input then
+    /// evaluates, in order:
     ///
     /// - the screensaver tier: blanks (`power_transition = Some(Off)`) once
-    ///   `Active && at_home_root && now - last_input >= idle_timeout`.
+    ///   `Active && at_home_root && !mute_or_zero && now - last_input >=
+    ///   idle_timeout`. `mute_or_zero` gates this exactly like
+    ///   `at_home_root` already does -- design section 5.4: entering mute
+    ///   or zero must never itself cause a blank, and an idle timeout that
+    ///   elapses while already muted/zero must land on the dim floor
+    ///   (i.e. stay `On`), not `Off`.
     /// - the deep-sleep tier (independent of the screensaver's own
     ///   `PowerState`, per the module doc's "Deep sleep" section): fires
     ///   at most once, when `!deep_sleep_triggered && now - last_input >=
@@ -321,9 +336,55 @@ impl IdlePolicy {
     ///
     /// Either tier is permanently disabled by passing `None` for its
     /// timeout.
-    pub fn tick(&mut self, now: crate::platform::Instant, had_input: bool, at_home_root: bool, on_external_power: bool) -> IdleDecision {
+    ///
+    /// # The mute/zero floor (design section 5.4) -- "dim", not a new
+    /// `DisplayPower` variant
+    ///
+    /// This project's backlight is a plain digital GPIO (see
+    /// `firmware/src/st7789.c`'s `st7789_set_backlight`) -- there is no PWM
+    /// brightness control to build a literal dimmer physical level from.
+    /// "Dim" is therefore implemented as a *policy* floor, not a third
+    /// [`DisplayPower`] variant: the screen is simply never allowed to
+    /// reach `Off` while `mute_or_zero` holds, and an already-`Off` screen
+    /// self-heals straight back to `On` the moment `mute_or_zero` becomes
+    /// true (the block below, evaluated before the `had_input` early
+    /// return). Both read as ordinary `On` at the `DisplaySurface` level --
+    /// the behavioral distinction the design cares about (never blank,
+    /// don't extend the idle timer) is fully captured without it. If real
+    /// PWM brightness ever lands, this is the one place that would gain a
+    /// genuine dim level.
+    // Four independent boolean inputs, not a bitflags/enum bundle: each
+    // one is read from a different source at the call site (input poll,
+    // `App::is_at_home_root`, `PowerControl::on_external_power`,
+    // `App::volume_requires_dim_floor`) and named at every call site
+    // already (`policy.tick(now, had_input, at_home_root, ...)`), which is
+    // what this pedantic lint is really guarding against -- an opaque
+    // string of positional bools with no names in sight. Bundling them
+    // into a struct would cost every caller (and every existing test) a
+    // construction step for no readability gain here.
+    #[allow(clippy::fn_params_excessive_bools)]
+    pub fn tick(
+        &mut self,
+        now: crate::platform::Instant,
+        had_input: bool,
+        at_home_root: bool,
+        on_external_power: bool,
+        mute_or_zero: bool,
+    ) -> IdleDecision {
         let last_input = *self.last_input.get_or_insert(now);
         let mut decision = IdleDecision::default();
+
+        // The mute/zero floor: an already-blanked screen must never stay
+        // blank once the model enters muted/zero (design section 5.4) --
+        // checked unconditionally, ahead of the `had_input` early return,
+        // since a volume-driven promotion is not "input" and must not
+        // reset `last_input` (see `VolumeState::wakes_idle`'s doc comment:
+        // that's the separate, event-driven "wakes to full" case, which
+        // goes through the ordinary `on_input`/`had_input` path instead).
+        if self.power_state == PowerState::Asleep && mute_or_zero {
+            self.power_state = PowerState::Active;
+            decision.power_transition = Some(DisplayPower::On);
+        }
 
         if had_input {
             self.last_input = Some(now);
@@ -331,7 +392,11 @@ impl IdlePolicy {
         }
 
         if let Some(idle_timeout) = self.idle_timeout {
-            if self.power_state == PowerState::Active && at_home_root && now.saturating_duration_since(last_input) >= idle_timeout {
+            if self.power_state == PowerState::Active
+                && at_home_root
+                && !mute_or_zero
+                && now.saturating_duration_since(last_input) >= idle_timeout
+            {
                 self.power_state = PowerState::Asleep;
                 decision.power_transition = Some(DisplayPower::Off);
             }
@@ -497,8 +562,19 @@ impl Runner {
         // `IdlePolicy::tick` updates `last_input` (if `had_input`) and
         // evaluates both timeout tiers (if not) -- see its doc comment.
         // Called every step regardless of `had_input`, mirroring the
-        // module doc's pseudocode.
-        let decision = self.idle.tick(frame_start, had_input, app.is_at_home_root(), platform.power().on_external_power());
+        // module doc's pseudocode. `mute_or_zero` reads
+        // `App::volume_requires_dim_floor` fresh every step -- the
+        // emulator has no volume-event source of its own (see
+        // `.planning/design/2026-09-07-volume-on-display.md` section 5.5),
+        // but this keeps the same shared `IdlePolicy` code path exercised
+        // by both callers, per that section's requirement.
+        let decision = self.idle.tick(
+            frame_start,
+            had_input,
+            app.is_at_home_root(),
+            platform.power().on_external_power(),
+            app.volume_requires_dim_floor(),
+        );
         if let Some(power) = decision.power_transition {
             match platform.display().set_power(power) {
                 Ok(()) => self.power_errors.on_ok(),
@@ -1342,7 +1418,7 @@ mod idle_policy_tests {
         // first frame.
         let mut policy = IdlePolicy::new(Some(Duration::from_secs(60)), None);
         let far_future = Instant::from_micros(1_000_000_000);
-        let decision = policy.tick(far_future, false, true, true);
+        let decision = policy.tick(far_future, false, true, true, false);
         assert_eq!(decision.power_transition, None, "the first tick must establish the baseline, not read as already-idle");
         assert_eq!(policy.display_power(), DisplayPower::On);
     }
@@ -1352,18 +1428,18 @@ mod idle_policy_tests {
         let idle_timeout = Duration::from_secs(60);
         let mut policy = IdlePolicy::new(Some(idle_timeout), None);
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, true, true); // establishes baseline
+        policy.tick(t0, false, true, true, false); // establishes baseline
 
-        let still_before = policy.tick(t0 + Duration::from_secs(59), false, true, true);
+        let still_before = policy.tick(t0 + Duration::from_secs(59), false, true, true, false);
         assert_eq!(still_before.power_transition, None);
         assert_eq!(policy.display_power(), DisplayPower::On);
 
-        let crosses = policy.tick(t0 + idle_timeout, false, true, true);
+        let crosses = policy.tick(t0 + idle_timeout, false, true, true, false);
         assert_eq!(crosses.power_transition, Some(DisplayPower::Off));
         assert_eq!(policy.display_power(), DisplayPower::Off);
 
         // Must not repeat the transition on a later tick while still idle.
-        let later = policy.tick(t0 + idle_timeout + Duration::from_secs(1), false, true, true);
+        let later = policy.tick(t0 + idle_timeout + Duration::from_secs(1), false, true, true, false);
         assert_eq!(later.power_transition, None, "already Asleep -- no repeat transition");
     }
 
@@ -1372,8 +1448,8 @@ mod idle_policy_tests {
         let idle_timeout = Duration::from_secs(60);
         let mut policy = IdlePolicy::new(Some(idle_timeout), None);
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, false, true);
-        let decision = policy.tick(t0 + Duration::from_secs(1000), false, false, true);
+        policy.tick(t0, false, false, true, false);
+        let decision = policy.tick(t0 + Duration::from_secs(1000), false, false, true, false);
         assert_eq!(decision.power_transition, None, "must never arm off Home root");
         assert_eq!(policy.display_power(), DisplayPower::On);
     }
@@ -1382,8 +1458,8 @@ mod idle_policy_tests {
     fn idle_timeout_none_never_blanks() {
         let mut policy = IdlePolicy::new(None, None);
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, true, true);
-        let decision = policy.tick(t0 + Duration::from_secs(10_000), false, true, true);
+        policy.tick(t0, false, true, true, false);
+        let decision = policy.tick(t0 + Duration::from_secs(10_000), false, true, true, false);
         assert_eq!(decision.power_transition, None);
         assert_eq!(policy.display_power(), DisplayPower::On);
     }
@@ -1393,8 +1469,8 @@ mod idle_policy_tests {
         let idle_timeout = Duration::from_secs(60);
         let mut policy = IdlePolicy::new(Some(idle_timeout), None);
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, true, true);
-        policy.tick(t0 + idle_timeout, false, true, true);
+        policy.tick(t0, false, true, true, false);
+        policy.tick(t0 + idle_timeout, false, true, true, false);
         assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
 
         assert!(policy.on_input(), "waking from Asleep must report true (caller must swallow this input)");
@@ -1403,22 +1479,72 @@ mod idle_policy_tests {
         assert!(!policy.on_input(), "already Active -- must not report a wake a second time");
     }
 
+    // --- Design `.planning/design/2026-09-07-volume-on-display.md`
+    // section 5.4's `mute_or_zero` floor, at the `IdlePolicy` level ---
+
+    #[test]
+    fn mute_or_zero_prevents_blanking_even_past_the_idle_timeout() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+
+        let decision = policy.tick(t0 + idle_timeout, false, true, true, true);
+        assert_eq!(decision.power_transition, None, "must not blank while mute_or_zero holds");
+        assert_eq!(policy.display_power(), DisplayPower::On);
+    }
+
+    #[test]
+    fn mute_or_zero_promotes_an_already_asleep_policy_back_to_on() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+        policy.tick(t0 + idle_timeout, false, true, true, false);
+        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
+
+        let decision = policy.tick(t0 + idle_timeout + Duration::from_secs(1), false, true, true, true);
+        assert_eq!(decision.power_transition, Some(DisplayPower::On), "an already-blank display must self-heal once mute_or_zero holds");
+        assert_eq!(policy.display_power(), DisplayPower::On);
+    }
+
+    #[test]
+    fn mute_or_zero_promotion_does_not_extend_the_idle_timer() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+        policy.tick(t0 + idle_timeout, false, true, true, false);
+        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
+
+        // Promote back on while mute/zero holds...
+        policy.tick(t0 + idle_timeout + Duration::from_secs(1), false, true, true, true);
+        assert_eq!(policy.display_power(), DisplayPower::On);
+
+        // ...then un-mute with no other activity: the very next tick must
+        // blank again almost immediately (the original idle timeout has
+        // already long elapsed since `t0`) -- the promotion above must not
+        // have reset `last_input`.
+        let decision = policy.tick(t0 + idle_timeout + Duration::from_secs(2), false, true, true, false);
+        assert_eq!(decision.power_transition, Some(DisplayPower::Off), "un-muting must not have extended the idle timer");
+    }
+
     #[test]
     fn input_while_active_resets_the_idle_clock() {
         let idle_timeout = Duration::from_secs(60);
         let mut policy = IdlePolicy::new(Some(idle_timeout), None);
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, true, true);
+        policy.tick(t0, false, true, true, false);
 
         // Input arrives just before the timeout would have fired.
         let just_before = t0 + Duration::from_secs(59);
         assert!(!policy.on_input(), "already Active");
-        policy.tick(just_before, true, true, true);
+        policy.tick(just_before, true, true, true, false);
 
         // A full `idle_timeout` after the ORIGINAL baseline (t0) has now
         // passed, but only ~1s has passed since the reset -- must not
         // blank yet.
-        let decision = policy.tick(t0 + idle_timeout + Duration::from_millis(500), false, true, true);
+        let decision = policy.tick(t0 + idle_timeout + Duration::from_millis(500), false, true, true, false);
         assert_eq!(decision.power_transition, None, "the idle clock must have reset on the input at `just_before`, not stayed anchored to t0");
     }
 
@@ -1427,12 +1553,12 @@ mod idle_policy_tests {
         let deep_sleep_timeout = Duration::from_secs(600);
         let mut policy = IdlePolicy::new(None, Some(deep_sleep_timeout));
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, true, false);
+        policy.tick(t0, false, true, false, false);
 
-        let decision = policy.tick(t0 + deep_sleep_timeout, false, true, false);
+        let decision = policy.tick(t0 + deep_sleep_timeout, false, true, false, false);
         assert!(decision.enter_deep_sleep);
 
-        let again = policy.tick(t0 + deep_sleep_timeout + Duration::from_secs(1), false, true, false);
+        let again = policy.tick(t0 + deep_sleep_timeout + Duration::from_secs(1), false, true, false, false);
         assert!(!again.enter_deep_sleep, "must fire at most once");
     }
 
@@ -1441,8 +1567,8 @@ mod idle_policy_tests {
         let deep_sleep_timeout = Duration::from_secs(600);
         let mut policy = IdlePolicy::new(None, Some(deep_sleep_timeout));
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, true, true);
-        let decision = policy.tick(t0 + deep_sleep_timeout, false, true, true);
+        policy.tick(t0, false, true, true, false);
+        let decision = policy.tick(t0 + deep_sleep_timeout, false, true, true, false);
         assert!(!decision.enter_deep_sleep);
     }
 
@@ -1450,8 +1576,8 @@ mod idle_policy_tests {
     fn deep_sleep_timeout_none_never_fires() {
         let mut policy = IdlePolicy::new(None, None);
         let t0 = Instant::from_micros(0);
-        policy.tick(t0, false, true, false);
-        let decision = policy.tick(t0 + Duration::from_secs(100_000), false, true, false);
+        policy.tick(t0, false, true, false, false);
+        let decision = policy.tick(t0 + Duration::from_secs(100_000), false, true, false, false);
         assert!(!decision.enter_deep_sleep);
     }
 }

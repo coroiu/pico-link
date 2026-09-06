@@ -287,6 +287,19 @@ pub struct PlUi {
     /// (there, input poll and idle tick happen in the same call; here they
     /// are necessarily two separate C calls per frame).
     input_since_last_tick: bool,
+    /// Set by [`pl_ui_push_event`] whenever a `VolumeChanged` event arrives
+    /// whose [`pico_link_core::app::VolumeState::wakes_idle`] is `true`
+    /// (design `.planning/design/2026-09-07-volume-on-display.md` section
+    /// 5.3: a non-host source that isn't itself muted/zero) -- consumed
+    /// (reset to `false`, OR'd into `had_input`) by the next [`pl_ui_tick`]
+    /// call, the same deferred-flag shape [`PlUi::input_since_last_tick`]
+    /// already uses and for the identical reason: `pl_ui_push_event` has
+    /// no clock, only `pl_ui_tick`'s `now_us` does, so "extend the idle
+    /// timer" can only take effect at the next tick. The immediate
+    /// Asleep -> Active wake itself (`IdlePolicy::on_input`) is applied
+    /// synchronously in `pl_ui_push_event`, not deferred -- only the
+    /// clock-dependent `last_input` reset waits for `pl_ui_tick`.
+    volume_wake_since_last_tick: bool,
     /// Count of `pl_ui_input`/`pl_ui_push_event` calls that carried a tag
     /// value with no corresponding `PlIntentTag`/`PlEventTag` variant --
     /// i.e. a malformed or garbage discriminant, most plausibly arriving via
@@ -355,6 +368,7 @@ pub extern "C" fn pl_ui_create(width: u32, height: u32) -> *mut PlUi {
         app: App::new(width, height),
         idle: IdlePolicy::new(Some(DEFAULT_IDLE_TIMEOUT), None),
         input_since_last_tick: false,
+        volume_wake_since_last_tick: false,
         malformed_tag_count: 0,
         last_damage_rects: [PlDamageRect { x: 0, y: 0, w: 0, h: 0 }; 1],
     };
@@ -557,14 +571,23 @@ pub unsafe extern "C" fn pl_ui_input(ui: *mut PlUi, intents: *const PlIntent, co
 ///
 /// Also arms/evaluates the idle-screensaver tier for this frame (see
 /// [`IdlePolicy::tick`]): consumes [`PlUi::input_since_last_tick`] and
-/// updates the idle clock accordingly. `on_external_power` is hardcoded to
-/// `true` -- the firmware has no external-power sense yet (see the design
-/// doc's §5.2) and this instance's `deep_sleep_timeout` is always `None`
-/// (set in [`pl_ui_create`]), so the deep-sleep tier can never actually
-/// fire regardless of this value; it exists only so `IdlePolicy::tick`'s
-/// signature doesn't need a second, firmware-only variant. The resulting
-/// power level is read separately via [`pl_ui_display_power`] -- this
-/// function does not report it.
+/// [`PlUi::volume_wake_since_last_tick`] (OR'd together into `had_input` --
+/// design `.planning/design/2026-09-07-volume-on-display.md` section
+/// 5.1/5.3: a sink/device volume change extends the idle timer exactly
+/// like ordinary input does) and updates the idle clock accordingly.
+/// `mute_or_zero` reads [`pico_link_core::app::App::volume_requires_dim_floor`]
+/// fresh every tick -- this is what makes design section 5.4's "never
+/// fully blank while muted/zero" rule apply on the real target, not just
+/// the emulator (see [`IdlePolicy::tick`]'s doc comment for the mechanism;
+/// this is the ONE call site that matters for that guarantee, since the
+/// firmware never runs `pico_link_core::run::Runner`). `on_external_power`
+/// is hardcoded to `true` -- the firmware has no external-power sense yet
+/// (see the design doc's §5.2) and this instance's `deep_sleep_timeout` is
+/// always `None` (set in [`pl_ui_create`]), so the deep-sleep tier can
+/// never actually fire regardless of this value; it exists only so
+/// `IdlePolicy::tick`'s signature doesn't need a second, firmware-only
+/// variant. The resulting power level is read separately via
+/// [`pl_ui_display_power`] -- this function does not report it.
 ///
 /// # Safety
 ///
@@ -577,11 +600,12 @@ pub unsafe extern "C" fn pl_ui_tick(ui: *mut PlUi, now_us: u64) {
     }
     // SAFETY: caller contract above.
     let ui = &mut *ui;
-    let had_input = core::mem::take(&mut ui.input_since_last_tick);
+    let had_input = core::mem::take(&mut ui.input_since_last_tick) || core::mem::take(&mut ui.volume_wake_since_last_tick);
     let now = pico_link_core::platform::Instant::from_micros(now_us);
+    let mute_or_zero = ui.app.volume_requires_dim_floor();
     // `enter_deep_sleep` is deliberately ignored -- see the doc comment
     // above for why it can never be `true` here.
-    let _decision = ui.idle.tick(now, had_input, ui.app.is_at_home_root(), true);
+    let _decision = ui.idle.tick(now, had_input, ui.app.is_at_home_root(), true, mute_or_zero);
     ui.app.tick(now_us);
 }
 
@@ -1736,7 +1760,39 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                     return;
                 }
             };
-            Event::VolumeChanged { level: payload.level, muted: payload.muted != 0, source: source.into() }
+            let volume =
+                pico_link_core::app::VolumeState { level: payload.level, muted: payload.muted != 0, source: source.into() };
+            // Design `.planning/design/2026-09-07-volume-on-display.md`
+            // section 5.1/5.3: a non-host source that isn't itself
+            // muted/zero wakes the display to full and extends the idle
+            // timer -- applied HERE (not deferred to `pl_ui_tick`)
+            // because this is the site that actually observes the event,
+            // and because `VolumeState::wakes_idle` needs the event's own
+            // fields, not just the model's already-folded state. The
+            // Asleep -> Active flip itself needs no clock (`on_input`),
+            // but extending `last_input` does (`pl_ui_tick`'s `now_us`) --
+            // see `PlUi::volume_wake_since_last_tick`'s doc comment for why
+            // that half is deferred. A host-sourced or muted/zero reading
+            // does neither: section 5.4 outranks 5.3, and a host event is
+            // never evidence of a human at the device (section 5.2).
+            if volume.wakes_idle() {
+                ui.idle.on_input();
+                ui.volume_wake_since_last_tick = true;
+            } else if volume.muted || volume.level == 0 {
+                // Section 5.4's floor, applied immediately rather than
+                // waiting for the next `pl_ui_tick` -- an already-blanked
+                // display must never sit dark once a mute/zero reading
+                // arrives, from ANY source (including host). `on_input`
+                // only flips the power level; it never touches
+                // `last_input`, so this deliberately does NOT extend the
+                // idle timer (no `volume_wake_since_last_tick` set here) --
+                // `IdlePolicy::tick`'s own `mute_or_zero` check is what
+                // then holds the display up for as long as the mute/zero
+                // reading persists (see its doc comment), independent of
+                // this one-off promotion.
+                ui.idle.on_input();
+            }
+            Event::VolumeChanged { level: volume.level, muted: volume.muted, source: volume.source }
         }
     };
     ui.app.handle_event(core_event);
@@ -2524,6 +2580,131 @@ mod tests {
                 Some(64),
                 "volume must survive a disconnect -- it is not link-lifetime state (design section 7)"
             );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Builds a `VolumeChanged` [`PlEvent`] with the given fields -- shared
+    /// by the wake/dim-floor tests below.
+    fn volume_event(level: u8, muted: bool, source: PlVolumeSource) -> PlEvent {
+        PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::VolumeChanged as u32,
+            payload: PlEventPayload { volume_changed: PlVolumeChangedPayload { level, muted: u8::from(muted), source: source as u8 } },
+        }
+    }
+
+    // --- Design `.planning/design/2026-09-07-volume-on-display.md`
+    // section 5's wake policy, proven through the REAL FFI entry points
+    // (`pl_ui_push_event`/`pl_ui_tick`), not just `IdlePolicy` directly --
+    // section 5.5's trap is that a rule proven only against
+    // `pico_link_core::run` never runs on the firmware, which never calls
+    // `Runner::step` at all. These are the tests that close that gap. ---
+
+    #[test]
+    fn a_host_volume_change_does_not_wake_and_does_not_extend_the_idle_timer() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe {
+            pl_ui_tick(ui, 0);
+            pl_ui_tick(ui, idle_timeout_us);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "sanity: asleep");
+
+            // A host-originated volume change while blanked: per section
+            // 5.1/5.2, a host event is never evidence of a human at the
+            // device (mixer apps, ducking, a locked machine's alarm) -- it
+            // must not wake the display, unlike the sink-originated case
+            // below.
+            pl_ui_push_event(ui, volume_event(80, false, PlVolumeSource::Host));
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "a host volume change must not wake the display");
+
+            pl_ui_tick(ui, idle_timeout_us + 1);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "a host volume change must not extend the idle timer either");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn a_sink_volume_change_wakes_the_display_to_full_and_extends_the_idle_timer() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe {
+            pl_ui_tick(ui, 0);
+            pl_ui_tick(ui, idle_timeout_us);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "sanity: asleep");
+
+            // Section 5.3: the headphones' own dial is the one case where a
+            // human acted with no display in front of them -- must wake
+            // immediately, before the next tick even runs.
+            pl_ui_push_event(ui, volume_event(80, false, PlVolumeSource::Sink));
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::On, "a sink volume change must wake the display immediately, before the next tick");
+
+            // And it must extend the idle timer -- one more full idle
+            // timeout from THIS tick, not from the original `last_input`,
+            // must be required before it blanks again.
+            pl_ui_tick(ui, idle_timeout_us + 1);
+            assert!(
+                pl_ui_display_power(ui) == PlDisplayPower::On,
+                "the sink-originated wake must reset the idle clock, not just flip the level once"
+            );
+            pl_ui_tick(ui, 2 * idle_timeout_us + 1);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "it must still blank again once a full idle timeout elapses from the wake");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn muted_from_any_source_never_lets_an_already_blank_display_stay_blank() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe {
+            pl_ui_tick(ui, 0);
+            pl_ui_tick(ui, idle_timeout_us);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "sanity: asleep");
+
+            // Section 5.4: a HOST-originated mute must still self-heal an
+            // already-blanked display -- the "never fully blank while a
+            // muted banner shows" rule (section 6.1) cannot lapse just
+            // because the screen already went dark first.
+            pl_ui_push_event(ui, volume_event(0, true, PlVolumeSource::Host));
+            assert!(
+                pl_ui_display_power(ui) == PlDisplayPower::On,
+                "a host mute must promote an already-blank display back on, even though a host volume CHANGE alone (section 5.1) would not have woken it"
+            );
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn muted_never_re_blanks_at_the_next_idle_timeout_while_it_holds() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe {
+            pl_ui_tick(ui, 0);
+            pl_ui_push_event(ui, volume_event(0, true, PlVolumeSource::Sink));
+            pl_ui_tick(ui, idle_timeout_us);
+            assert!(
+                pl_ui_display_power(ui) == PlDisplayPower::On,
+                "the screensaver must never blank while muted holds, even once a full idle timeout elapses (section 5.4's floor)"
+            );
+
+            // And once un-muted with no further activity, the ordinary
+            // screensaver resumes promptly -- muting must not have
+            // extended the idle timer (section 5.4's "no" in the table).
+            pl_ui_push_event(ui, volume_event(50, false, PlVolumeSource::Host));
+            pl_ui_tick(ui, idle_timeout_us + 1);
+            assert!(
+                pl_ui_display_power(ui) == PlDisplayPower::Off,
+                "un-muting must not have reset the idle clock -- it should blank again almost immediately, not need another full timeout"
+            );
+
             pl_ui_destroy(ui);
         }
     }
