@@ -211,4 +211,12 @@ void pl_bt_debug_disconnect(void);
 // ("Reentrancy") for the full rationale.
 void pl_bt_enqueue_persist_write(void);
 
+// Bead pico-link-7jol.5: same idiom as pl_bt_enqueue_persist_write above,
+// for persist.c's LDAC-quality settings write instead of a pairing write
+// -- see persist.h's doc comment on pl_persist_request_ldac_quality/
+// pl_persist_execute_pending_ldac_quality_write for the full rationale.
+// Called from persist.c's pl_persist_service() (thread context, the
+// superloop).
+void pl_bt_enqueue_ldac_quality_write(void);
+
 #endif // PL_BT_H

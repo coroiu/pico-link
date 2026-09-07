@@ -68,7 +68,7 @@ fn main() {
         "1_connected_nominal",
         &HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+            CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 909, adaptive: false } },
         )
         .with_stat_line("USB 48k 24-bit"),
     );
@@ -78,7 +78,7 @@ fn main() {
         "2_connected_idle",
         &HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Idle },
+            CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Idle { adaptive: false } },
         )
         .with_stat_line("USB 48k 24-bit"),
     );
@@ -91,7 +91,7 @@ fn main() {
             CodecStatus::Connected {
                 word: "SBC".into(),
                 fallback: Some("Headphones don't support LDAC".into()),
-                bitrate: BitrateStatus::Kbps(328),
+                bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false },
             },
         )
         .with_stat_line("USB 48k 24-bit"),
@@ -105,7 +105,7 @@ fn main() {
             CodecStatus::Connected {
                 word: "SBC".into(),
                 fallback: Some("Headphones don't support LDAC".into()),
-                bitrate: BitrateStatus::Kbps(328),
+                bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false },
             },
         )
         .with_volume(Some(HeroVolume { percent: 42, muted: true, source: HeroVolumeSource::Host }))
@@ -122,7 +122,7 @@ fn main() {
         "6_aptx_hd_descender",
         &HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: "aptX HD".into(), fallback: None, bitrate: BitrateStatus::Kbps(576) },
+            CodecStatus::Connected { word: "aptX HD".into(), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 576, adaptive: false } },
         )
         .with_stat_line("USB 48k 24-bit"),
     );
@@ -136,7 +136,7 @@ fn main() {
             CodecStatus::Connected {
                 word: "aptX HD".into(),
                 fallback: Some("Headphones don't support aptX Adaptive".into()),
-                bitrate: BitrateStatus::Kbps(276),
+                bitrate: BitrateStatus::Kbps { kbps: 276, adaptive: false },
             },
         )
         .with_stat_line("USB 48k 24-bit"),
@@ -147,7 +147,7 @@ fn main() {
         "8_long_device_name",
         &HeroStatusView::new(
             "Sennheiser Momentum 4 Wireless Over-Ear Headphones",
-            CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Kbps(990) },
+            CodecStatus::Connected { word: "LDAC".into(), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 990, adaptive: false } },
         )
         .with_stat_line("USB 48k 24-bit"),
     );

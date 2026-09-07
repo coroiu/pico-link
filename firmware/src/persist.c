@@ -196,6 +196,15 @@ static volatile bool s_urgent;
 // pending queue and potentially crowding out a real scan/connect request.
 static volatile bool s_write_enqueued;
 
+// Bead pico-link-7jol.5: a SECOND, independent staging slot for per-device
+// SETTINGS writes (today, only ldac_quality) -- see persist.h's doc
+// comment on pl_persist_request_ldac_quality for why this is not folded
+// into s_pending/s_pending_addr above.
+static bool s_settings_pending;
+static uint8_t s_settings_pending_addr[6];
+static uint8_t s_settings_pending_ldac_quality;
+static volatile bool s_settings_write_enqueued;
+
 // Unconditional (NOT #ifndef NDEBUG-gated) firmware/storage-region collision
 // check -- replaces btstack_flash_bank.c:53-58's assert, which pico-sdk's
 // forced-Release build (CMAKE_BUILD_TYPE unset -> NDEBUG defined) silently
@@ -847,31 +856,81 @@ bool pl_persist_forget_device(const uint8_t addr[6]) {
 }
 
 void pl_persist_service(void) {
-    if (!s_pending) {
+    // Bead pico-link-7jol.5: services BOTH staging slots on the same
+    // "not streaming" gate -- they are otherwise fully independent (no
+    // shared settle timer, no shared enqueued flag), see
+    // s_settings_pending's doc comment for why they're not merged.
+    if (s_pending && !s_write_enqueued && !(pl_usb_audio_streaming() || pl_a2dp_streaming())) {
+        bool due;
+        if (s_urgent) {
+            due = true;
+        } else {
+            uint64_t now_us = time_us_64();
+            due = (now_us - s_pending_since_us >= PL_PERSIST_SETTLE_US) &&
+                  (!s_have_last_write || (now_us - s_last_write_us >= PL_PERSIST_MIN_INTERVAL_US));
+        }
+        if (due) {
+            // Code-review finding 1: no direct flash access here any more
+            // -- only enqueues onto bt.c's existing pending-queue/
+            // heartbeat mechanism (see pl_persist_execute_pending_write's
+            // doc comment above for the full rationale). s_write_enqueued
+            // guards against flooding that queue on every subsequent
+            // superloop iteration before the heartbeat (up to 100ms
+            // later) actually drains this request.
+            s_write_enqueued = true;
+            pl_bt_enqueue_persist_write();
+        }
+    }
+    if (s_settings_pending && !s_settings_write_enqueued && !(pl_usb_audio_streaming() || pl_a2dp_streaming())) {
+        // No settle/rate-limit window -- a manual pick is already the
+        // debounced event (design sec 5: "applies live", the user pressed
+        // A once); nothing to coalesce a burst of.
+        s_settings_write_enqueued = true;
+        pl_bt_enqueue_ldac_quality_write();
+    }
+}
+
+// Bead pico-link-7jol.5. See persist.h's doc comment.
+void pl_persist_request_ldac_quality(const uint8_t addr[6], uint8_t ldac_quality) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    memcpy(s_settings_pending_addr, addr, 6);
+    s_settings_pending_ldac_quality = ldac_quality;
+    s_settings_pending = true;
+    restore_interrupts(irq_state);
+}
+
+// Bead pico-link-7jol.5. See persist.h's doc comment.
+void pl_persist_execute_pending_ldac_quality_write(void) {
+    if (!s_settings_pending) {
+        s_settings_write_enqueued = false;
         return;
     }
     if (pl_usb_audio_streaming() || pl_a2dp_streaming()) {
+        // Gate flipped true again between enqueue and drain -- bail, leave
+        // the request pending; pl_persist_service() re-arms it the next
+        // time it sees a safe window (unconditionally, same as the
+        // pairing path above).
+        s_settings_write_enqueued = false;
         return;
     }
-    bool due;
-    if (s_urgent) {
-        due = true;
-    } else {
-        uint64_t now_us = time_us_64();
-        due = (now_us - s_pending_since_us >= PL_PERSIST_SETTLE_US) &&
-              (!s_have_last_write || (now_us - s_last_write_us >= PL_PERSIST_MIN_INTERVAL_US));
-    }
-    if (!due || s_write_enqueued) {
-        return;
-    }
-    // Code-review finding 1: no direct flash access here any more -- only
-    // enqueues onto bt.c's existing pending-queue/heartbeat mechanism (see
-    // pl_persist_execute_pending_write's doc comment above for the full
-    // rationale). s_write_enqueued guards against flooding that queue on
-    // every subsequent superloop iteration before the heartbeat (up to
-    // 100ms later) actually drains this request.
-    s_write_enqueued = true;
-    pl_bt_enqueue_persist_write();
+
+    uint8_t addr[6];
+    uint8_t ldac_quality;
+    uint32_t irq_state = save_and_disable_interrupts();
+    memcpy(addr, s_settings_pending_addr, 6);
+    ldac_quality = s_settings_pending_ldac_quality;
+    s_settings_pending = false;
+    restore_interrupts(irq_state);
+
+    // Read-then-write, both from this same async_context call, so this
+    // can never race a concurrent write to the same slot's codec_id --
+    // reads the device's EXISTING codec_id first so this write never
+    // clobbers it (this bead's UI only ever changes ldac_quality).
+    uint8_t existing_codec_id = 0;
+    uint8_t existing_ldac_quality_unused = 0;
+    pl_persist_get_device_settings(addr, &existing_codec_id, &existing_ldac_quality_unused);
+    pl_persist_write_device_settings(addr, existing_codec_id, ldac_quality);
+    s_settings_write_enqueued = false;
 }
 
 void pl_persist_request_urgent_flush(void) {

@@ -81,6 +81,7 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
     build_devices_screen, build_settings_screen, BtModel, Command, DeviceEntry, HomeFace, LinkState, ScreenId, VolumeSource, WizardPhase,
+    LDAC_QUALITY_ADAPTIVE,
 };
 use crate::input::NavIntent;
 
@@ -191,7 +192,25 @@ impl HomeView {
                 // long after the scan that first discovered it is gone.
                 let device_name =
                     model.paired.iter().find(|d| d.addr == codec.addr).map(|d| d.name.clone()).unwrap_or_default();
-                let bitrate = BitrateStatus::Kbps(codec.nominal_bitrate_bps / 1000);
+                // Bead pico-link-7jol.5, design §6 amendment 4: Home's
+                // bitrate line ALWAYS shows the live rate, in every mode.
+                // `ldac_live_kbps` is only ever populated while the
+                // connected codec is LDAC (see that field's doc comment),
+                // so a non-LDAC codec here always falls through to its own
+                // nominal figure, honestly -- there is no live figure to
+                // ask for on any other codec today. `adaptive` is the
+                // connected device's *stored* quality pick (`4` ==
+                // Adaptive), not a per-frame "did it just step" flag --
+                // see `BitrateStatus`'s own doc comment.
+                let is_ldac = codec.word == "LDAC";
+                let device_ldac_quality = model.paired.iter().find(|d| d.addr == codec.addr).map_or(0, |d| d.ldac_quality);
+                // Never tag a fallback codec (design table: "Not LDAC:
+                // ... no tag, ever") even though `ldac_quality` is a
+                // per-device stored preference that outlives a fallback to
+                // SBC.
+                let adaptive = is_ldac && device_ldac_quality == LDAC_QUALITY_ADAPTIVE;
+                let kbps = if is_ldac { model.ldac_live_kbps.unwrap_or(codec.nominal_bitrate_bps / 1000) } else { codec.nominal_bitrate_bps / 1000 };
+                let bitrate = BitrateStatus::Kbps { kbps, adaptive };
                 // Bead pico-link-du0 (design section 21 E17/C8): the
                 // stereo OUT level meter -- a straight field-for-field
                 // translation from `BtModel::out_level`'s own

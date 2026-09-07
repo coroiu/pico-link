@@ -205,17 +205,28 @@ pub enum CodecStatus {
 }
 
 /// The bitrate line's content, for a [`CodecStatus::Connected`] link.
+///
+/// Both variants carry `adaptive` (bead pico-link-7jol.5, design
+/// `.planning/design/2026-09-07-ldac-quality-selector.md` §6 amendment 4):
+/// whether the connected device's LDAC quality is currently set to
+/// Adaptive, which draws a dim `ADAPTIVE` tag after the number (or after
+/// "idle") — see [`HeroStatusView::render`]'s bitrate-line drawing. This is
+/// the *setting*, not a per-frame "did it just step" signal: it stays true
+/// for the whole time Adaptive is selected, tag included through every
+/// rung change (design §6.1: "the digits change, nothing else happens").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitrateStatus {
     /// Host connected but silent. Renders as "idle", **never** "0 kbps" —
     /// design section 6.1 state 4: a zero reads as broken, not quiet.
-    Idle,
-    /// A live figure, already smoothed and snapped to the nominal LDAC
-    /// ladder (330/660/909/990) by the caller per the design's numeric
-    /// rule — this widget only formats and right-aligns whatever it's
-    /// given, it does not smooth or snap itself (that needs a clock/
-    /// history the widget has no business owning).
-    Kbps(u32),
+    Idle { adaptive: bool },
+    /// A live figure. **Not** snapped to the nominal LDAC ladder
+    /// (330/660/909/990) — superseded by bead pico-link-7jol.5: libldac can
+    /// briefly report a non-ladder rate mid-step (bead pico-link-qx8's
+    /// trap), and the quality-selector design requires showing exactly
+    /// what the encoder reports. This widget only formats and left-aligns
+    /// whatever it's given, it does not smooth or snap itself (that needs
+    /// a clock/history the widget has no business owning).
+    Kbps { kbps: u32, adaptive: bool },
 }
 
 /// One live OUT-meter reading, as this widget's own render-time clock
@@ -431,9 +442,16 @@ impl HeroStatusView {
             CodecStatus::Connected { word, fallback, bitrate } => {
                 let key = key.fold(1).fold_str(word);
                 let key = key.fold_opt_str(fallback.as_deref());
+                // `adaptive` is drawn (the `ADAPTIVE` tag) on both arms --
+                // it must be folded on both, not just `Kbps`'s. Folding an
+                // undrawn value is one bug; NOT folding a drawn one
+                // silently freezes the tag on screen (design
+                // `.planning/design/2026-09-07-ldac-quality-selector.md`
+                // §9, "For Ruby" item 1 -- already bitten this project
+                // once, see `damage_keys_must_fold_only_what_is_drawn`).
                 match bitrate {
-                    BitrateStatus::Idle => key.fold(0),
-                    BitrateStatus::Kbps(kbps) => key.fold(1).fold(u64::from(*kbps)),
+                    BitrateStatus::Idle { adaptive } => key.fold(0).fold(u64::from(*adaptive)),
+                    BitrateStatus::Kbps { kbps, adaptive } => key.fold(1).fold(u64::from(*kbps)).fold(u64::from(*adaptive)),
                 }
             }
         };
@@ -674,9 +692,9 @@ impl Widget for HeroStatusView {
             let value_line_h = line_height(&value_font);
             let bitrate_y = hero_y + HERO_SLOT_HEIGHT + GAP_HERO_TO_BITRATE;
             if let CodecStatus::Connected { bitrate, .. } = &self.status {
-                let bitrate_text = match bitrate {
-                    BitrateStatus::Idle => String::from("idle"),
-                    BitrateStatus::Kbps(kbps) => format!("{kbps} kbps"),
+                let (bitrate_text, adaptive) = match bitrate {
+                    BitrateStatus::Idle { adaptive } => (String::from("idle"), *adaptive),
+                    BitrateStatus::Kbps { kbps, adaptive } => (format!("{kbps} kbps"), *adaptive),
                 };
                 let slot_rect = Rectangle::new(
                     Point::new(hero_body.top_left.x + LEFT_MARGIN, bitrate_y),
@@ -691,6 +709,34 @@ impl Widget for HeroStatusView {
                     FontColor::Transparent(palette::TEXT_PRIMARY),
                     &mut clipped,
                 );
+                // Bead pico-link-7jol.5, design §6 amendment 4: a dim,
+                // uppercase `ADAPTIVE` tag ~8px after the number's ink,
+                // inside the SAME `BITRATE_SLOT_WIDTH` slot cleared above
+                // -- never a status colour (this is a mode indicator, not
+                // a fault). Falls back to `AUTO` if the preferred tag
+                // would overrun the slot's remaining width (measured, not
+                // assumed -- design's own instruction). The number's
+                // position is unaffected either way: `TEXT_SECONDARY`
+                // never touches `LEFT_MARGIN`.
+                if adaptive {
+                    const ADAPTIVE_TAG_GAP: i32 = 8;
+                    const ADAPTIVE_TAG: &str = "ADAPTIVE";
+                    const ADAPTIVE_TAG_FALLBACK: &str = "AUTO";
+                    let label_font = font::label();
+                    let number_width = text_width(&value_font, &bitrate_text) as i32;
+                    let remaining = BITRATE_SLOT_WIDTH as i32 - number_width - ADAPTIVE_TAG_GAP;
+                    let tag_text = if text_width(&label_font, ADAPTIVE_TAG) as i32 <= remaining { ADAPTIVE_TAG } else { ADAPTIVE_TAG_FALLBACK };
+                    let label_h = line_height(&label_font);
+                    let tag_y = bitrate_y + (value_line_h - label_h) / 2;
+                    let _ = label_font.render_aligned(
+                        tag_text,
+                        Point::new(slot_rect.top_left.x + number_width + ADAPTIVE_TAG_GAP, tag_y),
+                        VerticalPosition::Top,
+                        HorizontalAlignment::Left,
+                        FontColor::Transparent(palette::TEXT_SECONDARY),
+                        &mut clipped,
+                    );
+                }
             }
 
             // --- Persistent banner slot: at most one, MUTED outranks
@@ -1072,7 +1118,7 @@ mod tests {
     fn nominal() -> HeroStatusView {
         HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 909, adaptive: false } },
         )
         .with_stat_line("USB 48k 24-bit")
     }
@@ -1116,7 +1162,7 @@ mod tests {
             CodecStatus::Connected {
                 word: String::from("SBC"),
                 fallback: Some(String::from("Headphones don't support LDAC")),
-                bitrate: BitrateStatus::Kbps(328),
+                bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false },
             },
         );
         let fb = render(&view);
@@ -1146,7 +1192,7 @@ mod tests {
     fn idle_bitrate_never_renders_a_literal_zero_kbps() {
         let view = HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Idle },
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Idle { adaptive: false } },
         );
         // Rendering must not panic on the idle path, and (checked via
         // chrome_contribution/is_fallback below) must not be mistaken for
@@ -1189,7 +1235,7 @@ mod tests {
             CodecStatus::Connected {
                 word: String::from("SBC"),
                 fallback: Some(String::from("Headphones don't support LDAC")),
-                bitrate: BitrateStatus::Kbps(328),
+                bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false },
             },
         );
         assert_eq!(view.active_banner(), Some(ActiveBanner::Fallback("Headphones don't support LDAC")));
@@ -1232,7 +1278,7 @@ mod tests {
             CodecStatus::Connected {
                 word: String::from("SBC"),
                 fallback: Some(String::from("Headphones don't support LDAC")),
-                bitrate: BitrateStatus::Kbps(328),
+                bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false },
             },
         )
         .with_volume(Some(HeroVolume { percent: 0, muted: true, source: HeroVolumeSource::Host }));
@@ -1261,7 +1307,7 @@ mod tests {
             CodecStatus::Connected {
                 word: String::from("SBC"),
                 fallback: Some(String::from("Headphones don't support LDAC")),
-                bitrate: BitrateStatus::Kbps(328),
+                bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false },
             },
         );
         let contribution = view.chrome_contribution(&test_ctx()).expect("hero widget always reports a contribution");
@@ -1303,7 +1349,7 @@ mod tests {
     fn rendering_a_long_device_name_does_not_panic_and_stays_left_of_the_right_margin() {
         let view = HeroStatusView::new(
             "Sennheiser Momentum 4 Wireless Over-Ear Headphones With An Extremely Long Marketing Name",
-            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 909, adaptive: false } },
         );
         let fb = render(&view);
         // No ink at all in the rightmost margin column of the name's row
@@ -1323,7 +1369,7 @@ mod tests {
     fn aptx_hd_hero_word_does_not_collide_with_the_bitrate_line_below_it() {
         let view = HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("aptX HD"), fallback: None, bitrate: BitrateStatus::Kbps(576) },
+            CodecStatus::Connected { word: String::from("aptX HD"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 576, adaptive: false } },
         );
         let fb = render(&view);
         // The bitrate slot is cleared to BACKGROUND immediately before
@@ -1374,7 +1420,7 @@ mod tests {
             CodecStatus::Connected {
                 word: String::from("SBC"),
                 fallback: Some(String::from("Headphones don't support LDAC")),
-                bitrate: BitrateStatus::Kbps(328),
+                bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false },
             },
         )
         .with_stat_line("USB 48k 24-bit");
@@ -1672,7 +1718,7 @@ mod tests {
 
         let frame1 = HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 909, adaptive: false } },
         )
         .with_out_level(Some(level));
 
@@ -1701,7 +1747,7 @@ mod tests {
         // this correct.
         let frame2 = HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps(328) },
+            CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false } },
         )
         .with_out_level(Some(level));
         inner.replace(frame2);
@@ -1735,7 +1781,7 @@ mod tests {
         let word_a = nominal();
         let word_b = HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+            CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 909, adaptive: false } },
         );
         assert_ne!(word_a.paint_key(&test_ctx()), word_b.paint_key(&test_ctx()), "a different codec word must change the key");
 
@@ -1744,14 +1790,14 @@ mod tests {
             CodecStatus::Connected {
                 word: String::from("LDAC"),
                 fallback: Some(String::from("reason")),
-                bitrate: BitrateStatus::Kbps(909),
+                bitrate: BitrateStatus::Kbps { kbps: 909, adaptive: false },
             },
         );
         assert_ne!(word_a.paint_key(&test_ctx()), fallback.paint_key(&test_ctx()), "a fallback reason must change the key");
 
         let bitrate = HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(328) },
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false } },
         );
         assert_ne!(word_a.paint_key(&test_ctx()), bitrate.paint_key(&test_ctx()), "a different bitrate must change the key");
 
@@ -1774,7 +1820,7 @@ mod tests {
 
         let no_stat = HeroStatusView::new(
             "Sony WH-1000XM5",
-            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps(909) },
+            CodecStatus::Connected { word: String::from("LDAC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 909, adaptive: false } },
         );
         assert_ne!(no_stat.paint_key(&test_ctx()), base.paint_key(&test_ctx()), "a stat line vs none must change the key");
     }

@@ -52,7 +52,7 @@ fn save_zoomed_png(app: &mut App, out_dir: &Path, name: &str) {
 }
 
 fn upsert(addr: [u8; 6], name: &str, mru_seq: u32) -> Event {
-    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq })
+    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality: 0 })
 }
 
 /// Home(1) -> Devices(2), same shape as `devices_screenshots.rs`'s own
@@ -80,8 +80,11 @@ fn main() {
     save_zoomed_png(&mut app, &out_dir, "01_connected_ldac");
 
     // --- Focus moved down to ADDRESS, proving the small-value font row
-    // and that focus traversal lands on every Readonly row. ---
-    app.handle_input(vec![NavIntent::Down, NavIntent::Down, NavIntent::Down, NavIntent::Down]);
+    // and that focus traversal lands on every Readonly row. Bead
+    // pico-link-7jol.5: the row order is now CODEC(0), QUALITY(1),
+    // SAMPLE RATE(2), USB IN(3), A2DP(4), ADDRESS(5) -- one more Down than
+    // before QUALITY existed. ---
+    app.handle_input(vec![NavIntent::Down, NavIntent::Down, NavIntent::Down, NavIntent::Down, NavIntent::Down]);
     save_zoomed_png(&mut app, &out_dir, "02_focus_on_address_row");
 
     // --- Focus on Forget this device (last row, red, the only pressable
@@ -91,15 +94,20 @@ fn main() {
 
     // --- X (drop): queues Command::Disconnect, then the link actually
     // drops -- refresh_stack must flip CODEC back to Automatic and the
-    // rail from `drop` to `link`, live, without leaving this screen. ---
-    app.handle_input(vec![NavIntent::Up, NavIntent::Up, NavIntent::Up, NavIntent::Up, NavIntent::Up]); // back to CODEC (row 0)
+    // rail from `drop` to `link`, live, without leaving this screen.
+    // QUALITY disappears too (design §2/§8: absent, not dim, once the
+    // stored ldac_quality is 0/never-chosen and the device is
+    // disconnected). ---
+    app.handle_input(vec![NavIntent::Up, NavIntent::Up, NavIntent::Up, NavIntent::Up, NavIntent::Up, NavIntent::Up]); // back to CODEC (row 0)
     app.handle_input(vec![NavIntent::ShortcutX]);
     app.poll_command(); // drain the queued Disconnect
     app.handle_event(Event::LinkStateChanged(LinkState::Idle));
     save_zoomed_png(&mut app, &out_dir, "04_disconnected_automatic_link_rail");
 
     // --- Forget confirm, reached through the device page (not Devices'
-    // X): proves the shared ConfirmView still opens correctly from here. ---
+    // X): proves the shared ConfirmView still opens correctly from here.
+    // QUALITY is gone now (disconnected, never chosen), so the page is
+    // back to 6 rows: CODEC, SAMPLE RATE, USB IN, A2DP, ADDRESS, Forget. ---
     app.handle_input(vec![NavIntent::Down, NavIntent::Down, NavIntent::Down, NavIntent::Down, NavIntent::Down]); // -> Forget row
     app.handle_input(vec![NavIntent::Select]);
     save_zoomed_png(&mut app, &out_dir, "05_forget_confirm_from_device_page");

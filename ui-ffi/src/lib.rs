@@ -1252,6 +1252,20 @@ pub struct PlVolumeChangedPayload {
     pub source: u8,
 }
 
+/// [`PlEvent`]'s payload when `tag == PlEventTag::LdacBitrateChanged`
+/// (bead pico-link-7jol.5, design `.planning/design/2026-09-07-ldac-
+/// quality-selector.md` §6). Pushed from `firmware/src/a2dp.c`'s
+/// `pl_a2dp_poll_ldac_bitrate` -- same once-per-superloop-iteration,
+/// push-only-on-change cadence as `PlLevelsChangedPayload`. Deliberately
+/// carries no `adaptive` flag: Home's `ADAPTIVE` tag is driven by the
+/// connected device's *stored* `ldac_quality` (the `PairedDeviceUpserted`
+/// echo), not a fact this event needs to duplicate.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlLdacBitrateChangedPayload {
+    pub kbps: u32,
+}
+
 /// Mirrors [`pico_link_core::StoreStatus`]'s four variants 1:1 (bead
 /// pico-link-cz0.6, M5 persistence). Explicit discriminants pinned for the
 /// same reason as [`PlLinkState`]'s -- see [`PlStoreLoadedPayload::status`]'s
@@ -1376,6 +1390,16 @@ pub struct PlPairedDeviceUpsertedPayload {
     /// doc comment in `core` -- never a wall clock, this board has no RTC).
     /// Ordering key for the eventual Devices screen (design section 4).
     pub mru_seq: u32,
+    /// The persisted LDAC quality pick, 1-based -- [`PairedDevice::
+    /// ldac_quality`]'s doc comment. Added by bead pico-link-7jol.5
+    /// (`.planning/design/2026-09-07-device-page-and-single-select-
+    /// picker.md` §2.2's option (a)): a non-additive shape change to an
+    /// EXISTING tag's payload (same class of change
+    /// [`PlDeviceDiscoveredPayload::class_of_device`]'s own addition was),
+    /// hence the [`PL_EVENT_ABI_VERSION`] bump 4 -> 5. This is the wire
+    /// shape the `QUALITY` row/picker's "check follows the stored echo,
+    /// never the press" rule depends on.
+    pub ldac_quality: u8,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::PairedDeviceForgotten`
@@ -1451,6 +1475,15 @@ pub enum PlEventTag {
     /// addition, same discipline `LevelsChanged` (tag 13, bead
     /// pico-link-du0) used for its own additive tag.
     VolumeChanged = 14,
+    /// Bead pico-link-7jol.5, design `.planning/design/2026-09-07-ldac-
+    /// quality-selector.md` §6: the LDAC encoder's live effective rate.
+    /// Purely additive -- see [`PlLdacBitrateChangedPayload`]'s doc
+    /// comment; [`PL_EVENT_ABI_VERSION`] is unchanged by THIS tag's own
+    /// addition (same discipline as `LevelsChanged`/`VolumeChanged`
+    /// above) -- the version bump this bead needed was for
+    /// `PlPairedDeviceUpsertedPayload` gaining `ldac_quality`, an existing
+    /// tag's payload, not this new one.
+    LdacBitrateChanged = 15,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1476,6 +1509,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             12 => Ok(PlEventTag::PairedStoreFull),
             13 => Ok(PlEventTag::LevelsChanged),
             14 => Ok(PlEventTag::VolumeChanged),
+            15 => Ok(PlEventTag::LdacBitrateChanged),
             _ => Err(()),
         }
     }
@@ -1513,6 +1547,9 @@ pub union PlEventPayload {
     /// Bead pico-link-4v2.5 (VT5). See [`PlVolumeChangedPayload`]'s doc
     /// comment.
     pub volume_changed: PlVolumeChangedPayload,
+    /// Bead pico-link-7jol.5. See [`PlLdacBitrateChangedPayload`]'s doc
+    /// comment.
+    pub ldac_bitrate_changed: PlLdacBitrateChangedPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -1537,7 +1574,13 @@ pub union PlEventPayload {
 // phase 2 rule 3: bumped 3 -> 4. PlDeviceDiscoveredPayload gained
 // `class_of_device` -- a non-additive shape change to an existing tag's
 // payload, same class of bump as both above (see that field's doc comment).
-pub const PL_EVENT_ABI_VERSION: u32 = 4;
+//
+// Bead pico-link-7jol.5, design `.planning/design/2026-09-07-device-page-
+// and-single-select-picker.md` §2.2 option (a): bumped 4 -> 5.
+// PlPairedDeviceUpsertedPayload gained `ldac_quality` -- a non-additive
+// shape change to an existing tag's payload, same class of bump as all
+// three above (see that field's doc comment).
+pub const PL_EVENT_ABI_VERSION: u32 = 5;
 
 /// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
@@ -1724,7 +1767,7 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             let payload = unsafe { event.payload.paired_device_upserted };
             let name_len = usize::from(payload.name_len).min(payload.name.len());
             let name = String::from_utf8_lossy(&payload.name[..name_len]).into_owned();
-            Event::PairedDeviceUpserted(PairedDevice { addr: payload.addr, name, mru_seq: payload.mru_seq })
+            Event::PairedDeviceUpserted(PairedDevice { addr: payload.addr, name, mru_seq: payload.mru_seq, ldac_quality: payload.ldac_quality })
         }
         PlEventTag::PairedDeviceForgotten => {
             // SAFETY: same as the `PairedDeviceUpserted` arm above.
@@ -1793,6 +1836,14 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                 ui.idle.on_input();
             }
             Event::VolumeChanged { level: volume.level, muted: volume.muted, source: volume.source }
+        }
+        PlEventTag::LdacBitrateChanged => {
+            // SAFETY: `tag` says this union currently holds
+            // `ldac_bitrate_changed`. Reading it is sound regardless of
+            // field values -- `kbps` is a plain `u32` with no validity
+            // invariant to violate.
+            let payload = unsafe { event.payload.ldac_bitrate_changed };
+            Event::LdacBitrateChanged { kbps: payload.kbps }
         }
     };
     ui.app.handle_event(core_event);
@@ -1876,6 +1927,13 @@ pub enum PlCommandTag {
     /// that constant's doc comment: the bump is reserved for non-additive
     /// changes to an *existing* tag's payload, which this is not).
     Disconnect = 7,
+    /// Bead pico-link-7jol.5, design `.planning/design/2026-09-07-ldac-
+    /// quality-selector.md` §5: user-initiated pin/Adaptive pick for one
+    /// device's LDAC quality, from the `QUALITY` picker's `A` handler.
+    /// Purely additive to the tag enum -- no existing payload shape
+    /// changed -- so this does not bump [`PL_COMMAND_ABI_VERSION`], same
+    /// reasoning as [`Disconnect`](Self::Disconnect)'s own addition.
+    SetDeviceLdacQuality = 8,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -1922,6 +1980,18 @@ pub struct PlAddrPayload {
     pub addr: [u8; 6],
 }
 
+/// [`PlCommand`]'s payload when `tag == PlCommandTag::SetDeviceLdacQuality`
+/// (bead pico-link-7jol.5). `ldac_quality` is 1-based, mirroring
+/// [`pico_link_core::app::PairedDevice::ldac_quality`]'s convention (`0` =
+/// never chosen, `1`/`2`/`3` = pinned 990/660/330 kbps, `4` = Adaptive) --
+/// `core` is the sole producer and always sends a value in `1..=4`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlSetDeviceLdacQualityPayload {
+    pub addr: [u8; 6],
+    pub ldac_quality: u8,
+}
+
 /// The union of every [`PlCommand`] payload shape -- mirrors
 /// [`PlEventPayload`]'s shape (one member per tag that carries data;
 /// `StartScan`/`None` carry none). Kept as a real union rather than a flat
@@ -1937,6 +2007,9 @@ pub union PlCommandPayload {
     pub connect: PlConnectPayload,
     /// See [`PlAddrPayload`]'s doc comment. Bead pico-link-4vb.6 (T2).
     pub addr: PlAddrPayload,
+    /// See [`PlSetDeviceLdacQualityPayload`]'s doc comment. Bead
+    /// pico-link-7jol.5.
+    pub set_device_ldac_quality: PlSetDeviceLdacQualityPayload,
 }
 
 /// ABI version [`PlCommand`] consumers (C call sites, i.e. `bt.c`'s poll
@@ -2042,6 +2115,11 @@ fn pl_command_from(command: Command) -> PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::Disconnect,
             payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+        },
+        Command::SetDeviceLdacQuality { addr, ldac_quality } => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::SetDeviceLdacQuality,
+            payload: PlCommandPayload { set_device_ldac_quality: PlSetDeviceLdacQualityPayload { addr, ldac_quality } },
         },
     }
 }
@@ -2330,10 +2408,10 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past VolumeChanged = 14, the highest legal PlEventTag as
-            // of bead pico-link-4v2.5 -- moved from 14 (one past the old
-            // highest, LevelsChanged = 13) when this bead added tag 14.
-            tag: 15,
+            // One past LdacBitrateChanged = 15, the highest legal PlEventTag
+            // as of bead pico-link-7jol.5 -- moved from 15 (one past the
+            // old highest, VolumeChanged = 14) when this bead added tag 15.
+            tag: 16,
             payload: bogus_payload,
         };
         unsafe {
@@ -2776,14 +2854,14 @@ mod tests {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::PairedDeviceUpserted as u32,
             payload: PlEventPayload {
-                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_old, name: [0u8; 32], name_len: 0, mru_seq: 1 },
+                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_old, name: [0u8; 32], name_len: 0, mru_seq: 1, ldac_quality: 0 },
             },
         };
         let upsert_new = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::PairedDeviceUpserted as u32,
             payload: PlEventPayload {
-                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_new, name, name_len: 3, mru_seq: 2 },
+                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_new, name, name_len: 3, mru_seq: 2, ldac_quality: 0 },
             },
         };
         let store_loaded = PlEvent {
@@ -2854,7 +2932,7 @@ mod tests {
         let upsert = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::PairedDeviceUpserted as u32,
-            payload: PlEventPayload { paired_device_upserted: PlPairedDeviceUpsertedPayload { addr, name, name_len: 2, mru_seq: 7 } },
+            payload: PlEventPayload { paired_device_upserted: PlPairedDeviceUpsertedPayload { addr, name, name_len: 2, mru_seq: 7, ldac_quality: 0 } },
         };
         let forget = PlEvent {
             version: PL_EVENT_ABI_VERSION,
@@ -2957,9 +3035,9 @@ mod tests {
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 15 -- one past VolumeChanged = 14, the highest legal PlEventTag
-        // as of bead pico-link-4v2.5.
-        assert!(PlEventTag::try_from(15u32).is_err());
+        // 16 -- one past LdacBitrateChanged = 15, the highest legal
+        // PlEventTag as of bead pico-link-7jol.5.
+        assert!(PlEventTag::try_from(16u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 

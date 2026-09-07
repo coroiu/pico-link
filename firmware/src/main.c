@@ -644,6 +644,12 @@ int main(void) {
         // ordering closes at the root.
 #ifndef PL_DIAG_SKIP_BT
         pl_a2dp_poll_levels(ui);
+        // Bead pico-link-7jol.5: same cadence/ordering rationale as
+        // pl_a2dp_poll_levels above, but this event carries no clock-
+        // dependent field, so placement relative to it doesn't matter --
+        // kept adjacent purely because both are "poll a live a2dp.c
+        // reading, push if changed" calls.
+        pl_a2dp_poll_ldac_bitrate(ui);
 #endif
 
         // Idle-screensaver seam (pico-link-i3e): a LEVEL, read once per

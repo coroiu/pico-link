@@ -104,4 +104,32 @@ uint32_t pl_codec_ldac_abr_steps_up(void);
 uint32_t pl_codec_ldac_abr_rail_hits(void);
 uint32_t pl_codec_ldac_abr_apply_fail(void);
 
+// Bead pico-link-7jol.5, design `.planning/design/2026-09-07-ldac-quality-
+// selector.md` §5: applies a manual quality pick to the CURRENTLY
+// established encoder, live, without waiting for a reconnect -- callable
+// from any context (only touches this file's own volatile ladder state,
+// no flash, no libldac handle access). A no-op if no LDAC encoder is live
+// (`s_ldac_encoder.handle == NULL`) -- the caller (bt.c) is expected to
+// have already checked pl_a2dp_is_connected_ldac(addr) first, but this
+// function stays defensive on its own. `ldac_quality_1based` uses the
+// same convention as pl_codec_ldac_set_quality (0 = never chosen, 1/2/3 =
+// pinned 990/660/330, 4 = Adaptive). Reuses pl_ldac_quality_to_initial_
+// state's ONE mapping function (sec 5.4: "do not scatter the policy") for
+// the adaptive-or-not decision; entering Adaptive starts the target from
+// wherever the ladder currently sits (no jump) so a2dp.c's decide loop
+// picks up from there on its next cycle.
+void pl_codec_ldac_pin_now(uint8_t ldac_quality_1based);
+
+// The live encoder's current effective bitrate, in kbps, or 0 if no LDAC
+// encoder is live. Updated only from encoder context (init(), and
+// immediately after each successful ldacBT_alter_eqmid_priority call in
+// the APPLY phase) -- NEVER by re-querying ldacBT_get_bitrate from a
+// different context, which would race the encoder's own concurrent use of
+// the handle (bead pico-link-qx8's "ask the library" doctrine applies at
+// the moment of the change, not on demand from elsewhere). Safe to read
+// from any context (single volatile word, same argument as
+// pl_codec_ldac_applied_rung). This is the fact `Event::LdacBitrateChanged`
+// carries to core -- see a2dp.c's pl_a2dp_poll_ldac_bitrate.
+uint32_t pl_codec_ldac_current_kbps(void);
+
 #endif // PICO_LINK_CODEC_LDAC_H

@@ -224,6 +224,31 @@ void pl_persist_request_urgent_flush(void);
 // centralized.
 pl_persist_write_result_t pl_persist_execute_pending_write(void);
 
+// Bead pico-link-7jol.5, design `.planning/design/2026-09-07-ldac-quality-
+// selector.md` §5.2: stages a per-device SETTINGS write (today, only
+// `ldac_quality`) -- a SEPARATE staging slot from
+// pl_persist_request_save_device's pairing-write one above, deliberately:
+// mixing a settings pick into the pairing slot's settle/rate-limit timers
+// would delay a "no confirm, applies live" UI action behind unrelated
+// pairing-write debouncing it has no reason to inherit. Same short-
+// critical-section pattern (RAM only, no flash) -- thread-context safe,
+// the same "one settle window, then pl_persist_service() flushes it" shape
+// as the pairing path, just with no settle delay: a user-initiated pick is
+// already the debounced event (there is no burst of these to coalesce).
+// `pl_persist_service()` (below) picks this up on the same "not
+// streaming" gate as every other flash write in this file.
+void pl_persist_request_ldac_quality(const uint8_t addr[6], uint8_t ldac_quality);
+
+// Performs the actual flash write for whatever settings save is currently
+// staged by pl_persist_request_ldac_quality -- same calling contract as
+// pl_persist_execute_pending_write (bt.c's pending-queue drain, async_
+// context ONLY), and the same "bails, leaving the request pending, if the
+// streaming gate flipped true again" behaviour. Reads the device's
+// EXISTING codec_id first (pl_persist_get_device_settings) so this write
+// can never clobber it -- `ldac_quality` is the only field this bead's UI
+// ever changes.
+void pl_persist_execute_pending_ldac_quality_write(void);
+
 // Andreas's ruling, 2026-09-01: writes the device record SYNCHRONOUSLY, as
 // part of establishing the connection -- see this header's module doc
 // (ORDERING) for the full rationale and the one carve-out
