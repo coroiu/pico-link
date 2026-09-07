@@ -8,8 +8,21 @@
 #include "pico/bootrom.h"
 #include "pico/stdio.h"
 #include "pico/stdlib.h"
+
+// Bead pico-link-fhf: a2dp.h (below, for pl_a2dp_debug_skip_media_ticks)
+// pulls in btstack.h, which collides with tusb.h's class/hid/hid_device.h
+// in any TU that includes both (identical `hid_report_type_t` enum member
+// names) -- see main.c's own doc comment on this exact conflict, first hit
+// there when CFG_TUD_HID was enabled (bead pico-link-47z.1). Same fix:
+// this TU calls no tud_hid_*() function directly (media keys go through
+// media_keys.c, which has its own TU with the real config), so force
+// CFG_TUD_HID off locally before pulling in tusb.h here.
+#include "tusb_config.h"
+#undef CFG_TUD_HID
+#define CFG_TUD_HID 0
 #include "tusb.h"
 
+#include "a2dp.h"
 #include "bt.h"
 #include "media_keys.h"
 #include "pl_prio.h"
@@ -131,6 +144,50 @@ static bool parse_connect_addr(const char *line, uint8_t addr[6]) {
     return byte_idx == 6 && *p == '\0';
 }
 
+// Bead pico-link-fhf, test A: parses "SKIPTICKS <K>" where <K> is a
+// non-negative decimal integer -- anything else (missing argument,
+// non-digit characters, empty digit string) is rejected outright, same
+// discipline as parse_connect_addr above. *out_ticks is only written on a
+// true return.
+//
+// Clamped to PL_DEBUG_SKIP_TICKS_MAX (code review, 2026-09-07, non-
+// blocking): the injection test only ever needs K=10 (~113ms of skipped
+// drain at the real ~11.3ms tick cadence); an unbounded K typed at the CDC
+// console -- or a garbled/malicious one -- could otherwise idle the drain
+// for minutes, well past PL_WDT_MEDIA's stall deadline, on a debug-only
+// path with no other guard. The accumulate-then-clamp order (rather than
+// rejecting outright) matches this file's "never fatal, never wedges"
+// contract for malformed input -- an oversized K still does SOMETHING
+// bounded rather than nothing.
+#define PL_DEBUG_SKIP_TICKS_MAX 1000u
+static bool parse_skip_ticks(const char *line, uint32_t *out_ticks) {
+    if (strncmp(line, "SKIPTICKS ", 10) != 0) {
+        return false;
+    }
+    const char *p = line + 10;
+    if (*p == '\0') {
+        return false;
+    }
+    // Saturating parse: once `value` reaches the clamp, stop advancing it
+    // (and pin it there) rather than let further digits keep multiplying --
+    // that would wrap a uint32_t on a long-enough digit string and could
+    // land back BELOW the clamp by chance, defeating the point of it.
+    uint32_t value = 0;
+    for (; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        if (value < PL_DEBUG_SKIP_TICKS_MAX) {
+            value = value * 10u + (uint32_t)(*p - '0');
+            if (value > PL_DEBUG_SKIP_TICKS_MAX) {
+                value = PL_DEBUG_SKIP_TICKS_MAX;
+            }
+        }
+    }
+    *out_ticks = value;
+    return true;
+}
+
 // Bead pico-link-4v2.1 (VT1): formats the feature unit's current state
 // (per-channel volume/mute plus the SET/GET call counters) into ONE line
 // and publishes it through pl_prio.h's slot 4 -- see that header's slot-4
@@ -219,6 +276,7 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
             if (s_line_len > 0) {
                 s_line[s_line_len] = '\0';
                 uint8_t connect_addr[6];
+                uint32_t skip_ticks;
                 if (strcmp(s_line, "BOOTSEL") == 0) {
                     // Bead pico-link-vu4: routes around pico-link-d74 (the
                     // vendor CONTROL transfer on interface 4 that STALLs on
@@ -233,6 +291,13 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                     pl_log("debug-remote: BOOTSEL -> reset_usb_boot(0, 0)\r\n");
                     reset_usb_boot(0, 0);
                     // unreachable -- reset_usb_boot() does not return.
+                } else if (parse_skip_ticks(s_line, &skip_ticks)) {
+                    // Bead pico-link-fhf, test A: one-shot injection, not
+                    // a NavIntent -- dispatched directly to a2dp.c's
+                    // debug counter, same "direct dispatch, not through
+                    // `out`" pattern as CONNECT below.
+                    pl_log("debug-remote: SKIPTICKS %lu -> dispatched\r\n", (unsigned long)skip_ticks);
+                    pl_a2dp_debug_skip_media_ticks(skip_ticks);
                 } else if (parse_connect_addr(s_line, connect_addr)) {
                     // Not a NavIntent -- dispatched directly to bt.c
                     // rather than going through `out`/pl_ui_input, since

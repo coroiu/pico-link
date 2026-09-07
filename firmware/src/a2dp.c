@@ -650,12 +650,36 @@ typedef struct {
 
     // Bead pico-link-pbv (C5), UNCHANGED by round 2's C2-3 (which deletes
     // the call site that used to increment this, not the field itself --
-    // acceptance's conservation check (A1) still sums this term). Always 0
-    // now that nothing calls pl_pcm_trim_to() any more.
+    // acceptance's conservation check (A1) still sums this term). As of
+    // pico-link-fhf this is the primary surplus-side resync counter: the
+    // media-timer trim block below increments it by pl_pcm_trim_to()'s
+    // return value whenever the EMA sustains above the hysteresis band.
     volatile uint32_t resync_drops;
+
+    // Bead pico-link-fhf: how many DISCRETE trims fired, as opposed to how
+    // many frames they dropped (resync_drops). Needed because resync_drops
+    // alone can't distinguish one large trim from many small ones -- that
+    // distinction is exactly the pass/fail line in the injection test (test
+    // A: exactly one event vs a double-cut).
+    volatile uint32_t resync_events;
+
+    // Bead pico-link-fhf: pbv_now_us at the last trim, for the
+    // PL_PCM_TRIM_MIN_INTERVAL_US lockout gate in the media-timer handler.
+    uint64_t last_resync_us;
 } pl_a2dp_ctx_t;
 
 static pl_a2dp_ctx_t s_ctx;
+
+#ifdef PL_DEBUG_REMOTE
+// Bead pico-link-fhf, test A. Set by pl_a2dp_debug_skip_media_ticks()
+// (thread context, debug_remote.c's poll) and consumed at the top of the
+// drain step in pl_a2dp_media_timer_handler (the same 0xFF IRQ context that
+// owns every other s_ctx field this file writes from there) -- single
+// aligned 32-bit word, one thread-context writer, one IRQ-context
+// reader/decrementer, so no tear and no lock needed, same discipline as
+// pcm_ring's s_head/s_tail.
+static volatile uint32_t s_debug_skip_media_ticks;
+#endif
 
 // SDP service record buffers -- sized exactly like a2dp_source_demo.c's
 // own (sdp_a2dp_source_service_buffer[150] / sdp_avrcp_target_service_buffer[200] /
@@ -2122,13 +2146,78 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     }
 
 #ifndef PL_ENCODER_ON_CORE1
+    // Bead pico-link-fhf: hysteresis-banded discrete resync. Ring fill
+    // under credit pacing is a free integrator (drain is defined by our
+    // own crystal, the same crystal supply is regulated against, so there
+    // is no restoring force) -- the +-500ppm feedback loop is ~100x too
+    // weak to remove an offset in useful time, so a sustained offset must
+    // be removed discretely instead of left to integrate toward overflow
+    // (the ~5.4 minute collapse this bead exists to fix). Evaluated on the
+    // EMA, NEVER raw fill -- raw fill sawtooths by up to one tick's drain
+    // (~3840B), comparable to the band itself, so a raw-fill comparison
+    // would trip constantly. See the bead's design comment sec 1-3.
+    //
+    // Skip while the host is silent (a paused host must not be trimmed on
+    // its way to auto-pause) and while inside the minimum interval (the
+    // EMA holds a stale pre-trim value for ~5 tau after a reseed; an
+    // ungated second tick would cut another band's worth on a reading that
+    // no longer exists).
+    //
+    // GATED ON !PL_ENCODER_ON_CORE1 (code review, 2026-09-07): pl_pcm_trim_to
+    // writes pcm_ring's s_tail, which under PL_ENCODER_ON_CORE1 is owned by
+    // core1's pl_a2dp_core1_entry loop (it calls pl_pcm_read(), the other
+    // read-modify-write of s_tail) -- running this block unconditionally in
+    // core0's IRQ would race that write with no lock, exactly the hazard
+    // pcm_ring.h's module doc calls out for a genuinely cross-core consumer.
+    // This mirrors every other core1 carve-out in this function. Dormant
+    // today (PL_ENCODER_ON_CORE1 defaults OFF), but core1 mode currently has
+    // NO resync mechanism until pico-link-quzf lands a core1-safe design --
+    // do not remove this guard without that design in place.
+    if (!host_silent) {
+        int32_t fill_ema = pl_usb_audio_fb_fill_ema();
+        uint32_t target = pl_pcm_target_fill_bytes();
+        if (fill_ema > 0 && (uint32_t)fill_ema > target + PL_PCM_TRIM_BAND_BYTES &&
+            (pbv_now_us - s_ctx.last_resync_us) > PL_PCM_TRIM_MIN_INTERVAL_US) {
+            uint32_t dropped = pl_pcm_trim_to(target);
+            s_ctx.resync_drops += dropped;
+            s_ctx.resync_events++;
+            s_ctx.last_resync_us = pbv_now_us;
+            // Reseed the EMA LAST, from the post-trim fill -- ordering
+            // matters, this is what makes the min-interval lockout above
+            // sufficient rather than merely helpful. (A 0xC0 preemption of
+            // this 0xFF handler between the trim and the reseed can fold
+            // one stale pre-trim sample into the EMA first -- harmless,
+            // one >>6 step, ~340B of transient error against a 2880B band,
+            // and both values are single aligned 32-bit words so there is
+            // no tear; no critical section needed.)
+            pl_usb_audio_fb_reset();
+        }
+    }
+    // NO pl_log in this block -- this file's module doc forbids it in the
+    // hot path, and it killed the ISO-OUT endpoint once already
+    // (pico-link-0d2). All reporting for this mechanism happens in
+    // pl_a2dp_report, at thread context.
+
     // Bead pico-link-85v (D1): the old "only fill if not already waiting
     // on a grant" gate is GONE -- that was the actual ceiling mechanism
     // (a tick with sbc_ready_to_send still true did no filling at all).
     // pl_a2dp_fill now self-manages sealing and re-arming
     // request_can_send_now as slots fill, so it is simply called every
     // tick regardless of any pending grant.
+#ifdef PL_DEBUG_REMOTE
+    // Bead pico-link-fhf, test A: consume one tick of the debug skip
+    // one-shot HERE, at the drain call site -- everything else in this
+    // handler (tick bookkeeping, credit accrual, the resync trim check
+    // above) still runs normally; only the drain itself goes idle, which
+    // is what lets the ring gain fill at the full 192 B/ms rate.
+    if (s_debug_skip_media_ticks > 0) {
+        s_debug_skip_media_ticks--;
+    } else {
+        pl_a2dp_fill();
+    }
+#else
     pl_a2dp_fill();
+#endif
 #else
     // Bead pico-link-nli.4 (G3), design sec 5: core1 fills and seals; this
     // handler's job shrinks to the "send kick" -- if a slot is pending and
@@ -2848,6 +2937,20 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // this bug was.
             s_ctx.priming_target_bytes = btstack_min(unclamped_priming_target_bytes, PL_PCM_RING_CAPACITY / 4u);
 
+            // Bead pico-link-fhf (orchestrator decision on Ada's design
+            // sec 7): unify the three consumers of "the target" onto one
+            // runtime setpoint, set from the already-clamped, already-
+            // derived priming cushion computed above. Before this, the
+            // feedback loop (usb_audio.c) and the resync trim (this file's
+            // media-timer handler) both regulated against the bare
+            // PL_PCM_TARGET_FILL_BYTES macro while PRIMING landed the ring
+            // on this larger derived cushion -- the controller then spent
+            // ~15s silently walking the ring back down, destroying the
+            // cushion its own derivation just built. Setting the runtime
+            // setpoint here makes all three agree on the value PRIMING
+            // actually achieved.
+            pl_pcm_set_target_fill_bytes(s_ctx.priming_target_bytes);
+
             // Signalling context, not the media hot path -- pl_log is
             // fine here (see this file's module doc). Startup-only line,
             // not rate-limited: fires once per stream, same as the
@@ -2993,9 +3096,20 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // for the derived priming_target_bytes cushion instead, C2-4
             // above; there is no overshoot left worth trimming away, and
             // trimming it destroyed the margin the fix depends on). Prime
-            // to the target and start; do not trim. resync_drops (see its
-            // doc comment on pl_a2dp_ctx_t) stays 0 now that nothing calls
-            // pl_pcm_trim_to() any more.
+            // to the target and start; do not trim here -- this stays
+            // deleted even after pico-link-fhf wires up the media-timer
+            // trim block above, because the priming cushion is not
+            // overshoot.
+            //
+            // Bead pico-link-fhf: reset resync_events and last_resync_us
+            // at the same instant, same reasoning as the other high-water/
+            // clock resets above -- a trim from a PRIOR stream must not
+            // gate or be double-counted against this one's test window.
+            // resync_drops itself stays a since-boot cumulative counter,
+            // same as flush_frames and ovr_frames, so it is NOT reset here
+            // -- the conservation check sums it across the whole session.
+            s_ctx.resync_events = 0;
+            s_ctx.last_resync_us = 0;
             //
             // Bead pico-link-pbv round 2 (C2-5): (re)establish the
             // host-silence baseline exactly at the instant real streaming
@@ -3284,6 +3398,18 @@ void pl_a2dp_disconnect(void) {
     pl_log("a2dp: disconnect requested, a2dp_cid=0x%04x status=0x%02x\r\n", s_ctx.a2dp_cid, status);
 }
 
+#ifdef PL_DEBUG_REMOTE
+// Bead pico-link-fhf, test A. Thread-context write (debug_remote.c's
+// poll, superloop) to the single aligned word the media-timer IRQ
+// decrements -- see s_debug_skip_media_ticks's doc comment above. A
+// second call before the first one-shot has drained simply overwrites
+// the remaining count rather than adding to it, same "last write wins"
+// semantics as every other thread-to-IRQ debug knob in this file.
+void pl_a2dp_debug_skip_media_ticks(uint32_t ticks) {
+    s_debug_skip_media_ticks = ticks;
+}
+#endif
+
 void pl_a2dp_report(uint32_t report_dt_us) {
     // Bead pico-link-pbv round 2 (C2-11): every rate the reader computes
     // from two report lines (enc_frames/s, tick rate, etc) MUST divide by
@@ -3299,10 +3425,16 @@ void pl_a2dp_report(uint32_t report_dt_us) {
     // ~1.02s windows. NOT cosmetic -- worth ~1 percent by construction. 0
     // on the very first call (no prior sample to diff against).
     const char *codec_name = s_ctx.codec != NULL ? s_ctx.codec->display_name : "none";
+    // Bead pico-link-fhf: fill's denominator is the RUNTIME setpoint
+    // (pl_pcm_target_fill_bytes), not the PL_PCM_TARGET_FILL_BYTES macro --
+    // STREAM_ESTABLISHED sets the runtime value from the priming cushion
+    // (typically higher than the macro for SBC), and this diagnostic ratio
+    // must read against whatever the pipeline is actually regulating to,
+    // same reasoning as the trim block and usb_audio.c's feedback loop.
     pl_log(
         "a2dp: codec=%s bitrate=%lu fill=%lu/%lu ovr_frames=%lu und=%lu report_dt_us=%lu\r\n", codec_name,
         (unsigned long)s_ctx.frame.nominal_bitrate_bps, (unsigned long)pl_pcm_fill_bytes(),
-        (unsigned long)PL_PCM_TARGET_FILL_BYTES, (unsigned long)pl_pcm_overrun_frames(),
+        (unsigned long)pl_pcm_target_fill_bytes(), (unsigned long)pl_pcm_overrun_frames(),
         (unsigned long)s_ctx.underrun_events, (unsigned long)report_dt_us
     );
     pl_log(
@@ -3338,12 +3470,16 @@ void pl_a2dp_report(uint32_t report_dt_us) {
     // together with enc_frames_total/ovr_frames feed the conservation
     // check. See Ada's design-round-3 bead comment for the full
     // acceptance criteria (A3-1..A3-8) and falsifiers (F3-1..F3-5).
+    // resync_events (pico-link-fhf) is the discrete-trim COUNT alongside
+    // resync_drops's frame count -- the injection test's pass criterion
+    // needs both: exactly one event distinguishes a correct single cut
+    // from a double-cut bug that resync_drops alone can't reveal.
     pl_log(
         "a2dp: frames_per_packet=%lu credit_clamped_samples=%lu credit_clamp_events=%lu flush_frames=%lu "
-        "resync_drops=%lu fill_ema=%ld fill_min=%lu\r\n",
+        "resync_drops=%lu resync_events=%lu fill_ema=%ld fill_min=%lu\r\n",
         (unsigned long)s_ctx.frames_per_packet, (unsigned long)s_ctx.credit_clamped_samples,
         (unsigned long)s_ctx.credit_clamp_events, (unsigned long)s_ctx.flush_frames, (unsigned long)s_ctx.resync_drops,
-        (long)pl_usb_audio_fb_fill_ema(), (unsigned long)pl_usb_audio_fill_min()
+        (unsigned long)s_ctx.resync_events, (long)pl_usb_audio_fb_fill_ema(), (unsigned long)pl_usb_audio_fill_min()
     );
     // Bead pico-link-pbv round 2 (C2-2), retuned by pico-link-85v: stop-
     // reason breakdown for pl_a2dp_fill's loop. stop_dwell must read 0 in

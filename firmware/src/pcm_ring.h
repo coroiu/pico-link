@@ -44,10 +44,36 @@
 // 3.3. SRAM cost (32KiB) is negligible against the 520KB budget.
 #define PL_PCM_RING_CAPACITY (32u * 1024u)
 
-// STARTING VALUE, not a measured one -- M4 stage S3 measures and tunes this.
-// 1152 frames = 24ms: covers one A2DP media packet (~13.3ms of SBC) plus
-// radio scheduling jitter. See design sec 3.3/3.5.
-#define PL_PCM_TARGET_FILL_BYTES 4608u
+// Default/floor target fill. Derived (pico-link-fhf, Ada 2026-08-30) from
+// the two gaps the ring must absorb between drain (credit-paced, exactly
+// 192 B/ms, codec-independent) and supply: worst media-tick interval
+// (~11.3ms real cadence, budget 20ms = 3840B) plus worst 0xC0 producer gap
+// (~1.03ms measured, pico-link-tfj, budget 5ms = 960B). 3840 + 960 = 4800B
+// floor, +20% safety = 5760B = 1440 frames = 30ms. Codec-independent because
+// it is keyed to the tick budget, not packet size -- even a 256-sample LDAC
+// frame (1024B) is far below the 3840B tick term. This macro is the
+// compile-time initial value only; the runtime setpoint
+// (pl_pcm_set_target_fill_bytes/pl_pcm_target_fill_bytes below) is what
+// a2dp.c, usb_audio.c and the resync trim actually read once
+// STREAM_ESTABLISHED has set it from the priming-derived cushion. See
+// .planning/design/2026-08-30-pcm-pacing.md and the bead's design comment
+// (pico-link-fhf).
+#define PL_PCM_TARGET_FILL_BYTES 5760u
+
+// Hysteresis-banded discrete resync (pico-link-fhf). Half-width 2880B
+// (720 frames, 15ms): trip when the EMA (never raw fill) exceeds
+// target + this band. Sized to ~11x the worst-case EMA ripple from the tick
+// sawtooth (~110B), so the controller's ~96 B/s of authority (500ppm at
+// 192 B/ms) is given ~30s to clear an offset silently before a trim cuts it
+// audibly. See the bead's design comment sec 2.
+#define PL_PCM_TRIM_BAND_BYTES 2880u
+
+// Minimum interval between trims: 2s, 6x the EMA's ~320ms settling time
+// after a reseed, and negligible against the controller's ~30s clearing
+// horizon. Safe only because a total drain stall is separately caught by
+// PL_WDT_MEDIA -- this lockout is not overflow protection. See the bead's
+// design comment sec 3.
+#define PL_PCM_TRIM_MIN_INTERVAL_US 2000000u
 
 // Appends whole frames only, producer side. `len` MUST be a multiple of
 // PL_PCM_FRAME_BYTES -- a misaligned length is rejected WHOLESALE and
@@ -109,5 +135,20 @@ uint32_t pl_pcm_misaligned(void);
 // already <= target_bytes -- the common case). Consumer side only, same
 // ownership rule as pl_pcm_reset().
 uint32_t pl_pcm_trim_to(uint32_t target_bytes);
+
+// Bead pico-link-fhf (orchestrator decision on Ada's design sec 7): the
+// runtime target-fill setpoint, initialised to PL_PCM_TARGET_FILL_BYTES.
+// Lives HERE, in pcm_ring, deliberately -- not in a2dp.h -- even though
+// a2dp.c already includes usb_audio.h and putting it there would compile.
+// pcm_ring is included by both a2dp.c and usb_audio.c and owned by
+// neither, which is the point: a2dp.c is the only writer (it sets this
+// from the priming-derived cushion at STREAM_ESTABLISHED, replacing the
+// bare macro that used to disagree with the priming target), and
+// usb_audio.c's feedback loop plus a2dp.c's own resync trim block are both
+// readers. Putting the setpoint in a2dp.h would point the module
+// dependency the wrong way and hand the a2dp layer ownership of a
+// quantity that belongs to neither side of the seam.
+void pl_pcm_set_target_fill_bytes(uint32_t target_bytes);
+uint32_t pl_pcm_target_fill_bytes(void);
 
 #endif // PICO_LINK_PCM_RING_H

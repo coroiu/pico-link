@@ -449,8 +449,14 @@ void pl_usb_audio_feedback_task(void) {
         s_fill_min = fill_now;
     }
     s_fb_fill_ema += ((int32_t)fill_now - s_fb_fill_ema) >> 6;
-    int32_t err_bytes = s_fb_fill_ema - (int32_t)PL_PCM_TARGET_FILL_BYTES;
-    int32_t p_ppm = -(err_bytes * PL_FB_KP_PPM) / (int32_t)PL_PCM_TARGET_FILL_BYTES;
+    // Bead pico-link-fhf: read the runtime setpoint (pcm_ring), not the
+    // bare macro -- a2dp.c sets this from the priming-derived cushion at
+    // STREAM_ESTABLISHED, and this feedback loop must regulate against the
+    // same value PRIMING actually landed the ring on, or it spends ~15s
+    // silently walking the ring back down to the macro's smaller value.
+    int32_t target_bytes = (int32_t)pl_pcm_target_fill_bytes();
+    int32_t err_bytes = s_fb_fill_ema - target_bytes;
+    int32_t p_ppm = -(err_bytes * PL_FB_KP_PPM) / target_bytes;
 
     // Integrate, then clamp the accumulator itself (not just the output) --
     // clamping only the output is the classic windup bug: the accumulator
