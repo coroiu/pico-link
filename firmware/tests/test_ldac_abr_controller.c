@@ -49,11 +49,16 @@ typedef struct {
     uint32_t qfull_snapshot;
     int32_t applied_rung;
     int32_t target_rung;
-    // Test-only failure injection for the APPLY phase, mirroring the two
-    // observationally-distinct outcomes design sec 11.1(b)/(c) describes:
-    // 0 == success, 1 == LDACBT_ERR_ALTER_EQMID_LIMITED (rail), 2 ==
-    // any other failure (fault). Defaults to 0 (always succeeds) --
-    // individual tests override it to exercise the rail/fault paths.
+    // Test-only failure injection for the APPLY phase. 0 == success,
+    // nonzero == ldacBT_alter_eqmid_priority failed. Code review,
+    // 2026-09-07: the real function's every reachable failure path
+    // returns LDACBT_ERR_ALTER_EQMID_LIMITED (ldacBT_api.c:321-341,
+    // including the pkt_type != _2_DH5 case design sec 0.2 names as the
+    // one persistent-failure mode) -- so this model does not re-classify
+    // by value at all, matching the fixed real function: our own rung
+    // counter already ruled the rail case out before this is even
+    // called, so ANY nonzero return here is a fault, unconditionally.
+    // Defaults to 0 (always succeeds).
     int inject_apply_status;
     uint32_t steps_down;
     uint32_t steps_up;
@@ -98,11 +103,16 @@ static void model_decide(model_abr_t *c, uint32_t tx_count_now, uint64_t now_us,
     }
 }
 
-#define MODEL_LDACBT_ERR_ALTER_EQMID_LIMITED 21
-
 // Copied verbatim (in spirit) from codec_ldac.c's
-// pl_codec_ldac_apply_pending_tuning. ldacBT_alter_eqmid_priority's return
-// is replaced by c->inject_apply_status (0 == success).
+// pl_codec_ldac_apply_pending_tuning, POST code-review-fix (2026-09-07):
+// our own rung counter's at_rail check runs FIRST and returns before the
+// (stubbed) library is ever consulted, so by construction any nonzero
+// return from it here is a genuine fault -- there is no second
+// classification via an error code (deleted: every reachable real
+// failure path returns the same LIMITED code, so re-checking it could
+// only ever re-derive "rail", silently burying a real fault). c-
+// >inject_apply_status stands in for ldacBT_alter_eqmid_priority's
+// return (0 == success).
 static void model_apply(model_abr_t *c) {
     int32_t target = c->target_rung;
     if (target == c->applied_rung) {
@@ -116,11 +126,7 @@ static void model_apply(model_abr_t *c) {
     }
     int status = c->inject_apply_status;
     if (status != 0) {
-        if (status == MODEL_LDACBT_ERR_ALTER_EQMID_LIMITED) {
-            c->rail_hits++;
-        } else {
-            c->apply_fail++;
-        }
+        c->apply_fail++;
         return;
     }
     if (stepping_down) {
@@ -313,12 +319,20 @@ int main(void) {
 
     // --- (g) a genuine apply fault (not a rail) is counted separately and
     // does not silently advance the rung -- the walk retries every call,
-    // matching design sec 11.1(c)'s "cannot wedge" claim. ---
+    // matching design sec 11.1(c)'s "cannot wedge" claim. Injects
+    // LDACBT_ERR_ALTER_EQMID_LIMITED itself -- the ONLY failure code the
+    // real vendored library ever actually returns from this function
+    // (ldacBT_api.c:321-341) -- to prove the model classifies it as a
+    // fault here, not a rail: our own rung counter already ruled the
+    // rail case out (applied_rung is 0, strictly inside the ladder, and
+    // we are stepping DOWN from it) before this call is even reached,
+    // so per design sec 11.1(b) that is what makes it a fault regardless
+    // of which value the library hands back. ---
     {
         model_abr_t c;
         model_abr_reset(&c, 0);
         c.target_rung = 1;
-        c.inject_apply_status = 1000; // some non-rail failure code
+        c.inject_apply_status = 21; // LDACBT_ERR_ALTER_EQMID_LIMITED
         model_apply(&c);
         assert(c.applied_rung == 0);
         assert(c.apply_fail == 1);
@@ -330,7 +344,8 @@ int main(void) {
         model_apply(&c);
         assert(c.applied_rung == 1);
         assert(c.steps_down == 1);
-        printf("ok:   a genuine apply fault is counted distinctly from a rail hit and retries cleanly\n");
+        printf("ok:   a genuine apply fault is counted distinctly from a rail hit and retries cleanly, "
+               "even when it carries libldac's own LIMITED error code\n");
     }
 
     printf("ALL LDAC ABR CONTROLLER MODEL TESTS PASSED\n");

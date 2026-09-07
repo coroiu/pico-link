@@ -117,12 +117,19 @@ static uint8_t s_pending_ldac_quality = 0;
 // Controller state. s_ldac_adaptive/s_ldac_applied_rung are reset every
 // pl_codec_ldac_init() call (design sec 5.2 -- STREAM_ESTABLISHED/codec
 // renegotiation is one of the four reset events; "no carried-over
-// controller state, ever"). s_ldac_target_rung is the ONE volatile word
-// core0's decide phase writes and the encoder-context apply phase reads
-// (design sec 6.2) -- one aligned word, one writer, one reader, a target
-// rather than a delta so a missed or duplicated observation converges.
+// controller state, ever"). s_ldac_target_rung is the ONE word core0's
+// decide phase writes and the encoder-context apply phase reads (design
+// sec 6.2) -- one aligned word, one writer, one reader, a target rather
+// than a delta so a missed or duplicated observation converges.
+// s_ldac_applied_rung is `volatile` for the same cross-core reason (code
+// review, 2026-09-07): it is written from encoder context (core1 under
+// PL_ENCODER_ON_CORE1) and read cross-core by a2dp.c's report/decide
+// paths -- every other cross-core field in this file is explicitly
+// volatile and this one should not be the sole exception, even though
+// aligned-word access on Cortex-M33 makes the plain-int version benign
+// today.
 static bool s_ldac_adaptive = false;
-static int32_t s_ldac_applied_rung = 0;
+static volatile int32_t s_ldac_applied_rung = 0;
 static volatile int32_t s_ldac_target_rung = 0;
 
 // Lifetime observability counters (design sec 7 / bead trap 4) -- NOT
@@ -225,19 +232,20 @@ static void pl_codec_ldac_apply_pending_tuning(void *state) {
     int direction = stepping_down ? LDACBT_EQMID_INC_CONNECTION : LDACBT_EQMID_INC_QUALITY;
     int status = ldacBT_alter_eqmid_priority(enc->handle, direction);
     if (status != 0) {
-        // design sec 11.1(b): a failure while our own rung counter is
-        // strictly inside 0..4 is a genuine fault, not a rail (we just
-        // ruled the rail case out above) -- LDACBT_ERR_ALTER_EQMID_LIMITED
-        // specifically would mean our rail check and libldac's disagree,
-        // which is itself worth a distinct counter from a true fault (sec
-        // 0.2's impossible-by-construction pkt_type case, or a NULL/
-        // not-in-encode-mode handle).
-        int err = ldacBT_get_error_code(enc->handle);
-        if (err == LDACBT_ERR_ALTER_EQMID_LIMITED) {
-            s_ldac_abr_rail_hits++;
-        } else {
-            s_ldac_abr_apply_fail++;
-        }
+        // Code review, 2026-09-07 (bead pico-link-7jol.3): our own rung
+        // counter already ruled the rail case out above, so per design
+        // sec 11.1(b) ANY non-zero return here is, by definition, a
+        // genuine fault -- never a rail. Do NOT re-classify via
+        // ldacBT_get_error_code(): reading ldacBT_api.c:321-341 shows
+        // EVERY reachable failure path inside ldacBT_alter_eqmid_priority
+        // sets LDACBT_ERR_ALTER_EQMID_LIMITED, including the
+        // pkt_type != _2_DH5 case sec 0.2 names as the one persistent-
+        // failure mode that must be reported LOUDLY -- so that re-check
+        // could only ever re-derive "rail", silently burying the exact
+        // fault this counter exists to catch. abr_apply_fail must be
+        // reachable; a rail hit is caught entirely by the at_rail branch
+        // above.
+        s_ldac_abr_apply_fail++;
         return;
     }
     if (stepping_down) {
