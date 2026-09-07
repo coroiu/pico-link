@@ -19,7 +19,7 @@ use embedded_graphics::{
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
-use crate::app::LinkState;
+use crate::app::{LinkState, ScreenId};
 use crate::input::NavIntent;
 use crate::panel::Button;
 
@@ -260,6 +260,14 @@ pub struct Screen {
     /// reveals an already-primed `Screen` whose own cache would otherwise
     /// see nothing dirty -- see `Navigator`'s `force_full_damage`).
     paint_cache: Vec<PaintSlot>,
+    /// This screen's identity for live-rebuild purposes -- `None` means
+    /// "never refresh me" (the wizard, confirms, Settings): see
+    /// [`crate::app::ScreenId`]'s doc comment and
+    /// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
+    /// §1. `Screen` importing `crate::app::ScreenId` mirrors the existing
+    /// `crate::app::LinkState` import above -- not a new instance of
+    /// `render` depending on `app`, a second one.
+    id: Option<ScreenId>,
 }
 
 impl Screen {
@@ -271,7 +279,26 @@ impl Screen {
             widgets,
             focused_index: None,
             paint_cache: Vec::new(),
+            id: None,
         }
+    }
+
+    /// Tags this screen with a [`ScreenId`], making it eligible for
+    /// [`crate::app::App`]'s `refresh_stack` to rebuild it in place when
+    /// the model changes. A screen that never calls this (the wizard,
+    /// confirms, Settings) is never touched by `refresh_stack` -- see
+    /// [`Screen::id`]'s doc comment.
+    #[must_use]
+    pub fn with_id(mut self, id: ScreenId) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// This screen's [`ScreenId`], if it has one. `None` means
+    /// `refresh_stack` must skip it entirely.
+    #[must_use]
+    pub fn id(&self) -> Option<ScreenId> {
+        self.id
     }
 
     /// Sets this screen's static X/Y rail labels. Neither A nor B is a

@@ -24,6 +24,7 @@ use super::screen::Screen;
 #[cfg(test)]
 use super::theme::palette;
 use super::widget::Action;
+use crate::app::ScreenId;
 use crate::input::NavIntent;
 use crate::platform::OutputRequest;
 
@@ -193,6 +194,35 @@ impl Navigator {
     #[must_use]
     pub fn title_at(&self, index: usize) -> Option<&str> {
         self.stack.get(index).map(|screen| screen.title.as_str())
+    }
+
+    /// The [`crate::app::ScreenId`] of the screen at `index`, if any --
+    /// `None` both for an out-of-range `index` and for a screen that never
+    /// called [`Screen::with_id`] (the "never refresh me" sentinel -- see
+    /// that method's doc comment). [`crate::app::App::refresh_stack`]'s
+    /// replacement for the old `title_at(1) == Some(DEVICES_TITLE)` check.
+    #[must_use]
+    pub fn id_at(&self, index: usize) -> Option<ScreenId> {
+        self.stack.get(index).and_then(Screen::id)
+    }
+
+    /// Drops every screen above `index`, leaving `stack[index]` as the new
+    /// top of the stack -- `index == 0` is equivalent to
+    /// [`Navigator::pop_to_root`]. Used by
+    /// [`crate::app::App::refresh_stack`] when a live-rebuild discovers a
+    /// pushed screen's subject no longer exists (e.g. the device shown by a
+    /// [`crate::app::ScreenId::DevicePage`] was forgotten): the whole
+    /// unwind from that point up is one atomic stack op, same shape as
+    /// [`Navigator::pop_to_root`], rather than repeated [`Navigator::pop`]
+    /// calls that would each be individually observed as a render.
+    ///
+    /// A no-op if `index + 1 >= self.depth()` (nothing above it to drop).
+    pub fn truncate_to(&mut self, index: usize) {
+        let keep = index.saturating_add(1);
+        if keep < self.stack.len() {
+            self.stack.truncate(keep);
+            self.force_full_damage = true;
+        }
     }
 
     /// Replaces **only** the root screen (`stack[0]`) with `screen`,
@@ -563,5 +593,53 @@ mod tests {
             any_pixel_of_color_in_rect(&fb2, b_rect2, palette::TEXT_SECONDARY),
             "after a push, depth > 1, B must render live"
         );
+    }
+
+    // --- pico-link-7jol.4: ScreenId / id_at / truncate_to ---
+
+    #[test]
+    fn a_screen_that_never_calls_with_id_reports_no_id() {
+        let nav = Navigator::new(list_screen("root", 3));
+        assert_eq!(nav.id_at(0), None);
+    }
+
+    #[test]
+    fn id_at_reports_a_tagged_screens_id_and_none_out_of_range() {
+        let mut nav = Navigator::new(list_screen("root", 3).with_id(ScreenId::Home));
+        nav.push(list_screen("detail", 1));
+        assert_eq!(nav.id_at(0), Some(ScreenId::Home));
+        assert_eq!(nav.id_at(1), None, "the pushed screen never called with_id");
+        assert_eq!(nav.id_at(2), None, "out of range");
+    }
+
+    #[test]
+    fn truncate_to_drops_everything_above_index_in_one_op() {
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(list_screen("a", 1));
+        nav.push(list_screen("b", 1));
+        nav.push(list_screen("c", 1));
+        assert_eq!(nav.depth(), 4);
+
+        nav.truncate_to(1);
+        assert_eq!(nav.depth(), 2, "truncate_to(1) must keep index 0 and 1, dropping everything above");
+        assert_eq!(nav.current().title, "a");
+    }
+
+    #[test]
+    fn truncate_to_zero_is_equivalent_to_pop_to_root() {
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(list_screen("a", 1));
+        nav.push(list_screen("b", 1));
+        nav.truncate_to(0);
+        assert_eq!(nav.depth(), 1);
+        assert_eq!(nav.current().title, "root");
+    }
+
+    #[test]
+    fn truncate_to_past_the_top_is_a_no_op() {
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(list_screen("a", 1));
+        nav.truncate_to(5);
+        assert_eq!(nav.depth(), 2, "truncating past the current depth must not panic or change anything");
     }
 }

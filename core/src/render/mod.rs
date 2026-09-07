@@ -30,6 +30,11 @@
 //! - [`confirm`]: [`ConfirmView`] — a self-contained
 //!   destructive-confirmation screen (headline + a wrapped [`MenuList`]),
 //!   for any "are you sure?" flow.
+//! - [`spacer`]: [`Spacer`] — a fixed-height, non-focusable, non-drawing
+//!   widget that reserves vertical space in a screen's widget stack (the
+//!   device page's 12px top gutter; see
+//!   `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
+//!   §3.3).
 //! - [`screen`]: [`Screen`], one entry in the navigation stack.
 //! - [`navigator`]: [`Navigator`], owning the screen stack.
 //! - [`theme`]: the visual design language — the semantic color palette,
@@ -80,6 +85,7 @@ pub mod navigator;
 pub mod paint_key;
 pub mod rail;
 pub mod screen;
+pub mod spacer;
 pub mod theme;
 pub mod widget;
 pub mod wizard;
@@ -99,5 +105,6 @@ pub use navigator::Navigator;
 pub use paint_key::PaintKey;
 pub use rail::{Button, ButtonLabel, ButtonLabels};
 pub use screen::Screen;
+pub use spacer::Spacer;
 pub use widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Verb, VolumeChrome, Widget};
 pub use wizard::{build_wizard_screen, WIZARD_TITLE};
