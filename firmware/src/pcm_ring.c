@@ -24,6 +24,11 @@ static volatile uint32_t s_head; // producer-owned; index into s_ring, [0, PL_PC
 static volatile uint32_t s_tail; // consumer-owned; index into s_ring, [0, PL_PCM_RING_CAPACITY)
 static volatile uint32_t s_overrun_frames;
 static volatile uint32_t s_misaligned;
+// Bead pico-link-fhf: runtime target-fill setpoint, single aligned 32-bit
+// word so a producer/consumer/thread-context read while a2dp.c's setter
+// writes it cannot tear. See pcm_ring.h's doc comment for why this lives
+// here rather than in a2dp.h.
+static volatile uint32_t s_target_fill_bytes = PL_PCM_TARGET_FILL_BYTES;
 
 void pl_pcm_push(const uint8_t *data, uint32_t len) {
     if (len == 0) {
@@ -156,4 +161,12 @@ uint32_t pl_pcm_overrun_frames(void) {
 
 uint32_t pl_pcm_misaligned(void) {
     return s_misaligned;
+}
+
+void pl_pcm_set_target_fill_bytes(uint32_t target_bytes) {
+    s_target_fill_bytes = target_bytes;
+}
+
+uint32_t pl_pcm_target_fill_bytes(void) {
+    return s_target_fill_bytes;
 }

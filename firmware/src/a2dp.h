@@ -144,4 +144,18 @@ void pl_a2dp_avrcp_volume_service(uint64_t now_us);
 #define PL_CONNECT_STEP_SETTING_UP_AUDIO 2u
 #define PL_CONNECT_STEP_NEGOTIATING_CODEC 3u
 
+#ifdef PL_DEBUG_REMOTE
+// Bead pico-link-fhf, test A (injection). One-shot: the NEXT `ticks` calls
+// to the media timer handler skip pl_a2dp_fill()'s drain entirely, so the
+// ring gains fill at the full 192 B/ms rate for that duration with no
+// restoring force -- proving the hysteresis-banded resync trim actually
+// fires (a soak alone can pass by doing nothing; see the bead's design
+// comment sec 5). Consumed at the top of the drain step in the media-timer
+// IRQ handler, same consumer context pl_pcm_trim_to() itself requires --
+// no SPSC violation, no push from the wrong side. Thread-context caller
+// only (debug_remote.c's poll, superloop). Compiled only when
+// PL_DEBUG_REMOTE is set; entirely absent from a shipping build.
+void pl_a2dp_debug_skip_media_ticks(uint32_t ticks);
+#endif
+
 #endif // PL_A2DP_H

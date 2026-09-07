@@ -59,6 +59,15 @@
 //                        a hang hunt: if BOOTSEL-over-CDC doesn't work,
 //                        that is not new information about the hang, it's
 //                        the expected outcome of a wedged board.
+//   SKIPTICKS <K>    -- bead pico-link-fhf, test A (injection): one-shot,
+//                        the NEXT <K> calls to a2dp.c's media timer
+//                        handler skip the drain (pl_a2dp_fill()) entirely,
+//                        so the PCM ring gains fill at the full 192 B/ms
+//                        rate for that duration -- proving the
+//                        hysteresis-banded resync trim actually fires
+//                        rather than passing a soak test by doing nothing.
+//                        Dispatched directly to a2dp.c's
+//                        pl_a2dp_debug_skip_media_ticks(), not a NavIntent.
 //   VOL GET          -- bead pico-link-4v2.1 (VT1, volume-sync risk gate,
 //                        .planning/design/2026-09-02-volume-sync.md sec 9):
 //                        dumps usb_audio.c's stored fu_volume[]/fu_mute[]
