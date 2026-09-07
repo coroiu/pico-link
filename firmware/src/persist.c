@@ -883,10 +883,23 @@ void pl_persist_service(void) {
             pl_bt_enqueue_persist_write();
         }
     }
-    if (s_settings_pending && !s_settings_write_enqueued && !(pl_usb_audio_streaming() || pl_a2dp_streaming())) {
+    if (s_settings_pending && !s_settings_write_enqueued) {
         // No settle/rate-limit window -- a manual pick is already the
         // debounced event (design sec 5: "applies live", the user pressed
         // A once); nothing to coalesce a burst of.
+        //
+        // Bead pico-link-xcmx, Andreas's ruling: unlike the general
+        // pairing/link-key write above, this write is NOT gated behind
+        // "not streaming". This is a user-initiated write -- the user just
+        // pressed A on the quality picker -- and the checkmark's
+        // check-follows-echo contract (design sec 5.1) means the echo, and
+        // therefore the UI feedback, never arrives at all while gated,
+        // since the one moment a user is guaranteed to be streaming is the
+        // moment they're auditioning a quality by ear. Andreas: "just
+        // write. It's fine if audio skips when I'm actively interacting
+        // with the device." Background/periodic persistence (the write
+        // above, and pl_persist_execute_pending_write) keeps the streaming
+        // gate.
         s_settings_write_enqueued = true;
         pl_bt_enqueue_ldac_quality_write();
     }
@@ -907,14 +920,9 @@ void pl_persist_execute_pending_ldac_quality_write(void) {
         s_settings_write_enqueued = false;
         return;
     }
-    if (pl_usb_audio_streaming() || pl_a2dp_streaming()) {
-        // Gate flipped true again between enqueue and drain -- bail, leave
-        // the request pending; pl_persist_service() re-arms it the next
-        // time it sees a safe window (unconditionally, same as the
-        // pairing path above).
-        s_settings_write_enqueued = false;
-        return;
-    }
+    // Bead pico-link-xcmx: no streaming re-check here, matching the
+    // enqueue side above -- this is the user-initiated write Andreas ruled
+    // should just go through, streaming or not.
 
     uint8_t addr[6];
     uint8_t ldac_quality;

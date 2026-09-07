@@ -1092,6 +1092,20 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             );
             if (pl_a2dp_is_connected_ldac(addr)) {
                 pl_codec_ldac_pin_now(ldac_quality);
+            } else {
+                // Bead pico-link-xcmx: not silent any more. This is the
+                // legitimately-unappliable case (a2dp.h:137-144) -- either
+                // this isn't the connected device, or the connected device
+                // has fallen back to SBC -- so there's no live encoder to
+                // pin. The flash write below still stages normally, so the
+                // pick takes effect next time this device connects on LDAC;
+                // this line exists so a console capture can tell
+                // "unappliable" apart from "broken" without re-deriving it.
+                pl_log(
+                    "BT: PL_CMD_SET_DEVICE_LDAC_QUALITY %02x:%02x:%02x:%02x:%02x:%02x quality=%u -- not the "
+                    "connected LDAC device, skipping live apply (flash write still staged)\r\n",
+                    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], ldac_quality
+                );
             }
             pl_persist_request_ldac_quality(addr, ldac_quality);
             break;
