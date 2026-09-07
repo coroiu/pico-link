@@ -103,6 +103,152 @@ typedef struct {
 
 static pl_ldac_encoder_t s_ldac_encoder;
 
+// Bead pico-link-7jol.3: the ABR ladder. PL_LDAC_ADAPTIVE_LADDER_RUNGS is
+// declared in codec_ldac.h (a2dp.c's controller needs it too). See
+// codec_ldac.h's doc comments on the public accessors this state backs,
+// and design sec 0.1 for why the ladder is 5 rungs (not 3) and only rungs
+// 0/2/4 are the public HQ/SQ/MQ constants.
+
+// Set by pl_codec_ldac_set_quality(), consumed once by pl_codec_ldac_init()
+// below. Plain (not volatile): both run on the same cyw43/BTstack
+// background async_context, never concurrently.
+static uint8_t s_pending_ldac_quality = 0;
+
+// Controller state. s_ldac_adaptive/s_ldac_applied_rung are reset every
+// pl_codec_ldac_init() call (design sec 5.2 -- STREAM_ESTABLISHED/codec
+// renegotiation is one of the four reset events; "no carried-over
+// controller state, ever"). s_ldac_target_rung is the ONE volatile word
+// core0's decide phase writes and the encoder-context apply phase reads
+// (design sec 6.2) -- one aligned word, one writer, one reader, a target
+// rather than a delta so a missed or duplicated observation converges.
+static bool s_ldac_adaptive = false;
+static int32_t s_ldac_applied_rung = 0;
+static volatile int32_t s_ldac_target_rung = 0;
+
+// Lifetime observability counters (design sec 7 / bead trap 4) -- NOT
+// reset by init(), same convention as this file's sibling lifetime
+// counters elsewhere in the firmware (e.g. a2dp.c's resync_events).
+static uint32_t s_ldac_abr_steps_down = 0;
+static uint32_t s_ldac_abr_steps_up = 0;
+static uint32_t s_ldac_abr_rail_hits = 0;
+static uint32_t s_ldac_abr_apply_fail = 0;
+
+// Andreas's ruling 2026-09-07 (design sec 5): a manual quality pick PINS
+// the EQMID; the controller is only ever constructed for ldac_quality ==
+// 4 (Adaptive). This is the ONE function that maps a persisted, 1-based
+// ldac_quality byte to an initial EQMID and an is-adaptive flag -- design
+// sec 5.4: "all of the pin-versus-ceiling policy therefore lives in the
+// single function that maps ldac_quality to that pair. Do not scatter the
+// policy anywhere else." If the ruling is ever reversed, this is the only
+// function that changes.
+static void pl_ldac_quality_to_initial_state(uint8_t ldac_quality_1based, int *out_eqmid, bool *out_adaptive) {
+    switch (ldac_quality_1based) {
+        case 2: // 660 kbps, pinned
+            *out_eqmid = LDACBT_EQMID_SQ;
+            *out_adaptive = false;
+            break;
+        case 3: // 330 kbps, pinned
+            *out_eqmid = LDACBT_EQMID_MQ;
+            *out_adaptive = false;
+            break;
+        case 4: // Adaptive -- starts at rung 0 (HQ, 990 kbps)
+            *out_eqmid = LDACBT_EQMID_HQ;
+            *out_adaptive = true;
+            break;
+        case 0: // never chosen -- firmware default (today: pinned HQ)
+        case 1: // 990 kbps, pinned
+        default:
+            *out_eqmid = LDACBT_EQMID_HQ;
+            *out_adaptive = false;
+            break;
+    }
+}
+
+void pl_codec_ldac_set_quality(uint8_t ldac_quality_1based) { s_pending_ldac_quality = ldac_quality_1based; }
+
+bool pl_codec_ldac_is_adaptive(void) { return s_ldac_adaptive; }
+
+void pl_codec_ldac_request_rung(int32_t rung) {
+    if (rung < 0) {
+        rung = 0;
+    } else if (rung > PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) {
+        rung = PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1;
+    }
+    s_ldac_target_rung = rung;
+}
+
+int32_t pl_codec_ldac_requested_rung(void) { return s_ldac_target_rung; }
+int32_t pl_codec_ldac_applied_rung(void) { return s_ldac_applied_rung; }
+uint32_t pl_codec_ldac_abr_steps_down(void) { return s_ldac_abr_steps_down; }
+uint32_t pl_codec_ldac_abr_steps_up(void) { return s_ldac_abr_steps_up; }
+uint32_t pl_codec_ldac_abr_rail_hits(void) { return s_ldac_abr_rail_hits; }
+uint32_t pl_codec_ldac_abr_apply_fail(void) { return s_ldac_abr_apply_fail; }
+
+// The vtable's optional apply_pending_tuning slot (codec_table.h,
+// design sec 6.2/6.3). Called once per pl_a2dp_fill() invocation, from
+// whichever context owns the encoder under the live build
+// (core0 IRQ legacy, core1 under PL_ENCODER_ON_CORE1) -- NEVER from
+// core0's media-timer decide phase, which is what makes this safe under
+// PL_ENCODER_ON_CORE1 without inheriting fhf's #ifndef gate: the decide
+// phase writes only s_ldac_target_rung (one volatile word); this function
+// is the sole reader AND the sole writer of every other piece of ladder
+// state, so there is no cross-context tear.
+//
+// Steps the applied rung ONE STEP per call toward the target, so a
+// multi-rung change converges over several fill() calls rather than all
+// at once (design sec 6.2: ~40ms for a 4-rung walk at 100 fill()/s).
+// Inert unless s_ldac_adaptive is true for the live stream -- a pinned
+// device's EQMID was set directly by ldacBT_init_handle_encode at init()
+// and is never touched again.
+static void pl_codec_ldac_apply_pending_tuning(void *state) {
+    pl_ldac_encoder_t *enc = (pl_ldac_encoder_t *)state;
+    if (!s_ldac_adaptive || enc->handle == NULL) {
+        return;
+    }
+    int32_t target = s_ldac_target_rung; // single volatile read
+    if (target == s_ldac_applied_rung) {
+        return;
+    }
+    // Rung increasing == moving AWAY from HQ (toward MQ) == "for better
+    // connectivity" == LDACBT_EQMID_INC_CONNECTION (ldacBT.h's own naming
+    // is relative to EQMID/HQ, not our rung counter -- this is the
+    // correct match, not an inversion). Rung decreasing == toward HQ ==
+    // LDACBT_EQMID_INC_QUALITY.
+    bool stepping_down = target > s_ldac_applied_rung;
+    bool at_rail = stepping_down ? (s_ldac_applied_rung >= PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) : (s_ldac_applied_rung <= 0);
+    if (at_rail) {
+        // design sec 3.5: already at the rail -- do not advance the rung
+        // counter, count it, log nothing (IRQ/encoder context).
+        s_ldac_abr_rail_hits++;
+        return;
+    }
+    int direction = stepping_down ? LDACBT_EQMID_INC_CONNECTION : LDACBT_EQMID_INC_QUALITY;
+    int status = ldacBT_alter_eqmid_priority(enc->handle, direction);
+    if (status != 0) {
+        // design sec 11.1(b): a failure while our own rung counter is
+        // strictly inside 0..4 is a genuine fault, not a rail (we just
+        // ruled the rail case out above) -- LDACBT_ERR_ALTER_EQMID_LIMITED
+        // specifically would mean our rail check and libldac's disagree,
+        // which is itself worth a distinct counter from a true fault (sec
+        // 0.2's impossible-by-construction pkt_type case, or a NULL/
+        // not-in-encode-mode handle).
+        int err = ldacBT_get_error_code(enc->handle);
+        if (err == LDACBT_ERR_ALTER_EQMID_LIMITED) {
+            s_ldac_abr_rail_hits++;
+        } else {
+            s_ldac_abr_apply_fail++;
+        }
+        return;
+    }
+    if (stepping_down) {
+        s_ldac_applied_rung++;
+        s_ldac_abr_steps_down++;
+    } else {
+        s_ldac_applied_rung--;
+        s_ldac_abr_steps_up++;
+    }
+}
+
 static bool pl_codec_ldac_init(
     void *state, const uint8_t *configuration, uint8_t configuration_len, pl_codec_format_t *out_format,
     pl_codec_frame_info_t *out_frame
@@ -137,8 +283,23 @@ static bool pl_codec_ldac_init(
         ldacBT_close_handle(enc->handle);
     }
 
+    // Bead pico-link-7jol.3 (design sec 5): map the persisted, per-device
+    // ldac_quality byte (set by a2dp.c's pl_a2dp_finish_codec_negotiation
+    // via pl_codec_ldac_set_quality, BEFORE this init() call) to the
+    // initial EQMID and whether the controller is active for this stream.
+    // Consuming s_pending_ldac_quality here, once, is what makes a pin
+    // "structurally inert" (sec 5.1) rather than merely unused: for a
+    // pinned device the controller is never told to step because
+    // s_ldac_adaptive is false, not because it happens not to fire.
+    int initial_eqmid;
+    pl_ldac_quality_to_initial_state(s_pending_ldac_quality, &initial_eqmid, &s_ldac_adaptive);
+    // design sec 5.2: no carried-over controller state, ever -- this
+    // init() call is one of the four reset events (codec re-negotiation).
+    s_ldac_applied_rung = 0;
+    s_ldac_target_rung = 0;
+
     int status = ldacBT_init_handle_encode(
-        enc->handle, PL_LDAC_INIT_MTU, LDACBT_EQMID_HQ, (int)cfg.channel_mode, LDACBT_SMPL_FMT_S16, 48000
+        enc->handle, PL_LDAC_INIT_MTU, initial_eqmid, (int)cfg.channel_mode, LDACBT_SMPL_FMT_S16, 48000
     );
     if (status != 0) {
         // Bead pico-link-371 heap finding: this is negotiation-time
@@ -224,7 +385,20 @@ static bool pl_codec_ldac_init(
         // to libldac's own documented packing range of 2..15 frames/packet.
         // This is computed once here, at configuration time, exactly like
         // every other frame_info field -- a2dp.c never recomputes it.
-        uint32_t bytes_per_frame = ((uint32_t)kbps * 1000u) / 3000u;
+        // Bead pico-link-7jol.3 (design sec 4.2, "must not ship without
+        // this"): size the hint for the FLOOR rung the controller may
+        // reach -- MQ (330 kbps) if this stream is Adaptive, this row's
+        // own (pinned, floor==ceiling) bitrate otherwise -- NOT the
+        // current bitrate. a2dp.c's STREAM_ESTABLISHED handler derives its
+        // priming cushion from this value ONCE, at connect time, and a
+        // rung change must never recompute it (sec 4.3: that would move
+        // the setpoint out from under a live fhf trim). Sizing for the
+        // worst case up front is what makes that setpoint rung-invariant.
+        // MQ's bitrate is a fixed ladder fact (design sec 0.1's table),
+        // not something to ask the library for mid-negotiation (no handle
+        // is at MQ yet to ask).
+        uint32_t worst_case_kbps = s_ldac_adaptive ? 330u : (uint32_t)kbps;
+        uint32_t bytes_per_frame = (worst_case_kbps * 1000u) / 3000u;
         uint32_t frmlen_tx = bytes_per_frame + 3u;
         uint32_t raw_frames_per_packet = frmlen_tx > 0 ? (uint32_t)PL_LDAC_INIT_MTU / frmlen_tx : 0u;
         uint32_t clamped_frames_per_packet = raw_frames_per_packet < 2u   ? 2u
@@ -232,9 +406,10 @@ static bool pl_codec_ldac_init(
                                                                             : raw_frames_per_packet;
         out_frame->self_packetising_frames_per_packet = (uint16_t)clamped_frames_per_packet;
         pl_log(
-            "ldac: self_packetising_frames_per_packet=%lu (bytes_per_frame=%lu frmlen_tx=%lu mtu=%d)\r\n",
-            (unsigned long)clamped_frames_per_packet, (unsigned long)bytes_per_frame, (unsigned long)frmlen_tx,
-            PL_LDAC_INIT_MTU
+            "ldac: self_packetising_frames_per_packet=%lu (worst_case_kbps=%lu bytes_per_frame=%lu "
+            "frmlen_tx=%lu mtu=%d adaptive=%d)\r\n",
+            (unsigned long)clamped_frames_per_packet, (unsigned long)worst_case_kbps, (unsigned long)bytes_per_frame,
+            (unsigned long)frmlen_tx, PL_LDAC_INIT_MTU, (int)s_ldac_adaptive
         );
     }
 
@@ -330,5 +505,8 @@ pl_codec_t pl_codec_ldac = {
     .init = pl_codec_ldac_init,
     .encode = pl_codec_ldac_encode,
     .deinit = pl_codec_ldac_deinit,
+    // Bead pico-link-7jol.3, design sec 6.3: the optional ABR-apply slot.
+    // NULL for codec_sbc.c's row (SBC has no ladder).
+    .apply_pending_tuning = pl_codec_ldac_apply_pending_tuning,
     .state = &s_ldac_encoder,
 };

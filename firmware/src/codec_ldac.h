@@ -49,4 +49,59 @@ typedef struct {
 // which a file-scope array in codec_ldac.c does by construction.
 extern const uint8_t pl_codec_ldac_negotiated_info[8];
 
+// The ladder's rung count (design sec 0.1: 5 rungs -- HQ, two unnameable
+// internal rungs, SQ... wait see that section's table for the real order:
+// 990/660/492/396/330 kbps). Exposed so a2dp.c's controller (the DECIDE
+// phase) can bound its own rung arithmetic without duplicating the
+// literal -- codec_ldac.c is still the only place that walks the ladder.
+#define PL_LDAC_ADAPTIVE_LADDER_RUNGS 5
+
+// --- Bead pico-link-7jol.3: the LDAC ABR ladder and the pinned-quality
+// setting. See .planning/design/2026-09-07-ldac-abr-control-loop.md,
+// especially sec 5 (pin-vs-adaptive is ONE mapping function, kept in
+// codec_ldac.c) and sec 6 (the core0-decide / encoder-context-apply
+// split this API exists to support). a2dp.c owns the controller's
+// decide phase (q_ema, the bands, the dwell timers); this module owns the
+// ladder itself and every ldacBT_* call, per sec 6.3's module boundary.
+
+// Sets the per-device persisted quality choice (persist.h's 1-based
+// ldac_quality: 0 = unset, 1/2/3 = pinned 990/660/330, 4 = Adaptive).
+// Consumed once, synchronously, by the NEXT pl_codec_ldac_init() call
+// (i.e. row->init(), called from a2dp.c's pl_a2dp_finish_codec_
+// negotiation, BEFORE init() runs -- design sec 11.2). Safe to call at any
+// time, including while a different codec (SBC) is the live stream -- it
+// only ever affects this row's own pending state, never touches a live
+// handle, so it is the "safe no-op on the live stream" sec 11.2 requires.
+void pl_codec_ldac_set_quality(uint8_t ldac_quality_1based);
+
+// True once init() has configured the CURRENT stream for Adaptive mode
+// (persisted quality == 4). Gates a2dp.c's ABR controller evaluation
+// (design sec 2.4) -- a2dp.c never inspects codec-private state (EQMID,
+// libldac internals) directly to decide this itself.
+bool pl_codec_ldac_is_adaptive(void);
+
+// Called from a2dp.c's control loop's DECIDE phase (core0, media-timer
+// IRQ) with a new TARGET rung in [0, 4] -- not a delta (design sec 6.2:
+// idempotent, so a missed or duplicated write converges rather than
+// accumulating error). Clamped internally to the valid range. Writing
+// this when the stream is not Adaptive is harmless -- the APPLY phase
+// below no-ops unless pl_codec_ldac_is_adaptive() is true.
+void pl_codec_ldac_request_rung(int32_t rung);
+
+// The rung the encoder context is currently asked to reach (== the last
+// value passed to pl_codec_ldac_request_rung).
+int32_t pl_codec_ldac_requested_rung(void);
+
+// The rung actually applied as of the last successful ldacBT_alter_eqmid_
+// priority call. Distinct from the requested rung by design (bead
+// pico-link-7jol.3's MUST-BUILD trap #4): a stuck walk shows up as a
+// persistent divergence here, never silently.
+int32_t pl_codec_ldac_applied_rung(void);
+
+// Lifetime observability counters for pl_a2dp_report (design sec 7).
+uint32_t pl_codec_ldac_abr_steps_down(void);
+uint32_t pl_codec_ldac_abr_steps_up(void);
+uint32_t pl_codec_ldac_abr_rail_hits(void);
+uint32_t pl_codec_ldac_abr_apply_fail(void);
+
 #endif // PICO_LINK_CODEC_LDAC_H

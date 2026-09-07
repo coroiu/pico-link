@@ -153,6 +153,19 @@ _Static_assert(
 );
 #define PL_A2DP_TX_QUEUE_MASK (PL_A2DP_TX_QUEUE_SLOTS - 1u)
 
+// Bead pico-link-7jol.3, design sec 3.1: the LDAC ABR controller's bands
+// and dwell timers. Units of PL_A2DP_TX_QUEUE_SLOTS - 1 (7) usable slots,
+// Q8 fixed point (1 slot == 256). The dead band (1.0..4.0 slots) is
+// deliberately enormous -- see the design doc's rationale: we are choosing
+// between five discrete operating points, not tracking a continuous
+// setpoint. Asymmetric dwell (1s down, 60s up) is the anti-oscillation
+// mechanism (sec 3.4) -- do not narrow SETTLE_US without re-reading that
+// section's limit-cycle argument.
+#define PL_LDAC_ABR_Q_HI (4 * 256)
+#define PL_LDAC_ABR_Q_LO (1 * 256)
+#define PL_LDAC_ABR_SETTLE_US 1000000ULL
+#define PL_LDAC_ABR_UP_DWELL_US 60000000ULL
+
 // design sec 1: our own crystal, via btstack_run_loop timers, paces the
 // A2DP media stream -- matches a2dp_source_demo.c's own AUDIO_TIMEOUT_MS.
 #define PL_A2DP_AUDIO_TIMEOUT_MS 10
@@ -666,6 +679,22 @@ typedef struct {
     // Bead pico-link-fhf: pbv_now_us at the last trim, for the
     // PL_PCM_TRIM_MIN_INTERVAL_US lockout gate in the media-timer handler.
     uint64_t last_resync_us;
+
+    // Bead pico-link-7jol.3 (design .planning/design/2026-09-07-ldac-abr-
+    // control-loop.md sec 2-3): the ABR controller's DECIDE-phase state --
+    // owned and evaluated entirely on core0's media-timer IRQ, same
+    // context as the fhf resync trim above and shaped after it. q_ema is
+    // Q8 fixed point (units of 1/256 of a tx-queue slot); last_step_us
+    // gates BOTH directions' settle/dwell timers (design sec 3.1's asym-
+    // metric SETTLE_US/UP_DWELL_US -- which one applies is inferred from
+    // the direction of the step that set it); qfull_snapshot is the
+    // stop_queue_full value at the start of the current up-dwell window,
+    // for the "clean minute" veto (design sec 2.3). Reset whenever
+    // STREAM_STARTED, STREAM_ESTABLISHED, or a quality change fires (sec
+    // 5.2) -- there is no carried-over controller state, ever.
+    int32_t abr_q_ema;
+    uint64_t abr_last_step_us;
+    uint32_t abr_qfull_snapshot;
 } pl_a2dp_ctx_t;
 
 static pl_a2dp_ctx_t s_ctx;
@@ -1382,6 +1411,17 @@ static void pl_a2dp_tx_flush(void) {
 // signal -- conflating the two would fire underrun_events on ordinary
 // ticks, mid-music.
 static void pl_a2dp_fill(void) {
+    // Bead pico-link-7jol.3, design sec 6.2: the APPLY half of the ABR
+    // decide/apply split. Runs once per call, in whichever context calls
+    // pl_a2dp_fill (core0 IRQ legacy, core1 under PL_ENCODER_ON_CORE1) --
+    // the SAME context that owns the encoder, which is what makes this
+    // safe without a lock (see codec_table.h's doc comment on this
+    // vtable slot). NULL for a codec row with no ladder (SBC) -- no
+    // codec-identity branch, per codec_table.c's own convention.
+    if (s_ctx.codec != NULL && s_ctx.codec->apply_pending_tuning != NULL) {
+        s_ctx.codec->apply_pending_tuning(s_ctx.codec->state);
+    }
+
     uint16_t frame_bytes = s_ctx.frame.encoded_frame_bytes;
     uint16_t pcm_frame_count = s_ctx.frame.pcm_frames_per_encoded_frame;
     uint32_t pcm_bytes_needed = (uint32_t)pcm_frame_count * PL_PCM_FRAME_BYTES;
@@ -2145,6 +2185,60 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
         return;
     }
 
+    // Bead pico-link-7jol.3, design sec 2/3: the LDAC ABR controller's
+    // DECIDE phase. Runs on core0's media-timer IRQ in BOTH build modes
+    // (pl_a2dp_tx_count() is already read from this handler under core1
+    // mode at the send-kick check below, so this signal side is core1-safe
+    // by the same argument -- design sec 6.1). Only ever WRITES a target
+    // rung via pl_codec_ldac_request_rung (one volatile word); the APPLY
+    // side lives in pl_codec_ldac_apply_pending_tuning, called from
+    // pl_a2dp_fill in whichever context owns the encoder (sec 6.2).
+    //
+    // Gating (sec 2.4): streaming (already established above),
+    // !host_silent (a paused host must not be stepped toward MQ on its
+    // way to auto-pause -- same reasoning as the fhf trim's own
+    // host_silent skip below), and the active row must be LDAC in
+    // Adaptive mode (pl_codec_ldac_is_adaptive() -- no codec-identity
+    // branch; this queries declared state, not codec_id).
+    if (!host_silent && s_ctx.codec != NULL && pl_codec_ldac_is_adaptive()) {
+        // Q8 fixed point (units of 1/256 of a tx-queue slot). Shift 4 =>
+        // tau ~= 16 ticks ~= 160ms (design sec 2.2, same discipline as
+        // fhf's fb_fill_ema: EMA, never raw -- raw tx_count sawtooths by a
+        // full packet between the seal and the can_send_now grant).
+        uint32_t tx_count_now = pl_a2dp_tx_count();
+        s_ctx.abr_q_ema += (((int32_t)tx_count_now * 256) - s_ctx.abr_q_ema) >> 4;
+
+        int32_t applied_rung = pl_codec_ldac_applied_rung();
+        bool past_settle = (pbv_now_us - s_ctx.abr_last_step_us) > PL_LDAC_ABR_SETTLE_US;
+
+        if (s_ctx.abr_q_ema >= PL_LDAC_ABR_Q_HI && past_settle && applied_rung < PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) {
+            // Step down (toward robustness): design sec 3.2.
+            pl_codec_ldac_request_rung(applied_rung + 1);
+            s_ctx.abr_last_step_us = pbv_now_us;
+            // Reseed LAST, from the post-decision reading -- fhf's
+            // ordering lesson (sec 3.3): the EMA holds a stale pre-step
+            // value for ~5 tau after the operating point moves, and an
+            // ungated second evaluation would step again on a reading
+            // that no longer exists.
+            s_ctx.abr_q_ema = (int32_t)tx_count_now * 256;
+            s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
+        } else if (s_ctx.abr_q_ema <= PL_LDAC_ABR_Q_LO && applied_rung > 0 &&
+                   (pbv_now_us - s_ctx.abr_last_step_us) > PL_LDAC_ABR_UP_DWELL_US &&
+                   s_ctx.stop_queue_full == s_ctx.abr_qfull_snapshot) {
+            // Step up (toward quality): design sec 3.2 -- gated on a
+            // provably clean dwell window (sec 2.3's veto: the rail
+            // tripwire must not have fired even once across the ENTIRE
+            // up-dwell, not just "recently").
+            pl_codec_ldac_request_rung(applied_rung - 1);
+            s_ctx.abr_last_step_us = pbv_now_us;
+            s_ctx.abr_q_ema = (int32_t)tx_count_now * 256;
+            s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
+        }
+    }
+    // NO pl_log anywhere in this block -- same IRQ-context contract as the
+    // fhf trim immediately below (pico-link-0d2's lesson). All reporting
+    // happens in pl_a2dp_report, at thread context.
+
 #ifndef PL_ENCODER_ON_CORE1
     // Bead pico-link-fhf: hysteresis-banded discrete resync. Ring fill
     // under credit pacing is a free integrator (drain is defined by our
@@ -2285,6 +2379,24 @@ static void pl_a2dp_finish_codec_negotiation(uint8_t local_seid, const uint8_t *
             break;
         }
     }
+
+    // Bead pico-link-7jol.3, design sec 11.2: re-apply the per-device
+    // ldac_quality pin on EVERY connection, here, immediately before
+    // row->init() -- this is the seam persist.h's own doc comment names
+    // as safe from this exact context ("a pin set now is visible to
+    // a2dp.c's next connection attempt immediately"), and it was
+    // documented but never wired before this bead. connect_addr is
+    // already populated (pl_a2dp_establish_stream_now, well before this
+    // handler runs). Unconditional and codec-identity-free: a never-
+    // remembered address reads back false and we pass 0 (unset), and
+    // pl_codec_ldac_set_quality is a safe no-op if the negotiated row
+    // turns out not to be LDAC (design sec 11.2's SBC-fallback case) --
+    // it only ever primes state that ONLY pl_codec_ldac_init reads.
+    uint8_t pinned_codec_id_unused;
+    uint8_t ldac_quality = 0;
+    pl_persist_get_device_settings(s_ctx.connect_addr, &pinned_codec_id_unused, &ldac_quality);
+    pl_codec_ldac_set_quality(ldac_quality);
+
     if (row == NULL || !row->init(row->state, cfg, cfg_len, &s_ctx.format, &s_ctx.frame)) {
         pl_log("a2dp: codec init FAILED for local_seid %u\r\n", local_seid);
         pl_bt_push_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_NO_A2DP_SINK);
@@ -3110,6 +3222,14 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // resets poisons later derivations).
             s_ctx.tx_depth_max = 0;
             s_ctx.dwell_max_us = 0;
+            // Bead pico-link-7jol.3, design sec 5.2: no carried-over ABR
+            // controller state across a stream boundary, ever -- q_ema
+            // reseeded cold, dwell timers cleared so the first tick's
+            // evaluation can't read a stale settle/dwell window from a
+            // previous stream.
+            s_ctx.abr_q_ema = 0;
+            s_ctx.abr_last_step_us = 0;
+            s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
             // Bead pico-link-pbv round 2 (C2-3): round 1's trim-to-target
             // here is DELETED -- it discarded exactly the cushion that
             // keeps one late tick from reaching zero (PRIMING now waits
@@ -3500,6 +3620,23 @@ void pl_a2dp_report(uint32_t report_dt_us) {
         (unsigned long)s_ctx.frames_per_packet, (unsigned long)s_ctx.credit_clamped_samples,
         (unsigned long)s_ctx.credit_clamp_events, (unsigned long)s_ctx.flush_frames, (unsigned long)s_ctx.resync_drops,
         (unsigned long)s_ctx.resync_events, (long)pl_usb_audio_fb_fill_ema(), (unsigned long)pl_usb_audio_fill_min()
+    );
+    // Bead pico-link-7jol.3, design sec 7: the LDAC ABR controller's
+    // observability line. quality_requested and quality_applied are
+    // reported as DISTINCT values (bead trap #4) -- a stuck walk shows up
+    // as a persistent divergence between them, never silently.
+    // abr_bitrate_bps is the APPLIED rate (ldacBT_get_bitrate's ground
+    // truth, via s_ctx.frame.nominal_bitrate_bps's own doc comment on
+    // "ask the library"), NOT re-derived from the rung counter -- reads 0
+    // for a non-LDAC/non-Adaptive stream, which is a legitimate reading,
+    // not a fault.
+    pl_log(
+        "a2dp: abr_adaptive=%d quality_requested=%ld quality_applied=%ld abr_steps_down=%lu abr_steps_up=%lu "
+        "abr_rail_hits=%lu abr_apply_fail=%lu abr_q_ema=%ld.%02ld\r\n",
+        (int)pl_codec_ldac_is_adaptive(), (long)pl_codec_ldac_requested_rung(), (long)pl_codec_ldac_applied_rung(),
+        (unsigned long)pl_codec_ldac_abr_steps_down(), (unsigned long)pl_codec_ldac_abr_steps_up(),
+        (unsigned long)pl_codec_ldac_abr_rail_hits(), (unsigned long)pl_codec_ldac_abr_apply_fail(),
+        (long)(s_ctx.abr_q_ema >> 8), (long)(((s_ctx.abr_q_ema & 0xFF) * 100) >> 8)
     );
     // Bead pico-link-pbv round 2 (C2-2), retuned by pico-link-85v: stop-
     // reason breakdown for pl_a2dp_fill's loop. stop_dwell must read 0 in
