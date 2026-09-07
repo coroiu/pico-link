@@ -1081,6 +1081,7 @@ pub enum PickerKind {
 /// forward instead of resetting to row 0 -- the same carry-forward
 /// [`App::build_identified_screen`]'s `ScreenId::Devices` arm already did
 /// pre-refactor, generalized to any identified screen at any depth.
+#[derive(Default)]
 pub(crate) struct ScreenCarry {
     selected_key: Option<ListItemKey>,
     selected_index: usize,
@@ -1089,7 +1090,12 @@ pub(crate) struct ScreenCarry {
 
 /// What [`App::build_identified_screen`] found for a given [`ScreenId`] --
 /// [`App::refresh_stack`]'s two possible outcomes per identified screen.
-enum Refresh {
+///
+/// `pub(crate)`: `render::home`'s `ShortcutY` binding
+/// (`pico-link-hr30`) pushes a device page the same way this module's own
+/// connected-row activation does (see `build_devices_screen`'s
+/// `model_for_device_page` closure), so it needs to see both arms too.
+pub(crate) enum Refresh {
     /// Replace the screen at this stack index with this freshly built one.
     Rebuild(Screen),
     /// This screen's subject no longer exists in the model (e.g. a
@@ -1617,7 +1623,7 @@ fn format_device_address(addr: DeviceAddr) -> String {
 /// confirm screen, or from Devices while this page happened to be open one
 /// level up -- so [`App::refresh_stack`] can unwind the stack rather than
 /// leave a page open on a device that no longer exists.
-fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
+pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
     let Some(device) = model.paired.iter().find(|d| d.addr == addr) else {
         return Refresh::Gone;
     };
@@ -3068,7 +3074,11 @@ mod tests {
         }
         fn settings() -> App {
             let mut app = App::new(240, 240);
-            app.handle_input(vec![NavIntent::ShortcutY]); // Home status face -> Settings
+            // `pico-link-hr30` repurposed Home's `ShortcutY` to the device
+            // page, so Settings is reached the ordinary way now: A/centre
+            // to the menu face, Down to the Settings row, A/centre to
+            // activate it.
+            app.handle_input(vec![NavIntent::Select, NavIntent::Down, NavIntent::Select]);
             app
         }
         /// Bead pico-link-du0: Home's status face, connected, with a live

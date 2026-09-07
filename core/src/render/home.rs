@@ -55,17 +55,23 @@
 //! fix -- the toggle-first behavior itself is exactly what the design's
 //! own global rule requires.
 //!
-//! # X is left inert on both faces
+//! # X is left inert on both faces (pico-link-hr30 superseding ruling)
 //!
-//! Design section 4's table gives Home's status face `X: link`/`why?`
-//! (Device detail) and the menu face `X: manage connected device` (also
-//! Device detail). Device detail is `pico-link-znb.13` (E11), not built
-//! yet. Per design section 4 rule 2 ("an unlabelled X or Y does nothing" --
-//! implying a *labelled* one must do something), labelling X here without
-//! a real destination would be worse than leaving it unlabelled: a
-//! pressable-looking button that silently does nothing is exactly the
-//! "mispress that isn't free" the rule exists to prevent. Left unlabelled
-//! and unbound on both faces until E11 lands.
+//! ANDREAS RULING 2026-09-07 (`pico-link-hr30`), superseding the older
+//! split-by-face ruling this doc comment used to describe: **X opens the
+//! fault strip detail, Y opens the device page, both on both faces** --
+//! same destination regardless of which face is showing. Y is wired below
+//! (device page when connected, an explicit "no device" message
+//! otherwise -- see [`HomeView::on_intent`]'s `ShortcutY` arm). X is NOT
+//! wired yet: the fault strip detail screen it targets does not exist
+//! (`pico-link-9eq2.3`), and design section 4 rule 2 ("an unlabelled X or Y
+//! does nothing" -- implying a *labelled* one must do something) means
+//! labelling X without a real destination would be worse than leaving it
+//! unlabelled -- a pressable-looking button that silently does nothing is
+//! exactly the "mispress that isn't free" the rule exists to prevent. So X
+//! stays `Action::None` and unlabelled (rail defaults it to
+//! [`ButtonLabel::Inert`]) on both faces until `pico-link-9eq2.3` lands and
+//! gives it a screen to push.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -80,8 +86,8 @@ use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
-    build_devices_screen, build_settings_screen, BtModel, Command, DeviceEntry, HomeFace, LinkState, ScreenId, VolumeSource, WizardPhase,
-    LDAC_QUALITY_ADAPTIVE,
+    build_device_page_screen, build_devices_screen, build_settings_screen, BtModel, Command, DeviceAddr, DeviceEntry, HomeFace, LinkState,
+    Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
 };
 use crate::input::NavIntent;
 
@@ -89,10 +95,16 @@ use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::hero::{BitrateStatus, CodecStatus, HeroStatusView, HeroVolume, HeroVolumeSource, OutLevelDisplay};
 use super::menu::{MenuItem, MenuList};
+use super::message::MessageView;
 use super::paint_key::PaintKey;
 use super::rail::ButtonLabel;
 use super::screen::Screen;
 use super::widget::{Action, ChromeContribution, FocusEvent, Verb, Widget};
+
+/// Home's title for the explicit "no device connected" screen `ShortcutY`
+/// pushes when there's nothing to open a device page for (bead
+/// `pico-link-hr30`: "do not leave it a silent no-op, and do not crash").
+const NO_DEVICE_TITLE: &str = "Device";
 
 /// Seed for [`HomeView::paint_key`] -- only needs to differ from other
 /// widgets' own seeds.
@@ -145,6 +157,22 @@ struct HomeView {
     /// widget's codec/bitrate fields; see [`HomeView::new`]'s doc
     /// comment).
     link_state: LinkState,
+    /// The connected device's address, if any -- read by `ShortcutY` to
+    /// decide whether to push the device page or the explicit "no device"
+    /// message (bead `pico-link-hr30`). A snapshot, same staleness
+    /// tolerance as `HomeView::new`'s other `BtModel` reads: `HomeView` is
+    /// rebuilt on every model change (module doc), so this is never more
+    /// than one frame stale.
+    connected_addr: Option<DeviceAddr>,
+    /// Snapshot of the model, for `ShortcutY`'s device-page push -- same
+    /// "`Action::PushView`'s builder is `FnOnce` with no path back to a
+    /// live `&BtModel`" reason `App::build_devices_screen`'s own
+    /// `model_for_device_page` snapshot exists for (`core/src/app.rs`).
+    model: BtModel,
+    /// For `ShortcutY`'s device-page push -- forwarded straight through to
+    /// [`crate::app::build_device_page_screen`], same as every other
+    /// `Command`-emitting `PushView` closure in this crate.
+    commands: Rc<RefCell<VecDeque<Command>>>,
 }
 
 impl HomeView {
@@ -243,8 +271,18 @@ impl HomeView {
         }
         .with_volume(hero_volume);
         let link_state = model.link_state;
+        let connected_addr = model.connected_addr;
 
         let model = model.clone();
+        // Snapshot for `ShortcutY`'s device-page push -- same reason
+        // `build_devices_screen`'s own `model_for_device_page`/
+        // `commands_for_activate` snapshots exist (`core/src/app.rs`):
+        // `Action::PushView`'s builder is `FnOnce` with no path back to a
+        // live `&BtModel`, and this is a `HomeView` field rather than a
+        // per-press clone because the same snapshot serves every
+        // `ShortcutY` press until the next `rebuild_root` replaces it.
+        let model_for_shortcut_y = model.clone();
+        let commands_for_shortcut_y = Rc::clone(commands);
         let commands_for_bluetooth = Rc::clone(commands);
         let wizard_phase_for_bluetooth = Rc::clone(wizard_phase);
         let wizard_devices_for_bluetooth = Rc::clone(wizard_devices);
@@ -268,7 +306,15 @@ impl HomeView {
             },
         );
 
-        Self { home_face, hero, menu, link_state }
+        Self {
+            home_face,
+            hero,
+            menu,
+            link_state,
+            connected_addr,
+            model: model_for_shortcut_y,
+            commands: commands_for_shortcut_y,
+        }
     }
 
     fn face(&self) -> HomeFace {
@@ -347,24 +393,51 @@ impl Widget for HomeView {
                 HomeFace::Status => Action::None,
                 HomeFace::Menu => self.menu.on_intent(intent),
             },
-            // Y: Settings, on the status face only (design section 4's
-            // rail table gives the menu face's Y slot no meaning at all --
-            // "-" -- since Settings is already one of its two rows).
-            // Unlike A, Y is a genuinely distinct `NavIntent` from centre,
-            // so this one *can* be wired to its real destination directly.
-            NavIntent::ShortcutY => match self.face() {
-                HomeFace::Status => Action::PushView(Box::new(build_settings_screen)),
-                HomeFace::Menu => Action::None,
-            },
+            // Y: the device page, on BOTH faces -- `pico-link-hr30`,
+            // Andreas's ruling superseding the old "Y: Settings on the
+            // status face only" binding (Settings stays reachable via A ->
+            // menu face -> Settings row; that shortcut is deliberately
+            // dropped so the same physical button does the same thing on
+            // either face, per the ruling's "no face-dependent behaviour
+            // to learn"). Connected: push the real device page, same
+            // `build_device_page_screen`/`Refresh` dance
+            // `build_devices_screen`'s own connected-row activation uses
+            // (`core/src/app.rs`). Not connected: an explicit "no device
+            // connected" message, not a silent no-op -- the bead is
+            // explicit that Y must never look like a dead button when
+            // there's nothing to open.
+            NavIntent::ShortcutY => {
+                if let Some(addr) = self.connected_addr {
+                    let model = self.model.clone();
+                    let commands = Rc::clone(&self.commands);
+                    Action::PushView(Box::new(move || match build_device_page_screen(&model, addr, &ScreenCarry::default(), &commands) {
+                        Refresh::Rebuild(screen) => screen,
+                        // The device we just read `connected_addr` for
+                        // cannot have vanished between that read and this
+                        // closure running on the very same input event --
+                        // structurally unreachable, but a same-titled
+                        // empty screen is a harmless fallback rather than
+                        // a panic if it ever is (same shape as
+                        // `build_devices_screen`'s own `fallback_title`
+                        // handling).
+                        Refresh::Gone => Screen::new(NO_DEVICE_TITLE, vec![]),
+                    }))
+                } else {
+                    Action::PushView(Box::new(|| {
+                        Screen::new(NO_DEVICE_TITLE, vec![Box::new(MessageView::new("No device connected"))])
+                    }))
+                }
+            }
             // X is left inert on both faces -- see the module doc's "X is
-            // left inert on both faces" section for why (Device detail,
-            // E11, isn't built yet). `Left`/`Right` have no meaning on
-            // Home (design section 4: identical to B/A elsewhere, but
-            // Home's exception already covers A/B/centre explicitly and
-            // doesn't mention them). `Select` is handled entirely in
-            // `on_focus` (`NavIntent::Select` reaches `Widget::on_focus`'s
-            // `FocusEvent::Activated`, not `on_intent` -- see
-            // `Navigator::dispatch`), so it never reaches here.
+            // left inert on both faces" section for why (fault strip
+            // detail, `pico-link-9eq2.3`, isn't built yet). `Left`/`Right`
+            // have no meaning on Home (design section 4: identical to B/A
+            // elsewhere, but Home's exception already covers A/B/centre
+            // explicitly and doesn't mention them). `Select` is handled
+            // entirely in `on_focus` (`NavIntent::Select` reaches
+            // `Widget::on_focus`'s `FocusEvent::Activated`, not
+            // `on_intent` -- see `Navigator::dispatch`), so it never
+            // reaches here.
             NavIntent::ShortcutX | NavIntent::Left | NavIntent::Right | NavIntent::Select => Action::None,
         }
     }
@@ -373,13 +446,19 @@ impl Widget for HomeView {
         match self.face() {
             HomeFace::Status => {
                 let mut contribution = self.hero.chrome_contribution(ctx).unwrap_or_default();
-                contribution.y = Some(ButtonLabel::Live(String::from("set")));
+                // "link": the device page, per `pico-link-hr30`'s ruling --
+                // was "set" (Settings) before that ruling repurposed Y; see
+                // `on_intent`'s `ShortcutY` arm and this bead's doc comment.
+                contribution.y = Some(ButtonLabel::Live(String::from("link")));
                 contribution.link = Some(self.link_state);
                 Some(contribution)
             }
             // A's word is entirely `activation()`'s job now (design rule
-            // 4) -- nothing left for this face to contribute to chrome.
-            HomeFace::Menu => None,
+            // 4), and there's no title-bar Bluetooth glyph on this face --
+            // but Y still needs a label here too (`pico-link-hr30`: both
+            // faces bind and label the same way), so this can no longer be
+            // a flat `None`.
+            HomeFace::Menu => Some(ChromeContribution { y: Some(ButtonLabel::Live(String::from("link"))), ..ChromeContribution::default() }),
         }
     }
 
@@ -479,6 +558,104 @@ mod tests {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
+    }
+
+    /// A [`HomeView`] whose model has a connected, paired device at
+    /// `addr` -- for `pico-link-hr30`'s `ShortcutY` -> device-page tests.
+    fn connected_home_view(addr: crate::app::DeviceAddr) -> HomeView {
+        let mut model = BtModel { connected_addr: Some(addr), ..BtModel::default() };
+        model.paired.push(crate::app::PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        let home_face = Rc::new(RefCell::new(HomeFace::default()));
+        let commands = Rc::new(RefCell::new(VecDeque::new()));
+        let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
+        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
+    }
+
+    /// Runs an [`Action::PushView`]'s builder and returns the resulting
+    /// [`Screen`], panicking if `action` isn't `PushView` -- shared shape
+    /// for the `ShortcutY` tests below, which only care about the pushed
+    /// screen's identity, not the raw `Action`.
+    fn pushed_screen(action: Action) -> Screen {
+        match action {
+            Action::PushView(build) => build(),
+            // `Action` isn't `Debug` (it carries a boxed `FnOnce`), so this
+            // can't print what it actually got -- the assertion still
+            // fails loudly, just without an interpolated value.
+            _ => panic!("expected Action::PushView"),
+        }
+    }
+
+    // --- pico-link-hr30: ShortcutY -> the device page (or an explicit
+    // "no device" message), on both faces ---
+
+    #[test]
+    fn shortcut_y_pushes_the_device_page_when_connected_on_the_status_face() {
+        let addr = [9; 6];
+        let mut view = connected_home_view(addr);
+        assert_eq!(view.face(), HomeFace::Status);
+        let screen = pushed_screen(view.on_intent(NavIntent::ShortcutY));
+        assert_eq!(screen.id(), Some(ScreenId::DevicePage(addr)), "status-face Y must open the connected device's device page");
+    }
+
+    #[test]
+    fn shortcut_y_pushes_the_device_page_when_connected_on_the_menu_face() {
+        let addr = [9; 6];
+        let mut view = connected_home_view(addr);
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.face(), HomeFace::Menu);
+        let screen = pushed_screen(view.on_intent(NavIntent::ShortcutY));
+        assert_eq!(screen.id(), Some(ScreenId::DevicePage(addr)), "menu-face Y must open the same device page as the status face");
+    }
+
+    #[test]
+    fn shortcut_y_is_not_a_silent_no_op_when_nothing_is_connected_on_the_status_face() {
+        let mut view = fresh_home_view();
+        assert_eq!(view.face(), HomeFace::Status);
+        let screen = pushed_screen(view.on_intent(NavIntent::ShortcutY));
+        assert_eq!(screen.id(), None, "the 'no device connected' screen must not be mistaken for a real device page by refresh_stack");
+    }
+
+    #[test]
+    fn shortcut_y_is_not_a_silent_no_op_when_nothing_is_connected_on_the_menu_face() {
+        let mut view = fresh_home_view();
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.face(), HomeFace::Menu);
+        let screen = pushed_screen(view.on_intent(NavIntent::ShortcutY));
+        assert_eq!(screen.id(), None, "the disconnected case must push the same 'no device' screen on the menu face too");
+    }
+
+    #[test]
+    fn y_is_labelled_link_on_both_faces() {
+        let mut view = fresh_home_view();
+        assert_eq!(
+            view.chrome_contribution(&test_ctx()).and_then(|c| c.y),
+            Some(ButtonLabel::Live(String::from("link"))),
+            "status face Y must be labelled -- an unlabelled Y binding breaks design rule 2"
+        );
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(
+            view.chrome_contribution(&test_ctx()).and_then(|c| c.y),
+            Some(ButtonLabel::Live(String::from("link"))),
+            "menu face Y must be labelled the same way -- same destination, same label"
+        );
+    }
+
+    /// `pico-link-hr30`: X is deliberately left unbound and unlabelled on
+    /// both faces until the fault strip detail screen it targets exists
+    /// (`pico-link-9eq2.3`) -- see the module doc's "X is left inert on
+    /// both faces" section. Rail default for an absent `chrome_contribution`
+    /// entry is [`ButtonLabel::Inert`] (`ButtonLabels::default`), so `None`
+    /// here is the correct assertion, not an oversight.
+    #[test]
+    fn x_stays_unbound_and_unlabelled_on_both_faces() {
+        let mut view = fresh_home_view();
+        assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), None);
+        assert!(matches!(view.on_intent(NavIntent::ShortcutX), Action::None));
+
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), None);
+        assert!(matches!(view.on_intent(NavIntent::ShortcutX), Action::None));
     }
 
     /// Regression test for the review finding on this bead: a `None`
