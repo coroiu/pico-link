@@ -199,9 +199,43 @@ static bool pl_codec_ldac_init(
         // bitrate on the panel is worse than an obviously absent one.
         pl_log("ldac: ldacBT_get_bitrate failed (%d), reporting 0\r\n", kbps);
         out_frame->nominal_bitrate_bps = 0;
+        // Bead pico-link-i6zn: no honest bitrate means no honest
+        // frames-per-packet either -- leave the hint at 0 (unknown) so
+        // a2dp.c's fallback (with its own loud warning) governs instead of
+        // a made-up number. See codec_table.h's doc comment on this field.
+        out_frame->self_packetising_frames_per_packet = 0;
     } else {
         out_frame->nominal_bitrate_bps = (uint32_t)kbps * 1000u;
         pl_log("ldac: nominal bitrate %d kbps from ldacBT_get_bitrate\r\n", kbps);
+
+        // Bead pico-link-i6zn (design .planning/design/2026-09-07-ldac-abr-
+        // control-loop.md sec 4.2): the honest per-packet transport-frame
+        // count, derived the same way libldac derives it internally --
+        // ASK THE LIBRARY'S OWN MATHS, never restate a per-EQMID table
+        // (same discipline as nominal_bitrate_bps just above, bead
+        // pico-link-qx8). bytes_per_frame is libldac's encoded byte count
+        // per 128-sample LDAC transport frame at 48kHz
+        // (kbps*1000 bits/s / 8 bits/byte * (128/48000) s/frame reduces to
+        // kbps*1000/3000); frmlen_tx adds LDAC's own 3-byte per-frame
+        // transport header; frames_per_packet is how many of those fit in
+        // the MTU libldac was ACTUALLY configured with (PL_LDAC_INIT_MTU,
+        // not the real negotiated AVDTP payload -- see that macro's doc
+        // comment for why libldac never sees the larger real MTU), clamped
+        // to libldac's own documented packing range of 2..15 frames/packet.
+        // This is computed once here, at configuration time, exactly like
+        // every other frame_info field -- a2dp.c never recomputes it.
+        uint32_t bytes_per_frame = ((uint32_t)kbps * 1000u) / 3000u;
+        uint32_t frmlen_tx = bytes_per_frame + 3u;
+        uint32_t raw_frames_per_packet = frmlen_tx > 0 ? (uint32_t)PL_LDAC_INIT_MTU / frmlen_tx : 0u;
+        uint32_t clamped_frames_per_packet = raw_frames_per_packet < 2u   ? 2u
+                                              : raw_frames_per_packet > 15u ? 15u
+                                                                            : raw_frames_per_packet;
+        out_frame->self_packetising_frames_per_packet = (uint16_t)clamped_frames_per_packet;
+        pl_log(
+            "ldac: self_packetising_frames_per_packet=%lu (bytes_per_frame=%lu frmlen_tx=%lu mtu=%d)\r\n",
+            (unsigned long)clamped_frames_per_packet, (unsigned long)bytes_per_frame, (unsigned long)frmlen_tx,
+            PL_LDAC_INIT_MTU
+        );
     }
 
     return true;

@@ -45,6 +45,30 @@ typedef struct {
     // rows agree on 1, so a future codec with a different header shape is
     // a table-row change, not a2dp.c surgery.
     uint8_t header_bytes;
+    // Bead pico-link-i6zn: PACKET framing for a self-packetising row
+    // (encoded_frame_bytes == 0 above), reported SEPARATELY from FRAME
+    // size because there is no fixed frame size to derive it from. Before
+    // this field existed, a2dp.c's STREAM_ESTABLISHED handler divided the
+    // usable AVDTP payload by encoded_frame_bytes and fell back to a
+    // hardcoded 1u whenever that was 0 -- which is EVERY TIME for a
+    // self-packetising codec, by the convention documented above. LDAC
+    // packs 2 (HQ) to 6 (MQ) transport frames per AVDTP packet, so that
+    // fallback understated the priming cushion and the tx-queue-depth
+    // check by 2x-6x (see .planning/design/2026-09-07-ldac-abr-control-
+    // loop.md sec 4.2). Zero here means "not applicable, use the
+    // encoded_frame_bytes division as before" -- every fixed-size row
+    // (SBC) leaves this zero. Non-zero means "this row already knows its
+    // own frames-per-packet for the configuration init() just set up";
+    // a2dp.c must use it VERBATIM and never divide encoded_frame_bytes
+    // (which is legitimately 0) to get here.
+    //
+    // This is a snapshot valid for whatever configuration init() (or a
+    // future rung change, pico-link-7jol.3's ABR ladder) most recently set
+    // up -- a2dp.c never inspects codec-private state (EQMID, libldac's
+    // internal nfrm_in_pkt) to compute it itself; the codec row owns that
+    // maths, same division of responsibility as every other frame_info
+    // field.
+    uint16_t self_packetising_frames_per_packet;
     uint32_t nominal_bitrate_bps;          // what the panel shows (S2)
     // Bead pico-link-pbv: worst-case wall-clock time one encode() call can
     // take, measured on real hardware plus margin -- NOT a live
