@@ -356,7 +356,7 @@ uint8_t pl_persist_boot_device_count(void) {
     return count;
 }
 
-void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq) {
+void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq, uint8_t *out_ldac_quality) {
     uint8_t seen = 0;
     for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
         if (!s_slots[i].occupied) {
@@ -367,6 +367,7 @@ void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_n
             memcpy(out_name, s_slots[i].name, 32);
             *out_name_len = s_slots[i].name_len;
             *out_mru_seq = s_slots[i].mru_seq;
+            *out_ldac_quality = s_slots[i].ldac_quality;
             return;
         }
         seen++;
@@ -375,6 +376,7 @@ void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_n
     memset(out_name, 0, 32);
     *out_name_len = 0;
     *out_mru_seq = 0;
+    *out_ldac_quality = 0;
 }
 
 // Code-review finding (bd-pico-link-cz0.6, 2026-09-01, CONFIRMED): this
@@ -621,7 +623,7 @@ static bool pl_persist_rmw(const uint8_t addr[6], const pl_persist_rmw_fields_t 
     // this is the ONLY place PlEventTag::PairedDeviceUpserted is pushed for
     // a save (pl_persist_do_write and pl_persist_write_device_settings both
     // funnel through this one function).
-    pl_bt_push_paired_device_upserted(rec.addr, rec.name, rec.name_len, rec.mru_seq);
+    pl_bt_push_paired_device_upserted(rec.addr, rec.name, rec.name_len, rec.mru_seq, rec.ldac_quality);
     *out_result = PL_PERSIST_WRITE_OK;
     return true;
 }

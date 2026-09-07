@@ -147,7 +147,12 @@ pl_persist_status_t pl_persist_boot_status(void);
 // `StoreLoaded{status, count}` as the terminator -- see
 // `pl_persist_init()`'s doc comment for where this snapshot is populated.
 uint8_t pl_persist_boot_device_count(void);
-void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq);
+// `out_ldac_quality` added by bead pico-link-7jol.5: the persisted 1-based
+// quality pick (0 = unset) from this record's slot mirror, same value
+// pl_persist_get_device_settings would return for this address -- needed
+// so bt.c's boot-restore PairedDeviceUpserted echo carries the real value
+// instead of silently zero-initialising it.
+void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq, uint8_t *out_ldac_quality);
 
 // Stages `addr` (and, optionally, `name`/`name_len`) to be persisted as the
 // last-used device -- called from bt.c's PL_COMMAND_TAG_PERSIST_DEVICE

@@ -448,11 +448,11 @@ static void pl_bt_push_store_loaded(uint32_t status, uint8_t count) {
 // Event::PairedDeviceUpserted{addr, name, name_len, mru_seq}. See bt.h's
 // doc comment for the two call sites (persist.c's write path, and this
 // file's own boot sequence).
-void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq) {
+void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq, uint8_t ldac_quality) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_PAIRED_DEVICE_UPSERTED,
-        .payload = {.paired_device_upserted = {.name_len = name_len, .mru_seq = mru_seq}},
+        .payload = {.paired_device_upserted = {.name_len = name_len, .mru_seq = mru_seq, .ldac_quality = ldac_quality}},
     };
     memcpy(event.payload.paired_device_upserted.addr, addr, 6);
     memcpy(event.payload.paired_device_upserted.name, name, sizeof(event.payload.paired_device_upserted.name));
@@ -616,8 +616,9 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                     uint8_t boot_name[32];
                     uint8_t boot_name_len;
                     uint32_t boot_mru_seq;
-                    pl_persist_boot_device_at(i, boot_addr, boot_name, &boot_name_len, &boot_mru_seq);
-                    pl_bt_push_paired_device_upserted(boot_addr, boot_name, boot_name_len, boot_mru_seq);
+                    uint8_t boot_ldac_quality;
+                    pl_persist_boot_device_at(i, boot_addr, boot_name, &boot_name_len, &boot_mru_seq, &boot_ldac_quality);
+                    pl_bt_push_paired_device_upserted(boot_addr, boot_name, boot_name_len, boot_mru_seq, boot_ldac_quality);
                 }
                 pl_bt_push_store_loaded((uint32_t)pl_persist_boot_status(), boot_device_count);
 
