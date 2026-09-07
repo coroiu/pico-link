@@ -2863,13 +2863,33 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // corrected capacity, not the raw negotiated size -- see that
             // helper's doc comment for why using the uncorrected size here
             // was a latent off-by-one that R3-1 would have turned active.
-            s_ctx.frames_per_packet = s_ctx.frame.encoded_frame_bytes > 0
-                                           ? btstack_max(
-                                                 1u,
-                                                 pl_a2dp_usable_payload(s_ctx.max_media_payload_size, s_ctx.frame.header_bytes) /
-                                                     s_ctx.frame.encoded_frame_bytes
-                                             )
-                                           : 1u;
+            //
+            // Bead pico-link-i6zn: for a self-packetising row
+            // (encoded_frame_bytes == 0), there is no fixed frame size to
+            // divide by -- the old `: 1u` fallback below fired on EVERY
+            // LDAC connection, undersizing the priming cushion and the
+            // tx-queue-depth check by 2x (HQ) to 6x (MQ), see codec_table.h's
+            // self_packetising_frames_per_packet doc comment. Use the
+            // codec row's own honest value when it has one; the bare `1u`
+            // is now only the doubly-defensive case where a self-
+            // packetising row forgot to set it (should never happen --
+            // warn loudly, pico-link-r44's lesson, never silently clamp).
+            if (s_ctx.frame.encoded_frame_bytes > 0) {
+                s_ctx.frames_per_packet = btstack_max(
+                    1u,
+                    pl_a2dp_usable_payload(s_ctx.max_media_payload_size, s_ctx.frame.header_bytes) /
+                        s_ctx.frame.encoded_frame_bytes
+                );
+            } else if (s_ctx.frame.self_packetising_frames_per_packet > 0) {
+                s_ctx.frames_per_packet = s_ctx.frame.self_packetising_frames_per_packet;
+            } else {
+                pl_log(
+                    "a2dp: WARNING self-packetising codec did not report "
+                    "self_packetising_frames_per_packet -- falling back to 1, "
+                    "priming cushion will be undersized\r\n"
+                );
+                s_ctx.frames_per_packet = 1u;
+            }
 
             // Bead pico-link-85v (D2): recompute the live tx-queue-depth
             // requirement from what was ACTUALLY negotiated, and warn

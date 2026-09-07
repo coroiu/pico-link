@@ -126,6 +126,13 @@ static bool pl_codec_sbc_init(
     // what a2dp.c hardcoded before this bead -- see codec_table.h's
     // header_bytes doc comment).
     out_frame->header_bytes = 1;
+    // Bead pico-link-i6zn: SBC is fixed-size, not self-packetising --
+    // a2dp.c's encoded_frame_bytes division above governs frames_per_packet
+    // for this row, unchanged. Set explicitly (not left to zero-init) so a
+    // reconnect that lands on this row after a prior LDAC session can never
+    // inherit a stale non-zero value from s_ctx.frame -- every other field
+    // in this struct is likewise set unconditionally by this function.
+    out_frame->self_packetising_frames_per_packet = 0;
     // Nominal bitrate: frame_bytes*8 bits per pcm_frames samples, scaled to
     // the negotiated sample rate. E.g. ~119B/128 samples @ 48kHz -> ~357kbps.
     out_frame->nominal_bitrate_bps =
