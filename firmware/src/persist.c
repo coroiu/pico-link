@@ -83,11 +83,12 @@ typedef struct __attribute__((packed)) {
 //   EQMID would make "never chosen" and "explicitly chose 990 kbps" the
 //   same byte forever. 0 = unset (use whatever codec_ldac.c's init()
 //   configures by default), 1 = 990 kbps (LDACBT_EQMID_HQ), 2 = 660 kbps
-//   (LDACBT_EQMID_SQ), 3 = 330 kbps (LDACBT_EQMID_MQ), 4 = Adaptive
-//   (reserved -- not implementable with the vendored libldac, design sec
-//   5). The EQMID mapping itself lives in exactly one place, codec_ldac.c
-//   (a later task) -- this module stores and moves the byte, never
-//   interprets it.
+//   (LDACBT_EQMID_SQ), 3 = 330 kbps (LDACBT_EQMID_MQ), 4 = Adaptive --
+//   IMPLEMENTED, bead pico-link-7jol.3, see .planning/design/2026-09-07-
+//   ldac-abr-control-loop.md sec 0.1: the reachable ladder is 5 rungs, not
+//   3, and the controller walks it with ldacBT_alter_eqmid_priority. The
+//   EQMID mapping itself lives in exactly one place, codec_ldac.c -- this
+//   module stores and moves the byte, never interprets it.
 typedef struct __attribute__((packed)) {
     uint8_t addr[6];
     uint8_t name[32];

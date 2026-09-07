@@ -286,9 +286,10 @@ bool pl_persist_forget_device(const uint8_t addr[6]);
 // 1.3, bead pico-link-ay0.1): updates per-device SETTINGS on an
 // ALREADY-REMEMBERED device -- `codec_id` (codec_table.h's PL_CODEC_ID_*,
 // 0 = Automatic) and `ldac_quality` (1-based: 0 = unset, 1 = 990 kbps, 2 =
-// 660 kbps, 3 = 330 kbps, 4 = Adaptive/reserved -- NOT a raw LDACBT_EQMID_*
-// value, since LDACBT_EQMID_HQ is literally 0 and would make "never chosen"
-// and "explicitly chose 990" the same byte forever). Shares ONE
+// 660 kbps, 3 = 330 kbps, 4 = Adaptive -- IMPLEMENTED, bead pico-link-7jol.3;
+// NOT a raw LDACBT_EQMID_* value, since LDACBT_EQMID_HQ is literally 0 and
+// would make "never chosen" and "explicitly chose 990" the same byte
+// forever). Shares ONE
 // read-modify-write core with pl_persist_do_write (persist.c) rather than
 // forking the RMW logic.
 //

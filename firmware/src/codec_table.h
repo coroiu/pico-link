@@ -188,6 +188,18 @@ typedef struct pl_codec {
     // background IRQ (0xFF).
     pl_codec_encode_result_t (*encode)(void *state, const int16_t *pcm, uint8_t *out, uint16_t out_cap);
     void (*deinit)(void *state);
+    // Bead pico-link-7jol.3 (design .planning/design/2026-09-07-ldac-abr-
+    // control-loop.md sec 6.2/6.3): OPTIONAL, NULL for a row with no
+    // adjustable ladder (SBC). Called once per pl_a2dp_fill() invocation,
+    // BEFORE the fill loop, from whichever context owns the encoder under
+    // the live build (core0 IRQ legacy, core1 under PL_ENCODER_ON_CORE1)
+    // -- this is the APPLY half of the decide/apply split that makes an
+    // ABR-capable row safe under PL_ENCODER_ON_CORE1 without needing
+    // fhf's #ifndef gate: the DECIDE phase (a2dp.c's control loop, core0
+    // only) writes nothing here directly, only a single volatile target
+    // word the row's own request function stores. Same IRQ-context
+    // contract as encode(): no allocation, no logging, no blocking.
+    void (*apply_pending_tuning)(void *state);
     void *state; // statically allocated per codec, never malloc'd
 } pl_codec_t;
 
