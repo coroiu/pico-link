@@ -79,7 +79,9 @@ use core::convert::Infallible;
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
-use crate::app::{build_devices_screen, build_settings_screen, BtModel, Command, DeviceEntry, HomeFace, LinkState, VolumeSource, WizardPhase};
+use crate::app::{
+    build_devices_screen, build_settings_screen, BtModel, Command, DeviceEntry, HomeFace, LinkState, ScreenId, VolumeSource, WizardPhase,
+};
 use crate::input::NavIntent;
 
 use super::ctx::RenderCtx;
@@ -123,7 +125,7 @@ pub fn build_home_screen(
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
     // though there was nothing there to back out of.
-    Screen::new(HOME_TITLE, vec![Box::new(view)])
+    Screen::new(HOME_TITLE, vec![Box::new(view)]).with_id(ScreenId::Home)
 }
 
 /// Home's sole top-level content widget -- one composite `Widget` owning

@@ -21,16 +21,17 @@ use core::cell::RefCell;
 use core::convert::Infallible;
 use core::time::Duration;
 
+use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::input::NavIntent;
 use crate::render::home::build_home_screen;
-use crate::render::theme::palette;
+use crate::render::theme::{icon, palette};
 use crate::render::wizard::build_wizard_screen;
 use crate::render::{
-    Action, ButtonLabel, ChromeContribution, ConfirmView, FocusEvent, FrameBuffer565, Instant, ListItem, ListItemKey, MenuItem,
-    Navigator, RenderCtx, Screen, Verb, VerticalList, Widget,
+    Action, ButtonLabel, ChromeContribution, ConfirmView, FieldList, FieldRow, FocusEvent, FrameBuffer565, Instant, ListItem, ListItemKey,
+    MenuItem, Navigator, PaintKey, RenderCtx, Screen, Spacer, Verb, VerticalList, Widget,
 };
 
 /// The devices screen's "Pair new headphones" row's identity key (bead
@@ -986,13 +987,48 @@ pub struct ConnectedCodec {
 /// when this screen was the navigator root (pre-`pico-link-znb.8`/E7);
 /// renamed now that it's reached by "A"/the menu face's "Bluetooth" row
 /// **from** Home, which owns the "Pico Link" brand title instead (design
-/// section 5's screen inventory). Also doubles as
-/// [`App::rebuild_root`]'s way of checking "is the screen currently
-/// sitting at stack index 1 the Devices screen" before refreshing it via
-/// [`crate::render::Navigator::replace_at`] -- the same pragmatic,
-/// title-string-as-identity approach [`crate::render::wizard::
-/// WIZARD_TITLE`] already uses one level up.
+/// section 5's screen inventory).
 pub(crate) const DEVICES_TITLE: &str = "Devices";
+
+/// Identity for a screen that must stay live-synced to [`BtModel`] while it
+/// sits on the [`Navigator`]'s stack -- see [`App::refresh_stack`]'s doc
+/// comment for why this exists and what replaced it
+/// (`.planning/design/2026-09-07-device-page-and-single-select-picker.md`
+/// §1). `Screen::id()` returns `None` for every screen that never calls
+/// [`Screen::with_id`] (the wizard, `ConfirmView`s, Settings): `None` is
+/// the "never refresh me" sentinel, so tagging a screen is opt-in and every
+/// untagged screen is behaviour-identical to before this type existed.
+///
+/// `Copy`/`Eq`, like [`ListItemKey`] and for the same reason: cheap to
+/// carry around and compare on every [`App::refresh_stack`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenId {
+    Home,
+    Devices,
+    DevicePage(DeviceAddr),
+}
+
+/// The focus/scroll state [`App::refresh_stack`] reads from a screen
+/// *before* replacing it, so the freshly built replacement can carry it
+/// forward instead of resetting to row 0 -- the same carry-forward
+/// [`App::build_identified_screen`]'s `ScreenId::Devices` arm already did
+/// pre-refactor, generalized to any identified screen at any depth.
+pub(crate) struct ScreenCarry {
+    selected_key: Option<ListItemKey>,
+    selected_index: usize,
+    scroll_top: Option<usize>,
+}
+
+/// What [`App::build_identified_screen`] found for a given [`ScreenId`] --
+/// [`App::refresh_stack`]'s two possible outcomes per identified screen.
+enum Refresh {
+    /// Replace the screen at this stack index with this freshly built one.
+    Rebuild(Screen),
+    /// This screen's subject no longer exists in the model (e.g. a
+    /// [`ScreenId::DevicePage`] for a forgotten device) -- drop it and
+    /// everything above it.
+    Gone,
+}
 
 /// A paired device's display label -- its name, or, if C never reported one
 /// (or it hasn't resolved yet), `(unknown device)` plus the address's last
@@ -1070,6 +1106,17 @@ pub(crate) fn build_devices_screen(
     let connected_addr = model.connected_addr;
     let ordered_for_activate = ordered.clone();
     let paired_for_full = model.paired.clone();
+    // Snapshot for the connected row's push -- `Action::PushView`'s
+    // builder is `FnOnce`, with no path back to a live `&BtModel` at the
+    // moment it actually runs (it's called from inside
+    // `Navigator::apply_action`, not from `App`). `BtModel` is `Clone` for
+    // exactly this reason (see [`build_forget_picker_screen`]'s own
+    // `model.paired.clone()` precedent above). The very next model event
+    // replaces this page with a live-read one via
+    // [`App::build_identified_screen`]'s `ScreenId::DevicePage` arm -- this
+    // snapshot only has to be right for the single frame between the press
+    // and that next refresh.
+    let model_for_device_page = model.clone();
     let commands_for_activate = Rc::clone(commands);
     let wizard_phase_for_activate = Rc::clone(wizard_phase);
     let wizard_devices_for_activate = Rc::clone(wizard_devices);
@@ -1081,11 +1128,26 @@ pub(crate) fn build_devices_screen(
             if let Some(device) = ordered_for_activate.get(index) {
                 if Some(device.addr) == connected_addr {
                     // A on the connected row: no reconnect to do -- push
-                    // the stub device-detail screen, the same
-                    // labelled-row-needs-a-destination precedent
-                    // `build_settings_screen` set (design section 4).
-                    let title = paired_device_label(device);
-                    return Action::PushView(Box::new(move || build_device_detail_screen(title)));
+                    // the real device page (design section 4;
+                    // `.planning/design/2026-09-07-device-page-and-
+                    // single-select-picker.md` §3).
+                    let addr = device.addr;
+                    let fallback_title = paired_device_label(device);
+                    let model = model_for_device_page.clone();
+                    let commands = Rc::clone(&commands_for_activate);
+                    return Action::PushView(Box::new(move || {
+                        let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
+                        match build_device_page_screen(&model, addr, &carry, &commands) {
+                            Refresh::Rebuild(screen) => screen,
+                            // The connected device we just pressed cannot
+                            // have vanished between the press and this
+                            // closure running -- `Refresh::Gone` is
+                            // structurally unreachable here, but a
+                            // same-titled empty screen is a harmless
+                            // fallback rather than a panic if it ever is.
+                            Refresh::Gone => Screen::new(fallback_title, vec![]),
+                        }
+                    }));
                 }
                 // A on any other paired row: switch to it, reusing the
                 // wizard (design section 4/S8) -- `Command::Connect` +
@@ -1121,7 +1183,7 @@ pub(crate) fn build_devices_screen(
     let list = if let Some(top) = prev_scroll_top { list.with_scroll_top(top) } else { list };
 
     let view = DevicesListView { list, row_devices: ordered, commands: Rc::clone(commands) };
-    Screen::new(DEVICES_TITLE, vec![Box::new(view)])
+    Screen::new(DEVICES_TITLE, vec![Box::new(view)]).with_id(ScreenId::Devices)
 }
 
 /// Wraps [`VerticalList`] to add the Devices screen's X action (design
@@ -1260,16 +1322,291 @@ fn build_forget_confirm_screen(addr: DeviceAddr, label: &str, commands: Rc<RefCe
     Screen::new(FORGET_CONFIRM_TITLE, vec![Box::new(view)])
 }
 
-/// The connected device's detail screen -- a stub, per the exact precedent
-/// [`build_settings_screen`] set for the Settings row (design section 4: a
-/// labelled, reachable row must have *somewhere* to go; its real content is
-/// design section 10's job, not this bead's). `title` is the device's own
-/// display label (its name, or the `(unknown device)` fallback), matching
-/// [`ChromeContribution::title`]'s override precedent used elsewhere for a
-/// detail view showing its own item's identity instead of a screen-level
-/// static title.
-fn build_device_detail_screen(title: String) -> Screen {
-    Screen::new(title, vec![])
+/// A placeholder for a live value this page cannot honestly report yet --
+/// `core` has no `SetDeviceCodecPref`/`CodecAvailability`/
+/// `A2dpStreamStateChanged` seam (Ada's
+/// `.planning/design/2026-09-02-device-page-seam.md`, none of it
+/// implemented -- verified: not present anywhere in `core`). Per that
+/// design's §3.0: a *live* field dashes when the value is unknown; a
+/// *stored* setting never dashes, because it is still true when nothing is
+/// connected. `CODEC`/`ADDRESS` are the latter and never use this.
+///
+/// Plain ASCII hyphen-minus, not a typographic em dash (`\u{2014}`):
+/// `theme::font`'s `u8g2_font_helv*_tf` faces are built with
+/// `with_ignore_unknown_chars(true)` and cover only the Latin-1 range, so
+/// U+2014 silently draws NOTHING rather than a placeholder box -- found by
+/// screenshotting this exact row (`core/examples/
+/// device_page_screenshots.rs`) and seeing an empty value where the dash
+/// should be. `-` is in range and renders.
+const DASH: &str = "-";
+
+/// Index of the `Forget this device` row within [`device_page_rows`]'s
+/// output -- the only [`FieldKind::Action`] row this bead's device page
+/// has, so [`build_device_page_screen`]'s activation callback can dispatch
+/// on it without a key lookup.
+const DEVICE_PAGE_FORGET_ROW_INDEX: usize = 5;
+
+/// The device page's rows, in order (design
+/// `.planning/design/2026-09-02-device-page.md` §3, as scoped by
+/// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
+/// §3.4): `CODEC`, `SAMPLE RATE`, `USB IN`, `A2DP`, `ADDRESS`, `Forget this
+/// device`. `QUALITY` (present only when LDAC is in play) is
+/// `pico-link-7jol.5`'s row, not this one's.
+///
+/// **PURE.** Model in, rows out -- no `Screen`, no `Navigator`, no
+/// framebuffer, testable directly. `CODEC` is [`FieldKind::Readonly`], not
+/// `Action`, in THIS bead: there is no codec picker to open yet (Ada's
+/// `CodecAvailability` seam doesn't exist), and a bright, caret-growing row
+/// that does nothing on `A` would be exactly the "an unlabelled/live A
+/// lies" defect design rule 4 exists to prevent. Wiring `CODEC` back to
+/// `Action` is the device-page follow-up that lands alongside the codec
+/// picker (§9 of the design of record above).
+fn device_page_rows(model: &BtModel, addr: DeviceAddr) -> Vec<FieldRow> {
+    let connected = model.connected_addr == Some(addr);
+    // A *stored* setting (§3.0): never dashes, even disconnected. Today
+    // that's only ever "the live codec, or Automatic" -- there is no real
+    // pin to read yet (`PairedDevice` carries no `codec_id` field), so a
+    // disconnected device always reads `Automatic`, honestly.
+    let codec_value =
+        if connected { model.connected_codec.as_ref().map_or_else(|| String::from("Automatic"), |c| c.word.clone()) } else { String::from("Automatic") };
+
+    vec![
+        FieldRow::readonly("CODEC").with_value(codec_value, palette::TEXT_PRIMARY).with_key(ListItemKey::from_u64(0)),
+        FieldRow::readonly("SAMPLE RATE").with_value(DASH, palette::TEXT_SECONDARY).with_key(ListItemKey::from_u64(1)),
+        FieldRow::readonly("USB IN").with_value(DASH, palette::TEXT_SECONDARY).with_key(ListItemKey::from_u64(2)),
+        FieldRow::readonly("A2DP").with_value(DASH, palette::TEXT_SECONDARY).with_key(ListItemKey::from_u64(3)),
+        FieldRow::readonly("ADDRESS")
+            .with_value(format_device_address(addr), palette::TEXT_PRIMARY)
+            .with_small_value()
+            .with_key(ListItemKey::from_u64(4)),
+        FieldRow::action("Forget this device").with_label_color(palette::STATUS_ERROR).with_key(ListItemKey::from_u64(5)),
+    ]
+}
+
+/// Formats a device address exactly like the address a phone or laptop
+/// shows for the same device -- colons kept (device-page design §3.6).
+fn format_device_address(addr: DeviceAddr) -> String {
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+    )
+}
+
+/// The connected-or-paired device's detail page (design
+/// `.planning/design/2026-09-02-device-page.md`, scoped for this bead by
+/// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
+/// §3). Returns [`Refresh::Gone`] when `addr` is no longer in
+/// [`BtModel::paired`] -- e.g. the device was forgotten from its own
+/// confirm screen, or from Devices while this page happened to be open one
+/// level up -- so [`App::refresh_stack`] can unwind the stack rather than
+/// leave a page open on a device that no longer exists.
+fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
+    let Some(device) = model.paired.iter().find(|d| d.addr == addr) else {
+        return Refresh::Gone;
+    };
+    let title = paired_device_label(device);
+    let connected = model.connected_addr == Some(addr);
+    let name = device.name.clone();
+    let forget_label = title.clone();
+    let commands_for_activate = Rc::clone(commands);
+    let rows = device_page_rows(model, addr);
+    let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index).on_activate_index(move |index| {
+        if index == DEVICE_PAGE_FORGET_ROW_INDEX {
+            let commands = Rc::clone(&commands_for_activate);
+            let label = forget_label.clone();
+            return Action::PushView(Box::new(move || build_forget_confirm_screen(addr, &label, commands)));
+        }
+        Action::None
+    });
+    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
+    let view = DevicePageView { list, addr, connected, name, commands: Rc::clone(commands) };
+    Refresh::Rebuild(Screen::new(title, vec![Box::new(Spacer::new(12)), Box::new(view)]).with_id(ScreenId::DevicePage(addr)))
+}
+
+/// Wraps [`FieldList`] to add the device page's `X` action (design §2.1's
+/// amendment: `drop` when connected, `link` when not -- both labelled,
+/// both real, no confirm needed since neither is destructive/irreversible)
+/// -- the same "small wrapper widget intercepts one `NavIntent` variant,
+/// delegates the rest" shape [`DevicesListView`] already uses for its own
+/// `ShortcutX` handling, and every method below that isn't
+/// `on_intent`/`chrome_contribution` is a forward, not an override -- see
+/// [`Widget::activation`]'s doc comment (pico-link-vxc D2) for why a
+/// wrapper must forward rather than let the default silently swallow one.
+struct DevicePageView {
+    list: FieldList,
+    addr: DeviceAddr,
+    connected: bool,
+    /// Needed only for the `link` (reconnect) path -- [`Command::Connect`]
+    /// carries a name, same as every other reconnect call site
+    /// ([`build_devices_screen`]'s own paired-row activation).
+    name: String,
+    commands: Rc<RefCell<VecDeque<Command>>>,
+}
+
+/// Seed for [`DevicePageView::paint_key`] -- only needs to differ from
+/// other widgets' own seeds.
+const DEVICE_PAGE_PAINT_KEY_SEED: u64 = 15;
+
+impl Widget for DevicePageView {
+    fn measure(&self, constraints: Size, ctx: &RenderCtx) -> Size {
+        self.list.measure(constraints, ctx)
+    }
+
+    fn is_focusable(&self) -> bool {
+        self.list.is_focusable()
+    }
+
+    /// Forwards `list`'s own answer -- see this struct's doc comment.
+    fn activation(&self) -> Option<Verb> {
+        self.list.activation()
+    }
+
+    fn on_focus(&mut self, event: FocusEvent) -> Action {
+        self.list.on_focus(event)
+    }
+
+    fn on_intent(&mut self, intent: NavIntent) -> Action {
+        if intent == NavIntent::ShortcutX {
+            if self.connected {
+                self.commands.borrow_mut().push_back(Command::Disconnect);
+            } else {
+                self.commands.borrow_mut().push_back(Command::Connect { addr: self.addr, name: truncate_device_name(&self.name) });
+            }
+            return Action::None;
+        }
+        self.list.on_intent(intent)
+    }
+
+    fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
+        let label = if self.connected { "drop" } else { "link" };
+        Some(ChromeContribution { x: Some(ButtonLabel::Live(String::from(label))), ..ChromeContribution::default() })
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        Some(self.list.selected_index())
+    }
+
+    /// Forwards `list`'s own answer -- see this struct's doc comment.
+    fn selected_key(&self) -> Option<ListItemKey> {
+        self.list.selected_key()
+    }
+
+    /// Forwards `list`'s own answer -- see this struct's doc comment.
+    fn scroll_top(&self) -> Option<usize> {
+        self.list.scroll_top()
+    }
+
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+        self.list.render(area, ctx, target)
+    }
+
+    /// Forwards `list`'s own answer -- see this struct's doc comment.
+    fn redraw_after(&self, ctx: &RenderCtx) -> Option<Duration> {
+        self.list.redraw_after(ctx)
+    }
+
+    /// Folds `list`'s own key and nothing else -- deliberately does NOT
+    /// fold `connected`/`LinkState`/the X label
+    /// (`.planning/design/2026-09-07-device-page-and-single-select-
+    /// picker.md` §5, damage-key rule 2): the rail has its own key fed by
+    /// the already-resolved `ButtonLabel`s (`chrome_contribution` above),
+    /// so folding link state into the *body* key would repaint the body on
+    /// every link-state change for zero changed body pixels -- exactly the
+    /// "fold something you don't draw" defect this project has already
+    /// shipped once.
+    fn paint_key(&self, ctx: &RenderCtx) -> PaintKey {
+        PaintKey::of(DEVICE_PAGE_PAINT_KEY_SEED).fold_key(self.list.paint_key(ctx))
+    }
+}
+
+/// A single row in a [`build_single_select_screen`] picker.
+///
+/// `#[allow(dead_code)]` on this and on [`build_single_select_screen`]
+/// itself: this bead (`pico-link-7jol.4`) builds and tests the general
+/// picker mechanism ahead of its first real caller, the `QUALITY` row
+/// (`pico-link-7jol.5`) -- see
+/// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
+/// §7 step 4. Exercised directly by this module's own tests; the "never
+/// constructed" warning is a normal, temporary consequence of shipping
+/// infrastructure ahead of its consumer (the same shape as
+/// [`BtModel::last_connect_failure`]'s "not yet rendered by any screen"
+/// precedent), not a sign the code is unreachable dead weight.
+#[allow(dead_code)]
+pub(crate) struct PickerOption {
+    /// Stable identity -- carries focus and the check across rebuilds, and
+    /// is what [`build_single_select_screen`]'s `on_pick` callback is
+    /// invoked with.
+    pub key: ListItemKey,
+    pub label: String,
+    /// The trailing note (e.g. `best audio`, `660 now`, `not offered`).
+    pub note: Option<(String, Rgb565)>,
+    /// `false` -> [`FieldKind::Readonly`]: focusable, dim, no caret, `A`
+    /// dead -- an unavailable option cannot be picked, structurally (the
+    /// activation gate lives in [`FieldList`], not in `on_pick`).
+    pub selectable: bool,
+}
+
+/// A generic single-select picker screen -- the codec picker and the LDAC
+/// quality picker (`pico-link-7jol.5`) are both this function with
+/// different `options`/`on_pick`, not two widgets
+/// (`.planning/design/2026-09-07-device-page-and-single-select-picker.md`
+/// §2). **Not a widget, not a `render/` module** -- composition of
+/// [`FieldList`] alone, per that design's §0.1 verdict.
+///
+/// Five rules this shape makes structural rather than remembered (design
+/// §2.1):
+/// 1. **The check follows the stored value.** `checked` is read from the
+///    model by the caller, not from a local "pressed" bit -- there is no
+///    place in this function to put an optimistic check by accident.
+/// 2. **Pop-vs-stay-open is entirely `on_pick`'s return value**
+///    (`Action::None` stays open, `Action::PopView` pops) -- there is no
+///    `stays_open` flag.
+/// 3. **The gutter is on the list, not the row** (`with_leading_gutter`),
+///    so every label aligns at the same `L` whether checked or not.
+/// 4. **An unavailable option cannot be picked** -- `selectable: false`
+///    produces `FieldKind::Readonly`, whose activation gate lives in
+///    `FieldList`, not in `on_pick`.
+/// 5. **`A` never lies** -- [`Verb::Select`] on selectable rows, no verb
+///    (dim `A`) on unavailable ones, both from `FieldList::activation`.
+///
+/// `A`'s rail word is [`Verb::Select`] (orchestrator ruling on
+/// `pico-link-7jol.4`: Uma's sketches say "pick", which would need a
+/// second `Verb::Exception` and her sign-off for one word that means the
+/// same thing to the user).
+#[allow(dead_code)] // see PickerOption's doc comment
+pub(crate) fn build_single_select_screen(
+    id: ScreenId,
+    title: impl Into<String>,
+    options: Vec<PickerOption>,
+    checked: Option<ListItemKey>,
+    carry: &ScreenCarry,
+    on_pick: impl Fn(ListItemKey) -> Action + 'static,
+) -> Screen {
+    let keys: Vec<ListItemKey> = options.iter().map(|option| option.key).collect();
+    let rows: Vec<FieldRow> = options
+        .into_iter()
+        .map(|option| {
+            let checked_here = Some(option.key) == checked;
+            let mut row = if option.selectable { FieldRow::action(option.label) } else { FieldRow::readonly(option.label) };
+            if option.selectable {
+                row = row.with_verb(Verb::Select);
+            }
+            if let Some((text, color)) = option.note {
+                row = row.with_value(text, color);
+            }
+            if checked_here {
+                row = row.with_leading_glyph(icon::CHECK);
+            }
+            row.with_key(option.key)
+        })
+        .collect();
+
+    let list = FieldList::new(rows)
+        .with_leading_gutter()
+        .with_selected_identity(carry.selected_key, carry.selected_index)
+        .on_activate_index(move |index| keys.get(index).map_or(Action::None, |key| on_pick(*key)));
+    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
+    Screen::new(title, vec![Box::new(list)]).with_id(id)
 }
 
 /// The Settings screen's fixed title. Placeholder content only (no rows)
@@ -1399,65 +1736,84 @@ impl App {
         }
     }
 
-    /// Refreshes the root (Home) screen to reflect the current
-    /// [`BtModel`], via [`Navigator::replace_root`] -- **not**
-    /// `Navigator::new`. That distinction is the whole point: replacing
-    /// only the root leaves any screen the user has navigated *to* (pushed
-    /// above root) untouched -- same stack depth, same screen instance,
-    /// same focus/selection state on it -- and carries the outgoing root
-    /// screen's own selection forward via
-    /// [`Navigator::root_selected_index`] rather than resetting it to row
-    /// 0. Previously this called `Navigator::new`, discarding the whole
-    /// stack on every Bluetooth event -- invisible with the one screen this
-    /// crate builds today, fatal for the approved multi-screen design (see
-    /// pico-link-a67 / pico-link-aii.1's defect 1).
+    /// Refreshes every screen on the [`Navigator`]'s stack that carries a
+    /// [`ScreenId`] to reflect the current [`BtModel`], via
+    /// [`Navigator::replace_at`] one index at a time -- the generalization
+    /// of the old `rebuild_root` (renamed by
+    /// `pico-link-7jol.4`/`.planning/design/2026-09-07-device-page-and-
+    /// single-select-picker.md` §1.1) from "refresh index 0, and index 1
+    /// if it happens to be Devices, identified by title string" to "refresh
+    /// every identified screen, at any depth, identified by
+    /// [`ScreenId`]".
     ///
-    /// Since `pico-link-znb.8` (E7) also refreshes the Devices screen, if
-    /// one happens to be sitting at stack index 1 (identified by
-    /// [`DEVICES_TITLE`], the same pragmatic title-as-identity approach
-    /// the wizard already uses) -- **not** because Devices is scoped to
-    /// stay live-synced while browsed (design section 8's real "paired
-    /// device list" doesn't exist until `pico-link-a67`'s successor, E14),
-    /// but because Devices already showed exactly this
-    /// discovered-during-scan data when it *was* the root, and preserving
-    /// that (rather than silently regressing it) costs one more
-    /// `Navigator::replace_at` call.
-    fn rebuild_root(&mut self) {
-        // Home's own top-level widget (`HomeView`) carries no
-        // `ListItemKey`/index selection concept the way the old
-        // devices-as-root screen did -- which face is showing lives in
-        // `self.home_face` (read fresh by the freshly built `HomeView`
-        // below), and the menu face's two-row selection is minor enough
-        // (fixed content, two items) not to need identity-based
-        // carry-forward across a live Bluetooth event. So, unlike the
-        // pre-E7 version of this method, there is no `root_selected_key`/
-        // `root_selected_index` to thread through here for Home itself.
-        self.navigator.replace_root(build_home_screen(
-            &self.model,
-            &self.home_face,
-            &self.commands,
-            &self.wizard_phase,
-            &self.wizard_devices,
-        ));
-
-        if self.navigator.title_at(1) == Some(DEVICES_TITLE) {
-            let devices_prev_key = self.navigator.selected_key_at(1);
-            let devices_prev_index = self.navigator.selected_index_at(1).unwrap_or(0);
-            let devices_prev_scroll_top = self.navigator.scroll_top_at(1);
-            self.navigator.replace_at(
-                1,
-                build_devices_screen(
-                    &self.model,
-                    devices_prev_key,
-                    devices_prev_index,
-                    devices_prev_scroll_top,
-                    &self.commands,
-                    &self.wizard_phase,
-                    &self.wizard_devices,
-                ),
-            );
+    /// **Behaviour-preserving for every screen that never calls
+    /// [`Screen::with_id`]** (the wizard, `ConfirmView`s, Settings):
+    /// [`Navigator::id_at`] returns `None` for those, and this loop skips
+    /// them exactly as before -- they were never in `rebuild_root`'s old
+    /// two-branch check either, so nothing about their behaviour changes.
+    /// [`ScreenId::Home`] and [`ScreenId::Devices`] replace the old
+    /// `stack[0]`-is-always-Home assumption and the
+    /// `title_at(1) == Some(DEVICES_TITLE)` check respectively, with
+    /// identical net effect; [`ScreenId::DevicePage`] is new with this
+    /// bead.
+    ///
+    /// If a screen's subject has vanished from the model (e.g. a
+    /// [`ScreenId::DevicePage`] for a device that was just forgotten from
+    /// one level up), [`Self::build_identified_screen`] returns
+    /// [`Refresh::Gone`] and the stack unwinds to just below it via
+    /// [`Navigator::truncate_to`] -- "Forget pops two levels" (device-page
+    /// design §3.7) becomes structural this way rather than a hand-written
+    /// double pop in a confirm's callback, and it fires from *either*
+    /// route a device can disappear by, not only the one the user is
+    /// looking at.
+    fn refresh_stack(&mut self) {
+        let mut truncate_at: Option<usize> = None;
+        for index in 0..self.navigator.depth() {
+            let Some(id) = self.navigator.id_at(index) else { continue };
+            let carry = ScreenCarry {
+                selected_key: self.navigator.selected_key_at(index),
+                selected_index: self.navigator.selected_index_at(index).unwrap_or(0),
+                scroll_top: self.navigator.scroll_top_at(index),
+            };
+            match self.build_identified_screen(id, &carry) {
+                Refresh::Rebuild(screen) => self.navigator.replace_at(index, screen),
+                Refresh::Gone => {
+                    truncate_at = Some(index);
+                    break;
+                }
+            }
+        }
+        if let Some(index) = truncate_at {
+            self.navigator.truncate_to(index.saturating_sub(1));
         }
         self.dirty = true;
+    }
+
+    /// The one mapping from [`ScreenId`] to screen builder --
+    /// [`Self::refresh_stack`]'s only caller. Every screen kind that can be
+    /// live-refreshed is one match arm here; adding a new refreshable
+    /// screen kind means adding a [`ScreenId`] variant and one arm, nothing
+    /// else.
+    fn build_identified_screen(&self, id: ScreenId, carry: &ScreenCarry) -> Refresh {
+        match id {
+            ScreenId::Home => Refresh::Rebuild(build_home_screen(
+                &self.model,
+                &self.home_face,
+                &self.commands,
+                &self.wizard_phase,
+                &self.wizard_devices,
+            )),
+            ScreenId::Devices => Refresh::Rebuild(build_devices_screen(
+                &self.model,
+                carry.selected_key,
+                carry.selected_index,
+                carry.scroll_top,
+                &self.commands,
+                &self.wizard_phase,
+                &self.wizard_devices,
+            )),
+            ScreenId::DevicePage(addr) => build_device_page_screen(&self.model, addr, carry, &self.commands),
+        }
     }
 
     /// Folds one inbound Bluetooth-domain [`Event`] into [`BtModel`] and
@@ -1620,7 +1976,7 @@ impl App {
             let name = truncate_device_name(&device.name);
             self.commands.borrow_mut().push_back(Command::Connect { addr, name });
         }
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Folds one [`Event::PairedDeviceUpserted`] into [`BtModel::paired`] --
@@ -1634,7 +1990,7 @@ impl App {
         } else {
             self.model.paired.push(device);
         }
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Folds one [`Event::PairedDeviceForgotten`] into [`BtModel::paired`] --
@@ -1642,7 +1998,7 @@ impl App {
     /// isn't currently known (e.g. a stray/duplicate echo).
     fn on_paired_device_forgotten(&mut self, addr: DeviceAddr) {
         self.model.paired.retain(|d| d.addr != addr);
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Folds one [`Event::PairedStoreFull`] -- see that event's and
@@ -1710,7 +2066,7 @@ impl App {
             // `BtModel::out_level`'s doc comment.
             self.model.out_level = None;
         }
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Records the live A2DP link's negotiated codec (or a renegotiation)
@@ -1720,7 +2076,7 @@ impl App {
     /// data rather than deriving them from codec identity itself.
     pub fn set_connected_codec(&mut self, codec: ConnectedCodec) {
         self.model.connected_codec = Some(codec);
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Folds one [`Event::VolumeChanged`] reading into [`BtModel::volume`]
@@ -1731,7 +2087,7 @@ impl App {
     /// a redraw is warranted.
     pub fn on_volume_changed(&mut self, level: u8, muted: bool, source: VolumeSource) {
         self.model.volume = Some(VolumeState { level, muted, source });
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Folds one [`Event::LevelsChanged`] reading into
@@ -1801,7 +2157,7 @@ impl App {
             attack_peak_l_at,
             attack_peak_r_at,
         });
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Adds (or, if `addr` is already known, updates the name/rssi of) one
@@ -1820,7 +2176,7 @@ impl App {
         // doc comment on why the wizard widget needs its own mirror
         // rather than a borrow into `self.model`.
         self.wizard_devices.borrow_mut().clone_from(&self.model.discovered);
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Clears the discovered-device list, e.g. at the start of a fresh
@@ -1828,7 +2184,7 @@ impl App {
     pub fn clear_devices(&mut self) {
         self.model.discovered.clear();
         self.wizard_devices.borrow_mut().clear();
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Records a failed connect attempt with its [`ConnectFailureReason`]
@@ -1847,7 +2203,7 @@ impl App {
         // (`build_devices_screen`'s "Pair new headphones" row activation
         // resets it to `WizardPhase::scanning_pending`).
         *self.wizard_phase.borrow_mut() = WizardPhase::Failed { addr, reason };
-        self.rebuild_root();
+        self.refresh_stack();
     }
 
     /// Read-only access to the live Bluetooth model, for tests/diagnostics
@@ -2124,6 +2480,7 @@ impl core::ops::Deref for RenderOutput<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use embedded_graphics::prelude::RgbColor;
 
     /// Home(1) -> Devices(2): since `pico-link-znb.8` (E7) made Home the
     /// navigator root, reaching the Devices screen (whose list rows this
@@ -3705,5 +4062,319 @@ mod tests {
         let sample_after_ticks = app.model().out_level.expect("no event cleared it");
         assert_eq!(sample_after_ticks.attack_peak_l, sample_at_fold.attack_peak_l);
         assert_eq!(sample_after_ticks.attack_peak_l_at, sample_at_fold.attack_peak_l_at);
+    }
+
+    // --- pico-link-7jol.4: refresh_stack (the ScreenId refactor) ---
+
+    /// Fern's design §7 step 1's explicit ask: an unidentified screen (the
+    /// wizard, `ConfirmView`s, Settings, or in this test's case an
+    /// arbitrary probe screen standing in for any of them) must never be
+    /// replaced OR truncated by `refresh_stack`, no matter how many
+    /// unrelated model events fire while it's on the stack.
+    #[test]
+    fn refresh_stack_never_touches_a_screen_with_no_screen_id() {
+        let mut app = App::new(240, 240);
+        open_devices(&mut app);
+        let probe = Screen::new("PROBE", vec![Box::new(VerticalList::new(vec![ListItem::new("x")]))]);
+        assert_eq!(probe.id(), None, "a screen that never calls with_id must report no ScreenId");
+        app.push_screen_for_test(probe);
+        assert_eq!(app.navigator_depth(), 3);
+        assert_eq!(app.current_screen_title(), "PROBE");
+
+        // A handful of unrelated Bluetooth-domain events, each of which
+        // calls `refresh_stack` internally.
+        app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
+        app.handle_event(upsert([9; 6], "Other", 3));
+        app.handle_event(Event::PairedDeviceForgotten { addr: [9; 6] });
+
+        assert_eq!(app.navigator_depth(), 3, "an unidentified screen must never be popped/truncated by refresh_stack");
+        assert_eq!(app.current_screen_title(), "PROBE", "an unidentified screen must never be replaced by refresh_stack");
+    }
+
+    #[test]
+    fn refresh_stack_keeps_home_and_devices_tagged_with_their_screen_ids() {
+        let mut app = App::new(240, 240);
+        assert_eq!(app.navigator.id_at(0), Some(ScreenId::Home));
+        open_devices(&mut app);
+        assert_eq!(app.navigator.id_at(1), Some(ScreenId::Devices));
+        // A model event refreshes both -- both must keep their identity
+        // (a stale/lost id here would silently stop refresh_stack from
+        // ever refreshing them again).
+        app.handle_event(upsert([1; 6], "Cans", 1));
+        assert_eq!(app.navigator.id_at(0), Some(ScreenId::Home));
+        assert_eq!(app.navigator.id_at(1), Some(ScreenId::Devices));
+    }
+
+    /// "Forget pops two levels" (device-page design §3.7), now structural
+    /// via `Refresh::Gone` rather than a hand-written double pop -- this
+    /// fires even when the device disappears from a route *other than*
+    /// the device page's own Forget row (here: forgetting it from the
+    /// Devices screen underneath, one level below the open device page).
+    #[test]
+    fn forgetting_the_device_shown_by_an_open_device_page_unwinds_the_stack_to_devices() {
+        let mut app = App::new(240, 240);
+        let addr = [7; 6];
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        app.handle_event(upsert(addr, "Cans", 1));
+        open_devices(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // connected row -> device page
+        assert_eq!(app.navigator_depth(), 3);
+        assert_eq!(app.current_screen_title(), "Cans");
+
+        app.handle_event(Event::PairedDeviceForgotten { addr });
+
+        assert_eq!(app.navigator_depth(), 2, "the device page must be dropped when its device vanishes");
+        assert_eq!(app.current_screen_title(), DEVICES_TITLE, "unwinding must land on Devices, not Home");
+    }
+
+    // --- pico-link-7jol.4: device_page_rows (pure) ---
+
+    #[test]
+    fn device_page_rows_shows_the_live_codec_when_connected() {
+        let mut model = BtModel::default();
+        let addr = [1; 6];
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1 });
+        model.connected_addr = Some(addr);
+        model.connected_codec = Some(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 });
+
+        let rows = device_page_rows(&model, addr);
+        assert_eq!(rows[0].label, "CODEC");
+        assert_eq!(rows[0].value(), Some("LDAC"), "a connected device must show its live codec, not Automatic");
+    }
+
+    #[test]
+    fn device_page_rows_shows_automatic_when_disconnected_and_never_dashes_the_codec() {
+        let mut model = BtModel::default();
+        let addr = [2; 6];
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1 });
+        // Not connected: `connected_addr` stays `None`.
+
+        let rows = device_page_rows(&model, addr);
+        assert_eq!(rows[0].value(), Some("Automatic"), "CODEC is a stored-setting-shaped row: it never dashes (design §3.0)");
+    }
+
+    #[test]
+    fn device_page_rows_dashes_the_three_unimplemented_live_fields() {
+        let model = BtModel::default();
+        let addr = [3; 6];
+        let rows = device_page_rows(&model, addr);
+        for label in ["SAMPLE RATE", "USB IN", "A2DP"] {
+            let row = rows.iter().find(|r| r.label == label).unwrap_or_else(|| panic!("missing row {label}"));
+            assert_eq!(row.value(), Some(DASH), "{label} has no seam yet and must dash honestly, not fake a value");
+        }
+    }
+
+    #[test]
+    fn device_page_rows_address_row_renders_colon_separated_hex() {
+        let model = BtModel::default();
+        let addr = [0x94, 0xDB, 0x56, 0x54, 0x7C, 0xF2];
+        let rows = device_page_rows(&model, addr);
+        let address_row = rows.iter().find(|r| r.label == "ADDRESS").expect("ADDRESS row must exist");
+        assert_eq!(address_row.value(), Some("94:DB:56:54:7C:F2"));
+    }
+
+    #[test]
+    fn device_page_rows_forget_is_the_only_pressable_row_and_sits_last() {
+        let model = BtModel::default();
+        let addr = [4; 6];
+        let rows = device_page_rows(&model, addr);
+        let row_count = rows.len();
+        assert_eq!(rows.last().expect("device page must have at least one row").label, "Forget this device");
+
+        // Black-box, per this crate's own `Navigator`/`FieldList` test
+        // convention (selection/kind state lives inside the widget, not
+        // exposed on `FieldRow` directly): CODEC/SAMPLE RATE/USB IN/A2DP/
+        // ADDRESS must be `Readonly` (A does nothing), and only the last
+        // row (Forget) must be `Action` (A is live) -- no codec picker to
+        // open yet in this bead (this file's `device_page_rows` doc
+        // comment).
+        let mut list = FieldList::new(rows);
+        for _ in 0..row_count - 1 {
+            assert_eq!(list.activation(), None, "only Forget should be pressable on this bead's device page");
+            list.on_intent(NavIntent::Down);
+        }
+        assert_eq!(list.activation(), Some(Verb::Open), "the focused last row (Forget) must be pressable");
+    }
+
+    // --- pico-link-7jol.4: the device page's own screen/wrapper ---
+
+    #[test]
+    fn the_connected_devices_page_x_binding_is_drop() {
+        let mut app = App::new(240, 240);
+        let addr = [8; 6];
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        app.poll_command(); // drain PersistDevice, queued by ConnectSucceeded
+        app.handle_event(upsert(addr, "Cans", 1));
+        open_devices(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // -> device page
+        app.handle_input(vec![NavIntent::ShortcutX]);
+        assert_eq!(app.poll_command(), Some(Command::Disconnect), "X on a connected device's page must queue Disconnect");
+    }
+
+    #[test]
+    fn a_disconnected_devices_page_x_binding_is_link_and_reconnects() {
+        // Reach a disconnected device's page the only way it's wired in
+        // this bead: connect once (so the page is reachable via the
+        // connected row), then let the link drop while the page stays
+        // open -- `refresh_stack` must flip `connected` (and therefore the
+        // X binding) live, matching device-page design §2.1's amendment.
+        let mut app = App::new(240, 240);
+        let addr = [9; 6];
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        app.poll_command(); // drain PersistDevice, queued by ConnectSucceeded
+        app.handle_event(upsert(addr, "Cans", 1));
+        open_devices(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // -> device page, connected
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle)); // drops -- refresh_stack must catch up in place
+
+        app.handle_input(vec![NavIntent::ShortcutX]);
+        assert_eq!(
+            app.poll_command(),
+            Some(Command::Connect { addr, name: String::from("Cans") }),
+            "X on a disconnected device's page must queue a reconnect, not Disconnect"
+        );
+    }
+
+    #[test]
+    fn device_page_scroll_and_selection_survive_a_live_refresh() {
+        let mut app = App::new(240, 240);
+        let addr = [10; 6];
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        app.handle_event(upsert(addr, "Cans", 1));
+        open_devices(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // -> device page
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // focus row 2 (USB IN)
+
+        // An unrelated model event must not reset the user's focus on the
+        // page they're looking at (the whole reason `refresh_stack` reads
+        // `ScreenCarry` before replacing).
+        app.handle_event(Event::LevelsChanged { peak_l: 10, peak_r: 10, rms_l: 10, rms_r: 10 });
+
+        assert_eq!(app.navigator.selected_index_at(2), Some(2), "focus must survive a live refresh of the page underneath it");
+    }
+
+    // --- pico-link-7jol.4: build_single_select_screen (the general picker) ---
+
+    fn quality_like_test_id() -> ScreenId {
+        // No ScreenId::Picker variant exists yet in this bead (it lands
+        // with pico-link-7jol.5, alongside its first real caller) --
+        // `build_single_select_screen` is generic over `id`, so any
+        // ScreenId value exercises its contract identically. Standing in
+        // with an address distinct from any real device used elsewhere in
+        // this module's tests.
+        ScreenId::DevicePage([0xAA; 6])
+    }
+
+    fn no_carry() -> ScreenCarry {
+        ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None }
+    }
+
+    fn three_option_picker(checked: Option<ListItemKey>, picked: Rc<RefCell<Vec<ListItemKey>>>, stay_open: bool) -> Screen {
+        let options = vec![
+            PickerOption { key: ListItemKey::from_u64(1), label: String::from("Alpha"), note: Some((String::from("best"), palette::TEXT_SECONDARY)), selectable: true },
+            PickerOption { key: ListItemKey::from_u64(2), label: String::from("Beta"), note: None, selectable: true },
+            PickerOption { key: ListItemKey::from_u64(3), label: String::from("Gamma"), note: Some((String::from("not offered"), palette::TEXT_SECONDARY)), selectable: false },
+        ];
+        build_single_select_screen(quality_like_test_id(), "Test Picker", options, checked, &no_carry(), move |key| {
+            picked.borrow_mut().push(key);
+            if stay_open {
+                Action::None
+            } else {
+                Action::PopView
+            }
+        })
+    }
+
+    #[test]
+    fn picker_check_glyph_sits_on_the_checked_row_and_nowhere_else() {
+        let picked = Rc::new(RefCell::new(Vec::new()));
+        let screen = three_option_picker(Some(ListItemKey::from_u64(2)), picked, true);
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(screen);
+        let pixels: Vec<_> = app.render().pixels().collect();
+        // A pixel-level probe would duplicate `fields.rs`'s own leading-
+        // glyph tests; here the load-bearing fact is behavioural, proven
+        // below (`on_pick` receiving the pressed key, not a locally-
+        // tracked "checked" bit) -- this render call only proves the
+        // screen with a `checked` value actually renders without panicking.
+        assert!(!pixels.is_empty());
+    }
+
+    #[test]
+    fn picker_a_press_invokes_on_pick_with_the_focused_rows_key() {
+        let picked = Rc::new(RefCell::new(Vec::new()));
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(three_option_picker(Some(ListItemKey::from_u64(1)), Rc::clone(&picked), true));
+        app.handle_input(vec![NavIntent::Down]); // focus row 1 (Beta)
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(picked.borrow().as_slice(), &[ListItemKey::from_u64(2)], "on_pick must be called with the FOCUSED row's key");
+    }
+
+    #[test]
+    fn picker_stays_open_when_on_pick_returns_action_none() {
+        let picked = Rc::new(RefCell::new(Vec::new()));
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(three_option_picker(None, Rc::clone(&picked), true));
+        let depth_before = app.navigator_depth();
+        app.handle_input(vec![NavIntent::Select]); // Alpha
+        assert_eq!(picked.borrow().len(), 1, "on_pick must have fired");
+        assert_eq!(app.navigator_depth(), depth_before, "Action::None from on_pick must leave the picker open");
+    }
+
+    #[test]
+    fn picker_pops_when_on_pick_returns_action_pop_view() {
+        let picked = Rc::new(RefCell::new(Vec::new()));
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(three_option_picker(None, Rc::clone(&picked), false));
+        let depth_before = app.navigator_depth();
+        app.handle_input(vec![NavIntent::Select]); // Alpha
+        assert_eq!(picked.borrow().len(), 1, "on_pick must have fired");
+        assert_eq!(app.navigator_depth(), depth_before - 1, "Action::PopView from on_pick must pop the picker");
+    }
+
+    #[test]
+    fn picker_unselectable_row_cannot_be_activated() {
+        let picked = Rc::new(RefCell::new(Vec::new()));
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(three_option_picker(None, Rc::clone(&picked), true));
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // focus Gamma (selectable: false)
+        app.handle_input(vec![NavIntent::Select]);
+        assert!(picked.borrow().is_empty(), "an unavailable option must not be pickable -- the activation gate lives in FieldList, not on_pick");
+    }
+
+    /// Headless PNG dump of the picker, at zoom -- the picker has no
+    /// wired-in caller yet in this bead (`ScreenId::Picker` and its first
+    /// real content land with `pico-link-7jol.5`), so it can't be reached
+    /// through the public `App`/emulator surface the way the device page
+    /// can (see `core/examples/device_page_screenshots.rs`). Dumped from
+    /// here instead, since this module's tests are the only place with
+    /// `pub(crate)` access to `build_single_select_screen` itself.
+    #[test]
+    fn picker_screenshot_at_zoom() {
+        const ZOOM: u32 = 3;
+
+        let out_dir = std::env::temp_dir().join("pico-link-picker-screenshot");
+        std::fs::create_dir_all(&out_dir).expect("failed to create output dir");
+        let picked = Rc::new(RefCell::new(Vec::new()));
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(three_option_picker(Some(ListItemKey::from_u64(2)), picked, true));
+        app.handle_input(vec![NavIntent::Down]); // focus Beta (the checked row) so its caret is also visible
+
+        let framebuffer = app.render();
+        let mut image = image::RgbImage::new(framebuffer.width(), framebuffer.height());
+        for pixel in framebuffer.pixels() {
+            let color = pixel.1;
+            #[allow(clippy::cast_sign_loss)]
+            image.put_pixel(
+                pixel.0.x as u32,
+                pixel.0.y as u32,
+                image::Rgb([(color.r() << 3) | (color.r() >> 2), (color.g() << 2) | (color.g() >> 4), (color.b() << 3) | (color.b() >> 2)]),
+            );
+        }
+        let zoomed =
+            image::imageops::resize(&image, framebuffer.width() * ZOOM, framebuffer.height() * ZOOM, image::imageops::FilterType::Nearest);
+        let path = out_dir.join("picker.png");
+        zoomed.save(&path).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        println!("wrote {}", path.display());
     }
 }

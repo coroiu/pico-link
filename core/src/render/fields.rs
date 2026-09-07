@@ -190,6 +190,16 @@ impl FieldRow {
         self
     }
 
+    /// This row's trailing value text, if any -- a read-only accessor
+    /// (matching `ListItem::label`/`sublabel`'s already-public-field
+    /// convention) for callers that need to assert on a built row's
+    /// content without a framebuffer (e.g. `crate::app`'s
+    /// `device_page_rows` tests). Does not affect rendering.
+    #[must_use]
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
     fn resolved_label_color(&self) -> Rgb565 {
         self.label_color.unwrap_or(match self.kind {
             FieldKind::Action => palette::TEXT_PRIMARY,
