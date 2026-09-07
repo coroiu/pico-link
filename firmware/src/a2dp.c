@@ -3515,6 +3515,40 @@ bool pl_a2dp_streaming(void) {
     return s_ctx.state != PL_A2DP_MEDIA_IDLE;
 }
 
+// Bead pico-link-7jol.5. See a2dp.h's doc comment.
+bool pl_a2dp_is_connected_ldac(const uint8_t addr[6]) {
+    return s_ctx.state != PL_A2DP_MEDIA_IDLE && s_ctx.codec == &pl_codec_ldac && memcmp(s_ctx.connect_addr, addr, 6) == 0;
+}
+
+// Bead pico-link-7jol.5. See a2dp.h's doc comment on pl_a2dp_poll_ldac_
+// bitrate for the push-only-on-change discipline this mirrors from
+// pl_a2dp_poll_levels.
+void pl_a2dp_poll_ldac_bitrate(struct PlUi *ui) {
+    static uint32_t s_last_pushed_kbps;
+    static bool s_last_pushed_valid;
+
+    if (s_ctx.codec != &pl_codec_ldac) {
+        // Not the live codec (disconnected, or fell back to SBC) -- reset
+        // the dedupe state so THIS codec's first reading on a later LDAC
+        // session is never suppressed as "unchanged" against a stale
+        // value from a previous one.
+        s_last_pushed_valid = false;
+        return;
+    }
+    uint32_t kbps = pl_codec_ldac_current_kbps();
+    if (s_last_pushed_valid && kbps == s_last_pushed_kbps) {
+        return;
+    }
+    s_last_pushed_kbps = kbps;
+    s_last_pushed_valid = true;
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_LDAC_BITRATE_CHANGED,
+        .payload = {.ldac_bitrate_changed = {.kbps = kbps}},
+    };
+    pl_ui_push_event(ui, event);
+}
+
 void pl_a2dp_connect(const uint8_t *addr) {
     // Bead pico-link-648: a fresh top-level connect attempt gets its own
     // single retry budget, and supersedes any retry still armed from a

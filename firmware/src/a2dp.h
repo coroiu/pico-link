@@ -122,6 +122,27 @@ void pl_a2dp_publish_counters(void);
 // sentinel is read as "nothing yet").
 void pl_a2dp_poll_levels(struct PlUi *ui);
 
+// Bead pico-link-7jol.5, design `.planning/design/2026-09-07-ldac-quality-
+// selector.md` §6: pushes Event::LdacBitrateChanged through `ui` whenever
+// the connected codec is LDAC and codec_ldac.c's live-kbps cache has
+// changed since the last push (same push-only-on-change discipline as
+// pl_a2dp_poll_levels, no seqlock needed here since the cache is one
+// volatile word). Call once per superloop iteration, anywhere after
+// pl_ui_tick -- order relative to pl_a2dp_poll_levels does not matter,
+// this event carries no clock-dependent field. A no-op while the
+// connected codec isn't LDAC (and resets its own dedupe state then, so a
+// later LDAC session's first reading is never suppressed as "unchanged").
+void pl_a2dp_poll_ldac_bitrate(struct PlUi *ui);
+
+// Bead pico-link-7jol.5: is `addr` the currently connected device AND is
+// LDAC its live codec? Gates bt.c's SET_DEVICE_LDAC_QUALITY command
+// handler's live-apply path (pl_codec_ldac_pin_now) -- a pick for a
+// different device, or for the connected device while it's actually
+// fallen back to SBC, only stages the flash write; it must not reach for
+// the LDAC encoder at all. Thread-context safe to call (reads two plain
+// fields, no BTstack call, same class as pl_a2dp_streaming above).
+bool pl_a2dp_is_connected_ldac(const uint8_t addr[6]);
+
 // T3 (pico-link-4v2.3), design sec 9 (host -> headphones over AVRCP):
 // consumes volume.c's outbound AVRCP latch and, if a connection exists and
 // no SET_ABSOLUTE_VOLUME is already awaiting a response, sends one via

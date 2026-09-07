@@ -117,6 +117,7 @@ fn injecting_a_navintent_over_http_moves_the_selection_and_is_observable_in_the_
         addr: [1, 2, 3, 4, 5, 6],
         name: String::from("Test Headphones"),
         mru_seq: 1,
+        ldac_quality: 0,
     }));
 
     // Pixel coordinates for row 0's and row 1's selection-highlight fill,

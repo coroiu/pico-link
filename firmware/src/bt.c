@@ -26,6 +26,7 @@
 #include "btstack.h"
 
 #include "a2dp.h"
+#include "codec_ldac.h"
 #include "bt.h"
 #include "persist.h"
 #include "pico_link_ui.h"
@@ -447,11 +448,11 @@ static void pl_bt_push_store_loaded(uint32_t status, uint8_t count) {
 // Event::PairedDeviceUpserted{addr, name, name_len, mru_seq}. See bt.h's
 // doc comment for the two call sites (persist.c's write path, and this
 // file's own boot sequence).
-void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq) {
+void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq, uint8_t ldac_quality) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_PAIRED_DEVICE_UPSERTED,
-        .payload = {.paired_device_upserted = {.name_len = name_len, .mru_seq = mru_seq}},
+        .payload = {.paired_device_upserted = {.name_len = name_len, .mru_seq = mru_seq, .ldac_quality = ldac_quality}},
     };
     memcpy(event.payload.paired_device_upserted.addr, addr, 6);
     memcpy(event.payload.paired_device_upserted.name, name, sizeof(event.payload.paired_device_upserted.name));
@@ -615,8 +616,9 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                     uint8_t boot_name[32];
                     uint8_t boot_name_len;
                     uint32_t boot_mru_seq;
-                    pl_persist_boot_device_at(i, boot_addr, boot_name, &boot_name_len, &boot_mru_seq);
-                    pl_bt_push_paired_device_upserted(boot_addr, boot_name, boot_name_len, boot_mru_seq);
+                    uint8_t boot_ldac_quality;
+                    pl_persist_boot_device_at(i, boot_addr, boot_name, &boot_name_len, &boot_mru_seq, &boot_ldac_quality);
+                    pl_bt_push_paired_device_upserted(boot_addr, boot_name, boot_name_len, boot_mru_seq, boot_ldac_quality);
                 }
                 pl_bt_push_store_loaded((uint32_t)pl_persist_boot_status(), boot_device_count);
 
@@ -736,6 +738,13 @@ typedef enum {
     // async_context (persist.h's Reentrancy doc). Carries the target addr,
     // same as PL_BT_PENDING_CONNECT.
     PL_BT_PENDING_FORGET_DEVICE,
+    // Bead pico-link-7jol.5: reuses this exact queue/heartbeat idiom for
+    // persist.c's per-device LDAC-quality settings write -- same
+    // reentrancy reason as PL_BT_PENDING_PERSIST_WRITE/
+    // PL_BT_PENDING_FORGET_DEVICE. Carries no addr -- persist.c already
+    // has the pending settings staged in its own s_settings_pending_addr,
+    // same convention as PL_BT_PENDING_PERSIST_WRITE.
+    PL_BT_PENDING_SET_DEVICE_LDAC_QUALITY,
 } pl_bt_pending_tag_t;
 
 typedef struct {
@@ -768,6 +777,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "PERSIST_WRITE";
         case PL_BT_PENDING_FORGET_DEVICE:
             return "FORGET_DEVICE";
+        case PL_BT_PENDING_SET_DEVICE_LDAC_QUALITY:
+            return "SET_DEVICE_LDAC_QUALITY";
         default:
             return "?";
     }
@@ -843,6 +854,13 @@ static void pl_bt_pending_service(void) {
                 // on success (persist.c).
                 pl_persist_forget_device(entry.addr);
                 break;
+            case PL_BT_PENDING_SET_DEVICE_LDAC_QUALITY:
+                // Bead pico-link-7jol.5: same reentrancy contract as
+                // PL_BT_PENDING_PERSIST_WRITE above. Pushes
+                // PairedDeviceUpserted itself on an actual write
+                // (persist.c's pl_persist_rmw, the shared RMW core).
+                pl_persist_execute_pending_ldac_quality_write();
+                break;
         }
     }
 }
@@ -856,6 +874,11 @@ static void pl_bt_pending_service(void) {
 // superloop). See persist.h's module doc for the full rationale.
 void pl_bt_enqueue_persist_write(void) {
     pl_bt_pending_push(PL_BT_PENDING_PERSIST_WRITE, NULL);
+}
+
+// Bead pico-link-7jol.5. See bt.h's doc comment.
+void pl_bt_enqueue_ldac_quality_write(void) {
+    pl_bt_pending_push(PL_BT_PENDING_SET_DEVICE_LDAC_QUALITY, NULL);
 }
 
 // Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the
@@ -1051,6 +1074,28 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             // pending-queue entry pico-link-nb6 already added.
             pl_bt_pending_push(PL_BT_PENDING_DISCONNECT, NULL);
             break;
+
+        case PL_COMMAND_TAG_SET_DEVICE_LDAC_QUALITY: {
+            // Bead pico-link-7jol.5, design `.planning/design/2026-09-07-
+            // ldac-quality-selector.md` §5: "A applies the pick
+            // immediately... no confirm... saves later". Split in two:
+            // (1) the live encoder application below is plain/volatile
+            // state only (no flash) and safe to do RIGHT HERE, in thread
+            // context; (2) the flash write is staged, not enqueued
+            // directly -- persist.c's own streaming gate decides when it
+            // is safe, same discipline as every other per-device setting.
+            const uint8_t *addr = command.payload.set_device_ldac_quality.addr;
+            uint8_t ldac_quality = command.payload.set_device_ldac_quality.ldac_quality;
+            pl_log(
+                "BT: PL_CMD_SET_DEVICE_LDAC_QUALITY %02x:%02x:%02x:%02x:%02x:%02x quality=%u\r\n", addr[0], addr[1], addr[2],
+                addr[3], addr[4], addr[5], ldac_quality
+            );
+            if (pl_a2dp_is_connected_ldac(addr)) {
+                pl_codec_ldac_pin_now(ldac_quality);
+            }
+            pl_persist_request_ldac_quality(addr, ldac_quality);
+            break;
+        }
 
         case PL_COMMAND_TAG_NONE:
             pl_wdt_mark(PL_WDT_CP_CMD_NONE);

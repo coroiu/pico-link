@@ -160,9 +160,13 @@ void pl_bt_get_connect_target_name(const uint8_t addr[6], uint8_t out_name[32], 
 // boot sequence (pl_bt_init's BTSTACK_EVENT_STATE case), once per record
 // persist.c loaded at boot. `name`/`name_len` follow
 // PlPairedDeviceUpsertedPayload's convention (fixed 32-byte buffer, copied
-// by value). Safe from IRQ or thread context -- routes through
+// by value). `ldac_quality` (bead pico-link-7jol.5, ABI 4->5) is the
+// persisted 1-based quality pick, 0 = unset -- callers must pass whatever
+// persist.c's slot mirror actually holds for this record (see
+// pl_persist_get_device_settings/pl_persist_boot_device_at), never a
+// literal 0. Safe from IRQ or thread context -- routes through
 // pl_bt_ring_push, same as every other push helper in this header.
-void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq);
+void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq, uint8_t ldac_quality);
 
 // Bead pico-link-4vb.7 (T3), design section 5.1: pushes
 // PlEventTag::PairedDeviceForgotten. Called from persist.c's
@@ -210,5 +214,13 @@ void pl_bt_debug_disconnect(void);
 // (thread context, the superloop). See persist.h's module doc
 // ("Reentrancy") for the full rationale.
 void pl_bt_enqueue_persist_write(void);
+
+// Bead pico-link-7jol.5: same idiom as pl_bt_enqueue_persist_write above,
+// for persist.c's LDAC-quality settings write instead of a pairing write
+// -- see persist.h's doc comment on pl_persist_request_ldac_quality/
+// pl_persist_execute_pending_ldac_quality_write for the full rationale.
+// Called from persist.c's pl_persist_service() (thread context, the
+// superloop).
+void pl_bt_enqueue_ldac_quality_write(void);
 
 #endif // PL_BT_H

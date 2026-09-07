@@ -94,7 +94,7 @@ pub fn generate(out_dir: &Path) {
     // after the scan that first found it is gone) -- so the scenario must
     // upsert it into `paired` the same way a real pairing does, or the
     // hero widget's device-name line silently renders empty (pico-link-70b).
-    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1 }));
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1, ldac_quality: 0 }));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[1]);
@@ -123,7 +123,7 @@ pub fn generate(out_dir: &Path) {
     // its hold cap right at the bar's edge. ---
     let mut app = App::new(240, 240);
     let addr = [0xDD; 6];
-    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1 }));
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1, ldac_quality: 0 }));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.tick(1);
@@ -137,7 +137,7 @@ pub fn generate(out_dir: &Path) {
     // comparable to the design doc's ASCII sketch (section 8). ---
     let mut app = App::new(240, 240);
     let addr = [0xEE; 6];
-    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1 }));
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Sony WH-1000XM5"), mru_seq: 1, ldac_quality: 0 }));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 909_000 }));
     app.handle_event(Event::VolumeChanged { level: 79, muted: false, source: VolumeSource::Sink });

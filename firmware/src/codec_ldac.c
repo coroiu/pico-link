@@ -128,9 +128,22 @@ static uint8_t s_pending_ldac_quality = 0;
 // volatile and this one should not be the sole exception, even though
 // aligned-word access on Cortex-M33 makes the plain-int version benign
 // today.
-static bool s_ldac_adaptive = false;
+// Bead pico-link-7jol.5: promoted plain -> volatile. A manual quality pick
+// (pl_codec_ldac_pin_now) now writes this from THREAD context (bt.c's
+// command dispatch) while pl_codec_ldac_apply_pending_tuning reads it from
+// encoder context (core0 IRQ legacy, core1 under PL_ENCODER_ON_CORE1) --
+// the exact same cross-context read/write class s_ldac_applied_rung/
+// s_ldac_target_rung already are, for the same reason: single aligned-word
+// access is atomic on Cortex-M33, so volatile is sufficient here without a
+// seqlock.
+static volatile bool s_ldac_adaptive = false;
 static volatile int32_t s_ldac_applied_rung = 0;
 static volatile int32_t s_ldac_target_rung = 0;
+// Bead pico-link-7jol.5: the live encoder's current effective bitrate, in
+// kbps -- see codec_ldac.h's doc comment on pl_codec_ldac_current_kbps for
+// why this is a cache updated only from encoder context, never a live
+// re-query from elsewhere.
+static volatile uint32_t s_ldac_current_kbps = 0;
 
 // Lifetime observability counters (design sec 7 / bead trap 4) -- NOT
 // reset by init(), same convention as this file's sibling lifetime
@@ -204,12 +217,22 @@ uint32_t pl_codec_ldac_abr_apply_fail(void) { return s_ldac_abr_apply_fail; }
 // Steps the applied rung ONE STEP per call toward the target, so a
 // multi-rung change converges over several fill() calls rather than all
 // at once (design sec 6.2: ~40ms for a 4-rung walk at 100 fill()/s).
-// Inert unless s_ldac_adaptive is true for the live stream -- a pinned
-// device's EQMID was set directly by ldacBT_init_handle_encode at init()
-// and is never touched again.
+//
+// Bead pico-link-7jol.5: the `!s_ldac_adaptive` half of this gate was
+// REMOVED. A pinned stream still never has a reason to step on its own --
+// nothing but pl_codec_ldac_pin_now (below) ever writes s_ldac_target_rung
+// away from s_ldac_applied_rung while not adaptive, and it only does so as
+// the ONE-TIME effect of a manual pick -- but this function must still be
+// the thing that WALKS toward that one-time target once pin_now sets it,
+// exactly like an ABR multi-rung walk already does. Gating on `handle`
+// alone is behaviour-preserving for every pre-existing pinned stream
+// (target == applied == 0 always, since nothing else moves it), and is
+// what lets a manual pin-while-Adaptive or pin-to-a-different-fixed-rate
+// converge the live encoder without a reconnect (design sec 5: "applies
+// live, no confirm").
 static void pl_codec_ldac_apply_pending_tuning(void *state) {
     pl_ldac_encoder_t *enc = (pl_ldac_encoder_t *)state;
-    if (!s_ldac_adaptive || enc->handle == NULL) {
+    if (enc->handle == NULL) {
         return;
     }
     int32_t target = s_ldac_target_rung; // single volatile read
@@ -255,7 +278,66 @@ static void pl_codec_ldac_apply_pending_tuning(void *state) {
         s_ldac_applied_rung--;
         s_ldac_abr_steps_up++;
     }
+    // Bead pico-link-7jol.5 (bead pico-link-qx8's doctrine: ASK THE
+    // LIBRARY, never restate its table). Safe here specifically because
+    // this function is the sole owner of `enc->handle` in this context --
+    // the same "no concurrent access" argument codec_ldac.c's init()
+    // already relies on for its own ldacBT_get_bitrate call, just at a
+    // different moment (after a successful step instead of after
+    // configuration).
+    int new_kbps = ldacBT_get_bitrate(enc->handle);
+    if (new_kbps > 0) {
+        s_ldac_current_kbps = (uint32_t)new_kbps;
+    }
 }
+
+// Bead pico-link-7jol.5, design sec 5: maps a FIXED (non-Adaptive)
+// ldac_quality to the ladder rung it corresponds to -- the ladder has 5
+// rungs but only 0/2/4 are the public HQ/SQ/MQ constants (this file's own
+// module doc, sec 0.1), same three rungs pl_ldac_quality_to_initial_state
+// maps to EQMIDs for the init()-time path. Kept next to that function so
+// the two mappings can never drift -- see design sec 5.4's "one function"
+// rule (extended to this rung-flavoured sibling).
+static int32_t pl_ldac_quality_to_rung(uint8_t ldac_quality_1based) {
+    switch (ldac_quality_1based) {
+        case 2: // 660 kbps / SQ
+            return 2;
+        case 3: // 330 kbps / MQ
+            return 4;
+        case 0: // never chosen -- same default as pinned 990/HQ
+        case 1: // 990 kbps / HQ
+        default:
+            return 0;
+    }
+}
+
+void pl_codec_ldac_pin_now(uint8_t ldac_quality_1based) {
+    if (s_ldac_encoder.handle == NULL) {
+        // No live LDAC stream to apply to right now -- the persisted pick
+        // still takes effect at the next connect via
+        // pl_a2dp_finish_codec_negotiation's existing re-apply (design sec
+        // 5, "a pin pins... re-applied on reconnect"). Not an error.
+        return;
+    }
+    int unused_eqmid;
+    bool adaptive;
+    pl_ldac_quality_to_initial_state(ldac_quality_1based, &unused_eqmid, &adaptive);
+    s_ldac_adaptive = adaptive;
+    if (adaptive) {
+        // Enter Adaptive from wherever the ladder currently sits -- no
+        // audible jump; a2dp.c's decide loop picks up from here on its
+        // next cycle (design sec 5.1: "the number walks... over the
+        // following moment", not a snap).
+        s_ldac_target_rung = s_ldac_applied_rung;
+    } else {
+        // A fixed pick pins the target; pl_codec_ldac_apply_pending_tuning
+        // (encoder context) walks s_ldac_applied_rung to it one step per
+        // fill() call, same primitive an ABR multi-rung walk already uses.
+        s_ldac_target_rung = pl_ldac_quality_to_rung(ldac_quality_1based);
+    }
+}
+
+uint32_t pl_codec_ldac_current_kbps(void) { return s_ldac_current_kbps; }
 
 static bool pl_codec_ldac_init(
     void *state, const uint8_t *configuration, uint8_t configuration_len, pl_codec_format_t *out_format,
@@ -300,11 +382,24 @@ static bool pl_codec_ldac_init(
     // pinned device the controller is never told to step because
     // s_ldac_adaptive is false, not because it happens not to fire.
     int initial_eqmid;
-    pl_ldac_quality_to_initial_state(s_pending_ldac_quality, &initial_eqmid, &s_ldac_adaptive);
+    // Bead pico-link-7jol.5: s_ldac_adaptive is now `volatile` (cross-
+    // context, see its own doc comment) -- write it through a plain local
+    // so this helper's signature doesn't need a volatile-qualified
+    // parameter for its only OTHER caller (pl_codec_ldac_pin_now), which
+    // writes a plain local of its own.
+    bool adaptive_out;
+    pl_ldac_quality_to_initial_state(s_pending_ldac_quality, &initial_eqmid, &adaptive_out);
+    s_ldac_adaptive = adaptive_out;
     // design sec 5.2: no carried-over controller state, ever -- this
     // init() call is one of the four reset events (codec re-negotiation).
     s_ldac_applied_rung = 0;
     s_ldac_target_rung = 0;
+    // Bead pico-link-7jol.5: same "no carried-over state" rule extends to
+    // the live-bitrate cache -- a stale reading from the PREVIOUS stream
+    // must not survive into this one, however briefly (Home's live number
+    // is read at any time via pl_codec_ldac_current_kbps). Set for real,
+    // below, once ldacBT_get_bitrate has actually run for this stream.
+    s_ldac_current_kbps = 0;
 
     int status = ldacBT_init_handle_encode(
         enc->handle, PL_LDAC_INIT_MTU, initial_eqmid, (int)cfg.channel_mode, LDACBT_SMPL_FMT_S16, 48000
@@ -368,6 +463,8 @@ static bool pl_codec_ldac_init(
         // bitrate on the panel is worse than an obviously absent one.
         pl_log("ldac: ldacBT_get_bitrate failed (%d), reporting 0\r\n", kbps);
         out_frame->nominal_bitrate_bps = 0;
+        // s_ldac_current_kbps stays 0 (set above) -- no honest bitrate to
+        // cache either.
         // Bead pico-link-i6zn: no honest bitrate means no honest
         // frames-per-packet either -- leave the hint at 0 (unknown) so
         // a2dp.c's fallback (with its own loud warning) governs instead of
@@ -376,6 +473,10 @@ static bool pl_codec_ldac_init(
     } else {
         out_frame->nominal_bitrate_bps = (uint32_t)kbps * 1000u;
         pl_log("ldac: nominal bitrate %d kbps from ldacBT_get_bitrate\r\n", kbps);
+        // Bead pico-link-7jol.5: this IS the first live reading for this
+        // stream -- Home must not wait for the first ABR step (which may
+        // never come, for a pinned device) to show a live number.
+        s_ldac_current_kbps = (uint32_t)kbps;
 
         // Bead pico-link-i6zn (design .planning/design/2026-09-07-ldac-abr-
         // control-loop.md sec 4.2): the honest per-packet transport-frame
