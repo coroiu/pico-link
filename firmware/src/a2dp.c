@@ -2145,6 +2145,7 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
         return;
     }
 
+#ifndef PL_ENCODER_ON_CORE1
     // Bead pico-link-fhf: hysteresis-banded discrete resync. Ring fill
     // under credit pacing is a free integrator (drain is defined by our
     // own crystal, the same crystal supply is regulated against, so there
@@ -2161,6 +2162,17 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     // EMA holds a stale pre-trim value for ~5 tau after a reseed; an
     // ungated second tick would cut another band's worth on a reading that
     // no longer exists).
+    //
+    // GATED ON !PL_ENCODER_ON_CORE1 (code review, 2026-09-07): pl_pcm_trim_to
+    // writes pcm_ring's s_tail, which under PL_ENCODER_ON_CORE1 is owned by
+    // core1's pl_a2dp_core1_entry loop (it calls pl_pcm_read(), the other
+    // read-modify-write of s_tail) -- running this block unconditionally in
+    // core0's IRQ would race that write with no lock, exactly the hazard
+    // pcm_ring.h's module doc calls out for a genuinely cross-core consumer.
+    // This mirrors every other core1 carve-out in this function. Dormant
+    // today (PL_ENCODER_ON_CORE1 defaults OFF), but core1 mode currently has
+    // NO resync mechanism until pico-link-quzf lands a core1-safe design --
+    // do not remove this guard without that design in place.
     if (!host_silent) {
         int32_t fill_ema = pl_usb_audio_fb_fill_ema();
         uint32_t target = pl_pcm_target_fill_bytes();
@@ -2186,7 +2198,6 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     // (pico-link-0d2). All reporting for this mechanism happens in
     // pl_a2dp_report, at thread context.
 
-#ifndef PL_ENCODER_ON_CORE1
     // Bead pico-link-85v (D1): the old "only fill if not already waiting
     // on a grant" gate is GONE -- that was the actual ceiling mechanism
     // (a tick with sbc_ready_to_send still true did no filling at all).
@@ -3414,10 +3425,16 @@ void pl_a2dp_report(uint32_t report_dt_us) {
     // ~1.02s windows. NOT cosmetic -- worth ~1 percent by construction. 0
     // on the very first call (no prior sample to diff against).
     const char *codec_name = s_ctx.codec != NULL ? s_ctx.codec->display_name : "none";
+    // Bead pico-link-fhf: fill's denominator is the RUNTIME setpoint
+    // (pl_pcm_target_fill_bytes), not the PL_PCM_TARGET_FILL_BYTES macro --
+    // STREAM_ESTABLISHED sets the runtime value from the priming cushion
+    // (typically higher than the macro for SBC), and this diagnostic ratio
+    // must read against whatever the pipeline is actually regulating to,
+    // same reasoning as the trim block and usb_audio.c's feedback loop.
     pl_log(
         "a2dp: codec=%s bitrate=%lu fill=%lu/%lu ovr_frames=%lu und=%lu report_dt_us=%lu\r\n", codec_name,
         (unsigned long)s_ctx.frame.nominal_bitrate_bps, (unsigned long)pl_pcm_fill_bytes(),
-        (unsigned long)PL_PCM_TARGET_FILL_BYTES, (unsigned long)pl_pcm_overrun_frames(),
+        (unsigned long)pl_pcm_target_fill_bytes(), (unsigned long)pl_pcm_overrun_frames(),
         (unsigned long)s_ctx.underrun_events, (unsigned long)report_dt_us
     );
     pl_log(

@@ -149,6 +149,17 @@ static bool parse_connect_addr(const char *line, uint8_t addr[6]) {
 // non-digit characters, empty digit string) is rejected outright, same
 // discipline as parse_connect_addr above. *out_ticks is only written on a
 // true return.
+//
+// Clamped to PL_DEBUG_SKIP_TICKS_MAX (code review, 2026-09-07, non-
+// blocking): the injection test only ever needs K=10 (~113ms of skipped
+// drain at the real ~11.3ms tick cadence); an unbounded K typed at the CDC
+// console -- or a garbled/malicious one -- could otherwise idle the drain
+// for minutes, well past PL_WDT_MEDIA's stall deadline, on a debug-only
+// path with no other guard. The accumulate-then-clamp order (rather than
+// rejecting outright) matches this file's "never fatal, never wedges"
+// contract for malformed input -- an oversized K still does SOMETHING
+// bounded rather than nothing.
+#define PL_DEBUG_SKIP_TICKS_MAX 1000u
 static bool parse_skip_ticks(const char *line, uint32_t *out_ticks) {
     if (strncmp(line, "SKIPTICKS ", 10) != 0) {
         return false;
@@ -157,12 +168,21 @@ static bool parse_skip_ticks(const char *line, uint32_t *out_ticks) {
     if (*p == '\0') {
         return false;
     }
+    // Saturating parse: once `value` reaches the clamp, stop advancing it
+    // (and pin it there) rather than let further digits keep multiplying --
+    // that would wrap a uint32_t on a long-enough digit string and could
+    // land back BELOW the clamp by chance, defeating the point of it.
     uint32_t value = 0;
     for (; *p != '\0'; p++) {
         if (*p < '0' || *p > '9') {
             return false;
         }
-        value = value * 10u + (uint32_t)(*p - '0');
+        if (value < PL_DEBUG_SKIP_TICKS_MAX) {
+            value = value * 10u + (uint32_t)(*p - '0');
+            if (value > PL_DEBUG_SKIP_TICKS_MAX) {
+                value = PL_DEBUG_SKIP_TICKS_MAX;
+            }
+        }
     }
     *out_ticks = value;
     return true;
