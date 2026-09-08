@@ -3791,10 +3791,18 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // SBC frame's worth of real time). stop_queue_full is the new ceiling
     // tripwire (replacing stop_packet_full_hot) -- must read 0 for SBC;
     // see that field's doc comment on pl_a2dp_ctx_t.
+    // Bead pico-link-9eq2.3.2, code review fix: fb_rail_ticks (design
+    // sec 6.1) had a consumer only in fault.c's own delta evaluation --
+    // nothing printed its absolute value, so it was unreachable by any
+    // human or console reader, which defeats its stated purpose ("the
+    // single most valuable missing counter in the firmware", "belongs in
+    // pl_a2dp_report's output regardless" of this bead). Added here,
+    // alongside the other quiet counters already on this line.
     pl_log(
-        "a2dp: stop_credit=%lu stop_queue_full=%lu stop_ring_empty=%lu stop_dwell=%lu fill_short_read=%lu\r\n",
+        "a2dp: stop_credit=%lu stop_queue_full=%lu stop_ring_empty=%lu stop_dwell=%lu fill_short_read=%lu "
+        "fb_rail_ticks=%lu\r\n",
         (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_queue_full, (unsigned long)s_ctx.stop_ring_empty,
-        (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read
+        (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read, (unsigned long)pl_usb_audio_fb_rail_ticks()
     );
     // Bead pico-link-cz0.5.8 (Ada's step 4): stop_dwell is documented two
     // comments up as "must read 0 in a healthy run" -- it was, all session,
