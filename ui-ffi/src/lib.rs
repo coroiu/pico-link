@@ -893,18 +893,33 @@ pub unsafe extern "C" fn pl_ui_render_ex(ui: *mut PlUi, out: *mut PlRenderOut) {
 // change entirely on the C side of this seam -- this function's signature
 // doesn't need to change for that fix to land.
 
-/// Mirrors [`pico_link_core::LinkState`]'s four variants 1:1. Explicit
+/// Mirrors [`pico_link_core::LinkState`]'s three variants 1:1. Explicit
 /// discriminants (pinned, not compiler-assigned) for the same reason as
 /// [`PlIntentTag`]'s: [`PlLinkStateChangedPayload::state`] carries this
 /// value as a plain `u32`, not as a `PlLinkState`-typed field -- see that
 /// field's doc comment. `PlLinkState` itself stays a real Rust enum purely
 /// so the cbindgen header keeps emitting named `PL_LINK_STATE_*` C
 /// constants for firmware source to use.
+///
+/// Bead `pico-link-88xs`, design `.planning/design/2026-09-08-link-state-
+/// vs-discovery-axis.md` section 2.5: `Scanning = 1` is **removed**, not
+/// renumbered -- `1` is reserved and rejected by `TryFrom` below rather
+/// than reused, and [`PL_EVENT_ABI_VERSION`] does NOT move for this
+/// change. This is a narrowing of a nested enum's accepted value space,
+/// not a layout change, and the version guard is the wrong instrument for
+/// it: on a version mismatch [`pl_ui_push_event`] returns silently and
+/// EVERY event in the stream vanishes with no counter moved, whereas
+/// leaving the version alone means a stale producer of `state == 1` is
+/// rejected AND counted in [`PlUi::malformed_tag_count`] -- one bad event,
+/// observably, which given this project's history with silent event drops
+/// is strictly the better failure mode. Scanning now travels on its own
+/// wire tag -- see [`PlDiscoveryState`].
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlLinkState {
     Idle = 0,
-    Scanning = 1,
+    // 1 was `Scanning` -- deliberately not reused, see the doc comment
+    // above and `TryFrom`'s match below.
     Connecting = 2,
     Connected = 3,
 }
@@ -916,11 +931,12 @@ impl core::convert::TryFrom<u32> for PlLinkState {
     /// as [`PlIntentTag`]'s `TryFrom` impl (pico-link-ptu): this payload
     /// sits inside [`PlEventPayload`], a union C constructs and
     /// [`pl_ui_push_event`] receives by value, one layer beneath the outer
-    /// tag this bead originally hardened.
+    /// tag this bead originally hardened. `1` (the former `Scanning`) is
+    /// deliberately absent -- a stale producer sending it is rejected and
+    /// counted (bead `pico-link-88xs`), not silently accepted.
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(PlLinkState::Idle),
-            1 => Ok(PlLinkState::Scanning),
             2 => Ok(PlLinkState::Connecting),
             3 => Ok(PlLinkState::Connected),
             _ => Err(()),
@@ -932,10 +948,46 @@ impl From<PlLinkState> for LinkState {
     fn from(state: PlLinkState) -> Self {
         match state {
             PlLinkState::Idle => LinkState::Idle,
-            PlLinkState::Scanning => LinkState::Scanning,
             PlLinkState::Connecting => LinkState::Connecting,
             PlLinkState::Connected => LinkState::Connected,
         }
+    }
+}
+
+/// Mirrors [`pico_link_core::BtModel::discovering`]'s two observable
+/// states 1:1 (bead `pico-link-88xs`, design section 2.3). Unlike
+/// [`PlLinkState`], the wire carries a nested enum rather than a raw
+/// `bool` byte -- deliberate room to grow (e.g. a future
+/// `PL_DISCOVERY_STATE_STARTING` or an LE-scan variant) without an ABI
+/// event, matching the shape every other nested enum on this wire already
+/// uses.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlDiscoveryState {
+    Idle = 0,
+    Scanning = 1,
+}
+
+impl core::convert::TryFrom<u32> for PlDiscoveryState {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see [`PlLinkState`]'s
+    /// `TryFrom` impl for the full rationale (pico-link-ptu).
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlDiscoveryState::Idle),
+            1 => Ok(PlDiscoveryState::Scanning),
+            _ => Err(()),
+        }
+    }
+}
+
+impl PlDiscoveryState {
+    /// Whether this wire value means "a GAP inquiry is running" -- the
+    /// exact `bool` [`pico_link_core::app::App::set_discovering`] takes.
+    #[must_use]
+    pub fn is_scanning(self) -> bool {
+        matches!(self, PlDiscoveryState::Scanning)
     }
 }
 
@@ -1035,6 +1087,19 @@ impl From<PlConnectStep> for ConnectStep {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlLinkStateChangedPayload {
+    pub state: u32,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::DiscoveryStateChanged`
+/// (bead `pico-link-88xs`). Shape copied exactly from
+/// [`PlLinkStateChangedPayload`] -- `state` is a plain `u32`, not
+/// [`PlDiscoveryState`], for the same reason: this sits inside
+/// [`PlEventPayload`], a union [`pl_ui_push_event`] receives by value, so a
+/// typed field here would already be UB to read on a garbage discriminant.
+/// Convert via [`PlDiscoveryState::try_from`] rather than transmuting.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlDiscoveryStateChangedPayload {
     pub state: u32,
 }
 
@@ -1654,6 +1719,16 @@ pub enum PlEventTag {
     /// [`PL_EVENT_ABI_VERSION`] is unchanged by this tag's own addition --
     /// see [`PlAudioFaultPayload`]'s doc comment.
     AudioFault = 16,
+    /// Bead `pico-link-88xs`, design `.planning/design/2026-09-08-link-
+    /// state-vs-discovery-axis.md` §2.3/§2.4: whether the radio is
+    /// currently running a GAP inquiry -- the second, independent axis
+    /// from [`Self::LinkStateChanged`]. Purely additive, same discipline
+    /// as `LevelsChanged`/`VolumeChanged`/`LdacBitrateChanged`/
+    /// `AudioFault` above -- [`PL_EVENT_ABI_VERSION`] is unchanged by this
+    /// tag's own addition. `17`, not reusing `PlLinkState::Scanning`'s old
+    /// `1` -- see [`PlLinkState`]'s doc comment for why that ordinal is
+    /// reserved-and-rejected rather than renumbered.
+    DiscoveryStateChanged = 17,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1681,6 +1756,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             14 => Ok(PlEventTag::VolumeChanged),
             15 => Ok(PlEventTag::LdacBitrateChanged),
             16 => Ok(PlEventTag::AudioFault),
+            17 => Ok(PlEventTag::DiscoveryStateChanged),
             _ => Err(()),
         }
     }
@@ -1723,6 +1799,9 @@ pub union PlEventPayload {
     pub ldac_bitrate_changed: PlLdacBitrateChangedPayload,
     /// Bead pico-link-9eq2.3.1. See [`PlAudioFaultPayload`]'s doc comment.
     pub audio_fault: PlAudioFaultPayload,
+    /// Bead pico-link-88xs. See [`PlDiscoveryStateChangedPayload`]'s doc
+    /// comment.
+    pub discovery_state_changed: PlDiscoveryStateChangedPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -2087,6 +2166,21 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                 ui.idle.on_fault_wake(now);
             }
             Event::FaultRaised { key: core_key, value, count: payload.count }
+        }
+        PlEventTag::DiscoveryStateChanged => {
+            // SAFETY: `tag` says this union currently holds
+            // `discovery_state_changed`. Reading it is sound regardless of
+            // `state`'s value because `PlDiscoveryStateChangedPayload::state`
+            // is a plain `u32` -- see that field's doc comment.
+            let payload = unsafe { event.payload.discovery_state_changed };
+            let state = match PlDiscoveryState::try_from(payload.state) {
+                Ok(state) => state,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            Event::DiscoveryStateChanged { scanning: state.is_scanning() }
         }
     };
     ui.app.handle_event(core_event);
@@ -2665,10 +2759,11 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past AudioFault = 16, the highest legal PlEventTag as of
-            // bead pico-link-9eq2.3.1 -- moved from 16 (one past the old
-            // highest, LdacBitrateChanged = 15) when this bead added tag 16.
-            tag: 17,
+            // One past DiscoveryStateChanged = 17, the highest legal
+            // PlEventTag as of bead pico-link-88xs -- moved from 17 (one
+            // past the old highest, AudioFault = 16) when this bead added
+            // tag 17.
+            tag: 18,
             payload: bogus_payload,
         };
         unsafe {
@@ -3309,14 +3404,15 @@ mod tests {
             PlEventTag::VolumeChanged,
             PlEventTag::LdacBitrateChanged,
             PlEventTag::AudioFault,
+            PlEventTag::DiscoveryStateChanged,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 17 -- one past AudioFault = 16, the highest legal PlEventTag as
-        // of bead pico-link-9eq2.3.1 (moved from 16, one past the old
-        // highest LdacBitrateChanged = 15, when this bead added tag 16).
-        assert!(PlEventTag::try_from(17u32).is_err());
+        // 18 -- one past DiscoveryStateChanged = 17, the highest legal
+        // PlEventTag as of bead pico-link-88xs (moved from 17, one past
+        // the old highest AudioFault = 16, when this bead added tag 17).
+        assert!(PlEventTag::try_from(18u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
@@ -3435,7 +3531,7 @@ mod tests {
     fn pl_ui_push_event_accepts_every_legal_nested_link_state_and_failure_reason() {
         let ui = new_ui();
         unsafe {
-            for state in [PlLinkState::Idle, PlLinkState::Scanning, PlLinkState::Connecting, PlLinkState::Connected] {
+            for state in [PlLinkState::Idle, PlLinkState::Connecting, PlLinkState::Connected] {
                 let event = PlEvent {
                     version: PL_EVENT_ABI_VERSION,
                     tag: PlEventTag::LinkStateChanged as u32,
@@ -3469,12 +3565,94 @@ mod tests {
 
     #[test]
     fn pl_link_state_try_from_round_trips_every_legal_discriminant() {
-        let legal = [PlLinkState::Idle, PlLinkState::Scanning, PlLinkState::Connecting, PlLinkState::Connected];
+        let legal = [PlLinkState::Idle, PlLinkState::Connecting, PlLinkState::Connected];
         for state in legal {
             assert!(PlLinkState::try_from(state as u32).is_ok());
         }
         assert!(PlLinkState::try_from(4u32).is_err());
         assert!(PlLinkState::try_from(u32::MAX).is_err());
+    }
+
+    /// Bead pico-link-88xs, design section 8.5 test 6: `1` was
+    /// `PlLinkState::Scanning`'s discriminant and is now reserved-and-
+    /// rejected, never renumbered -- see [`PlLinkState`]'s doc comment.
+    /// A stale producer that still sends it must be rejected AND counted,
+    /// not silently accepted or matched on.
+    #[test]
+    fn pl_link_state_try_from_rejects_the_reserved_former_scanning_discriminant() {
+        assert!(PlLinkState::try_from(1u32).is_err());
+    }
+
+    #[test]
+    fn pl_discovery_state_try_from_round_trips_every_legal_discriminant() {
+        let legal = [PlDiscoveryState::Idle, PlDiscoveryState::Scanning];
+        for state in legal {
+            assert!(PlDiscoveryState::try_from(state as u32).is_ok());
+        }
+        assert!(PlDiscoveryState::try_from(2u32).is_err());
+        assert!(PlDiscoveryState::try_from(u32::MAX).is_err());
+    }
+
+    /// Bead pico-link-88xs, design section 8.5 test 6: the malformed-wire
+    /// rejection itself. A raw `PlDiscoveryStateChangedPayload { state: 1
+    /// }` (the reserved former `PlLinkState::Scanning` discriminant,
+    /// carried on the wrong tag entirely) sent as
+    /// `DiscoveryStateChanged`'s own payload must round-trip fine (`1` is
+    /// legal there -- it's `PlDiscoveryState::Scanning`), and an actually
+    /// out-of-range value must be rejected and counted.
+    #[test]
+    fn pl_ui_push_event_rejects_a_garbage_discovery_state_and_counts_it() {
+        let ui = new_ui();
+        let bad_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::DiscoveryStateChanged as u32,
+            payload: PlEventPayload { discovery_state_changed: PlDiscoveryStateChangedPayload { state: 0xDEAD_BEEF } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range PlDiscoveryState should be counted, not matched-on");
+            assert!(!(*ui).app.model().discovering, "a rejected event must not reach App::handle_event");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// The wire's own reservation, exercised end to end: `PlEvent { tag:
+    /// LinkStateChanged, payload.state: 1 }` -- the raw discriminant that
+    /// used to mean `Scanning` -- must be rejected and counted, and must
+    /// not reach `App::handle_event` (i.e. must not silently become some
+    /// other `LinkState`).
+    #[test]
+    fn pl_ui_push_event_rejects_the_reserved_former_scanning_link_state_and_counts_it() {
+        let ui = new_ui();
+        let bad_event =
+            PlEvent { version: PL_EVENT_ABI_VERSION, tag: PlEventTag::LinkStateChanged as u32, payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: 1 } } };
+        unsafe {
+            pl_ui_push_event(ui, bad_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "the reserved former Scanning discriminant must be counted, not matched-on");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// End-to-end round trip for the new tag's happy path: a legal
+    /// `DiscoveryStateChanged { scanning: true }` must fold into
+    /// `BtModel::discovering` and must NOT touch `link_state` or clear any
+    /// connected-model field (design section 1: the whole point of the
+    /// axis split).
+    #[test]
+    fn pl_ui_push_event_folds_a_legal_discovery_state_changed_into_the_model() {
+        let ui = new_ui();
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::DiscoveryStateChanged as u32,
+            payload: PlEventPayload { discovery_state_changed: PlDiscoveryStateChangedPayload { state: PlDiscoveryState::Scanning as u32 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+            assert!((*ui).app.model().discovering);
+            assert_eq!((*ui).app.model().link_state, LinkState::Idle, "DiscoveryStateChanged must never touch link_state");
+            pl_ui_destroy(ui);
+        }
     }
 
     #[test]

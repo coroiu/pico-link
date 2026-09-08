@@ -240,6 +240,22 @@ static void pl_bt_push_link_state(enum PlLinkState state) {
     pl_bt_ring_push(event, NULL, 0);
 }
 
+// Bead pico-link-88xs, design .planning/design/2026-09-08-link-state-vs-
+// discovery-axis.md section 7: the SECOND, independent axis. A GAP inquiry
+// does not disconnect A2DP, so scanning must never travel on
+// PL_EVENT_TAG_LINK_STATE_CHANGED (PL_LINK_STATE_SCANNING no longer even
+// exists) -- it has its own tag and never touches the link axis. Same
+// shape as pl_bt_push_link_state above, same IRQ-context/thread-context
+// safety note.
+static void pl_bt_push_discovery_state(enum PlDiscoveryState state) {
+    struct PlEvent event = {
+        .version = PL_EVENT_ABI_VERSION,
+        .tag = PL_EVENT_TAG_DISCOVERY_STATE_CHANGED,
+        .payload = {.discovery_state_changed = {.state = state}},
+    };
+    pl_bt_ring_push(event, NULL, 0);
+}
+
 static void pl_bt_push_devices_cleared(void) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
@@ -534,7 +550,7 @@ static void pl_bt_start_scan_radio(void) {
 // (see the pending-queue section below).
 static void pl_bt_start_scan(void) {
     pl_bt_push_devices_cleared();
-    pl_bt_push_link_state(PL_LINK_STATE_SCANNING);
+    pl_bt_push_discovery_state(PL_DISCOVERY_STATE_SCANNING);
     pl_bt_start_scan_radio();
 }
 
@@ -544,9 +560,11 @@ static void pl_bt_start_scan(void) {
 // pico-link-znb.2 (E1, MVP-blocking): stops an in-flight GAP inquiry.
 // gap_inquiry_stop() itself triggers GAP_EVENT_INQUIRY_COMPLETE (same as a
 // natural timeout), so pl_bt_packet_handler's existing
-// GAP_EVENT_INQUIRY_COMPLETE case pushes PL_LINK_STATE_IDLE -- no separate
-// push needed here. Compiled but its runtime effect is UNVERIFIED (board is
-// wedged, see pico-link-icb; this bead may not block on hardware).
+// GAP_EVENT_INQUIRY_COMPLETE case pushes PL_DISCOVERY_STATE_IDLE (bead
+// pico-link-88xs -- was PL_LINK_STATE_IDLE; inquiry-complete no longer
+// touches the link axis at all) -- no separate push needed here. Compiled
+// but its runtime effect is UNVERIFIED (board is wedged, see pico-link-icb;
+// this bead may not block on hardware).
 static void pl_bt_cancel_scan_radio(void) {
     pl_log("BT: cancelling GAP inquiry\r\n");
     gap_inquiry_stop();
@@ -646,7 +664,12 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 
         case GAP_EVENT_INQUIRY_COMPLETE:
             pl_log("BT: inquiry complete\r\n");
-            pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+            // Bead pico-link-88xs: was pl_bt_push_link_state(PL_LINK_STATE_IDLE),
+            // which wiped a live, connected model's codec/addr/level/bitrate
+            // whenever an inquiry ended while the A2DP link was still up
+            // (design section 1). Inquiry-complete has no opinion about the
+            // A2DP link and now has no way to express one.
+            pl_bt_push_discovery_state(PL_DISCOVERY_STATE_IDLE);
             break;
 
         // Bead pico-link-648 diagnostic: raw HCI_EVENT_CONNECTION_COMPLETE
@@ -973,7 +996,7 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             // heartbeat handler. See the pending-queue module doc above.
             pl_wdt_mark(PL_WDT_CP_CMD_SCAN_CALL);
             pl_bt_push_devices_cleared();
-            pl_bt_push_link_state(PL_LINK_STATE_SCANNING);
+            pl_bt_push_discovery_state(PL_DISCOVERY_STATE_SCANNING);
             pl_bt_pending_push(PL_BT_PENDING_START_SCAN, NULL);
             pl_wdt_mark(PL_WDT_CP_CMD_SCAN_RET);
             break;

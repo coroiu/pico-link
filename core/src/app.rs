@@ -121,12 +121,23 @@ const MIN_REDRAW_DELAY: Duration = Duration::from_millis(16);
 /// The Bluetooth link's coarse lifecycle state, as reported by C over
 /// [`App::set_link_state`] (`pl_ui_set_link_state` in the FFI surface).
 /// Platform-free: `core` has no idea BTstack exists, it only knows these
-/// four labels.
+/// three labels.
+///
+/// Describes **exactly one thing**: the A2DP connection lifecycle of
+/// [`BtModel::connected_addr`] (bead `pico-link-88xs`, design
+/// `.planning/design/2026-09-08-link-state-vs-discovery-axis.md` INVARIANT
+/// L1). Whether the radio is currently running a GAP inquiry is a second,
+/// independent axis -- [`BtModel::discovering`] -- and is deliberately **not
+/// representable** as a `LinkState`: this enum used to carry a `Scanning`
+/// variant, and because an inquiry does not disconnect A2DP, that variant
+/// was a lie every time it reached [`App::set_link_state`], which wiped the
+/// connected model out from under a link that was still up. Removing the
+/// variant makes that unreachable through the type rather than merely
+/// undocumented -- see the design doc section 2.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkState {
     #[default]
     Idle,
-    Scanning,
     Connecting,
     Connected,
 }
@@ -446,6 +457,13 @@ impl ConnectFailureReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     LinkStateChanged(LinkState),
+    /// Whether the radio is currently running a GAP inquiry (bead
+    /// `pico-link-88xs`) -- the second, independent axis [`LinkState`]'s
+    /// doc comment describes. Folded by [`App::set_discovering`], which
+    /// deliberately touches only [`BtModel::discovering`] and none of the
+    /// four connected-model fields [`App::set_link_state`] clears: an
+    /// inquiry does not disconnect A2DP.
+    DiscoveryStateChanged { scanning: bool },
     DeviceDiscovered(DeviceEntry),
     DevicesCleared,
     ConnectFailed { addr: [u8; 6], reason: ConnectFailureReason },
@@ -921,6 +939,15 @@ pub enum HomeFace {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BtModel {
     pub link_state: LinkState,
+    /// Whether the radio is currently running a GAP inquiry -- the SECOND,
+    /// independent axis (bead `pico-link-88xs`, design `.planning/design/
+    /// 2026-09-08-link-state-vs-discovery-axis.md` section 2.2): an
+    /// inquiry does not disconnect A2DP, so scanning must never be
+    /// expressible as a [`LinkState`] (see that type's doc comment).
+    /// `bool`, not an enum -- there are exactly two observable states and
+    /// no producer for a third (design section 2.2). Written only by
+    /// [`App::set_discovering`].
+    pub discovering: bool,
     /// Inquiry-scan results. **Wizard-only reader** -- renamed from
     /// `devices` by bead pico-link-4vb.4 (T4), design section 3: the rename
     /// is the point, not cosmetics, because it turns "the Devices screen
@@ -2303,10 +2330,8 @@ impl App {
     /// updates what screens read.
     pub fn handle_event(&mut self, event: Event) {
         match event {
-            Event::LinkStateChanged(state) => {
-                self.set_link_state(state);
-                self.on_scan_ended_if_applicable(state);
-            }
+            Event::LinkStateChanged(state) => self.set_link_state(state),
+            Event::DiscoveryStateChanged { scanning } => self.set_discovering(scanning),
             Event::DeviceDiscovered(device) => {
                 self.add_device(device.addr, device.name, device.rssi, device.class_of_device);
             }
@@ -2350,9 +2375,13 @@ impl App {
         }
     }
 
-    /// Phase 2 -> phase 3 transition (design section 9): when the scan
-    /// ends (`link_state` reporting [`LinkState::Idle`] after having been
-    /// [`LinkState::Scanning`]) while the wizard is still on
+    /// Phase 2 -> phase 3 transition (design section 9): when a GAP
+    /// inquiry ends (bead `pico-link-88xs`: called only from
+    /// [`App::set_discovering`] on the `scanning == false` edge, i.e. a
+    /// genuine [`Event::DiscoveryStateChanged`] -- no longer a
+    /// `LinkStateChanged(Idle)`, which could also fire on a connect
+    /// failure or a disconnect and spuriously flip the wizard to
+    /// `NothingFound`) while the wizard is still on
     /// [`WizardPhase::Scanning`] and nothing was found, moves it to
     /// [`WizardPhase::NothingFound`]. A no-op in every other case --
     /// devices *were* found (the phase just stays `Scanning`, now showing
@@ -2361,10 +2390,7 @@ impl App {
     /// wizard isn't open, or it's already past phase 2 (e.g. the user
     /// already selected a device and moved on to phase 4 before this
     /// event arrived).
-    fn on_scan_ended_if_applicable(&mut self, state: LinkState) {
-        if state != LinkState::Idle {
-            return;
-        }
+    fn on_scan_ended_if_applicable(&mut self) {
         let mut phase = self.wizard_phase.borrow_mut();
         if matches!(*phase, WizardPhase::Scanning { .. }) && self.wizard_devices.borrow().is_empty() {
             *phase = WizardPhase::NothingFound;
@@ -2527,13 +2553,20 @@ impl App {
     ///
     /// Also clears [`BtModel::connected_codec`] whenever `state` isn't
     /// [`LinkState::Connected`] -- a stale codec word surviving a
-    /// disconnect (or a scan/connect that reuses the link before a fresh
-    /// [`Event::CodecChanged`] arrives) is worse than `NO LINK` (design
-    /// section 15). Deliberately keyed off the link state itself rather
-    /// than a dedicated disconnect event: every path off `Connected`
-    /// already flows through this one method (bead pico-link-1v5), so
-    /// this can't race with a disconnect notification C forgot to send,
-    /// and it needs zero new firmware plumbing in `bt.c`.
+    /// disconnect is worse than `NO LINK` (design section 15).
+    /// Deliberately keyed off the link state itself rather than a
+    /// dedicated disconnect event: every path off `Connected` already
+    /// flows through this one method (bead pico-link-1v5), so this can't
+    /// race with a disconnect notification C forgot to send, and it needs
+    /// zero new firmware plumbing in `bt.c`.
+    ///
+    /// `LinkState` no longer carries a scan (bead `pico-link-88xs`, design
+    /// `.planning/design/2026-09-08-link-state-vs-discovery-axis.md`):
+    /// this method's own clear-on-not-`Connected` rule is unchanged --
+    /// see [`LinkState`]'s doc comment for why narrowing the type, not
+    /// relaxing this rule, is what fixed the "a scan wipes the connected
+    /// model" bug. [`BtModel::link_state`] has exactly one writer: this
+    /// method (INVARIANT L2) -- see [`App::record_connect_failure`].
     pub fn set_link_state(&mut self, state: LinkState) {
         self.model.link_state = state;
         if state != LinkState::Connected {
@@ -2550,6 +2583,19 @@ impl App {
             // same lifecycle for the exact same reason -- see
             // `BtModel::ldac_live_kbps`'s doc comment.
             self.model.ldac_live_kbps = None;
+        }
+        self.refresh_stack();
+    }
+
+    /// Records whether the radio is running an inquiry. The SECOND,
+    /// independent axis (bead `pico-link-88xs`) -- deliberately does NOT
+    /// touch [`BtModel::link_state`] and does NOT clear any connected-model
+    /// field: an inquiry does not disconnect A2DP. [`BtModel::discovering`]
+    /// has exactly one writer: this method (INVARIANT L2).
+    pub fn set_discovering(&mut self, scanning: bool) {
+        self.model.discovering = scanning;
+        if !scanning {
+            self.on_scan_ended_if_applicable();
         }
         self.refresh_stack();
     }
@@ -2714,7 +2760,16 @@ impl App {
     /// `BtModel::last_connect_failure`, not the link state.
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
         self.model.last_connect_failure = Some((addr, reason));
-        self.model.link_state = LinkState::Idle;
+        // Bead pico-link-88xs, INVARIANT L2: `link_state` has exactly one
+        // writer. Routed through `set_link_state` rather than assigning
+        // the field directly (as this used to) -- correct today only by
+        // accident, since the preceding `Connecting` push had already
+        // cleared the four connected-model fields; going through the real
+        // setter makes that true by construction instead. The
+        // `refresh_stack()` call below is therefore redundant with the one
+        // inside `set_link_state`, but harmless -- `refresh_stack` is
+        // idempotent.
+        self.set_link_state(LinkState::Idle);
         // Phase 4/5 -> phase 6 (failure outcome). Unconditional (not
         // gated on the wizard currently being open/mid-connect): a stray
         // `ConnectFailed` with the wizard closed or already past this
@@ -3248,7 +3303,11 @@ mod tests {
         fn wizard_nothing_found() -> App {
             let mut app = App::new(240, 240);
             open_wizard(&mut app);
-            app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+            // Bead pico-link-88xs: a genuine end-of-inquiry, not a
+            // `LinkStateChanged(Idle)` -- see `on_scan_ended_if_applicable`'s
+            // doc comment for why `LinkStateChanged(Idle)` alone must no
+            // longer trigger this transition.
+            app.handle_event(Event::DiscoveryStateChanged { scanning: false });
             app
         }
         fn wizard_connecting() -> App {
@@ -3714,8 +3773,8 @@ mod tests {
 
         // Three different Event variants, all of which used to rebuild the
         // whole Navigator via App::rebuild_root.
-        app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
-        assert_eq!(app.navigator_depth(), 2, "LinkStateChanged must not pop the pushed screen");
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
+        assert_eq!(app.navigator_depth(), 2, "DiscoveryStateChanged must not pop the pushed screen");
         assert_eq!(app.current_screen_title(), "detail");
 
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
@@ -4253,7 +4312,7 @@ mod tests {
         // rebuilt `HomeView` -- see `render::home`'s module doc) survives
         // a root rebuild the same way pico-link-a67 already proved pushed
         // screens survive one.
-        app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
         app.handle_event(Event::DevicesCleared);
 
@@ -4675,7 +4734,7 @@ mod tests {
 
         // A handful of unrelated Bluetooth-domain events, each of which
         // calls `refresh_stack` internally.
-        app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
         app.handle_event(upsert([9; 6], "Other", 3));
         app.handle_event(Event::PairedDeviceForgotten { addr: [9; 6] });
 
@@ -5214,5 +5273,112 @@ mod tests {
         assert_eq!(app.model().ldac_live_kbps, Some(660));
         app.handle_event(Event::LinkStateChanged(LinkState::Idle));
         assert_eq!(app.model().ldac_live_kbps, None);
+    }
+
+    // --- pico-link-88xs: the link-state vs discovery axis split ---
+    //
+    // Design `.planning/design/2026-09-08-link-state-vs-discovery-axis.md`
+    // section 8.5's six owed tests. Test 5 (paint-key fold) lives in
+    // `render::screen`'s own test module, and test 6 (the malformed-wire
+    // rejection) lives in `ui-ffi`'s -- both own the code under test.
+
+    /// Test 1 (design 8.5.1): THE REGRESSION ITSELF -- the test whose
+    /// absence let the bug ship. A scan started while connected must not
+    /// wipe any of the four connected-model fields, and `link_state` must
+    /// still read `Connected` throughout and after the scan.
+    #[test]
+    fn a_scan_while_connected_does_not_wipe_the_connected_model() {
+        let mut app = App::new(240, 240);
+        let addr = [7; 6];
+        app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        app.poll_command();
+        app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+        app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
+        app.handle_event(Event::LdacBitrateChanged { kbps: 660 });
+
+        assert_eq!(app.model().link_state, LinkState::Connected);
+        assert!(app.model().connected_codec.is_some());
+        assert_eq!(app.model().connected_addr, Some(addr));
+        assert!(app.model().out_level.is_some());
+        assert_eq!(app.model().ldac_live_kbps, Some(660));
+
+        // The scan itself: start, then end.
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
+        assert_eq!(app.model().link_state, LinkState::Connected, "scan start must not touch link_state");
+        assert!(app.model().connected_codec.is_some(), "scan start must not clear connected_codec");
+        assert_eq!(app.model().connected_addr, Some(addr), "scan start must not clear connected_addr");
+        assert!(app.model().out_level.is_some(), "scan start must not clear out_level");
+        assert_eq!(app.model().ldac_live_kbps, Some(660), "scan start must not clear ldac_live_kbps");
+
+        app.handle_event(Event::DiscoveryStateChanged { scanning: false });
+        assert_eq!(app.model().link_state, LinkState::Connected, "inquiry-complete must not touch link_state");
+        assert!(app.model().connected_codec.is_some(), "inquiry-complete must not clear connected_codec");
+        assert_eq!(app.model().connected_addr, Some(addr), "inquiry-complete must not clear connected_addr");
+        assert!(app.model().out_level.is_some(), "inquiry-complete must not clear out_level");
+        assert_eq!(app.model().ldac_live_kbps, Some(660), "inquiry-complete must not clear ldac_live_kbps");
+    }
+
+    /// Test 2 (design 8.5.2): guard against over-correcting -- a real
+    /// disconnect must still clear all four fields, exactly as before.
+    #[test]
+    fn a_real_disconnect_still_clears_the_connected_model() {
+        let mut app = App::new(240, 240);
+        let addr = [8; 6];
+        app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        app.poll_command();
+        app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+        app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
+        app.handle_event(Event::LdacBitrateChanged { kbps: 660 });
+        assert!(app.model().connected_codec.is_some());
+
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        assert_eq!(app.model().link_state, LinkState::Idle);
+        assert_eq!(app.model().connected_codec, None);
+        assert_eq!(app.model().connected_addr, None);
+        assert_eq!(app.model().out_level, None);
+        assert_eq!(app.model().ldac_live_kbps, None);
+    }
+
+    /// Test 3 (design 8.5.3): the wizard's scan-end detection moves onto
+    /// `DiscoveryStateChanged` -- a `LinkStateChanged(Idle)` alone (e.g. a
+    /// connect failure or a disconnect landing while the wizard happens to
+    /// be on `WizardPhase::Scanning`) must no longer spuriously flip it to
+    /// `NothingFound`, but a genuine `DiscoveryStateChanged { scanning:
+    /// false }` with zero devices found still does.
+    #[test]
+    fn only_a_genuine_discovery_state_changed_ends_the_wizard_scan() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        assert!(matches!(app.wizard_phase_for_test(), WizardPhase::Scanning { .. }));
+
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        assert!(
+            matches!(app.wizard_phase_for_test(), WizardPhase::Scanning { .. }),
+            "LinkStateChanged(Idle) alone must no longer end the wizard's scan phase"
+        );
+
+        app.handle_event(Event::DiscoveryStateChanged { scanning: false });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::NothingFound, "a genuine end-of-inquiry with zero devices found must still advance to NothingFound");
+    }
+
+    /// Test 4 (design 8.5.4): the pending-timestamp backfill
+    /// (`stamp_pending_wizard_timestamp`, called unconditionally at the
+    /// end of `handle_event`) must still fire when the event that lands is
+    /// a `DiscoveryStateChanged` -- the new arm must not early-return
+    /// before reaching it.
+    #[test]
+    fn pending_timestamp_backfill_fires_on_a_discovery_state_changed_event() {
+        let mut app = App::new(240, 240);
+        *app.wizard_phase.borrow_mut() = WizardPhase::scanning_pending();
+        app.tick(555_000);
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
+        match app.wizard_phase_for_test() {
+            WizardPhase::Scanning { started } => {
+                assert_eq!(started, Instant::from_micros(555_000), "DiscoveryStateChanged must still backfill a pending started timestamp");
+            }
+            other => panic!("expected WizardPhase::Scanning, got {other:?}"),
+        }
     }
 }

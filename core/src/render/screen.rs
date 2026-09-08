@@ -19,7 +19,7 @@ use embedded_graphics::{
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
-use crate::app::{LinkState, ScreenId};
+use crate::app::ScreenId;
 use crate::input::NavIntent;
 use crate::panel::Button;
 
@@ -29,7 +29,7 @@ use super::framebuffer::FrameBuffer565;
 use super::paint_key::PaintKey;
 use super::rail::{draw_rail, ButtonLabel, ButtonLabels};
 use super::theme::{font, icon, palette};
-use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, Verb, Widget};
+use super::widget::{Action, ChromeContribution, ChromeStatus, FocusEvent, LinkGlyph, Verb, Widget};
 
 /// Margin (px) from the title bar's left/right edges to its content —
 /// now the same left rule `L = 12` the body content uses (design doc
@@ -61,18 +61,18 @@ fn text_width(font: &FontRenderer, text: &str) -> u32 {
 
 /// Draws the A2DP/Bluetooth link glyph immediately left of
 /// `right_cursor`, in a
-/// color derived from `link_state`, and returns the updated `right_cursor`
+/// color derived from `link_glyph`, and returns the updated `right_cursor`
 /// after reserving this glyph's width plus [`TITLE_ELEMENT_GAP`] -- the
 /// same "each title-bar element returns the next available cursor" shape
 /// `Screen::render`'s status-dot/readout blocks use inline. Split out of
 /// `render` itself (rather than inlined alongside those) purely to keep
 /// that function's line count in check; there is nothing else this helper
 /// needs to be independently reusable for.
-fn draw_link_glyph(link_state: LinkState, right_cursor: i32, title_mid_y: i32, target: &mut FrameBuffer565) -> i32 {
-    let link_color = match link_state {
-        LinkState::Connected => palette::BRAND_BRIGHT,
-        LinkState::Scanning | LinkState::Connecting => palette::STATUS_WARNING,
-        LinkState::Idle => palette::TEXT_SECONDARY,
+fn draw_link_glyph(link_glyph: LinkGlyph, right_cursor: i32, title_mid_y: i32, target: &mut FrameBuffer565) -> i32 {
+    let link_color = match link_glyph {
+        LinkGlyph::Live => palette::BRAND_BRIGHT,
+        LinkGlyph::Busy => palette::STATUS_WARNING,
+        LinkGlyph::Idle => palette::TEXT_SECONDARY,
     };
 
     // `icon_1x`, not `icon_2x` -- fits the fixed `TITLE_BAR_HEIGHT`-px bar
@@ -177,7 +177,7 @@ fn title_paint_key(
     volume_text: Option<&str>,
     volume_muted: bool,
     status: Option<ChromeStatus>,
-    link: Option<LinkState>,
+    link: Option<LinkGlyph>,
 ) -> PaintKey {
     let key = PaintKey::of(TITLE_PAINT_KEY_SEED).fold_str(title_text);
     let key = fold_opt_str(key, readout_text);
@@ -189,12 +189,18 @@ fn title_paint_key(
         Some(ChromeStatus::Error) => 2,
         Some(ChromeStatus::Neutral) => 3,
     });
+    // Bead pico-link-88xs: folds the RESOLVED `LinkGlyph`, not `LinkState`
+    // and `discovering` separately -- see `LinkGlyph`'s doc comment.
+    // Folding both inputs would reinstate a repaint every time
+    // `discovering` flips while the glyph doesn't change (e.g. a scan
+    // while already `Connected`, where the glyph is `Live` either way and
+    // must NOT repaint) -- the "damage keys must fold only what is drawn"
+    // rule.
     key.fold(match link {
         None => 0,
-        Some(LinkState::Idle) => 1,
-        Some(LinkState::Scanning) => 2,
-        Some(LinkState::Connecting) => 3,
-        Some(LinkState::Connected) => 4,
+        Some(LinkGlyph::Idle) => 1,
+        Some(LinkGlyph::Busy) => 2,
+        Some(LinkGlyph::Live) => 3,
     })
 }
 
@@ -264,9 +270,12 @@ pub struct Screen {
     /// "never refresh me" (the wizard, confirms, Settings): see
     /// [`crate::app::ScreenId`]'s doc comment and
     /// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
-    /// §1. `Screen` importing `crate::app::ScreenId` mirrors the existing
-    /// `crate::app::LinkState` import above -- not a new instance of
-    /// `render` depending on `app`, a second one.
+    /// §1. `Screen` importing `crate::app::ScreenId` is the one place
+    /// `render` still depends on `app` -- bead `pico-link-88xs` removed the
+    /// other one (`crate::app::LinkState`, this file used to import it for
+    /// `draw_link_glyph`/`title_paint_key`; both now take
+    /// [`super::widget::LinkGlyph`] instead, resolved upstream in
+    /// `home.rs`).
     id: Option<ScreenId>,
 }
 
@@ -762,8 +771,8 @@ impl Screen {
             // drawing it in some "definitely not connected" color: a widget
             // with no link-state opinion at all has nothing meaningful to
             // report here.
-            if let Some(link_state) = link {
-                right_cursor = draw_link_glyph(link_state, right_cursor, title_mid_y, target);
+            if let Some(link_glyph) = link {
+                right_cursor = draw_link_glyph(link_glyph, right_cursor, title_mid_y, target);
             }
 
             // Volume, inboard of the link glyph/status dot and outboard of
@@ -892,7 +901,7 @@ mod tests {
     /// glyph rendering could plausibly have painted (no status dot, no
     /// readout, a one-character title to keep the title text away from
     /// the right edge this glyph draws into).
-    struct LinkOnlyWidget(core::cell::Cell<Option<LinkState>>);
+    struct LinkOnlyWidget(core::cell::Cell<Option<LinkGlyph>>);
 
     impl Widget for LinkOnlyWidget {
         fn measure(&self, _constraints: Size, _ctx: &RenderCtx) -> Size {
@@ -909,7 +918,7 @@ mod tests {
         }
     }
 
-    fn link_screen(state: Option<LinkState>) -> Screen {
+    fn link_screen(state: Option<LinkGlyph>) -> Screen {
         let mut screen = Screen::new("T", vec![Box::new(LinkOnlyWidget(core::cell::Cell::new(state)))]);
         screen.initialize_focus();
         screen
@@ -930,35 +939,39 @@ mod tests {
     }
 
     #[test]
-    fn connected_link_state_paints_the_glyph_in_the_brand_bright_color() {
-        let mut screen = link_screen(Some(LinkState::Connected));
+    fn live_link_glyph_paints_in_the_brand_bright_color() {
+        let mut screen = link_screen(Some(LinkGlyph::Live));
         assert!(
             any_pixel_near_the_right_title_edge(&mut screen, palette::BRAND_BRIGHT),
-            "a Connected link should paint the glyph in BRAND_BRIGHT near the title bar's right edge"
+            "a Live link glyph should paint in BRAND_BRIGHT near the title bar's right edge"
         );
     }
 
+    /// Bead pico-link-88xs: was `scanning_link_state_paints_the_glyph_in_
+    /// the_warning_color`, retargeted at `LinkGlyph::Busy` -- `Busy` is
+    /// what a scan (or a mid-connect link) now resolves to, since
+    /// `LinkState` no longer has a `Scanning` variant of its own.
     #[test]
-    fn scanning_link_state_paints_the_glyph_in_the_warning_color() {
-        let mut screen = link_screen(Some(LinkState::Scanning));
+    fn busy_link_glyph_paints_in_the_warning_color() {
+        let mut screen = link_screen(Some(LinkGlyph::Busy));
         assert!(
             any_pixel_near_the_right_title_edge(&mut screen, palette::STATUS_WARNING),
-            "a Scanning link should paint the glyph in STATUS_WARNING (shared with Connecting -- both are 'in progress')"
+            "a Busy link glyph should paint in STATUS_WARNING (shared by 'scanning' and 'connecting' -- both are 'in progress')"
         );
     }
 
     #[test]
-    fn idle_link_state_paints_the_glyph_in_the_muted_secondary_color() {
-        let mut screen = link_screen(Some(LinkState::Idle));
+    fn idle_link_glyph_paints_in_the_muted_secondary_color() {
+        let mut screen = link_screen(Some(LinkGlyph::Idle));
         assert!(
             any_pixel_near_the_right_title_edge(&mut screen, palette::TEXT_SECONDARY),
-            "an Idle link should paint the glyph in TEXT_SECONDARY"
+            "an Idle link glyph should paint in TEXT_SECONDARY"
         );
     }
 
     #[test]
-    fn no_link_state_omits_the_glyph_entirely() {
-        let mut connected = link_screen(Some(LinkState::Connected));
+    fn no_link_glyph_omits_the_glyph_entirely() {
+        let mut connected = link_screen(Some(LinkGlyph::Live));
         let mut none = link_screen(None);
 
         assert!(
@@ -1075,7 +1088,7 @@ mod tests {
                 Some(ChromeContribution {
                     volume: Some(VolumeChrome { percent: 62, muted: false }),
                     readout: Some(String::from("2 / 5")),
-                    link: Some(LinkState::Connected),
+                    link: Some(LinkGlyph::Live),
                     ..Default::default()
                 })
             }
@@ -1115,6 +1128,29 @@ mod tests {
         let none = title_paint_key("T", None, None, false, None, None);
         let some = title_paint_key("T", None, Some("0%"), false, None, None);
         assert_ne!(none, some);
+    }
+
+    /// Bead pico-link-88xs, design section 5.1 test 5: the key must fold
+    /// only the RESOLVED [`LinkGlyph`], not the two domain inputs that
+    /// produced it. Two identical `LinkGlyph::Live` values (the glyph a
+    /// scan-while-connected and an idle connected both resolve to) must
+    /// key the same, so home's title bar doesn't repaint a pixel that
+    /// didn't change.
+    #[test]
+    fn title_paint_key_is_unchanged_when_only_the_glyph_stays_the_same() {
+        let live = title_paint_key("T", None, None, false, None, Some(LinkGlyph::Live));
+        let live_again = title_paint_key("T", None, None, false, None, Some(LinkGlyph::Live));
+        assert_eq!(live, live_again, "two resolutions to the same glyph must produce the same key");
+    }
+
+    /// The complementary half: an actual glyph change (e.g. `Idle` ->
+    /// `Busy`, which a scan starting while disconnected produces) must
+    /// still change the key.
+    #[test]
+    fn title_paint_key_changes_when_the_glyph_changes() {
+        let idle = title_paint_key("T", None, None, false, None, Some(LinkGlyph::Idle));
+        let busy = title_paint_key("T", None, None, false, None, Some(LinkGlyph::Busy));
+        assert_ne!(idle, busy, "a real glyph change must change the key");
     }
 
     // --- Button rail (pico-link-znb.5 / E2) ---
