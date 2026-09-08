@@ -1412,6 +1412,168 @@ pub struct PlPairedDeviceForgottenPayload {
     pub addr: [u8; 6],
 }
 
+/// Mirrors [`pico_link_core::app::FaultKey`]'s six ordinals exactly (design
+/// `.planning/design/2026-09-07-audio-fault-model.md` §3.1's catalogue
+/// table). Ordinals are **append-only forever** -- reordering this
+/// catalogue is a wire break (§7.3). Only the ordinal itself is part of
+/// the wire contract; the display name lives on the `core`-side type (rule
+/// 3, §2).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlFaultKey {
+    BufStarved = 0,
+    BufOverflow = 1,
+    UsbSupplyLow = 2,
+    AirCongested = 3,
+    AirLinkLost = 4,
+    EncResync = 5,
+}
+
+impl core::convert::TryFrom<u8> for PlFaultKey {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- same hazard/fix as
+    /// [`PlVolumeSource`]'s `TryFrom` impl (pico-link-ptu): an unknown
+    /// ordinal must be rejected, never matched-on or transmuted (design
+    /// §7.3: "an unknown ordinal increments `malformed_tag_count` and is
+    /// dropped, never matched on as a discriminant").
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlFaultKey::BufStarved),
+            1 => Ok(PlFaultKey::BufOverflow),
+            2 => Ok(PlFaultKey::UsbSupplyLow),
+            3 => Ok(PlFaultKey::AirCongested),
+            4 => Ok(PlFaultKey::AirLinkLost),
+            5 => Ok(PlFaultKey::EncResync),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<PlFaultKey> for pico_link_core::app::FaultKey {
+    fn from(key: PlFaultKey) -> Self {
+        match key {
+            PlFaultKey::BufStarved => pico_link_core::app::FaultKey::BufStarved,
+            PlFaultKey::BufOverflow => pico_link_core::app::FaultKey::BufOverflow,
+            PlFaultKey::UsbSupplyLow => pico_link_core::app::FaultKey::UsbSupplyLow,
+            PlFaultKey::AirCongested => pico_link_core::app::FaultKey::AirCongested,
+            PlFaultKey::AirLinkLost => pico_link_core::app::FaultKey::AirLinkLost,
+            PlFaultKey::EncResync => pico_link_core::app::FaultKey::EncResync,
+        }
+    }
+}
+
+/// Wire-authoritative severity (design §7.3: "`glyph` and `severity` are
+/// on the wire, not derived in Rust"). C decides this per raise, including
+/// `AIR CONGESTED`'s dynamic escalation to `Audible` on co-occurrence with
+/// `BUF OVERFLOW` (§7.3, §3.1) -- a computation that depends on window
+/// counter deltas which never cross the seam, so `core`/`ui-ffi` could not
+/// reproduce it even if they wanted to.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PlFaultSeverity {
+    Concealed = 0,
+    Audible = 1,
+}
+
+impl core::convert::TryFrom<u8> for PlFaultSeverity {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see [`PlFaultKey`]'s
+    /// `TryFrom` impl for the identical rationale.
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlFaultSeverity::Concealed),
+            1 => Ok(PlFaultSeverity::Audible),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Wire-authoritative glyph class (design §3.1, §7.3) -- declared by C,
+/// never inferred at render time (Uma's §5.2 requirement, satisfied here
+/// with one table rather than two). Not consumed by anything in this bead
+/// (S1 is Rust-only foundation, no rendering) -- carried through so S3
+/// (`pico-link-9eq2.3.3`) has it without a follow-up wire change.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlFaultGlyph {
+    Neutral = 0,
+    Filled = 1,
+    Starved = 2,
+}
+
+impl core::convert::TryFrom<u8> for PlFaultGlyph {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see [`PlFaultKey`]'s
+    /// `TryFrom` impl for the identical rationale.
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlFaultGlyph::Neutral),
+            1 => Ok(PlFaultGlyph::Filled),
+            2 => Ok(PlFaultGlyph::Starved),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Which of [`PlAudioFaultPayload::value`]'s interpretations applies
+/// (design §3.1's "value kind" column) -- mirrors
+/// [`pico_link_core::app::FaultValue`]'s three variants plus `None` (no
+/// value at all, e.g. `USB SUPPLY LOW` before `pl_usb_supply_q8()` exists,
+/// design §6.3: "ship that row absent, never faked").
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub enum PlFaultValueKind {
+    None = 0,
+    Ratio = 1,
+    Count = 2,
+    Millis = 3,
+}
+
+impl core::convert::TryFrom<u8> for PlFaultValueKind {
+    type Error = ();
+
+    /// Checked conversion from the raw wire value -- see [`PlFaultKey`]'s
+    /// `TryFrom` impl for the identical rationale.
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PlFaultValueKind::None),
+            1 => Ok(PlFaultValueKind::Ratio),
+            2 => Ok(PlFaultValueKind::Count),
+            3 => Ok(PlFaultValueKind::Millis),
+            _ => Err(()),
+        }
+    }
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::AudioFault` (bead
+/// pico-link-9eq2.3.1, design `.planning/design/2026-09-07-audio-fault-
+/// model.md` §7.3 exactly). Eight bytes, POD, `Copy`, no `Drop`, no
+/// pointers -- unlike `DeviceDiscovered` it borrows nothing, so it has no
+/// lifetime contract to violate and nothing to memcpy.
+///
+/// `key`/`severity`/`glyph`/`value_kind` are all **checked** on the Rust
+/// side with the existing `TryFrom` idiom in [`pl_ui_push_event`]; an
+/// unknown ordinal for any of them increments [`PlUi::malformed_tag_count`]
+/// and the event is dropped rather than matched on as a discriminant
+/// (which would be UB).
+///
+/// `count` is C's ABSOLUTE running count for `key`, not an increment --
+/// see [`pico_link_core::app::FaultLog::record`]'s doc comment for the
+/// "assigned, never added" rule (design §5.4).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlAudioFaultPayload {
+    pub key: u8,
+    pub severity: u8,
+    pub glyph: u8,
+    pub value_kind: u8,
+    pub value: u16,
+    pub count: u16,
+}
+
 /// Which variant of [`PlEventPayload`] is active in a given [`PlEvent`].
 /// `DevicesCleared`/`WizardAutoDismiss` carry no data -- the payload union
 /// is simply unread for those tags (see [`PlEventPayload`]'s doc comment).
@@ -1484,6 +1646,14 @@ pub enum PlEventTag {
     /// `PlPairedDeviceUpsertedPayload` gaining `ldac_quality`, an existing
     /// tag's payload, not this new one.
     LdacBitrateChanged = 15,
+    /// Bead pico-link-9eq2.3.1, design `.planning/design/2026-09-07-audio-
+    /// fault-model.md` §7.3: one audio fault raised or refreshed by C's 1Hz
+    /// fault evaluator (firmware half is `pico-link-9eq2.3.2`, not yet
+    /// producible from C as of this bead). Purely additive, same discipline
+    /// as `LevelsChanged`/`VolumeChanged`/`LdacBitrateChanged` above --
+    /// [`PL_EVENT_ABI_VERSION`] is unchanged by this tag's own addition --
+    /// see [`PlAudioFaultPayload`]'s doc comment.
+    AudioFault = 16,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1510,6 +1680,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             13 => Ok(PlEventTag::LevelsChanged),
             14 => Ok(PlEventTag::VolumeChanged),
             15 => Ok(PlEventTag::LdacBitrateChanged),
+            16 => Ok(PlEventTag::AudioFault),
             _ => Err(()),
         }
     }
@@ -1550,6 +1721,8 @@ pub union PlEventPayload {
     /// Bead pico-link-7jol.5. See [`PlLdacBitrateChangedPayload`]'s doc
     /// comment.
     pub ldac_bitrate_changed: PlLdacBitrateChangedPayload,
+    /// Bead pico-link-9eq2.3.1. See [`PlAudioFaultPayload`]'s doc comment.
+    pub audio_fault: PlAudioFaultPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -1845,8 +2018,92 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             let payload = unsafe { event.payload.ldac_bitrate_changed };
             Event::LdacBitrateChanged { kbps: payload.kbps }
         }
+        PlEventTag::AudioFault => {
+            // SAFETY: `tag` says this union currently holds `audio_fault`.
+            // Reading it is sound regardless of field values -- every
+            // field is a plain `u8`/`u16` with no validity invariant to
+            // violate; `key`/`severity`/`glyph`/`value_kind` are range-
+            // checked below before use (design §7.3).
+            let payload = unsafe { event.payload.audio_fault };
+            let key = match PlFaultKey::try_from(payload.key) {
+                Ok(key) => key,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            let severity = match PlFaultSeverity::try_from(payload.severity) {
+                Ok(severity) => severity,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            // `glyph` is validated even though this bead does no
+            // rendering and never reads the checked value -- an unknown
+            // ordinal must still be counted and dropped (design §7.3),
+            // not silently accepted just because nothing consumes it yet.
+            if PlFaultGlyph::try_from(payload.glyph).is_err() {
+                ui.malformed_tag_count += 1;
+                return;
+            }
+            let value_kind = match PlFaultValueKind::try_from(payload.value_kind) {
+                Ok(value_kind) => value_kind,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            let value = match value_kind {
+                PlFaultValueKind::None => None,
+                PlFaultValueKind::Ratio => Some(pico_link_core::app::FaultValue::Ratio(payload.value)),
+                PlFaultValueKind::Count => Some(pico_link_core::app::FaultValue::Count(payload.value)),
+                PlFaultValueKind::Millis => Some(pico_link_core::app::FaultValue::Millis(payload.value)),
+            };
+            let core_key: pico_link_core::app::FaultKey = key.into();
+            let now = pico_link_core::platform::Instant::from_micros(ui.app.now_us());
+            // Design §7.2: only an `Audible` key, not already Live, whose
+            // static `wakes_display` bit is set, wakes the display (§7.5:
+            // ords 0/1/4 -- `AIR CONGESTED` keeps `wakes_display = false`
+            // even when it escalates to `Audible`, because its co-live
+            // `BUF OVERFLOW` already provides the wake). Computed BEFORE
+            // folding this event below -- folding first would make
+            // `is_live` trivially true for the very raise being checked.
+            let already_live = ui.app.model().fault_log.is_live(core_key, now);
+            let wants_wake = severity == PlFaultSeverity::Audible && fault_key_wakes_display(core_key) && !already_live;
+            if wants_wake {
+                // Storm-limited: `IdlePolicy::on_fault_wake` applies the
+                // cooldown/session-cap gate and, if granted, both flips
+                // the display Asleep -> Active and arms the expiring
+                // hold. Applied HERE, at the event site (design §7.5),
+                // using `ui.app.now_us()` -- unlike `VolumeChanged`'s
+                // wake (which defers its clock-dependent half to the next
+                // `pl_ui_tick`, see `PlUi::volume_wake_since_last_tick`'s
+                // doc comment), this call site already has a clock
+                // reading available, so no deferred flag is needed --
+                // exactly the "nothing equivalent to
+                // `volume_wake_since_last_tick`" instruction (design
+                // §7.5, home-fault-strip §12 Ruby item 3).
+                ui.idle.on_fault_wake(now);
+            }
+            Event::FaultRaised { key: core_key, value, count: payload.count }
+        }
     };
     ui.app.handle_event(core_event);
+}
+
+/// Static wake-eligibility table (design §7.5: "Only `Audible` keys with
+/// `wakes_display = true` request a wake -- three of six (ords 0, 1, 4)").
+/// Deliberately NOT on the wire (§7.3: "a static per-key property... Rust
+/// never needs it" -- from C's side; `ui-ffi` still needs its own copy to
+/// gate the wake decision) and deliberately NOT part of
+/// [`pico_link_core::app::FaultKey`]'s own table (this bead's scope item 2:
+/// only ordinals and names live in `core`) -- this is wake *policy*, kept
+/// beside the one FFI call site that applies it rather than the display
+/// catalogue.
+fn fault_key_wakes_display(key: pico_link_core::app::FaultKey) -> bool {
+    use pico_link_core::app::FaultKey;
+    matches!(key, FaultKey::BufStarved | FaultKey::BufOverflow | FaultKey::AirLinkLost)
 }
 
 /// Which variant of [`PlCommand`] this value is. `None` is not one of
@@ -2408,10 +2665,10 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past LdacBitrateChanged = 15, the highest legal PlEventTag
-            // as of bead pico-link-7jol.5 -- moved from 15 (one past the
-            // old highest, VolumeChanged = 14) when this bead added tag 15.
-            tag: 16,
+            // One past AudioFault = 16, the highest legal PlEventTag as of
+            // bead pico-link-9eq2.3.1 -- moved from 16 (one past the old
+            // highest, LdacBitrateChanged = 15) when this bead added tag 16.
+            tag: 17,
             payload: bogus_payload,
         };
         unsafe {
@@ -2669,6 +2926,25 @@ mod tests {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::VolumeChanged as u32,
             payload: PlEventPayload { volume_changed: PlVolumeChangedPayload { level, muted: u8::from(muted), source: source as u8 } },
+        }
+    }
+
+    /// Builds an `AudioFault` [`PlEvent`] with the given fields -- shared
+    /// by the wake-on-fault tests below (bead pico-link-9eq2.3.1).
+    fn audio_fault_event(key: PlFaultKey, severity: PlFaultSeverity, count: u16) -> PlEvent {
+        PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::AudioFault as u32,
+            payload: PlEventPayload {
+                audio_fault: PlAudioFaultPayload {
+                    key: key as u8,
+                    severity: severity as u8,
+                    glyph: PlFaultGlyph::Neutral as u8,
+                    value_kind: PlFaultValueKind::None as u8,
+                    value: 0,
+                    count,
+                },
+            },
         }
     }
 
@@ -3031,13 +3307,16 @@ mod tests {
             PlEventTag::PairedStoreFull,
             PlEventTag::LevelsChanged,
             PlEventTag::VolumeChanged,
+            PlEventTag::LdacBitrateChanged,
+            PlEventTag::AudioFault,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 16 -- one past LdacBitrateChanged = 15, the highest legal
-        // PlEventTag as of bead pico-link-7jol.5.
-        assert!(PlEventTag::try_from(16u32).is_err());
+        // 17 -- one past AudioFault = 16, the highest legal PlEventTag as
+        // of bead pico-link-9eq2.3.1 (moved from 16, one past the old
+        // highest LdacBitrateChanged = 15, when this bead added tag 16).
+        assert!(PlEventTag::try_from(17u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
@@ -3313,5 +3592,109 @@ mod tests {
         let wire = pl_command_from(Command::Disconnect);
         assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
         assert_eq!(wire.tag as u32, PlCommandTag::Disconnect as u32);
+    }
+
+    // --- `PlEventTag::AudioFault` / wake-on-fault, proven through the REAL
+    // FFI entry points (bead pico-link-9eq2.3.1, design `.planning/design/
+    // 2026-09-07-audio-fault-model.md` §7, `.planning/design/2026-09-07-
+    // home-fault-strip.md` §7) ---
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_fault_key() {
+        let ui = new_ui();
+        let mut event = audio_fault_event(PlFaultKey::BufStarved, PlFaultSeverity::Audible, 1);
+        // Writing a union field is safe (only reading requires `unsafe`);
+        // this deliberately corrupts `key` to an out-of-range ordinal.
+        event.payload.audio_fault.key = 200; // one past the highest legal ordinal (5)
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range fault key ordinal must be counted, not matched-on");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_rejects_out_of_range_fault_severity() {
+        let ui = new_ui();
+        let mut event = audio_fault_event(PlFaultKey::BufStarved, PlFaultSeverity::Audible, 1);
+        // Writing a union field is safe (only reading requires `unsafe`);
+        // this deliberately corrupts `severity` to an out-of-range ordinal.
+        event.payload.audio_fault.severity = 200;
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "an out-of-range severity ordinal must be counted, not matched-on");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn a_concealed_fault_never_wakes() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe {
+            pl_ui_tick(ui, 0);
+            pl_ui_tick(ui, idle_timeout_us);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "sanity: asleep");
+
+            // `BufStarved` is otherwise wake-eligible (ord 0) -- only its
+            // severity differs from the waking case below.
+            pl_ui_push_event(ui, audio_fault_event(PlFaultKey::BufStarved, PlFaultSeverity::Concealed, 1));
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "a Concealed fault must never wake the display");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn an_audible_wake_eligible_fault_wakes_the_display() {
+        // Sanity/control for `a_concealed_fault_never_wakes` above -- same
+        // key, same setup, only `severity` differs, so the Concealed
+        // test's negative result is meaningful rather than "nothing wakes
+        // through this path at all".
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+
+        unsafe {
+            pl_ui_tick(ui, 0);
+            pl_ui_tick(ui, idle_timeout_us);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "sanity: asleep");
+
+            pl_ui_push_event(ui, audio_fault_event(PlFaultKey::BufStarved, PlFaultSeverity::Audible, 1));
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::On, "an Audible, wake-eligible, not-already-Live fault must wake the display");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn a_repeat_of_an_already_live_fault_key_never_re_arms_the_hold() {
+        let ui = new_ui();
+        let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
+        let hold_us = pico_link_core::run::FAULT_WAKE_HOLD.as_micros() as u64;
+
+        unsafe {
+            pl_ui_tick(ui, 0);
+            pl_ui_tick(ui, idle_timeout_us);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "sanity: asleep");
+
+            pl_ui_push_event(ui, audio_fault_event(PlFaultKey::BufStarved, PlFaultSeverity::Audible, 1));
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::On, "the first raise must wake");
+
+            // A repeat of the SAME key, still well within the Live window,
+            // arriving immediately after (no tick in between, so `now` is
+            // unchanged). If this incorrectly re-armed the hold, the
+            // display would still be On one full hold-window after this
+            // second raise, in addition to the first.
+            pl_ui_push_event(ui, audio_fault_event(PlFaultKey::BufStarved, PlFaultSeverity::Audible, 2));
+
+            // The hold expires exactly `FAULT_WAKE_HOLD` after the FIRST
+            // (and only granted) wake -- proving the repeat did not extend
+            // it.
+            pl_ui_tick(ui, idle_timeout_us + hold_us);
+            assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "a repeat of an already-Live key must not have re-armed the hold");
+
+            pl_ui_destroy(ui);
+        }
     }
 }

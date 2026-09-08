@@ -589,6 +589,163 @@ pub enum Event {
     LdacBitrateChanged {
         kbps: u32,
     },
+    /// One audio fault raised or refreshed, from C's 1Hz fault evaluator
+    /// (design `.planning/design/2026-09-07-audio-fault-model.md` §5,
+    /// §7.3-7.4; firmware half is `pico-link-9eq2.3.2`). `count` is C's
+    /// ABSOLUTE running count for `key` (§5.4) -- [`App::on_fault_raised`]
+    /// *assigns* it into [`FaultLog`] rather than accumulating, so a
+    /// dropped event costs one refresh cycle of staleness, never permanent
+    /// drift.
+    ///
+    /// Deliberately does not carry `severity`/`glyph`: those are consumed
+    /// only at the FFI event site to decide whether this raise wakes the
+    /// display (design §7.5) -- [`FaultLog`]'s own entry shape (§7.4) has
+    /// no field for either, so `core`'s model never needs them.
+    FaultRaised {
+        key: FaultKey,
+        value: Option<FaultValue>,
+        count: u16,
+    },
+}
+
+/// The audio fault catalogue's six keys (design `.planning/design/2026-09-
+/// 07-audio-fault-model.md` §3.1). Ordinals are append-only forever --
+/// this is the wire discriminant `ui-ffi`'s `PlFaultKey` mirrors 1:1 (see
+/// that type's `TryFrom` impl). Only the ordinal and the display name live
+/// in `core` -- glyph and severity are authoritative on the C side and
+/// travel with each event instead, never stored here (design §7.3's "one
+/// table, not two"; rule 3, §2: "names, strings and colours live in
+/// Rust... a rename is then a Rust-only change").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKey {
+    BufStarved,
+    BufOverflow,
+    UsbSupplyLow,
+    AirCongested,
+    AirLinkLost,
+    EncResync,
+}
+
+impl FaultKey {
+    /// All six keys, in ordinal order -- for callers that need to iterate
+    /// [`FaultLog`] positionally.
+    pub const ALL: [FaultKey; 6] = [
+        FaultKey::BufStarved,
+        FaultKey::BufOverflow,
+        FaultKey::UsbSupplyLow,
+        FaultKey::AirCongested,
+        FaultKey::AirLinkLost,
+        FaultKey::EncResync,
+    ];
+
+    /// <= 16 char, uppercase ASCII display name (design §3.1's table). A
+    /// rename is a Rust-only change (rule 3, §2) -- never a firmware
+    /// reflash.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            FaultKey::BufStarved => "BUF STARVED",
+            FaultKey::BufOverflow => "BUF OVERFLOW",
+            FaultKey::UsbSupplyLow => "USB SUPPLY LOW",
+            FaultKey::AirCongested => "AIR CONGESTED",
+            FaultKey::AirLinkLost => "AIR LINK LOST",
+            FaultKey::EncResync => "ENC RESYNC",
+        }
+    }
+
+    /// This key's position in [`FaultLog`]'s fixed six-entry array --
+    /// spelled out as its own method so callers never depend on the enum's
+    /// discriminant/`as u8` representation directly.
+    #[must_use]
+    const fn index(self) -> usize {
+        match self {
+            FaultKey::BufStarved => 0,
+            FaultKey::BufOverflow => 1,
+            FaultKey::UsbSupplyLow => 2,
+            FaultKey::AirCongested => 3,
+            FaultKey::AirLinkLost => 4,
+            FaultKey::EncResync => 5,
+        }
+    }
+}
+
+/// The `why?` page's value slot (design §3.1's "value kind" column) --
+/// [`Event::FaultRaised`]'s optional value, carried through into
+/// [`FaultEntry::value`] unchanged. `u16` payloads throughout, matching
+/// the wire payload's `value: u16` field (`ui-ffi`'s
+/// `PlAudioFaultPayload`) -- `core` never widens or rescales it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultValue {
+    /// A q8 fixed-point ratio (design §3.1 ord 2: the USB supply ratio).
+    Ratio(u16),
+    /// A plain count (frames dropped, occurrences -- design §3.1 ords 1,
+    /// 3, 4, 5).
+    Count(u16),
+    /// A duration in milliseconds (design §3.1 ord 0: the windowed
+    /// minimum ring fill -- "`0ms` whenever the fault is real").
+    Millis(u16),
+}
+
+/// One [`FaultKey`]'s state in [`FaultLog`] (design §7.4's entry shape).
+/// `count` and `value` are the most recent [`Event::FaultRaised`]'s
+/// payload, assigned wholesale each time (§5.4) -- never accumulated.
+/// `first_seen`/`last_seen` are what the (future, S3) render layer derives
+/// freshness tiers and retirement from; this bead computes neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FaultEntry {
+    pub count: u16,
+    pub first_seen: Instant,
+    pub last_seen: Instant,
+    pub value: Option<FaultValue>,
+}
+
+/// The audio fault strip's model: a **fixed array of six entries**, one
+/// per [`FaultKey`] (design §7.4, home-fault-strip §12 Ruby item 1 --
+/// "no `Vec`, no allocation on a fault event"). `None` until a key has
+/// been raised at least once since boot; never removed once raised
+/// (retirement is a render-time-only concept, computed from
+/// `now - last_seen`, per §7.4 -- there is no clear event over the wire,
+/// design §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FaultLog {
+    entries: [Option<FaultEntry>; 6],
+}
+
+impl FaultLog {
+    /// `key`'s current entry, if it has ever been raised.
+    #[must_use]
+    pub fn entry(&self, key: FaultKey) -> Option<FaultEntry> {
+        self.entries[key.index()]
+    }
+
+    /// Whether `key`'s most recent raise is within
+    /// [`crate::run::FAULT_LIVE_WINDOW`] of `now` -- design §7.2's
+    /// "already Live" test, which gates a repeat raise from waking the
+    /// display again. `false` for a key that has never been raised.
+    #[must_use]
+    pub fn is_live(&self, key: FaultKey, now: Instant) -> bool {
+        self.entries[key.index()].is_some_and(|entry| now.saturating_duration_since(entry.last_seen) < crate::run::FAULT_LIVE_WINDOW)
+    }
+
+    /// Folds one raise into `key`'s entry (design §5.4/§7.4): `count` is
+    /// ASSIGNED, never accumulated -- idempotent by construction, so a
+    /// dropped event costs one refresh cycle of staleness rather than
+    /// permanent drift. `first_seen` is set once, on the entry's first-
+    /// ever raise, and left unchanged by every subsequent one (there is no
+    /// "re-arm" concept here -- retirement and freshness are entirely
+    /// render-time, derived from `last_seen`, per §7.4).
+    pub fn record(&mut self, key: FaultKey, now: Instant, value: Option<FaultValue>, count: u16) {
+        match &mut self.entries[key.index()] {
+            Some(entry) => {
+                entry.count = count;
+                entry.last_seen = now;
+                entry.value = value;
+            }
+            slot @ None => {
+                *slot = Some(FaultEntry { count, first_seen: now, last_seen: now, value });
+            }
+        }
+    }
 }
 
 /// Phase 4's four named connect sub-steps (design section 9): naming the
@@ -860,6 +1017,18 @@ pub struct BtModel {
     /// selector.md` §5.1) requires showing exactly what the encoder
     /// reports, not the nearest rung. Bead pico-link-7jol.5.
     pub ldac_live_kbps: Option<u32>,
+    /// The audio fault strip's model (design `.planning/design/2026-09-07-
+    /// audio-fault-model.md` §7.4, home-fault-strip §12 Ruby item 1) --
+    /// folded by [`App::on_fault_raised`] from [`Event::FaultRaised`].
+    /// Deliberately NOT cleared by [`App::set_link_state`] on disconnect,
+    /// unlike `out_level`/`connected_codec`/`ldac_live_kbps` above: a
+    /// fault raised on the connection that just dropped is still relevant
+    /// history for the `why?` page (S3, `pico-link-9eq2.3.3`) after a
+    /// reconnect, and C's own evaluator already re-snapshots and clears
+    /// its *own* fault state at every stream transition (§5.6 rule 3) --
+    /// `core`'s log just reflects whatever C tells it, per doctrine (§2:
+    /// "faults are a view, never a second source of truth").
+    pub fault_log: FaultLog,
 }
 
 /// One [`Event::LevelsChanged`] reading, timestamped and peak-held at the
@@ -2155,6 +2324,7 @@ impl App {
             Event::LevelsChanged { peak_l, peak_r, rms_l, rms_r } => self.on_levels_changed(peak_l, peak_r, rms_l, rms_r),
             Event::VolumeChanged { level, muted, source } => self.on_volume_changed(level, muted, source),
             Event::LdacBitrateChanged { kbps } => self.on_ldac_bitrate_changed(kbps),
+            Event::FaultRaised { key, value, count } => self.on_fault_raised(key, value, count),
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -2421,6 +2591,22 @@ impl App {
     /// figure the same frame it arrives.
     pub fn on_ldac_bitrate_changed(&mut self, kbps: u32) {
         self.model.ldac_live_kbps = Some(kbps);
+        self.refresh_stack();
+    }
+
+    /// Folds one [`Event::FaultRaised`] reading into
+    /// [`BtModel::fault_log`] (design `.planning/design/2026-09-07-audio-
+    /// fault-model.md` §7.4). Uses `self.now_us` (the FFI seam's own
+    /// stored clock, see [`App::tick`]'s doc comment) rather than taking a
+    /// clock parameter -- the same convention [`App::on_levels_changed`]'s
+    /// peak-hold already uses. Calls [`App::refresh_stack`] like every
+    /// other `BtModel`-mutating fold, so a future screen (S3,
+    /// `pico-link-9eq2.3.3`) can rely on that convention rather than each
+    /// one deciding for itself whether a redraw is warranted -- this bead
+    /// builds no screen that actually reads `fault_log` yet.
+    pub fn on_fault_raised(&mut self, key: FaultKey, value: Option<FaultValue>, count: u16) {
+        let now = Instant::from_micros(self.now_us);
+        self.model.fault_log.record(key, now, value, count);
         self.refresh_stack();
     }
 
@@ -2913,6 +3099,68 @@ mod tests {
 
         app.on_volume_changed(80, false, VolumeSource::Sink);
         assert!(!app.volume_requires_dim_floor(), "an ordinary non-zero unmuted reading must not require the floor");
+    }
+
+    // --- `FaultLog` (design `.planning/design/2026-09-07-audio-fault-
+    // model.md` §5.4/§7.4, bead pico-link-9eq2.3.1) ---
+
+    #[test]
+    fn fault_log_record_assigns_count_rather_than_accumulating_it() {
+        // Design §5.4: "the payload carries an absolute count, not an
+        // increment" -- C's own running total, assigned wholesale each
+        // time so a dropped event only costs one refresh cycle of
+        // staleness rather than permanent drift.
+        let mut log = FaultLog::default();
+        let t1 = Instant::from_micros(1_000_000);
+        let t2 = Instant::from_micros(2_000_000);
+
+        log.record(FaultKey::BufStarved, t1, None, 5);
+        assert_eq!(log.entry(FaultKey::BufStarved).unwrap().count, 5);
+
+        log.record(FaultKey::BufStarved, t2, None, 3);
+        assert_eq!(
+            log.entry(FaultKey::BufStarved).unwrap().count,
+            3,
+            "count must be ASSIGNED from the payload, never accumulated (5 + 3 = 8 would be the accumulation bug)"
+        );
+    }
+
+    #[test]
+    fn fault_log_record_sets_first_seen_once_and_always_updates_last_seen() {
+        let mut log = FaultLog::default();
+        let t1 = Instant::from_micros(1_000_000);
+        let t2 = Instant::from_micros(2_000_000);
+
+        log.record(FaultKey::EncResync, t1, None, 1);
+        let first = log.entry(FaultKey::EncResync).unwrap();
+        assert_eq!(first.first_seen, t1);
+        assert_eq!(first.last_seen, t1);
+
+        log.record(FaultKey::EncResync, t2, None, 2);
+        let second = log.entry(FaultKey::EncResync).unwrap();
+        assert_eq!(second.first_seen, t1, "first_seen must not move on a later raise");
+        assert_eq!(second.last_seen, t2, "last_seen must always advance to the latest raise");
+    }
+
+    #[test]
+    fn fault_log_is_live_within_the_window_and_false_after_it_elapses() {
+        let mut log = FaultLog::default();
+        let raised_at = Instant::from_micros(1_000_000);
+        log.record(FaultKey::AirLinkLost, raised_at, None, 1);
+
+        let almost_closed = Instant::from_micros((raised_at + crate::run::FAULT_LIVE_WINDOW).as_micros() - 1);
+        let closed = raised_at + crate::run::FAULT_LIVE_WINDOW;
+
+        assert!(log.is_live(FaultKey::AirLinkLost, raised_at), "must be Live at the instant it was raised");
+        assert!(log.is_live(FaultKey::AirLinkLost, almost_closed), "must still be Live one microsecond before the window closes");
+        assert!(!log.is_live(FaultKey::AirLinkLost, closed), "must no longer be Live once the full window has elapsed");
+    }
+
+    #[test]
+    fn fault_log_is_live_is_false_for_a_key_never_raised() {
+        let log = FaultLog::default();
+        assert!(!log.is_live(FaultKey::BufOverflow, Instant::from_micros(0)));
+        assert!(log.entry(FaultKey::BufOverflow).is_none());
     }
 
     // --- pico-link-vxc, design doc §6.1: the freshness invariant ---

@@ -209,6 +209,43 @@ enum PowerState {
     Asleep,
 }
 
+/// Wake-on-fault constants (design `.planning/design/2026-09-07-audio-
+/// fault-model.md` §7.5, `.planning/design/2026-09-07-home-fault-strip.md`
+/// §7). Kept in one place beside [`IdlePolicy`], which is the type that
+/// enforces them — never in C (audio-fault-model §7.5's explicit ruling:
+/// "they live in Rust beside `IdlePolicy`, not in C").
+///
+/// How long a granted fault wake holds the display on before it's allowed
+/// to blank again (home-fault-strip §7.3). A fault wake never touches
+/// [`IdlePolicy`]'s `last_input`, so this is the *entire* grant — once it
+/// expires, the screen blanks immediately if the ordinary 60s screensaver
+/// clock has already elapsed (which it usually has, since a fault wake by
+/// definition arrives with no real input).
+pub const FAULT_WAKE_HOLD: Duration = Duration::from_secs(20);
+/// The minimum gap between two granted fault wakes, regardless of key
+/// (home-fault-strip §7.4 limiter 2) — the first of two independent storm
+/// limiters (the second is [`FAULT_WAKE_SESSION_CAP`]).
+pub const FAULT_WAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// How many fault wakes one continuous stream session may spend before
+/// wake-on-fault stops entirely for that session (home-fault-strip §7.4
+/// limiter 3). Resets on a stream stop→start transition
+/// ([`IdlePolicy::reset_fault_wake_session`]) or any real press (handled
+/// automatically by [`IdlePolicy::tick`]'s `had_input` branch).
+pub const FAULT_WAKE_SESSION_CAP: u8 = 6;
+/// How long a raised fault key counts as "Live" for wake-gating purposes
+/// (audio-fault-model §7.2: "a repeat of a key already showing Live never
+/// wakes") — see [`crate::app::FaultLog::is_live`]. Also the freshness
+/// tier boundary the eventual render layer uses (home-fault-strip §5);
+/// kept here, in the one place these five constants live, even though
+/// `IdlePolicy` itself never reads it.
+pub const FAULT_LIVE_WINDOW: Duration = Duration::from_secs(20);
+/// How long a fault entry survives with no refresh before the (future)
+/// render layer retires it from the strip (home-fault-strip §5). Not
+/// consumed by anything in this bead — S3 (`pico-link-9eq2.3.3`) is where
+/// render-time retirement is computed — kept here so every fault-wake-
+/// related constant lives in one place per the design's instruction.
+pub const FAULT_RETIRE: Duration = Duration::from_secs(120);
+
 /// What one [`IdlePolicy::tick`] call decided, for the caller to act on.
 /// Both fields default to "do nothing" (`None`/`false`) on a tick that
 /// changed nothing.
@@ -268,6 +305,25 @@ pub struct IdlePolicy {
     deep_sleep_triggered: bool,
     idle_timeout: Option<Duration>,
     deep_sleep_timeout: Option<Duration>,
+    /// The wake-on-fault floor's expiry, if a fault wake is currently
+    /// holding the display on (design §7.5's third, *expiring* floor,
+    /// alongside the mute/zero floor above). `Some(until)` while active;
+    /// cleared either when `until` is reached ([`IdlePolicy::tick`], no
+    /// one-frame flash: the screensaver tier evaluates in the same call
+    /// that clears it) or by any real press (design §7.3: "any real button
+    /// press during the hold cancels it"). **Never derived from
+    /// `last_input`** — a fault wake must not extend the idle timer (design
+    /// §7.5's correction: no `volume_wake_since_last_tick`-style OR into
+    /// `had_input`).
+    fault_hold_until: Option<crate::platform::Instant>,
+    /// When the most recent *granted* fault wake occurred — the storm
+    /// limiter's cooldown clock ([`FAULT_WAKE_COOLDOWN`]). `None` until the
+    /// first grant.
+    fault_wake_last: Option<crate::platform::Instant>,
+    /// How many fault wakes this policy has granted since the last reset
+    /// (a real press, or [`IdlePolicy::reset_fault_wake_session`]) — the
+    /// session cap ([`FAULT_WAKE_SESSION_CAP`]).
+    fault_wake_session_count: u8,
 }
 
 impl IdlePolicy {
@@ -277,7 +333,16 @@ impl IdlePolicy {
     /// [`run`] always took.
     #[must_use]
     pub const fn new(idle_timeout: Option<Duration>, deep_sleep_timeout: Option<Duration>) -> Self {
-        Self { power_state: PowerState::Active, last_input: None, deep_sleep_triggered: false, idle_timeout, deep_sleep_timeout }
+        Self {
+            power_state: PowerState::Active,
+            last_input: None,
+            deep_sleep_triggered: false,
+            idle_timeout,
+            deep_sleep_timeout,
+            fault_hold_until: None,
+            fault_wake_last: None,
+            fault_wake_session_count: 0,
+        }
     }
 
     /// The wake half. Call synchronously when a non-empty input batch has
@@ -374,20 +439,34 @@ impl IdlePolicy {
         let last_input = *self.last_input.get_or_insert(now);
         let mut decision = IdleDecision::default();
 
-        // The mute/zero floor: an already-blanked screen must never stay
-        // blank once the model enters muted/zero (design section 5.4) --
+        // The fault-wake floor: expire it first (clearing it if `now` has
+        // reached it) so the screensaver-arm check below sees an
+        // up-to-date value in the SAME tick the hold expires -- this is
+        // what makes expiry blank immediately rather than one frame late
+        // (design `.planning/design/2026-09-07-home-fault-strip.md` §7.3).
+        let fault_hold = self.fault_hold_active(now);
+
+        // The mute/zero and fault-hold floors: an already-blanked screen
+        // must never stay blank while either holds (design section 5.4 for
+        // mute/zero; audio-fault-model §7.5 for the fault hold) --
         // checked unconditionally, ahead of the `had_input` early return,
-        // since a volume-driven promotion is not "input" and must not
-        // reset `last_input` (see `VolumeState::wakes_idle`'s doc comment:
+        // since neither promotion is "input" and must not reset
+        // `last_input` (see `VolumeState::wakes_idle`'s doc comment:
         // that's the separate, event-driven "wakes to full" case, which
         // goes through the ordinary `on_input`/`had_input` path instead).
-        if self.power_state == PowerState::Asleep && mute_or_zero {
+        if self.power_state == PowerState::Asleep && (mute_or_zero || fault_hold) {
             self.power_state = PowerState::Active;
             decision.power_transition = Some(DisplayPower::On);
         }
 
         if had_input {
             self.last_input = Some(now);
+            // Any real press cancels the fault hold and hands control back
+            // to the ordinary screensaver (home-fault-strip §7.3), and
+            // resets the storm-limiter session cap (§7.4 limiter 3's
+            // "resets on ... any real press").
+            self.fault_hold_until = None;
+            self.fault_wake_session_count = 0;
             return decision;
         }
 
@@ -395,6 +474,7 @@ impl IdlePolicy {
             if self.power_state == PowerState::Active
                 && at_home_root
                 && !mute_or_zero
+                && !fault_hold
                 && now.saturating_duration_since(last_input) >= idle_timeout
             {
                 self.power_state = PowerState::Asleep;
@@ -411,6 +491,70 @@ impl IdlePolicy {
         }
 
         decision
+    }
+
+    /// `true` if the fault-wake hold is still within its
+    /// [`FAULT_WAKE_HOLD`] window at `now`. Clears `fault_hold_until` the
+    /// moment it has expired (mutating even though this looks like a plain
+    /// query) so the caller -- [`IdlePolicy::tick`] -- observes the
+    /// post-expiry state in the very same call, which is what makes expiry
+    /// blank immediately rather than one tick late (home-fault-strip §7.3:
+    /// "the screen blanks immediately at hold expiry").
+    fn fault_hold_active(&mut self, now: crate::platform::Instant) -> bool {
+        match self.fault_hold_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.fault_hold_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Attempts to grant a fault wake at `now` -- the storm-limited half of
+    /// design §7.5's wake-on-fault mechanism. Returns `true` and applies
+    /// the wake (flips to `Active`, arms a fresh [`FAULT_WAKE_HOLD`]
+    /// window, records the grant for [`FAULT_WAKE_COOLDOWN`] and counts
+    /// against [`FAULT_WAKE_SESSION_CAP`]) if neither limiter refuses it;
+    /// otherwise a no-op returning `false`.
+    ///
+    /// Callers are expected to have already checked the *eligibility*
+    /// half -- severity `Audible`, the key's static `wakes_display`, and
+    /// "not already Live" (design §7.2) -- before calling this; those
+    /// checks need [`crate::app::FaultLog`], which this `Platform`-free
+    /// type deliberately knows nothing about (mirrors [`IdlePolicy::tick`]'s
+    /// own `mute_or_zero` being computed by the caller, not read from
+    /// `App` directly).
+    ///
+    /// **Never touches `last_input`** -- a fault is not evidence of a human
+    /// at the device (design §7.5's explicit correction against reusing
+    /// `volume_wake_since_last_tick`'s `had_input`-OR'ing shape).
+    pub fn on_fault_wake(&mut self, now: crate::platform::Instant) -> bool {
+        if let Some(last) = self.fault_wake_last {
+            if now.saturating_duration_since(last) < FAULT_WAKE_COOLDOWN {
+                return false;
+            }
+        }
+        if self.fault_wake_session_count >= FAULT_WAKE_SESSION_CAP {
+            return false;
+        }
+        self.fault_wake_last = Some(now);
+        self.fault_wake_session_count += 1;
+        self.fault_hold_until = Some(now + FAULT_WAKE_HOLD);
+        self.power_state = PowerState::Active;
+        true
+    }
+
+    /// Resets the fault-wake session cap ([`FAULT_WAKE_SESSION_CAP`]) back
+    /// to zero -- home-fault-strip §7.4 limiter 3's other reset trigger, "a
+    /// stream stop -> start transition" (the "any real press" trigger is
+    /// handled automatically inside [`IdlePolicy::tick`]). Call sites are
+    /// not wired in this bead (`pico-link-9eq2.3.1`) -- `ui-ffi` has no
+    /// stream-transition event to observe yet; that's `pico-link-9eq2.3.2`'s
+    /// firmware half. Exposed now so that wiring is a one-line call, not a
+    /// new method, once it lands.
+    pub fn reset_fault_wake_session(&mut self) {
+        self.fault_wake_session_count = 0;
     }
 
     /// The current requested display power level -- `On` unless the
@@ -1398,7 +1542,7 @@ mod tests {
 /// `Platform`-free type `ui-ffi` also calls.
 #[cfg(test)]
 mod idle_policy_tests {
-    use super::{DisplayPower, IdlePolicy};
+    use super::{DisplayPower, IdlePolicy, FAULT_WAKE_COOLDOWN, FAULT_WAKE_HOLD, FAULT_WAKE_SESSION_CAP};
     use crate::platform::Instant;
     use core::time::Duration;
 
@@ -1579,5 +1723,134 @@ mod idle_policy_tests {
         policy.tick(t0, false, true, false, false);
         let decision = policy.tick(t0 + Duration::from_secs(100_000), false, true, false, false);
         assert!(!decision.enter_deep_sleep);
+    }
+
+    // --- Wake-on-fault (design `.planning/design/2026-09-07-audio-fault-
+    // model.md` §7.5, `.planning/design/2026-09-07-home-fault-strip.md`
+    // §7), bead pico-link-9eq2.3.1 ---
+
+    #[test]
+    fn a_fault_wake_does_not_extend_last_input() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+        policy.tick(t0 + idle_timeout, false, true, true, false);
+        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
+
+        // The fault arrives long after `t0` -- if `on_fault_wake` had
+        // (incorrectly) bumped `last_input` to this instant, the hold
+        // expiring below would still read as within a fresh 60s idle
+        // window and stay On.
+        let wake_at = t0 + idle_timeout + Duration::from_secs(30);
+        assert!(policy.on_fault_wake(wake_at), "first fault wake in a fresh session must be granted");
+        assert_eq!(policy.display_power(), DisplayPower::On);
+
+        // Once the hold expires, the screen must blank on the very next
+        // tick -- proof `last_input` is still `t0`, not `wake_at`: had it
+        // been extended, `now - last_input` at hold-expiry (`FAULT_WAKE_
+        // HOLD` after `wake_at`) would only be `FAULT_WAKE_HOLD`, well
+        // under `idle_timeout`, and the screen would stay On.
+        let decision = policy.tick(wake_at + FAULT_WAKE_HOLD, false, true, true, false);
+        assert_eq!(decision.power_transition, Some(DisplayPower::Off), "the fault wake must not have extended last_input");
+    }
+
+    #[test]
+    fn the_fault_hold_expiring_blanks_immediately_with_no_one_frame_flash() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+        policy.tick(t0 + idle_timeout, false, true, true, false);
+        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
+
+        let wake_at = t0 + idle_timeout + Duration::from_secs(10);
+        assert!(policy.on_fault_wake(wake_at));
+        assert_eq!(policy.display_power(), DisplayPower::On, "on_fault_wake must apply synchronously, with no intervening tick needed");
+
+        // A tick that lands one microsecond before expiry must still be On
+        // (no premature blank)...
+        let almost_expired = Instant::from_micros((wake_at + FAULT_WAKE_HOLD).as_micros() - 1);
+        let still_holding = policy.tick(almost_expired, false, true, true, false);
+        assert_eq!(still_holding.power_transition, None);
+        assert_eq!(policy.display_power(), DisplayPower::On);
+
+        // ...and the tick that reaches expiry must blank in that SAME
+        // call -- no extra tick required, i.e. no one-frame flash where a
+        // stale hold is still honoured one call too many.
+        let expiry_tick = policy.tick(wake_at + FAULT_WAKE_HOLD, false, true, true, false);
+        assert_eq!(expiry_tick.power_transition, Some(DisplayPower::Off), "the hold's expiry tick itself must blank, immediately");
+        assert_eq!(policy.display_power(), DisplayPower::Off);
+    }
+
+    #[test]
+    fn a_real_press_during_the_fault_hold_hands_control_back_to_the_ordinary_screensaver() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+        policy.tick(t0 + idle_timeout, false, true, true, false);
+
+        let wake_at = t0 + idle_timeout + Duration::from_secs(5);
+        assert!(policy.on_fault_wake(wake_at));
+
+        // A real press arrives mid-hold.
+        let press_at = wake_at + Duration::from_secs(2);
+        policy.tick(press_at, true, true, true, false);
+        assert_eq!(policy.display_power(), DisplayPower::On);
+
+        // The ordinary 60s screensaver now governs, timed from the press
+        // -- not from the (now-cancelled) fault hold, and not from the
+        // stale original `t0`.
+        let just_before_instant = Instant::from_micros((press_at + idle_timeout).as_micros() - 1);
+        let just_before = policy.tick(just_before_instant, false, true, true, false);
+        assert_eq!(just_before.power_transition, None, "must still be on just before a fresh 60s timeout from the press");
+
+        let at_timeout = policy.tick(press_at + idle_timeout, false, true, true, false);
+        assert_eq!(at_timeout.power_transition, Some(DisplayPower::Off), "must blank exactly one ordinary idle timeout after the press");
+    }
+
+    #[test]
+    fn on_fault_wake_is_refused_within_the_cooldown_and_granted_once_it_elapses() {
+        let mut policy = IdlePolicy::new(Some(Duration::from_secs(60)), None);
+        let t0 = Instant::from_micros(0);
+
+        assert!(policy.on_fault_wake(t0), "the first-ever wake has no prior grant to cool down from");
+        let just_before_cooldown = Instant::from_micros((t0 + FAULT_WAKE_COOLDOWN).as_micros() - 1);
+        assert!(!policy.on_fault_wake(just_before_cooldown), "a second wake one microsecond before the cooldown elapses must be refused");
+        assert!(policy.on_fault_wake(t0 + FAULT_WAKE_COOLDOWN), "a wake exactly at the cooldown boundary must be granted");
+    }
+
+    #[test]
+    fn on_fault_wake_session_cap_binds_and_resets_on_a_real_press() {
+        let mut policy = IdlePolicy::new(Some(Duration::from_secs(60)), None);
+        // Space every attempt a full cooldown apart so only the session
+        // cap is under test.
+        let mut now = Instant::from_micros(0);
+        for i in 0..FAULT_WAKE_SESSION_CAP {
+            assert!(policy.on_fault_wake(now), "grant {i} of {FAULT_WAKE_SESSION_CAP} must be allowed");
+            now += FAULT_WAKE_COOLDOWN;
+        }
+        assert!(!policy.on_fault_wake(now), "the session cap must refuse a {}th wake", FAULT_WAKE_SESSION_CAP + 1);
+
+        // A real press resets the cap (home-fault-strip §7.4 limiter 3).
+        policy.tick(now, true, true, true, false);
+        assert!(policy.on_fault_wake(now + FAULT_WAKE_COOLDOWN), "a real press must reset the session cap");
+    }
+
+    #[test]
+    fn reset_fault_wake_session_resets_the_cap_without_a_press() {
+        let mut policy = IdlePolicy::new(Some(Duration::from_secs(60)), None);
+        let mut now = Instant::from_micros(0);
+        for _ in 0..FAULT_WAKE_SESSION_CAP {
+            assert!(policy.on_fault_wake(now));
+            now += FAULT_WAKE_COOLDOWN;
+        }
+        assert!(!policy.on_fault_wake(now), "sanity: the cap is reached");
+
+        // The stream-stop->start reset path (design §7.4 limiter 3's other
+        // trigger) -- no press involved.
+        policy.reset_fault_wake_session();
+        assert!(policy.on_fault_wake(now + FAULT_WAKE_COOLDOWN), "reset_fault_wake_session must clear the cap");
     }
 }
