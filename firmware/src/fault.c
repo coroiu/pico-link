@@ -26,19 +26,17 @@
 #define PL_FAULT_CLEAR_WINDOWS 3u
 // Slow to declare a fault over; asymmetric with the 1-window raise below.
 #define PL_FAULT_LEVEL_ENTER_WINDOWS 3u
-// No level fault is implemented by this bead (design sec 6.3: USB SUPPLY
-// LOW ships with only its short-packet RATE half, since pl_usb_supply_q8()
-// is optional and not built here) -- kept for parity with the design's own
-// constant table and for whichever future level fault needs it.
+// Applied by ord 2 (USB SUPPLY LOW), the one level fault -- it must be
+// under the band for three consecutive windows before it is believed.
 #define PL_FAULT_REFRESH_US 10000000u
 #define PL_FAULT_CONGEST_MIN 2u
 // Measured by Tess on pico-link-9eq2.4 -- NOT Ada's provisional 8 (design
 // sec 5.7's own flagged "no measurement behind it" caveat is now resolved).
 #define PL_FAULT_SUPPLY_LO 250u
 #define PL_FAULT_SUPPLY_HI 254u
-// q8; unused until pl_usb_supply_q8() exists (design sec 6.3) -- kept so a
-// future implementer has the exact band this design specifies, rather
-// than re-deriving it.
+// q8 hysteresis band for ord 2's LEVEL half, live as of bead
+// pico-link-47us: raise below LO, clear above HI, hold in between. 250/256
+// == 0.977x nominal, i.e. a sustained ~2.3% USB under-delivery.
 
 // Wire ordinals -- MUST match ui-ffi's PlFaultKey (ui-ffi/src/lib.rs)
 // exactly; append-only forever (design sec 7.3).
@@ -104,6 +102,32 @@ static pl_fault_key_state_t s_keys[PL_FAULT_KEY_COUNT];
 static uint32_t s_resync_drops_snapshot;
 static bool s_resync_drops_have_snapshot;
 
+// --- ord 2 (USB SUPPLY LOW) level state. Bead pico-link-47us. ---
+// The design's LEVEL half (sec 6.3), built at last. What shipped before was
+// the RATE half alone: raise on any ISO-OUT packet whose size differed from
+// 192 bytes. That is not an under-supply signal at all -- we run EXPLICIT
+// feedback (usb_audio.c's tud_audio_feedback_params_cb selects
+// AUDIO_FEEDBACK_METHOD_DISABLED and pl_usb_audio_feedback_task drives
+// tud_audio_fb_set), so the host varying its send size IS the control loop
+// working. One trimmed packet in 48000 raised the fault, and a 196-byte
+// packet (OVER-supply) raised "SUPPLY LOW" too.
+//
+// The level signal is delivered bytes over the 192 B/ms nominal for the
+// MEASURED window -- not an assumed 1s, because the superloop stretches.
+// rx_bytes_total is usb_audio.c's since-boot sum, so it gets the same
+// reset-safe snapshot treatment as every other cumulative counter here.
+static uint32_t s_rx_bytes_snapshot;
+static bool s_rx_bytes_have_snapshot;
+static uint64_t s_last_eval_us;
+static bool s_have_last_eval;
+// Consecutive windows below PL_FAULT_SUPPLY_LO (the sec 5.7 enter count),
+// and the cumulative seconds spent raised -- the latter is this key's
+// absolute `count`, i.e. the strip's "xN", and is deliberately NOT cleared
+// by pl_fault_reset_all: like every other key's count it is a since-boot
+// total, not a per-stream one.
+static uint8_t s_supply_low_windows;
+static uint32_t s_supply_low_seconds;
+
 // Bead pico-link-9eq2.3.2, design sec 5.6.5: the ONLY cache in this file
 // that survives a non-evaluated window (host-silent / not-streaming) --
 // pl_a2dp_report needs a fresh reading every second regardless of A2DP
@@ -138,6 +162,9 @@ static void pl_fault_reset_all(void) {
         // is never read until a fresh raise sets it again.
     }
     s_resync_drops_have_snapshot = false;
+    s_rx_bytes_have_snapshot = false;
+    s_have_last_eval = false;
+    s_supply_low_windows = 0;
 }
 
 static uint16_t pl_fault_clamp_u16(uint32_t v) {
@@ -236,7 +263,6 @@ void pl_fault_evaluate(struct PlUi *ui, uint64_t now_us) {
 
     uint32_t ovr_frames = pl_pcm_overrun_frames();
     uint32_t underrun_events = pl_a2dp_underrun_events();
-    uint32_t rx_short_packets = pl_usb_audio_rx_short_packets();
     uint32_t stop_queue_full = pl_a2dp_stop_queue_full();
     uint32_t link_lost_events = pl_a2dp_link_lost_events();
     uint32_t resync_events = pl_a2dp_resync_events();
@@ -244,7 +270,6 @@ void pl_fault_evaluate(struct PlUi *ui, uint64_t now_us) {
 
     uint32_t d_underrun = pl_fault_delta(&s_keys[PL_FAULT_KEY_BUF_STARVED], underrun_events);
     uint32_t d_ovr = pl_fault_delta(&s_keys[PL_FAULT_KEY_BUF_OVERFLOW], ovr_frames);
-    uint32_t d_short = pl_fault_delta(&s_keys[PL_FAULT_KEY_USB_SUPPLY_LOW], rx_short_packets);
     uint32_t d_queue_full = pl_fault_delta(&s_keys[PL_FAULT_KEY_AIR_CONGESTED], stop_queue_full);
     uint32_t d_link_lost = pl_fault_delta(&s_keys[PL_FAULT_KEY_AIR_LINK_LOST], link_lost_events);
     uint32_t d_resync_events = pl_fault_delta(&s_keys[PL_FAULT_KEY_ENC_RESYNC], resync_events);
@@ -260,6 +285,45 @@ void pl_fault_evaluate(struct PlUi *ui, uint64_t now_us) {
     }
     s_resync_drops_snapshot = resync_drops;
     s_resync_drops_have_snapshot = true;
+
+    // ord 2's level signal (see s_rx_bytes_snapshot's doc comment above).
+    // The window is the elapsed time since the previous EVALUATED window,
+    // so a stretched superloop scales the nominal budget instead of faking
+    // a deficit.
+    uint64_t d_us = (s_have_last_eval && now_us > s_last_eval_us) ? (now_us - s_last_eval_us) : 0;
+    s_last_eval_us = now_us;
+    s_have_last_eval = true;
+
+    uint32_t rx_bytes_total = pl_usb_audio_rx_bytes_total();
+    uint32_t d_bytes = 0;
+    if (s_rx_bytes_have_snapshot && rx_bytes_total >= s_rx_bytes_snapshot) {
+        d_bytes = rx_bytes_total - s_rx_bytes_snapshot;
+    }
+    s_rx_bytes_snapshot = rx_bytes_total;
+    s_rx_bytes_have_snapshot = true;
+
+    // A window outside this range is not measurable (the first window
+    // after a reset has d_us == 0; a multi-second one means the evaluator
+    // itself was starved, which says nothing about the host). Both report
+    // nominal and clear the enter counter -- never a fault.
+    bool supply_valid = d_us >= 250000u && d_us <= 4000000u;
+    uint32_t supply_q8 = 256u;
+    if (supply_valid) {
+        uint32_t nominal = (uint32_t)((d_us * 192u) / 1000u);
+        uint64_t ratio = nominal > 0u ? ((uint64_t)d_bytes * 256u) / nominal : 256u;
+        supply_q8 = ratio > 0xFFFFu ? 0xFFFFu : (uint32_t)ratio;
+    }
+    if (supply_valid && supply_q8 < PL_FAULT_SUPPLY_LO) {
+        if (s_supply_low_windows < 0xFFu) {
+            s_supply_low_windows++;
+        }
+    } else if (!supply_valid || supply_q8 > PL_FAULT_SUPPLY_HI) {
+        s_supply_low_windows = 0;
+    }
+    bool supply_low_raised = s_supply_low_windows >= PL_FAULT_LEVEL_ENTER_WINDOWS;
+    if (supply_low_raised) {
+        s_supply_low_seconds++;
+    }
 
     // Evaluated BEFORE ord 3 (AIR_CONGESTED) below, in the same window --
     // design sec 7.3/3.4's dynamic-severity escalation reads this.
@@ -283,13 +347,14 @@ void pl_fault_evaluate(struct PlUi *ui, uint64_t now_us) {
         PL_FAULT_VALUE_KIND_COUNT, d_ovr, ovr_frames
     );
 
-    // ord 2: USB SUPPLY LOW -- design sec 6.3: pl_usb_supply_q8() is
-    // optional and NOT built by this bead, so this key ships with only its
-    // short-packet RATE half; the value slot is ABSENT (None), never
-    // faked with a synthesized ratio.
+    // ord 2: USB SUPPLY LOW -- the LEVEL fault (bead pico-link-47us).
+    // Raised only after PL_FAULT_LEVEL_ENTER_WINDOWS consecutive windows
+    // below the q8 band, i.e. a sustained, genuine under-delivery; the
+    // value is the real supply ratio, which is what line 3 renders as
+    // "supply 0.9Nx nominal", and the count is seconds spent raised.
     pl_fault_emit_if_due(
-        ui, PL_FAULT_KEY_USB_SUPPLY_LOW, now_us, d_short >= 1, PL_FAULT_SEVERITY_CONCEALED, PL_FAULT_VALUE_KIND_NONE,
-        0, rx_short_packets
+        ui, PL_FAULT_KEY_USB_SUPPLY_LOW, now_us, supply_low_raised, PL_FAULT_SEVERITY_CONCEALED,
+        PL_FAULT_VALUE_KIND_RATIO, supply_q8, s_supply_low_seconds
     );
 
     // ord 3: AIR CONGESTED -- design sec 7.3: dynamic severity, escalating
