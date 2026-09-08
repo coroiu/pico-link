@@ -685,6 +685,78 @@ impl FaultKey {
             FaultKey::EncResync => 5,
         }
     }
+
+    /// This key's glyph class -- **static per key, never per-event**
+    /// (design `.planning/design/2026-09-07-home-fault-strip.md` §3.1's
+    /// table). The wire payload also carries a `glyph` byte
+    /// (`PlAudioFaultPayload::glyph`), but [`Event::FaultRaised`]
+    /// deliberately does not forward it into `core` (see that variant's
+    /// doc comment) -- it doesn't need to, because the audio-fault-model
+    /// design (§4) forbids a key from ever changing glyph class at
+    /// runtime ("what she may not do is give the two keys the same glyph
+    /// class[...]"). This table is therefore the single, static source of
+    /// truth the render layer (`render::hero`) reads, matching the wire
+    /// exactly by construction rather than by trusting a value that could
+    /// in principle disagree frame to frame.
+    #[must_use]
+    pub const fn glyph(self) -> FaultGlyphClass {
+        match self {
+            FaultKey::BufStarved | FaultKey::UsbSupplyLow => FaultGlyphClass::Starved,
+            FaultKey::BufOverflow => FaultGlyphClass::Filled,
+            FaultKey::AirCongested | FaultKey::AirLinkLost | FaultKey::EncResync => FaultGlyphClass::Neutral,
+        }
+    }
+
+    /// This key's **base** severity (design §3.1's table) -- used by the
+    /// render layer to pick red ([`FaultGlyphClass`]'s sibling colour
+    /// table lives in `render::hero`) vs amber. Unlike [`Self::glyph`],
+    /// this is a genuine simplification, not just an unforwarded wire
+    /// field: the audio-fault-model design (§7.3) has `AirCongested`
+    /// dynamically escalate `Concealed` -> `Audible` on co-occurrence with
+    /// `BufOverflow` within a single evaluation window, but that
+    /// escalation is consumed *only* at the FFI event site to decide a
+    /// wake (`ui-ffi`'s `pl_ui_push_event`) and never crosses into
+    /// [`Event::FaultRaised`] or [`FaultLog`] -- there is no per-entry
+    /// severity field to read at render time (see [`FaultEntry`]'s own
+    /// doc comment). So `AirCongested`'s Home row always renders at its
+    /// base `Concealed` (amber) colour, even during a window where it was
+    /// briefly `Audible` on the wire for wake purposes -- a deliberate,
+    /// documented gap (bead `pico-link-9eq2.3.3`'s completion report),
+    /// not a bug: fixing it would mean adding a severity field the design
+    /// explicitly chose not to carry (§7.4: "core's model never needs
+    /// them").
+    #[must_use]
+    pub const fn severity(self) -> FaultSeverity {
+        match self {
+            FaultKey::BufStarved | FaultKey::BufOverflow | FaultKey::AirLinkLost => FaultSeverity::Audible,
+            FaultKey::UsbSupplyLow | FaultKey::AirCongested | FaultKey::EncResync => FaultSeverity::Concealed,
+        }
+    }
+}
+
+/// A fault key's glyph shape class (design §3's table) -- the render-layer
+/// enum [`FaultKey::glyph`] maps into; `render::hero`/`render::fault_glyph`
+/// resolve this to one of the three drawn primitives (design §12 Fern item
+/// 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultGlyphClass {
+    /// Up triangle -- "the level went up past the top" (over-run/overflow).
+    Filled,
+    /// Down triangle -- "the level went down past the bottom" (under-run/
+    /// starvation).
+    Starved,
+    /// Square -- a non-directional fault.
+    Neutral,
+}
+
+/// A fault key's base severity (design §3.1's table) -- `Audible` (red,
+/// `STATUS_ERROR`) or `Concealed` (amber, `STATUS_WARNING`). See
+/// [`FaultKey::severity`]'s doc comment for the one documented gap this
+/// static table has relative to the wire's dynamic, per-event severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultSeverity {
+    Audible,
+    Concealed,
 }
 
 /// The `why?` page's value slot (design §3.1's "value kind" column) --
@@ -743,6 +815,20 @@ impl FaultLog {
     #[must_use]
     pub fn is_live(&self, key: FaultKey, now: Instant) -> bool {
         self.entries[key.index()].is_some_and(|entry| now.saturating_duration_since(entry.last_seen) < crate::run::FAULT_LIVE_WINDOW)
+    }
+
+    /// Whether ANY key has an entry not yet retired at `now` (design
+    /// `.planning/design/2026-09-07-home-fault-strip.md` §6.3's
+    /// `now - last_seen > FAULT_RETIRE` retirement rule) -- the Home fault
+    /// strip's own "is the strip non-empty" test, shared by
+    /// `render::hero`'s drawing/`paint_key`/`redraw_after` and
+    /// `render::home`'s `ShortcutX` gate (design §8.1: "X is labelled and
+    /// live only while the strip is non-empty").
+    #[must_use]
+    pub fn has_visible_entry(&self, now: Instant) -> bool {
+        FaultKey::ALL
+            .into_iter()
+            .any(|key| self.entries[key.index()].is_some_and(|entry| now.saturating_duration_since(entry.last_seen) < crate::run::FAULT_RETIRE))
     }
 
     /// Folds one raise into `key`'s entry (design §5.4/§7.4): `count` is
@@ -1262,6 +1348,14 @@ pub enum ScreenId {
     /// [`PickerKind::LdacQuality`] -- the codec picker itself waits on
     /// Ada's `CodecAvailability` seam.
     Picker(PickerKind, DeviceAddr),
+    /// The Home fault strip's `why?` detail page (design
+    /// `.planning/design/2026-09-07-home-fault-strip.md` §8, bead
+    /// `pico-link-9eq2.3.3`) -- a singleton, no payload: there is exactly
+    /// one, reached only from `X` on Home. Refreshed like every other
+    /// identified screen so a fault that fires while it's open updates
+    /// counts/times/tier in place (see [`build_why_page_screen`]'s doc
+    /// comment for the append-only ordering rule this refresh enforces).
+    WhyPage,
 }
 
 /// Which picker a [`ScreenId::Picker`] identifies -- distinguishes screens
@@ -2053,6 +2147,112 @@ pub(crate) fn build_single_select_screen(
     Screen::new(title, vec![Box::new(list)]).with_id(id)
 }
 
+/// The `why?` page's fixed title (design
+/// `.planning/design/2026-09-07-home-fault-strip.md` §8.2: "Header: `WHY?`").
+const WHY_PAGE_TITLE: &str = "WHY?";
+
+/// Formats `elapsed_since(at)` as a short relative age -- `"8s ago"`,
+/// `"4m ago"`, `"2h ago"` -- **never an absolute timestamp**, per design
+/// §8.2's "Relative times only. Never absolute timestamps -- no RTC." This
+/// board has no RTC (`.planning/design/2026-09-01-idle-policy-across-the-
+/// ffi-seam.md`'s own note, restated here because it is easy to
+/// rediscover as a missing feature rather than a hard constraint) --
+/// `now`/`at` are both [`crate::run::FAULT_LIVE_WINDOW`]-scale
+/// [`Instant`]s derived from the FFI seam's monotonic microsecond clock,
+/// never wall-clock time.
+fn relative_time(now: Instant, at: Instant) -> String {
+    let elapsed = now.saturating_duration_since(at);
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+/// The Home fault strip's `why?` detail page (design
+/// `.planning/design/2026-09-07-home-fault-strip.md` §8, bead
+/// `pico-link-9eq2.3.3`) -- a scrollable list of **kinds, not events**
+/// (orchestrator ruling on this bead): one aggregated two-line block per
+/// [`FaultKey`] that has ever fired, in `order`'s sequence, including
+/// retired keys (design §8.2: "including retired keys -- this is the
+/// session history").
+///
+/// **Ordering discipline is the load-bearing part of this function**
+/// (orchestrator ruling, restated because it is easy to miss): `order` is
+/// the caller's frozen block order, established once by `render::home`'s
+/// `ShortcutX` handler (a fresh most-recently-active-first sort, written
+/// directly into the shared `Rc<RefCell<_>>` at push time) and never
+/// re-sorted by this function on any subsequent call. What this function
+/// DOES do, every call (including the very first, harmlessly, since
+/// `order` starts empty then): **append** any key that has an entry in
+/// [`BtModel::fault_log`] but is not yet present in `order`, at the END --
+/// "a key that fires for the first time while the page is open appends at
+/// the bottom rather than jumping to the top." A live re-sort under a
+/// scrolling thumb is exactly the moving-target problem design §6.2
+/// rejects for Home's own rows, worse here because the user is reading,
+/// not glancing.
+///
+/// Never returns [`Refresh::Gone`] -- this page has no subject that can
+/// vanish out from under it (unlike [`ScreenId::DevicePage`]'s device).
+pub(crate) fn build_why_page_screen(model: &BtModel, now: Instant, order: &Rc<RefCell<Vec<FaultKey>>>, carry: &ScreenCarry) -> Refresh {
+    {
+        let mut order = order.borrow_mut();
+        for key in FaultKey::ALL {
+            if model.fault_log.entry(key).is_some() && !order.contains(&key) {
+                order.push(key);
+            }
+        }
+    }
+    let ordered_keys = order.borrow().clone();
+
+    let mut rows = Vec::new();
+    let mut next_key = 0_u64;
+    for key in ordered_keys {
+        let Some(entry) = model.fault_log.entry(key) else {
+            // Structurally unreachable: every key in `order` was inserted
+            // above (or on a prior call) only after confirming
+            // `fault_log.entry(key).is_some()`, and entries are never
+            // removed once raised (`FaultLog`'s own doc comment) --
+            // defensive rather than a panic, matching this crate's own
+            // convention elsewhere (e.g. `device_page_rows`'s
+            // `unwrap_or(&default_device)`).
+            continue;
+        };
+        let glyph_char = match key.glyph() {
+            FaultGlyphClass::Filled => '^',
+            FaultGlyphClass::Starved => 'v',
+            FaultGlyphClass::Neutral => '#',
+        };
+        let color = match key.severity() {
+            FaultSeverity::Audible => palette::STATUS_ERROR,
+            FaultSeverity::Concealed => palette::STATUS_WARNING,
+        };
+        // Line 1: glyph, name, TOTAL count -- "no saturation here, show the
+        // real number" (design §8.2), unlike Home's own `x99+` cap.
+        rows.push(
+            FieldRow::readonly(format!("{glyph_char} {}", key.name()))
+                .with_label_color(color)
+                .with_value(format!("x{}", entry.count), color)
+                .with_key(ListItemKey::from_u64(next_key)),
+        );
+        next_key += 1;
+        // Line 2: relative times only, `TEXT_SECONDARY` (readonly's default
+        // label color -- no override needed).
+        rows.push(
+            FieldRow::readonly(format!("last {} . first {}", relative_time(now, entry.last_seen), relative_time(now, entry.first_seen)))
+                .with_key(ListItemKey::from_u64(next_key)),
+        );
+        next_key += 1;
+    }
+
+    let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index);
+    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
+    Refresh::Rebuild(Screen::new(WHY_PAGE_TITLE, vec![Box::new(list)]).with_id(ScreenId::WhyPage))
+}
+
 /// The `QUALITY` picker's four entries, per design §4.1: numbers leading,
 /// highest first, `HQ`/`SQ`/`MQ` never shown
 /// (`.planning/design/2026-09-07-ldac-quality-selector.md`). Returns
@@ -2210,6 +2410,15 @@ pub struct App {
     /// by every freshly built `HomeView`, so the toggle survives a
     /// rebuild with no navigator involvement.
     home_face: Rc<RefCell<HomeFace>>,
+    /// The `why?` page's frozen block order (design
+    /// `.planning/design/2026-09-07-home-fault-strip.md` §8.1, orchestrator
+    /// ruling on `pico-link-9eq2.3.3`) -- shared with `HomeView`/
+    /// `build_why_page_screen` the same `Rc<RefCell<_>>`-mailbox shape
+    /// `home_face` uses, for the same reason: the page's ordering must
+    /// survive [`App::refresh_stack`] rebuilding it on every subsequent
+    /// fault event while it's open, only ever appending, never re-sorting
+    /// (see [`build_why_page_screen`]'s doc comment).
+    why_page_order: Rc<RefCell<Vec<FaultKey>>>,
 }
 
 impl App {
@@ -2224,9 +2433,17 @@ impl App {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
+        let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let model = BtModel::default();
-        let navigator =
-            Navigator::new(build_home_screen(&model, &home_face, &commands, &wizard_phase, &wizard_devices));
+        let navigator = Navigator::new(build_home_screen(
+            &model,
+            &home_face,
+            &commands,
+            &wizard_phase,
+            &wizard_devices,
+            Instant::from_micros(0),
+            &why_page_order,
+        ));
         Self {
             navigator,
             framebuffer: FrameBuffer565::new(width, height),
@@ -2238,6 +2455,7 @@ impl App {
             wizard_phase,
             wizard_devices,
             home_face,
+            why_page_order,
         }
     }
 
@@ -2307,6 +2525,8 @@ impl App {
                 &self.commands,
                 &self.wizard_phase,
                 &self.wizard_devices,
+                Instant::from_micros(self.now_us),
+                &self.why_page_order,
             )),
             ScreenId::Devices => Refresh::Rebuild(build_devices_screen(
                 &self.model,
@@ -2319,6 +2539,7 @@ impl App {
             )),
             ScreenId::DevicePage(addr) => build_device_page_screen(&self.model, addr, carry, &self.commands),
             ScreenId::Picker(PickerKind::LdacQuality, addr) => build_ldac_quality_picker_screen(&self.model, addr, carry, &self.commands),
+            ScreenId::WhyPage => build_why_page_screen(&self.model, Instant::from_micros(self.now_us), &self.why_page_order, carry),
         }
     }
 

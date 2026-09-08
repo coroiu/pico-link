@@ -74,6 +74,7 @@
 pub mod chrome;
 pub mod confirm;
 pub mod ctx;
+pub mod fault_glyph;
 pub mod fields;
 pub mod framebuffer;
 pub mod hero;
