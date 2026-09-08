@@ -2197,6 +2197,50 @@ fn relative_time(now: Instant, at: Instant) -> String {
 ///
 /// Never returns [`Refresh::Gone`] -- this page has no subject that can
 /// vanish out from under it (unlike [`ScreenId::DevicePage`]'s device).
+/// The `why?` page's line 3 (design §8.2): "one plain-language consequence
+/// sentence plus the raw number." Neither design doc dictates exact
+/// wording -- the audio-fault-model design (`.planning/design/2026-09-07-
+/// audio-fault-model.md` §3.1's "Reads" column) only specifies each key's
+/// value KIND and what it measures; Uma's sketch (§10.7) gives two worked
+/// examples in her own prose. This function is that prose, one sentence
+/// per key, filled in with the actual raw value -- never the saturated/
+/// rounded figure Home's own count slot uses (§8.2: "no saturation here").
+/// `None` (a key whose value has never been wired -- e.g. the USB supply
+/// ratio before `pl_usb_supply_q8()` lands) means no line 3 at all, never a
+/// guessed number.
+fn fault_consequence_text(key: FaultKey, value: Option<FaultValue>) -> Option<String> {
+    let value = value?;
+    // Every arm below is measured against the why? page's real row budget
+    // (`font::value()`, ~194px -- `core/examples/fault_strip_probe.rs`'s
+    // `measure_why_page_consequence_texts`) and kept under it: `FieldList`
+    // CLIPS an overlong label rather than ellipsising it (field-list ruling
+    // §4.6), which for a full sentence reads as a confusing mid-word cut
+    // rather than the name truncation this render core uses everywhere
+    // else -- so these stay short by construction, not by luck.
+    Some(match (key, value) {
+        (FaultKey::BufStarved, FaultValue::Millis(ms)) => format!("ring dry, min fill {ms}ms"),
+        (FaultKey::BufOverflow, FaultValue::Count(frames)) => format!("ring full, {frames} dropped"),
+        (FaultKey::UsbSupplyLow, FaultValue::Ratio(q8)) => {
+            // q8: 256 == 1.00x nominal -- rendered to 2 decimal places
+            // without a float format dependency, matching this codebase's
+            // "no_std + alloc" discipline (u8g2-fonts/core::fmt integer
+            // formatting only).
+            let whole = u32::from(q8) / 256;
+            let frac = (u32::from(q8) % 256) * 100 / 256;
+            format!("supply {whole}.{frac:02}x nominal")
+        }
+        (FaultKey::AirCongested, FaultValue::Count(deferred)) => format!("air busy, x{deferred} deferred"),
+        (FaultKey::AirLinkLost, FaultValue::Count(occurrences)) => format!("link dropped x{occurrences}"),
+        (FaultKey::EncResync, FaultValue::Count(frames)) => format!("trim dropped x{frames}"),
+        // A key paired with a `FaultValue` variant the audio-fault-model
+        // design's own table (§3.1) never assigns it -- e.g. a firmware
+        // bug sending the wrong `value_kind` tag. Never fabricate a
+        // sentence for a combination the design doesn't define; the
+        // count/name/times on lines 1-2 still show, just no line 3.
+        _ => return None,
+    })
+}
+
 pub(crate) fn build_why_page_screen(model: &BtModel, now: Instant, order: &Rc<RefCell<Vec<FaultKey>>>, carry: &ScreenCarry) -> Refresh {
     {
         let mut order = order.borrow_mut();
@@ -2246,6 +2290,17 @@ pub(crate) fn build_why_page_screen(model: &BtModel, now: Instant, order: &Rc<Re
                 .with_key(ListItemKey::from_u64(next_key)),
         );
         next_key += 1;
+        // Line 3 (design §8.2): "one plain-language consequence sentence
+        // plus the raw number, which is where pico-link-8jp's supply
+        // ratio and every other counter value now lives." Absent when
+        // `entry.value` is `None` -- some keys have never had a value
+        // wired (e.g. the USB supply ratio, per the audio-fault-model
+        // design §6.3, "absent (`None`) until `pl_usb_supply_q8()`
+        // exists") -- absent, never faked (parent design §15).
+        if let Some(text) = fault_consequence_text(key, entry.value) {
+            rows.push(FieldRow::readonly(text).with_key(ListItemKey::from_u64(next_key)));
+            next_key += 1;
+        }
     }
 
     let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index);
@@ -5670,5 +5725,38 @@ mod tests {
             Refresh::Rebuild(screen) => assert_eq!(screen.id(), Some(ScreenId::WhyPage)),
             Refresh::Gone => panic!("the why? page has no subject that can vanish -- must never be Gone"),
         }
+    }
+
+    #[test]
+    fn fault_consequence_text_is_absent_when_no_value_was_ever_wired() {
+        assert_eq!(fault_consequence_text(FaultKey::UsbSupplyLow, None), None, "absent, never faked (parent design §15)");
+    }
+
+    #[test]
+    fn fault_consequence_text_renders_the_real_count_not_a_saturated_one() {
+        let text = fault_consequence_text(FaultKey::BufOverflow, Some(FaultValue::Count(140))).expect("BufOverflow+Count must produce text");
+        assert!(text.contains("140"), "line 3 must show the REAL number, unlike Home's x99+ saturation: got {text:?}");
+    }
+
+    #[test]
+    fn fault_consequence_text_renders_the_supply_ratio_as_a_decimal() {
+        // q8: 256 == 1.00x nominal.
+        let text = fault_consequence_text(FaultKey::UsbSupplyLow, Some(FaultValue::Ratio(159))).expect("UsbSupplyLow+Ratio must produce text");
+        assert!(text.contains("0.62"), "159/256 = 0.621... must render as 0.62x: got {text:?}");
+    }
+
+    #[test]
+    fn why_page_builds_without_panicking_when_some_keys_have_a_value_and_some_dont() {
+        // Structural smoke test for the wiring itself (the row-presence
+        // logic is proven directly via `fault_consequence_text`'s own
+        // tests above): a mix of a valueless key (AirCongested) and a
+        // valued one (BufOverflow) must build cleanly with no line 3 for
+        // the former and one for the latter.
+        let mut model = BtModel::default();
+        model.fault_log.record(FaultKey::AirCongested, Instant::from_micros(0), None, 3);
+        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(1), Some(FaultValue::Count(14)), 14);
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let refresh = build_why_page_screen(&model, Instant::from_micros(1), &order, &ScreenCarry::default());
+        assert!(matches!(refresh, Refresh::Rebuild(_)));
     }
 }

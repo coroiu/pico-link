@@ -141,8 +141,28 @@ fn render_dim_swatch() {
     println!("wrote fault_strip_probe_dim_swatch.png (6x)");
 }
 
+fn measure_why_page_consequence_texts() {
+    let value_font = font::value(); // the why? page's readonly-row font (RowStyle::FIELD)
+    let budget: i32 = 206 - 12; // row width - left_margin, no value/caret on these rows
+    println!("why? page line-3 consequence texts (font::value(), budget ~{budget}px, no ellipsis -- FieldList clips, not truncates):");
+    // These strings must match app.rs's `fault_consequence_text` exactly --
+    // duplicated here (not calling the private fn) purely to measure width
+    // against the row budget before shipping the wording.
+    let samples = ["ring dry, min fill 0ms", "ring full, 140 dropped", "supply 0.62x nominal", "air busy, x3 deferred", "link dropped x2", "trim dropped x22"];
+    for sample in samples {
+        let w = value_font
+            .get_rendered_dimensions_aligned(sample, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
+            .unwrap()
+            .unwrap()
+            .size
+            .width;
+        println!("  {sample:?}: {w}px -- {}", if (w as i32) <= budget { "FITS" } else { "OVERFLOWS, will be hard-clipped" });
+    }
+}
+
 fn main() {
     measure_fonts();
+    measure_why_page_consequence_texts();
     render_dim_swatch();
 
     let now = 0u64;
@@ -210,4 +230,34 @@ fn main() {
     render_state("7b_recent", &nominal_hero().with_fault_log(log), recent_at);
     let retired_at = pico_link_core::run::FAULT_RETIRE.as_micros() as u64 + 5_000_000;
     render_state("7c_retired", &nominal_hero().with_fault_log(log), retired_at);
+
+    render_why_page_with_scroll();
+}
+
+/// The `why?` page fixture (design §10.7), via the real `App` +
+/// `Navigator` round trip (`ShortcutX` on Home), scrolled -- not the
+/// `HeroStatusView` in isolation like the fixtures above, since the page
+/// is a separate `Screen`, not part of the hero composite.
+fn render_why_page_with_scroll() {
+    use pico_link_core::app::{App, FaultValue};
+    use pico_link_core::input::NavIntent;
+
+    let mut app = App::new(240, 240);
+    app.tick(0);
+    // All 6 keys, so the page has more blocks than fit on screen at once.
+    app.on_fault_raised(FaultKey::BufStarved, Some(FaultValue::Millis(0)), 9);
+    app.on_fault_raised(FaultKey::BufOverflow, Some(FaultValue::Count(14)), 14);
+    app.on_fault_raised(FaultKey::UsbSupplyLow, Some(FaultValue::Ratio(159)), 5);
+    app.on_fault_raised(FaultKey::AirCongested, Some(FaultValue::Count(3)), 3);
+    app.on_fault_raised(FaultKey::AirLinkLost, None, 2);
+    app.on_fault_raised(FaultKey::EncResync, Some(FaultValue::Count(22)), 22);
+    app.tick(1_000_000);
+
+    app.handle_input(vec![NavIntent::ShortcutX]); // Home -> why? page
+    app.handle_input(vec![NavIntent::Down, NavIntent::Down, NavIntent::Down, NavIntent::Down]); // scroll down
+
+    let output = app.render();
+    let path = "fault_strip_probe_8_why_page_scrolled.png";
+    dump_png_scaled(&output, path, SCALE);
+    println!("wrote {path} ({}x{} at {SCALE}x)", output.width() * SCALE, output.height() * SCALE);
 }
