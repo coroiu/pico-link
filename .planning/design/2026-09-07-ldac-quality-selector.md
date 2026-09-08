@@ -374,6 +374,111 @@ that happens — the check simply starts on row 4.
 
 ---
 
+## 7.1 AMENDMENT 5 (2026-09-08, bead `pico-link-zl75`) — a paired device that is not the live link
+
+**The case §7 did not cover.** §7 rules on `ldac_quality == 0` but silently
+assumes the device is in front of you as a live link. The implementation had to
+decide the *disconnected* case on its own and gated the row on
+`ldac_quality != 0` (`core/src/app.rs:1691`). That makes the row's existence
+depend on having already used the row: a paired device that is not the current
+link and was never configured can never show `QUALITY`, from any button
+sequence, forever. Andreas hit exactly this on 2026-09-08 and read it as a bug.
+
+> **RULING. Yes — the `QUALITY` row appears for a paired, currently
+> disconnected device that has never been configured, provided we have ever
+> observed LDAC on that device. `ldac_quality != 0` is the wrong gate and is
+> withdrawn.**
+
+**Why this is not a new opinion but a correction.** §7's ruling is *"`0` is a
+storage state, never a display state."* The `ldac_quality != 0` gate makes `0`
+the most consequential display state on the page — it decides whether the row
+exists. And §8's *"explicitly ALLOWED: picking a quality while disconnected"*
+is unreachable in practice if the only devices that may be picked for while
+disconnected are the ones already picked for. The absent-not-dim rule (§8.1)
+is untouched: it says the row is absent **when LDAC is not effective-or-pinned**
+— a statement about the codec, not about whether a setting was ever saved. The
+implementation reached for `ldac_quality` only because it is the sole per-device
+LDAC-flavoured field that exists (`PairedDevice` today is
+`{addr, name, mru_seq, ldac_quality}`; `core` has no codec pin — see
+`app.rs:1569`). The proxy was reasonable; it is still wrong.
+
+### The mechanism: a separate persisted `ldac_seen` bit
+
+Ada's alternative is adopted, and for a reason of my own beyond her structural
+one:
+
+- **Do not seed `ldac_quality`.** Besides overloading intent with observation
+  (the same defect `pico-link-88xs` just removed), seeding destroys §7's second
+  wanted consequence outright: *un-chosen devices follow the firmware default
+  forward.* A device auto-seeded to `1` is pinned to today's default for life,
+  so the day the shipped default becomes Adaptive (§7's recommendation), every
+  device the user never touched stays behind. The 1-based encoding was bought
+  precisely to keep that distinction; spending it here wastes the byte.
+- **`ldac_seen`: one persisted bit per paired device, meaning "this link has
+  negotiated LDAC at least once."** Set when `Event::CodecChanged` reports LDAC
+  for the connected device — which fires at A2DP codec negotiation, at *connect*
+  time, before any PCM (established in `pico-link-zl75`'s investigation). Never
+  cleared except by `Forget`. Write-once: only touch flash on the 0→1 edge, not
+  every connect.
+
+**The presence gate becomes:**
+
+| Branch | Condition |
+|---|---|
+| Connected | live codec is LDAC — **unchanged** |
+| Disconnected | `ldac_seen \|\| ldac_quality != 0` |
+
+The second term (`ldac_quality != 0`) is kept deliberately as a free migration: it
+preserves the row for devices already configured under the old build, whose
+`ldac_seen` bit will be `0` in existing flash records.
+
+**The connected branch is not routed through the bit.** It stays keyed off the
+live codec so a fresh connect shows the row immediately, without waiting on a
+persist round-trip.
+
+### What the row reads for a seen-but-never-configured device
+
+**Exactly what §7 already prescribes, with no new string invented:** the
+effective built-in default, rendered as a fixed value, with the check on it in
+the picker. Today that is `QUALITY   990 kbps`, check on row 1. There is no
+`Default`, no `—`, no blank gutter, and specifically **not** `Adaptive` — that
+would be a claim about a choice nobody made and would break the check-follows-
+stored-value rule of §5.1.
+
+This does not violate §15's no-faked-numbers rule. That rule forbids inventing
+a *measurement*; `990 kbps` here is a *setting*, and it is true — a device with
+`ldac_quality == 0` will genuinely run the firmware default on its next connect.
+The value is identical to what the same device shows when connected and
+never configured, which is the point: the row must not change its story
+depending on whether the link happens to be up.
+
+### What stays out of reach, correctly
+
+A device that has been paired but has **never** completed a codec negotiation
+has no evidence it does LDAC at all. Its row stays absent, and that is §8.1
+working as intended, not a residual gap — offering an LDAC-only control for a
+link we have never seen do LDAC is the dim-row noise §8.1 rejects. The gap this
+amendment closes is narrower and is the one that was actually broken:
+**"reachable only while it is the live link" becomes "reachable forever once it
+has ever been the live link."**
+
+### Handoff for this amendment
+
+- **`ldac_seen` is a capability observation and must never be rendered.** It
+  gates the row's presence and nothing else. In particular it must not feed the
+  `CODEC` row — device-page §3.1 rules that `CODEC` describes the link and the
+  pin, and a last-seen codec displayed there would be the same intent/reality
+  confusion in a new place. If a richer `last_codec` field is ever wanted, it is
+  a separate decision with that constraint attached.
+- Ruby: `PairedDevice` gains `ldac_seen: bool`, persisted alongside
+  `ldac_quality`; set on the LDAC `CodecChanged` edge; cleared only by `Forget`.
+  Replace the `ldac_quality != 0` term at `app.rs:1691` per the table above.
+- Tess: one new screenshot — **device page, disconnected, `ldac_seen`, never
+  configured → `QUALITY   990 kbps`** — and one test that the row is still
+  absent for a paired device that has never negotiated LDAC.
+
+---
+
 ## 8. What the user must not be able to do
 
 1. **Reach the picker when LDAC is not effective-or-pinned.** The row is
