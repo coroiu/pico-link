@@ -653,10 +653,13 @@ mod tests {
 
     #[test]
     fn scan_ending_with_zero_devices_moves_to_nothing_found() {
+        // Bead pico-link-88xs: scan-end detection moved off
+        // `LinkStateChanged` onto `Event::DiscoveryStateChanged` -- see
+        // `App::on_scan_ended_if_applicable`'s doc comment.
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_event(Event::LinkStateChanged(LinkState::Scanning));
-        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
+        app.handle_event(Event::DiscoveryStateChanged { scanning: false });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::NothingFound);
     }
 
@@ -665,7 +668,7 @@ mod tests {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
-        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        app.handle_event(Event::DiscoveryStateChanged { scanning: false });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Scanning { started: untimed() });
     }
 

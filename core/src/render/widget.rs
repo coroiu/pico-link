@@ -27,7 +27,6 @@ use core::convert::Infallible;
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
-use crate::app::LinkState;
 use crate::input::NavIntent;
 use crate::panel::Button;
 use crate::platform::OutputRequest;
@@ -106,6 +105,32 @@ pub enum ChromeStatus {
     Neutral,
 }
 
+/// The A2DP/Bluetooth title-bar glyph's resolved presentation state (bead
+/// `pico-link-88xs`, design `.planning/design/2026-09-08-link-state-vs-
+/// discovery-axis.md` section 5). The glyph now has TWO independent
+/// domain inputs -- [`crate::app::LinkState`] and
+/// [`crate::app::BtModel::discovering`] -- so the contributing widget
+/// (`home.rs`) resolves them down to this one presentation value, rather
+/// than [`ChromeContribution::link`] carrying `LinkState` directly the way
+/// it used to. This deliberately amends `link`'s own earlier doc-comment
+/// ruling that reusing `LinkState` was enough, on that ruling's own stated
+/// principle: independent axes of domain state must be able to read
+/// differently on screen at once, and once there are two axes feeding one
+/// glyph, the chrome should receive the resolved answer, not both inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkGlyph {
+    /// Rendered in [`super::theme::palette::TEXT_SECONDARY`].
+    Idle,
+    /// Rendered in [`super::theme::palette::STATUS_WARNING`] -- either the
+    /// link is mid-connect, or a GAP inquiry is currently running
+    /// (regardless of link state).
+    Busy,
+    /// Rendered in [`super::theme::palette::BRAND_BRIGHT`] -- the A2DP
+    /// link is up, whether or not a scan happens to be running
+    /// concurrently (design section 1.1: a scan must never demote this).
+    Live,
+}
+
 /// A title-bar volume reading, in the display's own 0..100 percent domain
 /// (see [`crate::app::VolumeState::percent`] -- never the raw 0..127
 /// AVRCP level, per design section 3). `muted` is carried separately from
@@ -173,12 +198,11 @@ pub struct ChromeContribution {
     /// review: link connectivity and general app status are independent
     /// axes of "state" that must be able to read differently on screen at
     /// the same time (e.g. synced *and* disconnected). `None` omits the
-    /// glyph entirely — see `Screen::render`'s handling. Reuses
-    /// [`crate::app::LinkState`] (the same coarse Bluetooth lifecycle C
-    /// reports over `pl_ui_set_link_state`) rather than inventing a
-    /// separate chrome-only enum: the chrome doesn't need a fifth concept
-    /// of link state.
-    pub link: Option<LinkState>,
+    /// glyph entirely — see `Screen::render`'s handling. Bead
+    /// `pico-link-88xs`: [`LinkGlyph`] (the RESOLVED presentation value),
+    /// not [`crate::app::LinkState`] directly — see that type's doc
+    /// comment for why this field changed shape.
+    pub link: Option<LinkGlyph>,
     /// Whether the focused widget's codec link is currently in the
     /// design's fallback state (`.planning/design/2026-08-28-on-device-ui.md`
     /// section 6.2, link 3 of the five-link fallback chain: the X-rail

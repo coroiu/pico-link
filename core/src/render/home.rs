@@ -99,7 +99,7 @@ use super::message::MessageView;
 use super::paint_key::PaintKey;
 use super::rail::ButtonLabel;
 use super::screen::Screen;
-use super::widget::{Action, ChromeContribution, FocusEvent, Verb, Widget};
+use super::widget::{Action, ChromeContribution, FocusEvent, LinkGlyph, Verb, Widget};
 
 /// Home's title for the explicit "no device connected" screen `ShortcutY`
 /// pushes when there's nothing to open a device page for (bead
@@ -157,6 +157,12 @@ struct HomeView {
     /// widget's codec/bitrate fields; see [`HomeView::new`]'s doc
     /// comment).
     link_state: LinkState,
+    /// Whether the radio is currently running a GAP inquiry -- the second,
+    /// independent input `chrome_contribution` resolves alongside
+    /// `link_state` into one [`LinkGlyph`] (bead `pico-link-88xs`, design
+    /// `.planning/design/2026-09-08-link-state-vs-discovery-axis.md`
+    /// section 5).
+    discovering: bool,
     /// The connected device's address, if any -- read by `ShortcutY` to
     /// decide whether to push the device page or the explicit "no device"
     /// message (bead `pico-link-hr30`). A snapshot, same staleness
@@ -271,6 +277,7 @@ impl HomeView {
         }
         .with_volume(hero_volume);
         let link_state = model.link_state;
+        let discovering = model.discovering;
         let connected_addr = model.connected_addr;
 
         let model = model.clone();
@@ -311,6 +318,7 @@ impl HomeView {
             hero,
             menu,
             link_state,
+            discovering,
             connected_addr,
             model: model_for_shortcut_y,
             commands: commands_for_shortcut_y,
@@ -319,6 +327,19 @@ impl HomeView {
 
     fn face(&self) -> HomeFace {
         *self.home_face.borrow()
+    }
+
+    /// Resolves `link_state` + `discovering` down to one [`LinkGlyph`]
+    /// (bead `pico-link-88xs`, design section 5). `Connected` always wins
+    /// -- a scan running concurrently with a live link must render exactly
+    /// as it did before the scan started (design section 1.1: the whole
+    /// point is that the glyph must never demote on a scan).
+    fn resolved_link_glyph(&self) -> LinkGlyph {
+        match (self.link_state, self.discovering) {
+            (LinkState::Connected, _) => LinkGlyph::Live,
+            (LinkState::Connecting, _) | (_, true) => LinkGlyph::Busy,
+            (LinkState::Idle, false) => LinkGlyph::Idle,
+        }
     }
 }
 
@@ -450,7 +471,7 @@ impl Widget for HomeView {
                 // was "set" (Settings) before that ruling repurposed Y; see
                 // `on_intent`'s `ShortcutY` arm and this bead's doc comment.
                 contribution.y = Some(ButtonLabel::Live(String::from("link")));
-                contribution.link = Some(self.link_state);
+                contribution.link = Some(self.resolved_link_glyph());
                 Some(contribution)
             }
             // A's word is entirely `activation()`'s job now (design rule
