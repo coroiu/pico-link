@@ -453,6 +453,30 @@ typedef struct {
     uint32_t last_packet_count;
     uint64_t last_packet_change_us;
 
+    // Bead pico-link-9eq2.3.2, design `.planning/design/2026-09-07-audio-
+    // fault-model.md` §5.6.2: the media-timer handler's own `host_silent`
+    // local, stashed here every tick so fault.c's thread-context evaluator
+    // (which has no other way to see it -- host_silent is computed fresh
+    // each IRQ-context tick and never otherwise escapes this function) can
+    // gate on the SAME signal the fhf trim and the ABR controller already
+    // gate on, rather than re-deriving it from a second formula that could
+    // drift out of sync with this one. Single aligned word, IRQ-context
+    // writer / thread-context reader -- same benign-race convention as
+    // every other volatile in this struct.
+    volatile bool host_silent;
+
+    // Bead pico-link-9eq2.3.2, design §6.2: backs the `AIR LINK LOST` key
+    // (ord 4), otherwise the one catalogue row with no counter at all
+    // (design §1.4 row 24). Incremented in the STREAM_SUSPENDED/
+    // STREAM_RELEASED/SIGNALING_CONNECTION_RELEASED handlers, ONLY when the
+    // transition catches the pipeline actually STREAMING and the host was
+    // not the one who went silent (i.e. not our own auto-pause) -- see each
+    // handler's capture of `was_streaming_not_silent` BEFORE it mutates
+    // `state`. IRQ-context producer (same BTstack packet-handler context as
+    // every other one-off transition counter in this file), thread-context
+    // consumer (pl_a2dp_link_lost_events(), fault.c).
+    volatile uint32_t link_lost_events;
+
     // --- design sec 7 counters -- IRQ-context producer, thread-context
     // (pl_a2dp_report) consumer. Plain volatile, no formatting here. ---
     volatile uint32_t underrun_events;
@@ -2169,6 +2193,10 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     }
     bool host_silent =
         !pl_usb_audio_streaming() || (s_ctx.last_packet_change_us != 0 && (pbv_now_us - s_ctx.last_packet_change_us) > 200000u);
+    // Bead pico-link-9eq2.3.2: stash for fault.c's thread-context
+    // evaluator -- see s_ctx.host_silent's own doc comment above. Plain
+    // assignment, no new time_us_64() call, no new formula.
+    s_ctx.host_silent = host_silent;
 
     if (s_ctx.state == PL_A2DP_MEDIA_PRIMING) {
         // Bead pico-link-pbv round 2 (C2-4): prime to the structurally
@@ -3288,6 +3316,15 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_enc_state = PL_ENC_STATE_IDLE;
 #endif
             pl_log("a2dp: stream suspended (auto_resume=%d)\r\n", s_ctx.auto_resume ? 1 : 0);
+            // Bead pico-link-9eq2.3.2, design §6.2: captured BEFORE the
+            // state/reset writes below overwrite what this transition is
+            // dropping FROM. A suspend that catches us mid-stream, with the
+            // host genuinely still sending (not our own auto-pause), is a
+            // real link loss -- an auto-pause-driven suspend (host_silent)
+            // is expected behaviour and must not count.
+            if (s_ctx.state == PL_A2DP_MEDIA_STREAMING && !s_ctx.host_silent) {
+                s_ctx.link_lost_events++;
+            }
             // Bead pico-link-85v (D6): flush the tx ring -- rtp_next is
             // deliberately PRESERVED here (not reset) so auto-resume
             // continues one timeline, unlike ESTABLISHED/RELEASED below.
@@ -3320,6 +3357,11 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_enc_state = PL_ENC_STATE_IDLE;
 #endif
             pl_log("a2dp: stream released\r\n");
+            // Bead pico-link-9eq2.3.2, design §6.2: same capture-before-
+            // mutate as STREAM_SUSPENDED above.
+            if (s_ctx.state == PL_A2DP_MEDIA_STREAMING && !s_ctx.host_silent) {
+                s_ctx.link_lost_events++;
+            }
             s_ctx.state = PL_A2DP_MEDIA_IDLE;
             s_ctx.codec = NULL;
             if (s_ctx.timer_armed) {
@@ -3373,6 +3415,13 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // existing non-Connected handling already does, so no
             // separate codec-clear push is needed here.
             pl_bt_push_link_state_disconnected();
+            // Bead pico-link-9eq2.3.2, design §6.2: same capture-before-
+            // mutate as STREAM_SUSPENDED/STREAM_RELEASED above -- an ACL
+            // dropping out from under a live stream is exactly what this
+            // key exists to name.
+            if (s_ctx.state == PL_A2DP_MEDIA_STREAMING && !s_ctx.host_silent) {
+                s_ctx.link_lost_events++;
+            }
             s_ctx.connect_succeeded_pushed = false;
             s_ctx.a2dp_cid = 0;
             s_ctx.codec = NULL;
@@ -3515,6 +3564,59 @@ bool pl_a2dp_streaming(void) {
     return s_ctx.state != PL_A2DP_MEDIA_IDLE;
 }
 
+// Bead pico-link-9eq2.3.2, design §7.2/§5.6.1: unlike pl_a2dp_streaming()
+// above (true for PRIMING too), fault.c needs the EXACT
+// PL_A2DP_MEDIA_STREAMING condition its gating trap specifies -- faults
+// measured during PRIMING (still filling the cushion, no real drain rate
+// yet) would be meaningless, same reasoning as the trim/ABR gates already
+// in this file.
+bool pl_a2dp_media_streaming(void) {
+    return s_ctx.state == PL_A2DP_MEDIA_STREAMING;
+}
+
+// Bead pico-link-9eq2.3.2, design §5.6.2: exposes the media-timer
+// handler's own host_silent latch (s_ctx.host_silent's doc comment above)
+// to fault.c's thread-context evaluator.
+bool pl_a2dp_host_silent(void) {
+    return s_ctx.host_silent;
+}
+
+// --- Bead pico-link-9eq2.3.2, design §7.2: plain getters over existing
+// s_ctx counters, added for fault.c. Same pattern as every getter in this
+// file -- a single aligned-word read, thread-context safe, no locking. ---
+
+uint32_t pl_a2dp_underrun_events(void) {
+    return s_ctx.underrun_events;
+}
+
+uint32_t pl_a2dp_resync_events(void) {
+    return s_ctx.resync_events;
+}
+
+uint32_t pl_a2dp_resync_drops(void) {
+    return s_ctx.resync_drops;
+}
+
+uint32_t pl_a2dp_stop_queue_full(void) {
+    return s_ctx.stop_queue_full;
+}
+
+uint32_t pl_a2dp_dwell_max_us(void) {
+    return s_ctx.dwell_max_us;
+}
+
+uint32_t pl_a2dp_link_lost_events(void) {
+    return s_ctx.link_lost_events;
+}
+
+uint32_t pl_a2dp_stop_dwell(void) {
+    return s_ctx.stop_dwell;
+}
+
+uint32_t pl_a2dp_credit_clamp_events(void) {
+    return s_ctx.credit_clamp_events;
+}
+
 // Bead pico-link-7jol.5. See a2dp.h's doc comment.
 bool pl_a2dp_is_connected_ldac(const uint8_t addr[6]) {
     return s_ctx.state != PL_A2DP_MEDIA_IDLE && s_ctx.codec == &pl_codec_ldac && memcmp(s_ctx.connect_addr, addr, 6) == 0;
@@ -3584,7 +3686,7 @@ void pl_a2dp_debug_skip_media_ticks(uint32_t ticks) {
 }
 #endif
 
-void pl_a2dp_report(uint32_t report_dt_us) {
+void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // Bead pico-link-pbv round 2 (C2-11): every rate the reader computes
     // from two report lines (enc_frames/s, tick rate, etc) MUST divide by
     // the real interval since the last report, not an assumed 1s -- round
@@ -3648,12 +3750,21 @@ void pl_a2dp_report(uint32_t report_dt_us) {
     // resync_drops's frame count -- the injection test's pass criterion
     // needs both: exactly one event distinguishes a correct single cut
     // from a double-cut bug that resync_drops alone can't reveal.
+    //
+    // Bead pico-link-9eq2.3.2, design §5.6.5: fill_min used to be read
+    // here directly via pl_usb_audio_fill_min() -- but that accessor is
+    // DESTRUCTIVE ON READ (it resets the windowed minimum), and fault.c's
+    // evaluator now also needs it every window. Two readers would steal
+    // each other's windows and both produce garbage (the exact "two
+    // readers on one channel" failure class this project already paid for
+    // once on the CDC tty). fault.c is now the SOLE caller; main.c passes
+    // its cached value in here as `fault_fill_min_bytes` instead.
     pl_log(
         "a2dp: frames_per_packet=%lu credit_clamped_samples=%lu credit_clamp_events=%lu flush_frames=%lu "
         "resync_drops=%lu resync_events=%lu fill_ema=%ld fill_min=%lu\r\n",
         (unsigned long)s_ctx.frames_per_packet, (unsigned long)s_ctx.credit_clamped_samples,
         (unsigned long)s_ctx.credit_clamp_events, (unsigned long)s_ctx.flush_frames, (unsigned long)s_ctx.resync_drops,
-        (unsigned long)s_ctx.resync_events, (long)pl_usb_audio_fb_fill_ema(), (unsigned long)pl_usb_audio_fill_min()
+        (unsigned long)s_ctx.resync_events, (long)pl_usb_audio_fb_fill_ema(), (unsigned long)fault_fill_min_bytes
     );
     // Bead pico-link-7jol.3, design sec 7: the LDAC ABR controller's
     // observability line. quality_requested and quality_applied are

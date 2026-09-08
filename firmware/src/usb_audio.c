@@ -443,6 +443,16 @@ static int32_t s_fb_i_accum;
 // sampled yet" (link not up / no streaming started).
 static uint32_t s_fill_min = 0xFFFFFFFFu;
 
+// Bead pico-link-9eq2.3.2, design §6.1: "the single most valuable missing
+// counter in the firmware" -- counts ticks on which this function's
+// output was clamped at PL_FB_MAX_PPM, OR the integral accumulator was
+// clamped at PL_FB_I_ACCUM_MAX (the anti-windup bound below). Answers "does
+// the feedback loop still have authority to correct drift?" -- pico-link-
+// 0gtk is precisely the case where the answer was no and nothing said so.
+// Justified independently of the fault strip: belongs in pl_a2dp_report's
+// output regardless (backs the quiet `FB RAIL` key, design §3.3).
+static volatile uint32_t s_fb_rail_ticks;
+
 void pl_usb_audio_feedback_task(void) {
     uint32_t fill_now = pl_pcm_fill_bytes();
     if (fill_now < s_fill_min) {
@@ -463,20 +473,38 @@ void pl_usb_audio_feedback_task(void) {
     // keeps growing while saturated and then has to unwind before the loop
     // responds at all.
     s_fb_i_accum -= err_bytes;
+    // Bead pico-link-9eq2.3.2 (design §6.1): one tick counts as "rail" at
+    // most once, even if both clamps below fire on it -- a bool, checked
+    // once at the end, not two independent increments.
+    bool rail_this_tick = false;
     if (s_fb_i_accum > PL_FB_I_ACCUM_MAX) {
         s_fb_i_accum = PL_FB_I_ACCUM_MAX;
+        rail_this_tick = true;
     }
     if (s_fb_i_accum < -PL_FB_I_ACCUM_MAX) {
         s_fb_i_accum = -PL_FB_I_ACCUM_MAX;
+        rail_this_tick = true;
     }
     int32_t ppm = p_ppm + (s_fb_i_accum / PL_FB_KI_DIV);
     if (ppm > PL_FB_MAX_PPM) {
         ppm = PL_FB_MAX_PPM;
+        rail_this_tick = true;
     }
     if (ppm < -PL_FB_MAX_PPM) {
         ppm = -PL_FB_MAX_PPM;
+        rail_this_tick = true;
+    }
+    if (rail_this_tick) {
+        s_fb_rail_ticks++;
     }
     tud_audio_fb_set((uint32_t)((int32_t)PL_FB_NOMINAL_Q16 + (int32_t)((int64_t)PL_FB_NOMINAL_Q16 * ppm / 1000000)));
+}
+
+// Bead pico-link-9eq2.3.2, design §6.1. See s_fb_rail_ticks's doc comment
+// above. Thread-context safe (plain aligned read, same convention as every
+// other counter this file exposes).
+uint32_t pl_usb_audio_fb_rail_ticks(void) {
+    return s_fb_rail_ticks;
 }
 
 // Bead pico-link-pbv (C6): exposes the EMA pl_usb_audio_feedback_task
