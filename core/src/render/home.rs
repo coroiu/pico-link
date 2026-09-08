@@ -757,14 +757,17 @@ mod tests {
         );
     }
 
-    /// `pico-link-hr30`: X is deliberately left unbound and unlabelled on
-    /// both faces until the fault strip detail screen it targets exists
-    /// (`pico-link-9eq2.3`) -- see the module doc's "X is left inert on
-    /// both faces" section. Rail default for an absent `chrome_contribution`
-    /// entry is [`ButtonLabel::Inert`] (`ButtonLabels::default`), so `None`
-    /// here is the correct assertion, not an oversight.
+    /// `pico-link-9eq2.3.3` (superseding the old `pico-link-hr30`-era "X is
+    /// permanently inert" ruling, now that the fault strip's `why?` page
+    /// exists): X stays unbound and unlabelled on BOTH faces whenever the
+    /// fault strip is empty (design `.planning/design/2026-09-07-home-
+    /// fault-strip.md` §8.1 -- `fresh_home_view()`'s model has an empty
+    /// `FaultLog`, so this is exactly the empty-strip case). Rail default
+    /// for an absent `chrome_contribution` entry is [`ButtonLabel::Inert`]
+    /// (`ButtonLabels::default`), so `None` here is the correct assertion,
+    /// not an oversight. See `shortcut_x_*` below for the non-empty case.
     #[test]
-    fn x_stays_unbound_and_unlabelled_on_both_faces() {
+    fn x_stays_unbound_and_unlabelled_on_both_faces_while_the_strip_is_empty() {
         let mut view = fresh_home_view();
         assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), None);
         assert!(matches!(view.on_intent(NavIntent::ShortcutX), Action::None));
@@ -772,6 +775,35 @@ mod tests {
         view.on_focus(FocusEvent::Activated); // status -> menu
         assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), None);
         assert!(matches!(view.on_intent(NavIntent::ShortcutX), Action::None));
+    }
+
+    // --- pico-link-9eq2.3.3: ShortcutX -> the `why?` page, live only
+    // while the fault strip is non-empty ---
+
+    fn home_view_with_one_fault() -> HomeView {
+        let mut model = BtModel::default();
+        model.fault_log.record(crate::app::FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let home_face = Rc::new(RefCell::new(HomeFace::default()));
+        let commands = Rc::new(RefCell::new(VecDeque::new()));
+        let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
+        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
+        let why_page_order = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+    }
+
+    #[test]
+    fn x_is_labelled_why_on_both_faces_once_the_strip_is_non_empty() {
+        let mut view = home_view_with_one_fault();
+        assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), Some(ButtonLabel::Live(String::from("why?"))));
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), Some(ButtonLabel::Live(String::from("why?"))));
+    }
+
+    #[test]
+    fn shortcut_x_pushes_the_why_page_when_the_strip_is_non_empty() {
+        let mut view = home_view_with_one_fault();
+        let screen = pushed_screen(view.on_intent(NavIntent::ShortcutX));
+        assert_eq!(screen.id(), Some(ScreenId::WhyPage), "X must push the why? page's own identified ScreenId");
     }
 
     /// Regression test for the review finding on this bead: a `None`

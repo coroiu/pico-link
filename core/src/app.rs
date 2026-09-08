@@ -5602,4 +5602,73 @@ mod tests {
             other => panic!("expected WizardPhase::Scanning, got {other:?}"),
         }
     }
+
+    // --- `why?` page (design `.planning/design/2026-09-07-home-fault-
+    // strip.md` §8, bead `pico-link-9eq2.3.3`) ---
+
+    #[test]
+    fn relative_time_formats_seconds_minutes_and_hours() {
+        let base = Instant::from_micros(0);
+        assert_eq!(relative_time(base + Duration::from_secs(8), base), "8s ago");
+        assert_eq!(relative_time(base + Duration::from_secs(59), base), "59s ago");
+        assert_eq!(relative_time(base + Duration::from_secs(60), base), "1m ago");
+        assert_eq!(relative_time(base + Duration::from_secs(240), base), "4m ago");
+        assert_eq!(relative_time(base + Duration::from_secs(3599), base), "59m ago");
+        assert_eq!(relative_time(base + Duration::from_secs(3600), base), "1h ago");
+        assert_eq!(relative_time(base + Duration::from_secs(7200), base), "2h ago");
+    }
+
+    #[test]
+    fn why_page_appends_a_newly_fired_key_at_the_bottom_rather_than_resorting() {
+        // Orchestrator ruling on this bead: "the page FREEZES its block
+        // ordering on entry ... A key that fires for the first time while
+        // the page is open appends at the BOTTOM rather than jumping to
+        // the top."
+        let mut model = BtModel::default();
+        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let order = Rc::new(RefCell::new(vec![FaultKey::BufOverflow])); // simulates the page already open, frozen on entry
+        let carry = ScreenCarry::default();
+
+        // A second key fires while the page is open -- MORE recently than
+        // BufOverflow, which would sort first under a fresh most-recently-
+        // active-first re-sort.
+        model.fault_log.record(FaultKey::BufStarved, Instant::from_micros(1_000_000), None, 1);
+        let _ = build_why_page_screen(&model, Instant::from_micros(1_000_000), &order, &carry);
+
+        assert_eq!(
+            *order.borrow(),
+            vec![FaultKey::BufOverflow, FaultKey::BufStarved],
+            "the newly-fired key must append at the end, never jump ahead of the frozen order"
+        );
+    }
+
+    #[test]
+    fn why_page_does_not_reorder_already_present_keys_on_a_refresh() {
+        let mut model = BtModel::default();
+        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        model.fault_log.record(FaultKey::BufStarved, Instant::from_micros(1_000_000), None, 1);
+        // Order was frozen with BufStarved (the more recent) listed FIRST
+        // -- deliberately the opposite of first-seen, to prove a refresh
+        // doesn't silently re-derive it.
+        let order = Rc::new(RefCell::new(vec![FaultKey::BufStarved, FaultKey::BufOverflow]));
+        let carry = ScreenCarry::default();
+
+        // A repeat raise of an already-present key must not move it.
+        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(2_000_000), None, 5);
+        let _ = build_why_page_screen(&model, Instant::from_micros(2_000_000), &order, &carry);
+
+        assert_eq!(*order.borrow(), vec![FaultKey::BufStarved, FaultKey::BufOverflow], "a repeat raise of an already-ordered key must not reorder it");
+    }
+
+    #[test]
+    fn why_page_screen_is_identified_and_never_gone() {
+        let mut model = BtModel::default();
+        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let refresh = build_why_page_screen(&model, Instant::from_micros(0), &order, &ScreenCarry::default());
+        match refresh {
+            Refresh::Rebuild(screen) => assert_eq!(screen.id(), Some(ScreenId::WhyPage)),
+            Refresh::Gone => panic!("the why? page has no subject that can vanish -- must never be Gone"),
+        }
+    }
 }
