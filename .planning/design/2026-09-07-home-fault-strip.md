@@ -138,9 +138,9 @@ bright/dim colour pair on a screen whose two status hues are already close.
   count of one is the default and printing it is noise.
 - **No value slot on Home.** Struck from the 2026-09-01 design; see §8.
 
-**Row slot: 12px** (8px ink + 4px leading). *Unmeasured assumption — Ruby must
-confirm against `helvB08`'s real `line_height` probe, exactly as the old doc
-asked and as `hero.rs` does elsewhere.*
+**Row slot: 12px** (8px ink + 4px leading). **CONFIRMED 2026-09-08** against
+`helvB08`'s real line-height of 10px — the 12px slot holds with 2px spare. No
+change.
 
 **Vertical geometry** (absolute panel y, all fixed slots — nothing cursor-derived,
 per `.planning/design/2026-09-01-home-alignment-grid.md`):
@@ -171,9 +171,11 @@ I am designing against slots, not names. Ada owns `pico-link-9eq2.1`; this is
 what the presentation layer can accept. **Anything outside this does not fit and
 must come back to me rather than being silently truncated.**
 
-1. **Name: <= 16 characters, uppercase, ASCII.** At ~6px/char this is ~96px of the
-   105px name field, leaving slack for the wider glyphs. 17+ characters truncates,
-   and a truncated fault name is worse than no fault name.
+1. **Name: <= 16 characters, uppercase, ASCII.** **CONFIRMED 2026-09-08 by
+   measurement, not estimate:** the longest name in Ada's catalogue,
+   `USB SUPPLY LOW`, renders at **94px** against the 105px name field. The 16-char
+   cap holds with room to spare and no name needs re-cutting. 17+ characters
+   truncates, and a truncated fault name is worse than no fault name.
 2. **Every fault declares exactly one glyph class: `Filled` / `Starved` /
    `Neutral`.** Not derived, not inferred at render time — a field on the fault
    kind. If a fault genuinely has both directions it is two faults with two keys.
@@ -210,14 +212,22 @@ A repeat increments the count and refreshes `last_seen`. It never appends a row.
 With <= 6 keys and one row each, the strip cannot scroll and cannot evict a useful
 row. This is unchanged from 2026-09-01 and it is the right answer.
 
-### 6.2 Order is first-seen, stable, growing upward
+### 6.2 Position is first-seen, stable, growing upward
 
 The first fault of the session sits on the bottom row (abs y216) and stays there.
-The next new key appears above it. **Nothing is ever re-sorted.** A row that moves
-between two glances is worse than a row you have to scan for, on a screen read for
-1.5 seconds at a time by someone who was doing something else.
+The next new key appears above it. **Rows are never re-ordered relative to each
+other.** A row that moves between two glances is worse than a row you have to
+scan for, on a screen read for 1.5 seconds at a time by someone who was doing
+something else.
 
 Recency is carried by glyph fill and colour brightness, not by position (§3).
+
+**Scope of this rule, made explicit (ruling, 2026-09-08).** §6.2 governs
+**where a displayed key sits**. It does not govern **which keys are displayed**
+when there are more of them than there are slots — that is §6.4, and the two
+rules are orthogonal by construction. Below the cap (<= 4 non-retired keys) there
+is no interaction at all: every key is shown, in first-seen order, and nothing
+ever moves.
 
 ### 6.3 Dwell — the numbers, and why
 
@@ -250,18 +260,82 @@ ago.
 Retirement and tier are **computed at render time** from `now - last_seen`. No
 timer, no retirement event, no background task.
 
-### 6.4 Overflow
+### 6.4 Overflow — recency selects, first-seen presents
 
-Cap 4 rows. It is a legibility cap, not a space cap: once more than four *kinds*
-of thing are wrong simultaneously, the individual identity has stopped being the
-useful information and "a lot is wrong" is. Show the 3 most-recently-active keys
-plus a fourth row:
+**RULING, 2026-09-08 (Uma).** The v2 draft said "nothing is ever re-sorted" here
+and "show the 3 most-recently-active keys" three paragraphs later, which are not
+the same instruction once five keys are live. The implementer caught it rather
+than picking one silently. This section is the resolution and it is now the only
+statement of the overflow rule.
+
+**Neither draft rule wins outright, because they were answering different
+questions.** Ranking by recency and *drawing in that order* is a moving target
+and is rejected. But so is pure first-seen selection: in a storm it shows the
+three keys that appeared **earliest in the session**, which may all be Recent —
+dim, outlined, calm — while the keys firing right now sit behind `+N MORE`. That
+inverts the entire brief ("tell me what is going wrong, at the moment it goes
+wrong") and produces a strip that looks most placid exactly when things are
+worst. That is the worse failure of the two, and it is not a close call.
+
+So: **recency governs *selection*; first-seen governs *presentation*.**
+
+Cap stays at 4 rows. It is a legibility cap, not a space cap: once more than four
+*kinds* of thing are wrong simultaneously, individual identity has stopped being
+the useful information and "a lot is wrong" is.
+
+**Selection — which 3 keys occupy the content rows.** Let *eligible* = every
+non-retired key (§6.3). If eligible <= 4, all of them are shown and none of this
+applies. Otherwise the displayed set **S** (|S| = 3) is maintained
+**incrementally**, never recomputed by a sort:
+
+1. **Seeding.** The first three eligible keys of the session enter S in the order
+   they are first seen.
+2. **Promotion.** A key that becomes **Live** and is not in S displaces the member
+   of S with the **oldest `last_seen`** — but **only if that member is currently
+   `Recent`**. A Live member is never displaced.
+3. **No Live-on-Live churn.** If every member of S is Live, nothing is displaced.
+   When everything on screen is already firing, *which* three are shown carries
+   no information and stability wins outright. This clause is what makes the rule
+   thrash-free: two keys alternating at 10 Hz cannot swap slots.
+4. **Recent never displaces.** Only a Live key can take a slot. A key going from
+   Retired back to Recent does not evict anything.
+5. **Retirement.** When a member retires (> 120 s), it leaves S and the slot goes
+   to the highest-priority non-member: **Live before Recent, then greater
+   `last_seen`** (i.e. most recently active), ties broken by earlier `first_seen`.
+6. Evaluation happens on the strip's ordinary repaint cadence (§6.5, at most
+   1 Hz), never per fault event.
+
+"Most-recently-active" therefore means **`last_seen` descending, with Live
+outranking Recent**, and it is used **only to choose members** — never to order
+them on screen.
+
+**Presentation — where those 3 keys sit.** The members of S are drawn bottom-up
+in **`first_seen` ascending order among themselves**, exactly per §6.2. The
+oldest-established member of S is on the bottom row; the newest is directly under
+the `+N MORE` row. §6.2's spatial rule is untouched.
+
+**What this costs and why it is the right cost.** A row can still change under a
+glance — but only in one situation: a **stale** row (dim, outlined) is replaced by
+a key that is **firing right now**. That is not cosmetic motion, it is the strip
+delivering its one job. Every other kind of movement — recency reshuffles, sorts,
+ties, repeats — is structurally impossible. The user never sees two bright rows
+trade places.
+
+**The fourth row** is always the top slot (abs y180):
 
 ```
   +2 MORE - PRESS X
 ```
 
-16 characters, no glyph, `TEXT_SECONDARY`.
+`N` = eligible keys not in S (with 6 keys max and 3 shown, N is 1..3). 16
+characters, no glyph, `TEXT_SECONDARY`. Nothing is lost: the `why?` page (§8)
+lists **every** key including retired ones, ordered most-recently-active first.
+
+**Not chosen, and why:** a fifth row (the cap is legibility, not pixels); a
+"worst severity wins" selector (severity is already spent on colour, and an amber
+key firing now is more informative than a red key that stopped four minutes ago);
+freezing S for a dwell period after each change (adds a timer, and clause 3
+already removes the churn the dwell would have absorbed).
 
 ### 6.5 Repaint discipline
 
@@ -602,7 +676,12 @@ one-sided overflow.
  240  +----------------------------------+
 ```
 
-### 10.5 Overflow (5+ live keys)
+### 10.5 Overflow (5+ non-retired keys)
+
+Five keys are eligible; three slots. `USB OVERFLOW` is Live and displaced the
+stalest Recent member (§6.4 clause 2). The three shown are then drawn in
+first-seen order among themselves — recency picked them, position did not move
+for them.
 
 ```
  174  |  ------------------------  # #   |
@@ -728,7 +807,9 @@ formally struck.
 3. Two new palette constants: `STATUS_ERROR_DIM`, `STATUS_WARNING_DIM` (~45-50%
    toward `BACKGROUND`). They must be distinguishable **from each other** and from
    `TEXT_SECONDARY` at 8px — verify on a zoomed capture, the two bright forms are
-   already hue-adjacent.
+   already hue-adjacent. **DONE 2026-09-08: verified distinguishable on a zoomed
+   capture** (an earlier round had asserted this in a doc comment without
+   performing the check; it has now actually been performed).
 4. `IdlePolicy` gains a **third, expiring floor**: `on_fault_wake(now)` plus a
    `fault_hold_until: Option<Instant>` checked in `tick` alongside `mute_or_zero`.
    Same pattern as the mute floor, differing only in that it expires and in that
@@ -737,10 +818,17 @@ formally struck.
    non-empty; nothing scheduled when empty.
 6. The strip's `PaintKey` contribution folds the **derived tier**, never
    `last_seen`.
-7. Confirm the 12px row slot and the 16-character name cap against `helvB08`'s
-   real `line_height` and `get_rendered_dimensions_aligned` — 6px/char is my
-   estimate, not a measurement. **If 16 chars overflows 105px, tell me the real
-   cap and I will re-cut the names with Ada; do not truncate silently.**
+7. ~~Confirm the 12px row slot and the 16-character name cap~~ **CLOSED
+   2026-09-08, both measured and both hold:** `helvB08` line-height is 10px (12px
+   slot fits), and the longest name `USB SUPPLY LOW` measures 94px against the
+   105px field. No names re-cut, no silent truncation, nothing further owed here.
+8. **Overflow selection (§6.4).** The strip needs, per repaint, both the derived
+   tier and `last_seen` *ordering* to maintain the displayed set — but the
+   `PaintKey` still folds **only the derived tier and the drawn values**, never
+   `last_seen` (item 6 is unchanged and remains the binding constraint). The
+   displayed set is state carried across frames, not recomputed presentation, so
+   it must live in `FaultLog` (or beside it), **not in a widget** — widgets do not
+   survive frames on this project.
 
 **Ruby (implementer) — `pico-link-9eq2.3`:**
 1. `FaultLog` in `core`: a **fixed array of 6 entries**, one per key. No `Vec`, no
@@ -785,4 +873,5 @@ formally struck.
 | Session wake cap = 6 | Ship 6. Conservative on purpose; raise only if Andreas reports missing faults. |
 | X = `why?` while non-empty | **Ship it.** This reverses my 2026-09-01 recommendation; §8.1 gives the reason. |
 | Does `Settings > About > Advanced` still get built? | Yes, separately. `why?` is fault-scoped; Advanced is the continuous HUD. Not a blocker for this bead. |
+| Overflow: first-seen vs most-recently-active (§6.2 vs §6.4) | **Ruled 2026-09-08: recency selects, first-seen presents.** See §6.4; the contradiction is closed and the section rewritten. |
 | Should the over/under pair share one row with a flipping glyph? | **No.** They are opposite ends of one quantity but he needs both session counts, and a glyph that flips under him is a moving target. Two keys, two rows, stable order. |

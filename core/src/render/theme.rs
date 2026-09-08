@@ -76,6 +76,25 @@ pub mod palette {
     /// A caution/attention status indicator (`#FFB020`) — e.g. "secret
     /// currently revealed."
     pub const STATUS_WARNING: Rgb565 = Rgb565::new(31, 44, 4);
+    /// [`STATUS_ERROR`] blended exactly 50% toward [`BACKGROUND`] (within
+    /// the design's requested ~45-50% band) — the Home fault strip's
+    /// "Recent" tier for an `Audible` (red) key (design
+    /// `.planning/design/2026-09-07-home-fault-strip.md` §3/§6.3: outline
+    /// glyph, dim colour, 20-120s since last occurrence). Bead
+    /// `pico-link-9eq2.3.3`. Component-wise midpoint:
+    /// `r=(31+1)/2=16, g=(22+4)/2=13, b=(12+4)/2=8`. Verified distinguishable
+    /// from [`STATUS_WARNING_DIM`] and from [`TEXT_SECONDARY`] at 8px on a
+    /// zoomed capture (`core/examples/fault_strip_probe.rs`, its
+    /// `dim_swatch` output) rather than asserted from the hex values alone
+    /// -- confirmed 2026-09-08: at 6x zoom the three read as dark
+    /// maroon-red, dark olive-brown and blue-gray respectively, clearly
+    /// separable by hue, not merely by brightness.
+    pub const STATUS_ERROR_DIM: Rgb565 = Rgb565::new(16, 13, 8);
+    /// [`STATUS_WARNING`] blended exactly 50% toward [`BACKGROUND`] — the
+    /// Home fault strip's "Recent" tier for a `Concealed` (amber) key. Same
+    /// derivation and verification as [`STATUS_ERROR_DIM`]:
+    /// `r=(31+1)/2=16, g=(44+4)/2=24, b=(4+4)/2=4`.
+    pub const STATUS_WARNING_DIM: Rgb565 = Rgb565::new(16, 24, 4);
 }
 
 /// Per-role `u8g2-fonts` accessors. Each returns a fresh, independently

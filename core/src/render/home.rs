@@ -86,10 +86,11 @@ use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
-    build_device_page_screen, build_devices_screen, build_settings_screen, BtModel, Command, DeviceAddr, DeviceEntry, HomeFace, LinkState,
-    Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
+    build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, DeviceAddr, DeviceEntry,
+    FaultKey, FaultLog, HomeFace, LinkState, Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
 };
 use crate::input::NavIntent;
+use crate::platform::Instant;
 
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
@@ -132,8 +133,10 @@ pub fn build_home_screen(
     commands: &Rc<RefCell<VecDeque<Command>>>,
     wizard_phase: &Rc<RefCell<WizardPhase>>,
     wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
+    now: Instant,
+    why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
 ) -> Screen {
-    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices);
+    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order);
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
@@ -179,15 +182,45 @@ struct HomeView {
     /// [`crate::app::build_device_page_screen`], same as every other
     /// `Command`-emitting `PushView` closure in this crate.
     commands: Rc<RefCell<VecDeque<Command>>>,
+    /// A snapshot of `model.fault_log`, for `ShortcutX`'s "is the strip
+    /// non-empty" gate (both `on_intent` and `chrome_contribution`) --
+    /// design `.planning/design/2026-09-07-home-fault-strip.md` §8.1: "X is
+    /// labelled and live only while the strip is non-empty." `Copy`, so
+    /// this is a plain field, not an `Rc` -- same staleness tolerance as
+    /// `connected_addr` above.
+    fault_log: FaultLog,
+    /// A snapshot of the FFI seam's clock (`App`'s own `now_us`), for the
+    /// same two `ShortcutX` call sites `fault_log` serves -- freshness
+    /// tiers and retirement are otherwise always computed against
+    /// [`RenderCtx::now`] at render time (design §6.3), but `on_intent` has
+    /// no `RenderCtx` to read, so this is the one place in this bead that
+    /// falls back to a snapshot instead. Same "never more than one frame
+    /// stale" tolerance as every other field this struct snapshots from
+    /// `BtModel`/`App`.
+    now: Instant,
+    /// The `why?` page's frozen block order (design §8.1/orchestrator
+    /// ruling on `pico-link-9eq2.3.3`: ordering freezes on entry and only
+    /// ever appends) -- `ShortcutX` overwrites this with a fresh
+    /// most-recently-active-first sort every time it pushes the page;
+    /// [`crate::app::build_why_page_screen`] (called both by that push and
+    /// by every subsequent `App::refresh_stack` pass while the page is on
+    /// the stack) only ever appends to it, never re-sorts. Shared with
+    /// `App` via the same "long-lived `Rc<RefCell<_>>` threaded through
+    /// every rebuild" shape `home_face`/`wizard_phase`/`wizard_devices`
+    /// already use.
+    why_page_order: Rc<RefCell<Vec<FaultKey>>>,
 }
 
 impl HomeView {
+    #[allow(clippy::too_many_arguments)] // Mirrors every other screen builder in this crate that threads the wizard's shared Rcs through -- see `build_devices_screen`.
     fn new(
         model: &BtModel,
         home_face: Rc<RefCell<HomeFace>>,
         commands: &Rc<RefCell<VecDeque<Command>>>,
         wizard_phase: &Rc<RefCell<WizardPhase>>,
         wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
+        now: Instant,
+        why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
     ) -> Self {
         // The status face's hero widget: `NO LINK` whenever there is no
         // live codec (design section 15's "absent, never frozen or
@@ -275,10 +308,19 @@ impl HomeView {
             }
             None => HeroStatusView::new("", CodecStatus::NoLink),
         }
-        .with_volume(hero_volume);
+        .with_volume(hero_volume)
+        // The Home fault strip (design `.planning/design/2026-09-07-home-
+        // fault-strip.md`, bead `pico-link-9eq2.3.3`) -- a straight field
+        // pass-through, `Copy`, same "translate BtModel into the widget's
+        // own vocabulary here" shape `out_level` above already uses. Tiers/
+        // retirement/ordering are all derived at RENDER time from
+        // `RenderCtx::now` (design §6.3) -- this builder only hands the raw
+        // log across.
+        .with_fault_log(model.fault_log);
         let link_state = model.link_state;
         let discovering = model.discovering;
         let connected_addr = model.connected_addr;
+        let fault_log = model.fault_log;
 
         let model = model.clone();
         // Snapshot for `ShortcutY`'s device-page push -- same reason
@@ -322,6 +364,9 @@ impl HomeView {
             connected_addr,
             model: model_for_shortcut_y,
             commands: commands_for_shortcut_y,
+            fault_log,
+            now,
+            why_page_order: Rc::clone(why_page_order),
         }
     }
 
@@ -449,21 +494,66 @@ impl Widget for HomeView {
                     }))
                 }
             }
-            // X is left inert on both faces -- see the module doc's "X is
-            // left inert on both faces" section for why (fault strip
-            // detail, `pico-link-9eq2.3`, isn't built yet). `Left`/`Right`
-            // have no meaning on Home (design section 4: identical to B/A
-            // elsewhere, but Home's exception already covers A/B/centre
-            // explicitly and doesn't mention them). `Select` is handled
-            // entirely in `on_focus` (`NavIntent::Select` reaches
-            // `Widget::on_focus`'s `FocusEvent::Activated`, not
-            // `on_intent` -- see `Navigator::dispatch`), so it never
+            // X: the fault strip's `why?` page, live only while the strip
+            // is non-empty (design `.planning/design/2026-09-07-home-
+            // fault-strip.md` §8.1, bead `pico-link-9eq2.3.3` -- supersedes
+            // the older "X is inert" ruling this doc comment used to carry;
+            // `pico-link-9eq2.3` has now landed). Empty strip: `Action::
+            // None`, matching `chrome_contribution`'s unlabelled-X state
+            // below so a mispress is always free (design rule 4). Non-
+            // empty: overwrites `why_page_order` with a FRESH most-
+            // recently-active-first sort of every key that has ever fired
+            // (including retired ones -- the `why?` page shows session
+            // history, design §8.2), THEN pushes the page built from that
+            // order. This is the one and only place this order is ever
+            // re-sorted -- every subsequent `App::refresh_stack` pass
+            // while the page is open only appends
+            // (`build_why_page_screen`'s own doc comment; orchestrator
+            // ruling on this bead).
+            NavIntent::ShortcutX => {
+                if !self.fault_log.has_visible_entry(self.now) {
+                    return Action::None;
+                }
+                let mut fresh_order: Vec<FaultKey> = FaultKey::ALL.into_iter().filter(|key| self.fault_log.entry(*key).is_some()).collect();
+                fresh_order.sort_by(|a, b| {
+                    let a_last = self.fault_log.entry(*a).map_or(Instant::from_micros(0), |e| e.last_seen);
+                    let b_last = self.fault_log.entry(*b).map_or(Instant::from_micros(0), |e| e.last_seen);
+                    b_last.cmp(&a_last) // descending: most-recently-active first
+                });
+                *self.why_page_order.borrow_mut() = fresh_order;
+                let model = self.model.clone();
+                let now = self.now;
+                let why_page_order = Rc::clone(&self.why_page_order);
+                Action::PushView(Box::new(move || match build_why_page_screen(&model, now, &why_page_order, &ScreenCarry::default()) {
+                    Refresh::Rebuild(screen) => screen,
+                    // Never actually returned (see that function's doc
+                    // comment) -- defensive fallback only, same shape as
+                    // `ShortcutY`'s above.
+                    Refresh::Gone => Screen::new("Why?", vec![]),
+                }))
+            }
+            // `Left`/`Right` have no meaning on Home (design section 4:
+            // identical to B/A elsewhere, but Home's exception already
+            // covers A/B/centre explicitly and doesn't mention them).
+            // `Select` is handled entirely in `on_focus` (`NavIntent::
+            // Select` reaches `Widget::on_focus`'s `FocusEvent::Activated`,
+            // not `on_intent` -- see `Navigator::dispatch`), so it never
             // reaches here.
-            NavIntent::ShortcutX | NavIntent::Left | NavIntent::Right | NavIntent::Select => Action::None,
+            NavIntent::Left | NavIntent::Right | NavIntent::Select => Action::None,
         }
     }
 
     fn chrome_contribution(&self, ctx: &RenderCtx) -> Option<ChromeContribution> {
+        // X: "why?", live only while the fault strip is non-empty (design
+        // `.planning/design/2026-09-07-home-fault-strip.md` §8.1) -- on
+        // BOTH faces, same as Y, per `on_intent`'s `ShortcutX` arm having
+        // no face-dependent behaviour either. Computed against `ctx.now()`
+        // (not `self.now`) so the label demotes to inert at exactly the
+        // instant `render::hero`'s strip itself retires the last row --
+        // `on_intent` has no `RenderCtx` and falls back to `self.now`
+        // there (see that field's doc comment), but this method does, so
+        // it uses the fresher clock.
+        let why_label = self.fault_log.has_visible_entry(ctx.now()).then(|| ButtonLabel::Live(String::from("why?")));
         match self.face() {
             HomeFace::Status => {
                 let mut contribution = self.hero.chrome_contribution(ctx).unwrap_or_default();
@@ -472,6 +562,7 @@ impl Widget for HomeView {
                 // `on_intent`'s `ShortcutY` arm and this bead's doc comment.
                 contribution.y = Some(ButtonLabel::Live(String::from("link")));
                 contribution.link = Some(self.resolved_link_glyph());
+                contribution.x = why_label;
                 Some(contribution)
             }
             // A's word is entirely `activation()`'s job now (design rule
@@ -479,7 +570,9 @@ impl Widget for HomeView {
             // but Y still needs a label here too (`pico-link-hr30`: both
             // faces bind and label the same way), so this can no longer be
             // a flat `None`.
-            HomeFace::Menu => Some(ChromeContribution { y: Some(ButtonLabel::Live(String::from("link"))), ..ChromeContribution::default() }),
+            HomeFace::Menu => {
+                Some(ChromeContribution { x: why_label, y: Some(ButtonLabel::Live(String::from("link"))), ..ChromeContribution::default() })
+            }
         }
     }
 
@@ -578,7 +671,8 @@ mod tests {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
+        let why_page_order = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -590,7 +684,8 @@ mod tests {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
+        let why_page_order = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting
@@ -662,14 +757,17 @@ mod tests {
         );
     }
 
-    /// `pico-link-hr30`: X is deliberately left unbound and unlabelled on
-    /// both faces until the fault strip detail screen it targets exists
-    /// (`pico-link-9eq2.3`) -- see the module doc's "X is left inert on
-    /// both faces" section. Rail default for an absent `chrome_contribution`
-    /// entry is [`ButtonLabel::Inert`] (`ButtonLabels::default`), so `None`
-    /// here is the correct assertion, not an oversight.
+    /// `pico-link-9eq2.3.3` (superseding the old `pico-link-hr30`-era "X is
+    /// permanently inert" ruling, now that the fault strip's `why?` page
+    /// exists): X stays unbound and unlabelled on BOTH faces whenever the
+    /// fault strip is empty (design `.planning/design/2026-09-07-home-
+    /// fault-strip.md` §8.1 -- `fresh_home_view()`'s model has an empty
+    /// `FaultLog`, so this is exactly the empty-strip case). Rail default
+    /// for an absent `chrome_contribution` entry is [`ButtonLabel::Inert`]
+    /// (`ButtonLabels::default`), so `None` here is the correct assertion,
+    /// not an oversight. See `shortcut_x_*` below for the non-empty case.
     #[test]
-    fn x_stays_unbound_and_unlabelled_on_both_faces() {
+    fn x_stays_unbound_and_unlabelled_on_both_faces_while_the_strip_is_empty() {
         let mut view = fresh_home_view();
         assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), None);
         assert!(matches!(view.on_intent(NavIntent::ShortcutX), Action::None));
@@ -677,6 +775,35 @@ mod tests {
         view.on_focus(FocusEvent::Activated); // status -> menu
         assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), None);
         assert!(matches!(view.on_intent(NavIntent::ShortcutX), Action::None));
+    }
+
+    // --- pico-link-9eq2.3.3: ShortcutX -> the `why?` page, live only
+    // while the fault strip is non-empty ---
+
+    fn home_view_with_one_fault() -> HomeView {
+        let mut model = BtModel::default();
+        model.fault_log.record(crate::app::FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let home_face = Rc::new(RefCell::new(HomeFace::default()));
+        let commands = Rc::new(RefCell::new(VecDeque::new()));
+        let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
+        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
+        let why_page_order = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+    }
+
+    #[test]
+    fn x_is_labelled_why_on_both_faces_once_the_strip_is_non_empty() {
+        let mut view = home_view_with_one_fault();
+        assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), Some(ButtonLabel::Live(String::from("why?"))));
+        view.on_focus(FocusEvent::Activated); // status -> menu
+        assert_eq!(view.chrome_contribution(&test_ctx()).and_then(|c| c.x), Some(ButtonLabel::Live(String::from("why?"))));
+    }
+
+    #[test]
+    fn shortcut_x_pushes_the_why_page_when_the_strip_is_non_empty() {
+        let mut view = home_view_with_one_fault();
+        let screen = pushed_screen(view.on_intent(NavIntent::ShortcutX));
+        assert_eq!(screen.id(), Some(ScreenId::WhyPage), "X must push the why? page's own identified ScreenId");
     }
 
     /// Regression test for the review finding on this bead: a `None`
