@@ -125,6 +125,14 @@ uint32_t pl_usb_audio_fb_done(void);
 // host-reduced send, as opposed to a whole packet going missing.
 uint32_t pl_usb_audio_rx_bytes_total(void);
 uint32_t pl_usb_audio_rx_short_packets(void);
+
+// Bead pico-link-9eq2.3.2, design `.planning/design/2026-09-07-audio-fault-
+// model.md` §6.1: cumulative count of pl_usb_audio_feedback_task ticks on
+// which its output was clamped at PL_FB_MAX_PPM or the integral
+// accumulator was clamped at PL_FB_I_ACCUM_MAX -- "does the feedback loop
+// still have authority to correct drift?" (backs the quiet `FB RAIL` key,
+// fault.c). Thread-context safe, same convention as the rest of this file.
+uint32_t pl_usb_audio_fb_rail_ticks(void);
 // Cumulative count of SET_INTERFACE(streaming, alt=1) calls that found
 // usbd_edpt_busy(EP1 OUT) already true -- the precondition for the
 // EP1-OUT double-arm panic (rp2040_usb.c:108), captured non-fatally at the

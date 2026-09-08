@@ -216,6 +216,9 @@ add_executable(pico_link
     src/pl_prio.c
     src/pl_loop_prof.c
     src/pcm_ring.c
+    # Bead pico-link-9eq2.3.2, design .planning/design/2026-09-07-audio-
+    # fault-model.md: the audio fault evaluator -- see fault.h's module doc.
+    src/fault.c
     src/usb_reset.c
     src/watchdog_sup.c
     src/persist.c

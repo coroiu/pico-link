@@ -45,6 +45,10 @@
 #ifdef PL_DEBUG_REMOTE
 #include "debug_remote.h"
 #endif
+// Bead pico-link-9eq2.3.2: fault.h is included ONLY here (design sec 7.2)
+// -- see that header's module doc for why the include graph stays
+// one-directional (main.c -> fault.c -> {a2dp,usb_audio,pcm_ring}).
+#include "fault.h"
 #include "input.h"
 #include "media_keys.h"
 #include "ldac_bench.h"
@@ -872,10 +876,22 @@ int main(void) {
             pl_wdt_mark(PL_WDT_CP_REPORT_SHARED);
             pl_usb_pump_report(shared_report_dt_us);
 
+            // Bead pico-link-9eq2.3.2, design sec 5.1/7.1: the fault
+            // evaluator runs at this SAME 1Hz thread-context point, BEFORE
+            // pl_a2dp_report below -- it is usb_audio.c's pl_usb_audio_
+            // fill_min()'s sole caller (design sec 5.6.5) and must read it
+            // before pl_a2dp_report needs the cached result.
+            pl_fault_evaluate(ui, shared_now_us);
+
             // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
             // report line. Thread context only (pl_a2dp_report does no
             // BTstack calls, only pl_log + plain counter reads).
-            pl_a2dp_report(shared_report_dt_us);
+            //
+            // Bead pico-link-9eq2.3.2: fill_min is now sourced from
+            // pl_fault_last_fill_min() (fault.c's cache of this window's
+            // ONE pl_usb_audio_fill_min() read), not a second direct call
+            // -- see pl_a2dp_report's own doc comment (a2dp.h) for why.
+            pl_a2dp_report(shared_report_dt_us, pl_fault_last_fill_min());
 
             // Bead pico-link-auh, section 1: the non-starvable slot-0
             // ("ctr") snapshot -- same 1Hz point, does not replace the

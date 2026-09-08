@@ -96,7 +96,17 @@ bool pl_a2dp_streaming(void);
 // the caller decides when a second has elapsed. Pass 0 on the very first
 // call. See pl_usb_pump_report's doc comment (usb_pump.h) for why this
 // isn't cosmetic.
-void pl_a2dp_report(uint32_t report_dt_us);
+//
+// Bead pico-link-9eq2.3.2, design §5.6.5: fault_fill_min_bytes is fault.c's
+// CACHED value of usb_audio.c's destructive-on-read pl_usb_audio_fill_min()
+// -- fault.c is now that accessor's sole caller (a second reader would
+// steal windows from the first, producing garbage for both), so this
+// function's own former direct call is replaced by this parameter. Call
+// site: main.c, which reads pl_fault_last_fill_min() (fault.c calls
+// pl_usb_audio_fill_min() itself, once, earlier in the same 1Hz block) and
+// passes the result straight through -- see fault.h's module doc for why
+// fault.h itself is not included here.
+void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes);
 
 // Bead pico-link-auh, section 1: publishes slot 0 ("ctr") of the
 // non-starvable priority channel (pl_prio.h) from s_ctx's cumulative
@@ -164,6 +174,31 @@ void pl_a2dp_avrcp_volume_service(uint64_t now_us);
 #define PL_CONNECT_STEP_PAIRING 1u
 #define PL_CONNECT_STEP_SETTING_UP_AUDIO 2u
 #define PL_CONNECT_STEP_NEGOTIATING_CODEC 3u
+
+// --- Bead pico-link-9eq2.3.2, design `.planning/design/2026-09-07-audio-
+// fault-model.md` §7.2: the seam fault.c evaluates against. Plain getters
+// over s_ctx fields, same convention as pl_a2dp_streaming/pl_a2dp_is_
+// connected_ldac above -- a single aligned-word read, thread-context safe,
+// no locking. fault.h is the ONLY consumer; nothing else in the tree
+// should call these. ---
+
+// The exact PL_A2DP_MEDIA_STREAMING condition -- NOT pl_a2dp_streaming()
+// above, which is also true during PRIMING. Faults are meaningless before
+// real drain begins (design §5.6.1).
+bool pl_a2dp_media_streaming(void);
+
+// The media-timer handler's own host_silent latch, stashed every tick --
+// design §5.6.2 ("a paused host must not be reported as under-supplying").
+bool pl_a2dp_host_silent(void);
+
+uint32_t pl_a2dp_underrun_events(void);
+uint32_t pl_a2dp_resync_events(void);
+uint32_t pl_a2dp_resync_drops(void);
+uint32_t pl_a2dp_stop_queue_full(void);
+uint32_t pl_a2dp_dwell_max_us(void);
+uint32_t pl_a2dp_link_lost_events(void);
+uint32_t pl_a2dp_stop_dwell(void);
+uint32_t pl_a2dp_credit_clamp_events(void);
 
 #ifdef PL_DEBUG_REMOTE
 // Bead pico-link-fhf, test A (injection). One-shot: the NEXT `ticks` calls
