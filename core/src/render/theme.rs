@@ -84,9 +84,11 @@ pub mod palette {
     /// `pico-link-9eq2.3.3`. Component-wise midpoint:
     /// `r=(31+1)/2=16, g=(22+4)/2=13, b=(12+4)/2=8`. Verified distinguishable
     /// from [`STATUS_WARNING_DIM`] and from [`TEXT_SECONDARY`] at 8px on a
-    /// zoomed capture (`core/examples/fault_strip_probe.rs`) rather than
-    /// asserted from the hex values alone — see that example's own doc
-    /// comment for what was actually seen.
+    /// zoomed capture (`core/examples/fault_strip_probe.rs`, its
+    /// `dim_swatch` output) rather than asserted from the hex values alone
+    /// -- confirmed 2026-09-08: at 6x zoom the three read as dark
+    /// maroon-red, dark olive-brown and blue-gray respectively, clearly
+    /// separable by hue, not merely by brightness.
     pub const STATUS_ERROR_DIM: Rgb565 = Rgb565::new(16, 13, 8);
     /// [`STATUS_WARNING`] blended exactly 50% toward [`BACKGROUND`] — the
     /// Home fault strip's "Recent" tier for a `Concealed` (amber) key. Same

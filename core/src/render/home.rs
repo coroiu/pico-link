@@ -671,7 +671,8 @@ mod tests {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
+        let why_page_order = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -683,7 +684,8 @@ mod tests {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices)
+        let why_page_order = Rc::new(RefCell::new(Vec::new()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting

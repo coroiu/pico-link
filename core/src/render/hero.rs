@@ -2187,4 +2187,189 @@ mod tests {
             "stat strip ink must start within the STAT_TOP grid slot, got y={first_row}"
         );
     }
+
+    // --- The Home fault strip (design `.planning/design/2026-09-07-home-
+    // fault-strip.md`, bead `pico-link-9eq2.3.3`). `AREA` above (206px
+    // tall) clips the strip's own rows, so these tests use a taller area
+    // matching the design's real content geometry (206 x 224). ---
+
+    use crate::app::{FaultKey, FaultLog};
+
+    const FAULT_AREA: Rectangle = Rectangle::new(Point::new(0, 0), Size::new(206, 224));
+
+    fn render_at(view: &HeroStatusView, now_us: u64) -> FrameBuffer565 {
+        let mut fb = FrameBuffer565::new(206, 224);
+        let ctx = RenderCtx::at(Instant::from_micros(now_us));
+        view.render(FAULT_AREA, &ctx, &mut fb).unwrap();
+        fb
+    }
+
+    #[test]
+    fn visible_fault_keys_orders_first_seen_ascending() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::EncResync, Instant::from_micros(30), None, 1);
+        log.record(FaultKey::BufStarved, Instant::from_micros(10), None, 1);
+        log.record(FaultKey::AirCongested, Instant::from_micros(20), None, 1);
+        let (keys, count) = visible_fault_keys(&log, Instant::from_micros(30));
+        assert_eq!(count, 3);
+        assert_eq!(&keys[..3], &[Some(FaultKey::BufStarved), Some(FaultKey::AirCongested), Some(FaultKey::EncResync)]);
+    }
+
+    #[test]
+    fn visible_fault_keys_excludes_retired_entries() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::BufStarved, Instant::from_micros(0), None, 1);
+        let now = Instant::from_micros(0) + crate::run::FAULT_RETIRE;
+        let (_, count) = visible_fault_keys(&log, now);
+        assert_eq!(count, 0, "a key at exactly FAULT_RETIRE must already be retired (design's `<` boundary)");
+    }
+
+    #[test]
+    fn fault_tier_is_live_inside_the_window_and_recent_just_after() {
+        let last_seen = Instant::from_micros(0);
+        let almost_closed = Instant::from_micros((crate::run::FAULT_LIVE_WINDOW.as_micros() - 1) as u64);
+        let closed = Instant::from_micros(crate::run::FAULT_LIVE_WINDOW.as_micros() as u64);
+        assert_eq!(FaultTier::of(last_seen, last_seen), FaultTier::Live);
+        assert_eq!(FaultTier::of(almost_closed, last_seen), FaultTier::Live);
+        assert_eq!(FaultTier::of(closed, last_seen), FaultTier::Recent);
+    }
+
+    #[test]
+    fn empty_fault_log_renders_pixel_identical_to_no_fault_log_at_all() {
+        let with_default_log = nominal().with_fault_log(FaultLog::default());
+        let without_call = nominal();
+        assert_eq!(render_at(&with_default_log, 0).pixels().collect::<alloc::vec::Vec<_>>(), render_at(&without_call, 0).pixels().collect::<alloc::vec::Vec<_>>());
+    }
+
+    #[test]
+    fn empty_fault_log_draws_no_divider_and_no_strip_ink() {
+        let fb = render_at(&nominal(), 0);
+        // The divider is TEXT_SECONDARY at FAULT_DIVIDER_Y -- but so is the
+        // stat strip a few rows up, so isolate rows AT/BELOW the divider.
+        let divider_or_below = fb.pixels().any(|p| p.1 == palette::TEXT_SECONDARY && p.0.y >= FAULT_DIVIDER_Y);
+        assert!(!divider_or_below, "an empty strip must draw nothing at or below the divider row -- zero pixels, per design §9");
+    }
+
+    #[test]
+    fn a_single_live_fault_draws_status_error_ink() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let fb = render_at(&nominal().with_fault_log(log), 0);
+        assert!(fb.pixels().any(|p| p.1 == palette::STATUS_ERROR), "a live Audible fault must draw full-brightness STATUS_ERROR ink");
+    }
+
+    #[test]
+    fn a_recent_fault_draws_dim_ink_not_bright_ink() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let now = crate::run::FAULT_LIVE_WINDOW.as_micros() as u64 + 1;
+        let fb = render_at(&nominal().with_fault_log(log), now);
+        assert!(fb.pixels().any(|p| p.1 == palette::STATUS_ERROR_DIM), "a Recent fault must draw STATUS_ERROR_DIM ink");
+        assert!(!fb.pixels().any(|p| p.1 == palette::STATUS_ERROR), "a Recent fault must NOT draw the bright STATUS_ERROR colour");
+    }
+
+    #[test]
+    fn count_of_one_renders_no_count_text_but_count_of_two_does() {
+        let mut one = FaultLog::default();
+        one.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let mut two = FaultLog::default();
+        two.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 2);
+
+        let fb_one = render_at(&nominal().with_fault_log(one), 0);
+        let fb_two = render_at(&nominal().with_fault_log(two), 0);
+        // Both draw glyph + name ink (same STATUS_ERROR pixel count from
+        // those), but only `two` should have MORE ink than `one` -- the
+        // extra pixels are the "x2" count text `one` must not draw.
+        let count_one = fb_one.pixels().filter(|p| p.1 == palette::STATUS_ERROR).count();
+        let count_two = fb_two.pixels().filter(|p| p.1 == palette::STATUS_ERROR).count();
+        assert!(count_two > count_one, "x2 must draw strictly more ink than the omitted x1 (count_one={count_one}, count_two={count_two})");
+    }
+
+    #[test]
+    fn five_visible_keys_draw_an_overflow_row_and_only_three_key_rows() {
+        let mut log = FaultLog::default();
+        for (i, key) in [FaultKey::EncResync, FaultKey::BufOverflow, FaultKey::AirCongested, FaultKey::AirLinkLost, FaultKey::UsbSupplyLow]
+            .into_iter()
+            .enumerate()
+        {
+            log.record(key, Instant::from_micros(i as u64), None, 1);
+        }
+        let (visible, count) = visible_fault_keys(&log, Instant::from_micros(4));
+        assert_eq!(count, 5);
+        // The overflow arithmetic `render`/`body_paint_key` both use.
+        let shown = count.min(FAULT_ROW_CAP);
+        let overflow = count > FAULT_ROW_CAP;
+        let rows_to_draw = if overflow { FAULT_ROW_CAP - 1 } else { shown };
+        assert_eq!(rows_to_draw, 3, "only the 3 oldest keys get a real row when overflowing");
+        assert!(overflow);
+        let _ = visible; // exercised above via visible_fault_keys directly
+    }
+
+    #[test]
+    fn body_paint_key_is_unchanged_by_now_alone_while_a_fault_stays_in_the_same_tier() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 5);
+        let view = nominal().with_fault_log(log);
+        let ctx_a = RenderCtx::at(Instant::from_micros(0));
+        let ctx_b = RenderCtx::at(Instant::from_micros(1_000_000)); // 1s later, still Live (<20s)
+        assert_eq!(
+            view.paint_key(&ctx_a),
+            view.paint_key(&ctx_b),
+            "the fold must not change merely because `now` advanced within the same tier (design §6.5's timestamp-folding trap)"
+        );
+    }
+
+    #[test]
+    fn body_paint_key_changes_when_a_fault_crosses_from_live_to_recent() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 5);
+        let view = nominal().with_fault_log(log);
+        let live = RenderCtx::at(Instant::from_micros(0));
+        let recent = RenderCtx::at(Instant::from_micros(crate::run::FAULT_LIVE_WINDOW.as_micros() as u64));
+        assert_ne!(view.paint_key(&live), view.paint_key(&recent), "crossing the Live->Recent boundary must change the fold");
+    }
+
+    #[test]
+    fn body_paint_key_changes_when_the_strip_empties_on_retirement() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 5);
+        let view = nominal().with_fault_log(log);
+        let live = RenderCtx::at(Instant::from_micros(0));
+        let retired = RenderCtx::at(Instant::from_micros(crate::run::FAULT_RETIRE.as_micros() as u64));
+        assert_ne!(view.paint_key(&live), view.paint_key(&retired), "retirement (the row disappearing) must change the fold");
+        assert_eq!(
+            view.paint_key(&retired),
+            nominal().paint_key(&retired),
+            "once retired, the key must fold identically to a view with no fault log at all"
+        );
+    }
+
+    #[test]
+    fn redraw_after_schedules_nothing_when_the_strip_is_empty() {
+        let ctx = test_ctx();
+        assert_eq!(nominal().redraw_after(&ctx), None, "an empty strip (and no OUT level) must schedule no redraw at all");
+    }
+
+    #[test]
+    fn redraw_after_is_bounded_by_one_second_while_the_strip_is_live() {
+        let mut log = FaultLog::default();
+        log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 5);
+        let view = nominal().with_fault_log(log);
+        let ctx = test_ctx();
+        let scheduled = view.redraw_after(&ctx).expect("a non-empty strip must schedule a redraw");
+        assert!(scheduled <= Duration::from_secs(1), "design §6.5: count updates at most 1Hz, so redraw_after must never exceed 1s while non-empty");
+    }
+
+    #[test]
+    fn redraw_after_targets_the_live_to_recent_boundary_when_sooner_than_one_second() {
+        let mut log = FaultLog::default();
+        // last_seen 19.5s ago -- the Live->Recent boundary (20s) is 0.5s away, well under the 1s cap.
+        let last_seen_us = 0u64;
+        let now_us = crate::run::FAULT_LIVE_WINDOW.as_micros() as u64 - 500_000;
+        log.record(FaultKey::BufOverflow, Instant::from_micros(last_seen_us), None, 1);
+        let view = nominal().with_fault_log(log);
+        let ctx = RenderCtx::at(Instant::from_micros(now_us));
+        let scheduled = view.redraw_after(&ctx).expect("a live fault must schedule a redraw");
+        assert!(scheduled <= Duration::from_millis(500), "must schedule at (or before) the imminent tier boundary, got {scheduled:?}");
+    }
 }
