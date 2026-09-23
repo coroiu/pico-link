@@ -133,6 +133,15 @@ volatile unsigned int pl_ep_double_arm_count[32];
 // pl_ep_double_arm_count so the two sites are distinguishable in one report.
 volatile unsigned int pl_ep_inactive_xfer_count[32];
 
+// Bead pico-link-9ziq (F2): bytes tu_fifo_write_n() (audio_device.c's
+// audiod_xfer_isr, sdk-patches/06) failed to write into the ISO-OUT FIFO --
+// both the full-FIFO (written==0) case and, critically, the PARTIAL-write
+// case the original `if (!tu_fifo_write_n(...))` test alone could not see.
+// Written from true USB ISR context by the patched SDK file; read only from
+// pl_usb_pump_report below. volatile, no lock needed for a monotonic
+// counter read/written by a single producer.
+volatile uint32_t pl_usb_fifo_shortfall_bytes;
+
 // Bead pico-link-wbq (E2, fix 1): called from the vendored usbd.c patch
 // (firmware/sdk-patches/03-tinyusb-usbd-sof-isr-sample.patch), from INSIDE
 // dcd_event_handler's DCD_EVENT_SOF case, in TRUE ISR context, BEFORE that
@@ -235,10 +244,54 @@ static void pl_usb_pump_worker_irq(void) {
     // skips tud_task() still proves the IRQ path alive.
     pl_wdt_kick(PL_WDT_USB_TIMER);
 
+#if PL_USB_ISO_XFER_ISR
+    // Bead pico-link-9ziq (F1): with PL_USB_ISO_XFER_ISR on (the default),
+    // audiod_xfer_isr (sdk-patches/04+05) re-arms the ISO-OUT endpoint from
+    // TRUE USB ISR context, not from tud_task() -- so the audio data path no
+    // longer needs pl_usb_mutex at all. tud_audio_available()/
+    // tud_audio_read() are a single-consumer tu_fifo read against that
+    // single ISR producer, and pl_usb_audio_feedback_task() is a plain EMA
+    // plus tud_audio_fb_set(); neither touches anything tud_task() or the
+    // CDC calls mutate. Running this drain BEFORE AND REGARDLESS OF the
+    // mutex_try_enter below is the actual fix: previously a thread-mode
+    // pl_usb_mutex holder (the log drain, main.c's FU status push,
+    // media_keys.c, debug_remote.c) preempted by the 0xFF BTstack/LDAC IRQ
+    // made this ENTIRE tick -- audio drain included -- skip via D2 below,
+    // and on the OFF build (encoder fill loop on core0, dwell_max ~4.5ms)
+    // that starved the 784-byte/4-packet EP-OUT FIFO faster than TinyUSB's
+    // re-arm could keep up, and audiod_xfer_isr's tu_fifo_write_n silently
+    // truncated the overflow (see pl_usb_fifo_shortfall_bytes above and
+    // sdk-patches/06). See
+    // .planning/design/2026-09-23-usb-out-fifo-loss-off-build.md for the
+    // full conservation-accounting root cause.
+    //
+    // Ownership invariant this depends on: nothing outside this worker may
+    // ever call tud_audio_read() or otherwise touch the ISO-OUT FIFO -- see
+    // usb_pump.h's module doc; that invariant is unchanged, only WHERE in
+    // this function the drain runs relative to the mutex has moved.
+    uint16_t avail = tud_audio_available();
+    if (avail > s_avail_high_water) {
+        s_avail_high_water = avail;
+    }
+    if (avail >= 576) {
+        s_avail_ge_576++;
+    }
+    pl_usb_audio_task();
+    // See the big comment block below (non-ISO_XFER_ISR branch) for why
+    // this is guarded on pl_usb_audio_streaming() -- unchanged reasoning,
+    // only the call site moved.
+    if (pl_usb_audio_streaming()) {
+        pl_usb_audio_feedback_task();
+    }
+#endif
+
     // tud_task() is not reentrant -- this guard now exists purely for that
     // property in the abstract (bead pico-link-okx F1 removed pl_log's own
     // contention on pl_usb_mutex, so this is expected to never fail again
-    // in practice; D2 below is the counter that proves it).
+    // in practice; D2 below is the counter that proves it). With
+    // PL_USB_ISO_XFER_ISR on, a skipped tick here no longer costs audio (the
+    // drain above already ran) -- only SET_INTERFACE/control-request
+    // handling and other non-ISO tud_task() work waits for the next tick.
     if (!mutex_try_enter(&pl_usb_mutex, NULL)) {
         s_pump_ticks_skipped++;
         return;
@@ -266,6 +319,15 @@ static void pl_usb_pump_worker_irq(void) {
     // just that the timer/IRQ plumbing is alive.
     pl_wdt_kick(PL_WDT_USB_TASK);
 
+#if !PL_USB_ISO_XFER_ISR
+    // Bead pico-link-9ziq: with PL_USB_ISO_XFER_ISR off, ISO-OUT re-arm is
+    // still tud_task()'s job (audiod_xfer_cb, task context) -- so the drain
+    // below genuinely does need to run after tud_task() and therefore still
+    // needs to stay inside the mutex, exactly as before this bead. This is
+    // "keep the current gated behaviour" from the design doc: an OFF build
+    // (of PL_USB_ISO_XFER_ISR, not to be confused with PL_ENCODER_ON_CORE1)
+    // is untouched by F1.
+    //
     // Peek (does not consume) before pl_usb_audio_task()'s drain loop, so
     // the high-water mark reflects the fill level tud_task() just left
     // behind, before this tick's own drain reduces it. D6: WINDOWED now --
@@ -304,6 +366,7 @@ static void pl_usb_pump_worker_irq(void) {
     if (pl_usb_audio_streaming()) {
         pl_usb_audio_feedback_task();
     }
+#endif
 
     mutex_exit(&pl_usb_mutex);
 }
@@ -434,12 +497,18 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
     s_avail_high_water = 0;
     s_avail_ge_576 = 0;
 
-    // pump_ticks_run + pump_ticks_skipped (not printed) should sum to
-    // ~report_dt_us/1000 (one tick/ms). sof_isr is now sampled in true ISR
-    // context -- see pl_usb_sof_isr_sample's doc comment.
+    // pump_ticks_run + pump_ticks_skipped should sum to ~report_dt_us/1000
+    // (one tick/ms). sof_isr is now sampled in true ISR context -- see
+    // pl_usb_sof_isr_sample's doc comment. Bead pico-link-9ziq (F2):
+    // pump_ticks_skipped is now printed -- with PL_USB_ISO_XFER_ISR on, a
+    // nonzero value is EXPECTED and harmless (the audio drain above already
+    // ran regardless; only tud_task()'s non-audio work waited a tick), so
+    // its meaning changed with this bead and it needs to be visible, not
+    // just tracked.
     pl_log(
-        "usb-pump-race: pump_ticks_run=%lu sof_isr=%lu\r\n",
+        "usb-pump-race: pump_ticks_run=%lu pump_ticks_skipped=%lu sof_isr=%lu\r\n",
         (unsigned long)s_pump_ticks_run,
+        (unsigned long)s_pump_ticks_skipped,
         (unsigned long)s_sof_isr_count
     );
 
@@ -474,6 +543,21 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
     pl_log(
         "usb-audio-okx: rx_bytes_total=%lu rx_short_packets=%lu\r\n",
         (unsigned long)pl_usb_audio_rx_bytes_total(), (unsigned long)pl_usb_audio_rx_short_packets()
+    );
+
+    // Bead pico-link-9ziq (F2): THE direct conservation check for this
+    // bead's root cause -- no more inferring loss from three separate lines
+    // by hand. fifo_shortfall_bytes is the SDK-side counter (patch 06,
+    // audiod_xfer_isr's tu_fifo_write_n shortfall, both partial and
+    // full-FIFO); usb_lost_bytes is rx_bytes_total (counted on arrival,
+    // usb_audio.c:333) minus pcm_bytes_total (counted after
+    // tud_audio_read(), usb_audio.c:366) -- the two should track each other
+    // 1:1 once F1 lands, and both delta=0 over a soak is this bead's
+    // success criterion.
+    pl_log(
+        "usb-pump-loss: fifo_shortfall_bytes=%lu usb_lost_bytes=%lu\r\n",
+        (unsigned long)pl_usb_fifo_shortfall_bytes,
+        (unsigned long)(pl_usb_audio_rx_bytes_total() - pl_usb_audio_pcm_bytes_total())
     );
 
     // Bead pico-link-okx (F2): backlog_hwm approaching PL_LOG_RING_SIZE

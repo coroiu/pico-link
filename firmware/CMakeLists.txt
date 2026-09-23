@@ -91,6 +91,27 @@ if(_pl_patch5_pos EQUAL -1)
         "See firmware/sdk-patches/README.md (patch 05).")
 endif()
 message(STATUS "pico-link: vendored SDK patches 04+05 (ISO xfer_isr backport) are applied")
+
+# Bead pico-link-9ziq (F2): patch 06 (audio_device.c) -- counts bytes
+# tu_fifo_write_n() silently drops in audiod_xfer_isr (a partial write, FIFO
+# had room for some but not all of xferred_bytes, makes the old
+# `if (!tu_fifo_write_n(...))` test alone miss it). Measurement only, but a
+# silent revert here would make this bead's usb_lost_bytes/shortfall
+# counters read 0 even when loss is real -- see zero-readings-are-not-passes
+# in project memory -- so FATAL_ERROR like the others.
+set(_pl_audio_device_c "${PICO_SDK_PATH}/lib/tinyusb/src/class/audio/audio_device.c")
+if(NOT EXISTS "${_pl_audio_device_c}")
+    message(FATAL_ERROR "Cannot find ${_pl_audio_device_c} -- is PICO_SDK_PATH right?")
+endif()
+file(READ "${_pl_audio_device_c}" _pl_audio_device_c_src)
+string(FIND "${_pl_audio_device_c_src}" "pl_usb_fifo_shortfall_bytes" _pl_patch6_pos)
+if(_pl_patch6_pos EQUAL -1)
+    message(FATAL_ERROR
+        "pico-sdk is MISSING a vendored patch (marker pl_usb_fifo_shortfall_bytes in audio_device.c).\n"
+        "  Run:  tools/apply-sdk-patches.sh\n"
+        "See firmware/sdk-patches/README.md (patch 06).")
+endif()
+message(STATUS "pico-link: vendored SDK patch 06 (audio_device.c FIFO shortfall counter) is applied")
 # ---------------------------------------------------------------------------
 
 # Bead pico-link-cd3: debug-only NavIntent injection over the CDC console,

@@ -179,6 +179,32 @@ alt-setting-switch robustness becomes its own investigation.
 
 Beads: pico-link-2ap.6 (EXPERIMENT).
 
+## 06. Count bytes `tu_fifo_write_n` silently drops in `audiod_xfer_isr`
+
+`audio_device.c`, `audiod_xfer_isr()` (added by patch 04d). `tu_fifo_write_n()`
+returns the number of bytes it **actually wrote** -- clamped to the FIFO's
+remaining room on a non-overwritable FIFO, `tusb_fifo.c:469-488` -- not a
+bool. `audiod_xfer_isr`'s original `if (!tu_fifo_write_n(...)) return false;`
+only reacts to a return of exactly 0 (the FIFO already completely full): a
+**partial** write, where the FIFO has room for some but not all of
+`xferred_bytes`, makes that condition false and the packet's tail is dropped
+with nothing counting it.
+
+This is bead pico-link-9ziq's root cause for the OFF-build ring starvation
+(design doc `.planning/design/2026-09-23-usb-out-fifo-loss-off-build.md`):
+about 1.5 packets/s lost this way, silently, between the rx callback and
+`tud_audio_read`.
+
+The patch captures the return value into `written` and, whenever
+`written < xferred_bytes`, adds the shortfall to
+`pl_usb_fifo_shortfall_bytes` (defined in `firmware/src/usb_pump.c`, printed
+in the `usb-pump-loss:` report line) -- covering both the partial case and
+the already-handled full-FIFO (`written == 0`) case in one counter. The
+existing `return false` on `written == 0` is preserved exactly: **behaviour
+is unchanged, this is measurement only.**
+
+Beads: pico-link-9ziq (F2), rides with pico-link-0gtk.
+
 ## Deliberately NOT patched: dcd_rp2040.c:333 `panic("Unhandled IRQ")`
 
 Assessed 2026-08-30 and left FATAL on purpose. `if (status ^ handled) panic(...)`
