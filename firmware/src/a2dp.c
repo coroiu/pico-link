@@ -484,6 +484,21 @@ typedef struct {
     volatile uint32_t pkt_sent;
     volatile uint32_t pkt_fail;
 
+    // --- bead pico-link-nli.9 (P1, Ada's design on nli.8): per-report-window
+    // mean encode cost, the number the core1-vs-core0 decision rule is
+    // actually made on (enc_max_us alone can't distinguish "one outlier" from
+    // "every encode is slow"). Same producer/consumer discipline as the
+    // block above -- IRQ-context (or core1 fill-loop) producer, thread-
+    // context pl_a2dp_report consumer, racy-but-diagnostic-only: a torn
+    // read of enc_sum_us/enc_count can only skew one window's mean, never
+    // corrupt state that anything else depends on. enc_win_max_us mirrors
+    // enc_max_us but is RESET every window (enc_max_us stays cumulative
+    // since stream start, unchanged) so a stale early spike can't hide a
+    // regression in a later window.
+    volatile uint32_t enc_sum_us;
+    volatile uint32_t enc_count;
+    volatile uint32_t enc_win_max_us;
+
     // --- bead pico-link-pbv tick-cadence instrumentation: is the media
     // timer firing at its intended ~10ms cadence? Counters only, updated
     // from IRQ context (same producer as the block above), read from
@@ -1630,6 +1645,14 @@ static void pl_a2dp_fill(void) {
         uint32_t dt = (uint32_t)(time_us_64() - t0);
         if (dt > s_ctx.enc_max_us) {
             s_ctx.enc_max_us = dt;
+        }
+        // Bead pico-link-nli.9 (P1): windowed sum/count/max for
+        // pl_a2dp_report's enc_mean_us -- see the struct fields' doc
+        // comment for the producer/consumer discipline.
+        s_ctx.enc_sum_us += dt;
+        s_ctx.enc_count++;
+        if (dt > s_ctx.enc_win_max_us) {
+            s_ctx.enc_win_max_us = dt;
         }
         dwell_us += dt;
         if (dwell_us > s_ctx.dwell_max_us) {
@@ -3717,6 +3740,26 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
         "a2dp: enc_max_us=%lu pkt_sent=%lu pkt_fail=%lu misaligned=%lu\r\n", (unsigned long)s_ctx.enc_max_us,
         (unsigned long)s_ctx.pkt_sent, (unsigned long)s_ctx.pkt_fail, (unsigned long)pl_pcm_misaligned()
     );
+    // Bead pico-link-nli.9 (P1): enc_mean_us/enc_win_max_us are WINDOWED --
+    // snapshot and reset here, same read-resets-the-window discipline as
+    // usb_audio.c's fill_min (see that function's doc comment). Snapshot
+    // count/sum together before resetting either, so a producer write
+    // between the two reads can only widen this window's mean slightly,
+    // never divide by a count that doesn't match the sum it's paired with
+    // in the log line (both are read once, into locals, before any reset).
+    {
+        uint32_t enc_count_now = s_ctx.enc_count;
+        uint32_t enc_sum_now = s_ctx.enc_sum_us;
+        uint32_t enc_win_max_now = s_ctx.enc_win_max_us;
+        s_ctx.enc_count = 0;
+        s_ctx.enc_sum_us = 0;
+        s_ctx.enc_win_max_us = 0;
+        uint32_t enc_mean_us = enc_count_now > 0 ? enc_sum_now / enc_count_now : 0;
+        pl_log(
+            "a2dp: enc_mean_us=%lu enc_win_max_us=%lu enc_count=%lu\r\n", (unsigned long)enc_mean_us,
+            (unsigned long)enc_win_max_now, (unsigned long)enc_count_now
+        );
+    }
     // Cumulative, never reset -- compute deltas between two consecutive
     // report lines (report_dt_us apart) to get real tick rate (tick_count
     // delta) and enc_frames RATE (enc_frames_total delta, the pbv

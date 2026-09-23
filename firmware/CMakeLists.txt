@@ -199,6 +199,48 @@ add_dependencies(ui_ffi ui_ffi_build)
 # Q1 -- that is L3, pico-link-cz0.5.6).
 add_subdirectory(vendor/libldac)
 
+# Bead pico-link-nli.9 (P2, Ada's design on nli.8): force libldac's .text/
+# .rodata out of flash (XIP) into RAM via the .time_critical.* section
+# convention pico-sdk's own linker script already honors
+# (memmap_default.ld places *(.time_critical*) in RAM .data). Ada's design:
+# core1's LDAC encode stalls on XIP cache evictions caused by core0 running
+# concurrently on the same 16KB shared XIP cache libldac's 28.4KB .text+
+# .rodata is 1.8x the size of; objcopy renaming our own build OUTPUT is the
+# least invasive seam available -- pico-sdk 2.1.1 has no linker-fragment
+# hook, and vendor/libldac must not be forked (see
+# vendor/libldac/PROVENANCE.md). Runs UNCONDITIONALLY, not gated on
+# PL_ENCODER_ON_CORE1: it helps core0's own encode path too (fewer XIP
+# evictions either way) and keeps one memory layout for both builds.
+#
+# Relies on libldac being built WITHOUT -ffunction-sections, i.e. exactly
+# one plain .text and one plain .rodata section per object file (verified
+# against the linker map -- see nli.8's design comment). If that assumption
+# ever breaks (upstream changes, a toolchain flag change), --rename-section
+# silently does nothing to the extra per-function sections it doesn't name,
+# so those functions stay in flash -- hence the post-link check below on
+# pico_link itself, which FAILS THE BUILD (not just a warning) if that
+# happens instead of silently reverting to the slow path.
+#
+# NOTE: this is an OUTPUT-based custom command, not a TARGET POST_BUILD one
+# -- CMake requires add_custom_command(TARGET ...) to run in the SAME
+# directory scope the target was created in, and pl_ldac_enc is created in
+# vendor/libldac/CMakeLists.txt (must not be edited, see above). An
+# OUTPUT-based command plus a stamp file and add_dependencies() below has
+# no such restriction and orders correctly against the archive build.
+set(PL_LDAC_SRAM_STAMP ${CMAKE_CURRENT_BINARY_DIR}/pl_ldac_enc_sram.stamp)
+add_custom_command(
+    OUTPUT ${PL_LDAC_SRAM_STAMP}
+    COMMAND ${CMAKE_OBJCOPY}
+        --rename-section .text=.time_critical.pl_ldac_text
+        --rename-section .rodata=.time_critical.pl_ldac_rodata
+        $<TARGET_FILE:pl_ldac_enc>
+    COMMAND ${CMAKE_COMMAND} -E touch ${PL_LDAC_SRAM_STAMP}
+    DEPENDS pl_ldac_enc
+    COMMENT "pico-link-nli.9: renaming libldac .text/.rodata into .time_critical (SRAM-resident)"
+    VERBATIM
+)
+add_custom_target(pl_ldac_enc_sram ALL DEPENDS ${PL_LDAC_SRAM_STAMP})
+
 add_executable(pico_link
     src/main.c
     src/st7789.c
@@ -501,4 +543,27 @@ target_link_libraries(pico_link
     tinyusb_device
 )
 
+# Bead pico-link-nli.9 (P2): pico_link must not link pl_ldac_enc's archive
+# before the objcopy rename above has run on it -- target_link_libraries
+# above only orders against pl_ldac_enc's own build, not this extra step.
+add_dependencies(pico_link pl_ldac_enc_sram)
+
 pico_add_extra_outputs(pico_link)
+
+# Bead pico-link-nli.9 (P2): fail the BUILD (not just warn) if any libldac
+# object file (ldacBT.c.o / ldaclib.c.o) still has code or data placed in
+# flash (0x10xxxxxx) in the final link, i.e. the POST_BUILD rename above
+# didn't take for some symbol. Checks the linked .elf directly with nm --
+# no dependency on a .map file existing. See that rename's own comment for
+# why this can silently fail to catch everything (-ffunction-sections) and
+# why a hard build failure, not a warning, is the right response.
+add_custom_command(TARGET pico_link POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DELF_FILE=$<TARGET_FILE:pico_link>
+        -DNM=${CMAKE_NM}
+        -DOBJCOPY=${CMAKE_OBJCOPY}
+        -DLDAC_ARCHIVE=$<TARGET_FILE:pl_ldac_enc>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_ldac_not_in_flash.cmake
+    COMMENT "pico-link-nli.9: verifying libldac is not resident in flash"
+    VERBATIM
+)

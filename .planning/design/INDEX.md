@@ -47,6 +47,7 @@ status in `.planning/progress.md`.
 | 2026-09-02 | `2026-09-02-media-keys.md` | AVRCP passthrough -> USB HID consumer control | Live |
 | 2026-09-02 | `2026-09-02-volume-sync.md` | Host <-> dongle <-> headphones volume: canonical 0..127, the loop-breaking rule, event tag 14 with `source`. Section 6's M1/M2 recommendation is **superseded** (VT4a measured that macOS does act on the UAC2 status interrupt EP); section 10's UX split is answered by the 2026-09-07 volume doc. | Live, partly superseded |
 | 2026-09-07 | `2026-09-07-ldac-abr-control-loop.md` | LDAC adaptive bitrate: the 5-rung ladder, tx-queue-depth EMA as the control input, asymmetric dwell, and why a rung change is purely encoder-side. Records Andreas's ruling that a manual quality pick PINS. | Live |
+| 2026-09-23 | `2026-09-23-core1-encoder-default.md` | Root-causes core1's LDAC encode saturating its 2ms fill budget: the accounting is correct, the encode itself is 2-2.8x slower on core1, lead cause libldac running from flash (XIP cache eviction against core0's concurrent work). P1 instrumentation + P2 objcopy-into-SRAM fix; does NOT flip `PL_ENCODER_ON_CORE1`'s default (blocked on pico-link-quzf). | Live, implemented on pico-link-nli.9 |
 
 ## Platform / power / tooling
 
