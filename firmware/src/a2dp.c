@@ -485,7 +485,28 @@ typedef struct {
 
     // --- design sec 7 counters -- IRQ-context producer, thread-context
     // (pl_a2dp_report) consumer. Plain volatile, no formatting here. ---
+    //
+    // Bead pico-link-rzqd (Ada's design, comment on the bead, 2026-09-23):
+    // underrun_events is now EDGE-counted -- incremented once per
+    // starvation EPISODE (the pl_a2dp_fill() call where silent_ticks was
+    // still 0, i.e. the transition into starved), not once per poll. Under
+    // PL_ENCODER_ON_CORE1 the fill loop is called from core1's tight
+    // superloop (~50k+/s while parked in a starved tick, no WFE -- see
+    // pl_a2dp_core1_entry's doc comment), so per-poll counting inflated
+    // this by 5-6 orders of magnitude relative to the actual number of
+    // starvation episodes and made fault.c's BUF STARVED count
+    // (design sec 8.1's "underrun_events reached 13" convention)
+    // meaningless under ON. stop_ring_empty (below) stays the RAW per-poll
+    // counter -- it is the diagnostic that wants every trip of the
+    // ring-empty break, not just the episode boundary.
     volatile uint32_t underrun_events;
+    // Cumulative wall-clock microseconds spent in COMPLETED starvation
+    // episodes (added when an episode ends, i.e. the tick silent_ticks
+    // drops back to 0 -- see pl_a2dp_fill's doc comment at the bottom of
+    // its body). An episode still in progress is not yet reflected here;
+    // this is a coarse diagnostic (feeds pl_a2dp_report only), not a
+    // real-time signal, so that lag is acceptable.
+    volatile uint32_t starved_us;
     volatile uint32_t enc_max_us;
     volatile uint32_t pkt_sent;
     volatile uint32_t pkt_fail;
@@ -1726,10 +1747,27 @@ static void pl_a2dp_fill(void) {
     // for the acceptance-criterion rate this feeds.
     s_ctx.enc_frames_total += frames_this_tick;
 
+    // Bead pico-link-rzqd: edge-count underrun_events (once per starvation
+    // EPISODE) instead of once per call -- see that field's doc comment on
+    // pl_a2dp_ctx_t. silent_ticks == 0 here means this call is the FIRST
+    // starved tick since the last non-starved one, i.e. the entry edge;
+    // silent_ticks is still the pre-increment value at this point. Track
+    // the episode's start timestamp locally (this function's own private
+    // static, single-writer in both builds -- whichever context calls
+    // pl_a2dp_fill) so starved_us can be folded in once the episode ends,
+    // below.
+    static uint64_t s_starve_episode_start_us;
     if (starved) {
-        s_ctx.underrun_events++;
+        if (s_ctx.silent_ticks == 0) {
+            s_ctx.underrun_events++;
+            s_starve_episode_start_us = time_us_64();
+        }
         s_ctx.silent_ticks++;
     } else {
+        if (s_ctx.silent_ticks != 0) {
+            // Episode just ended: fold its duration into starved_us.
+            s_ctx.starved_us += (uint32_t)(time_us_64() - s_starve_episode_start_us);
+        }
         s_ctx.silent_ticks = 0;
     }
 
@@ -1984,7 +2022,36 @@ static void pl_a2dp_resync_apply(void) {
     if (req == s_trim_ack_seq) {
         return;
     }
-    s_trim_dropped = pl_pcm_trim_to(pl_pcm_target_fill_bytes());
+    // pl_pcm_trim_to returns a FRAME count already (pcm_ring.h's own doc
+    // comment: "Returns the number of whole frames dropped"), same units
+    // as samples_owed (see samples_owed's doc comment: "PCM SAMPLE-FRAMES,
+    // not SBC-encoded frames") -- no unit conversion needed below.
+    uint32_t dropped_frames = pl_pcm_trim_to(pl_pcm_target_fill_bytes());
+    s_trim_dropped = dropped_frames;
+
+    // Bead pico-link-rzqd (Ada's design, comment on the bead, 2026-09-23),
+    // FIX B, BOTH builds: a tx stall grows the ring AND samples_owed
+    // together (the credit clock keeps accruing while the ring backs up
+    // behind a full tx queue), the trim above cuts the ring back to
+    // target, but left samples_owed untouched the stale credit then
+    // drained the freshly-trimmed ring right back down toward empty --
+    // credit_clamp_events climbing at each episode was the symptom. The
+    // dropped PCM was never going to be played, so it must never still be
+    // owed either -- subtract it here, floored at 0 (a resync can
+    // legitimately drop more than samples_owed if the ring grew from
+    // priming cushion, not credit, so this is not a can't-happen clamp).
+    //
+    // No lock needed: this function is the tail owner in both builds --
+    // core1's RUNNING branch under ON (called from pl_a2dp_core1_entry),
+    // core0's own IRQ under OFF (called inline from the media-timer
+    // handler) -- and samples_owed's only other writer,
+    // pl_a2dp_accrue_credit, runs in that SAME context in both builds (see
+    // pl_a2dp_core1_entry's loop under ON, the ifndef'd call site in the
+    // media-timer handler under OFF). Single-writer, not concurrent-writer
+    // -- see this function's own doc comment above for the identical
+    // argument already made for s_trim_ack_seq.
+    s_ctx.samples_owed -= (dropped_frames < s_ctx.samples_owed) ? dropped_frames : s_ctx.samples_owed;
+
     __dmb(); // release: publish dropped before the ack that lets core0's complete() observe it
     s_trim_ack_seq = req;
 }
@@ -2106,6 +2173,18 @@ _Static_assert(
 // Plain static, not part of s_ctx -- core0 never reads or writes this.
 static uint64_t s_enc_last_tick_us;
 
+// Bead pico-link-rzqd (Ada's design, comment on the bead, 2026-09-23), FIX
+// A: core1-local edge flag for "was the previous loop iteration RUNNING".
+// Plain static, not part of s_ctx, single-writer/single-reader (core1's
+// own loop only) -- same locality as s_enc_last_tick_us above. See
+// pl_a2dp_core1_entry's RUNNING branch for why this exists: without it,
+// the first RUNNING iteration after a stream start OR a resume books the
+// entire WFE-parked idle gap as accrued credit (s_enc_last_tick_us was
+// last written before the park), which the windup clamp (fill/4+128) then
+// lets drain the whole primed ring into the 7 tx slots in one shot --
+// exactly the on-arm ring-collapse this bead's soak caught.
+static bool s_enc_was_running;
+
 // The core1 thread-mode entry point (multicore_launch_core1's target).
 // Registers as the flash lockout's victim FIRST (flash_lockout.h) -- core0
 // flash writes must never assume core1 is safely parked before this call
@@ -2152,6 +2231,11 @@ static void pl_a2dp_core1_entry(void) {
             // harmless WFE wake -- it can never cost a missed transition.
             s_enc_quiesced = true;
             s_enc_heartbeat++;
+            // Bead pico-link-rzqd, FIX A: core1-local edge flag -- cleared
+            // on every non-RUNNING iteration so the NEXT RUNNING iteration
+            // (whether a fresh stream or a resume) is recognised as the
+            // entry edge below. See that branch's doc comment for why.
+            s_enc_was_running = false;
             __wfe();
             continue;
         }
@@ -2197,9 +2281,25 @@ static void pl_a2dp_core1_entry(void) {
         }
 #endif
 
-        uint32_t elapsed_us = (uint32_t)(now - s_enc_last_tick_us);
-        s_enc_last_tick_us = now;
-        pl_a2dp_accrue_credit(elapsed_us);
+        // Bead pico-link-rzqd, FIX A: on the entry edge into RUNNING (fresh
+        // stream start, via pl_a2dp_core1_arm_running's samples_owed=0
+        // reset, OR resume out of a WFE park -- s_enc_was_running was
+        // cleared on every non-RUNNING iteration above), reset the clock
+        // and skip THIS iteration's accrual instead of crediting the
+        // WFE-parked idle gap. pl_a2dp_fill() below still runs -- with
+        // samples_owed at whatever arm_running left it (0 on a fresh
+        // stream), so it correctly trips stop_credit rather than draining
+        // the ring. The very next iteration accrues normally, from this
+        // freshly-reset s_enc_last_tick_us.
+        bool entering_running = !s_enc_was_running;
+        s_enc_was_running = true;
+        if (entering_running) {
+            s_enc_last_tick_us = now;
+        } else {
+            uint32_t elapsed_us = (uint32_t)(now - s_enc_last_tick_us);
+            s_enc_last_tick_us = now;
+            pl_a2dp_accrue_credit(elapsed_us);
+        }
         pl_a2dp_fill();
 
         s_enc_heartbeat++;
@@ -3772,6 +3872,12 @@ uint32_t pl_a2dp_underrun_events(void) {
     return s_ctx.underrun_events;
 }
 
+// Bead pico-link-rzqd: exposes starved_us for pl_a2dp_report. See that
+// field's doc comment on pl_a2dp_ctx_t.
+uint32_t pl_a2dp_starved_us(void) {
+    return s_ctx.starved_us;
+}
+
 uint32_t pl_a2dp_resync_events(void) {
     return s_ctx.resync_events;
 }
@@ -4021,9 +4127,10 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // alongside the other quiet counters already on this line.
     pl_log(
         "a2dp: stop_credit=%lu stop_queue_full=%lu stop_ring_empty=%lu stop_dwell=%lu fill_short_read=%lu "
-        "fb_rail_ticks=%lu\r\n",
+        "fb_rail_ticks=%lu starved_us=%lu\r\n",
         (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_queue_full, (unsigned long)s_ctx.stop_ring_empty,
-        (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read, (unsigned long)pl_usb_audio_fb_rail_ticks()
+        (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read, (unsigned long)pl_usb_audio_fb_rail_ticks(),
+        (unsigned long)s_ctx.starved_us
     );
     // Bead pico-link-quzf, design doc "Before CMakeLists.txt:322 flips
     // OFF -> ON" step 1: quiesce_timeouts and the flash lockout timeout

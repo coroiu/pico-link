@@ -192,6 +192,9 @@ bool pl_a2dp_media_streaming(void);
 bool pl_a2dp_host_silent(void);
 
 uint32_t pl_a2dp_underrun_events(void);
+// Bead pico-link-rzqd: cumulative microseconds in COMPLETED starvation
+// episodes -- see the underrun_events/starved_us doc comments in a2dp.c.
+uint32_t pl_a2dp_starved_us(void);
 uint32_t pl_a2dp_resync_events(void);
 uint32_t pl_a2dp_resync_drops(void);
 uint32_t pl_a2dp_stop_queue_full(void);
