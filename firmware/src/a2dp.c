@@ -108,14 +108,20 @@
 #include "volume.h" // pl_volume_take_avrcp_desired (T3) / pl_volume_notify_sink, pl_volume_take_fu_report (T4, pico-link-4v2.4)
 #include "watchdog_sup.h"
 
+// Bead pico-link-quzf: flash_lockout.h moved out of the PL_ENCODER_ON_CORE1
+// guard below -- flash_lockout.c is compiled unconditionally
+// (firmware/CMakeLists.txt), and pl_a2dp_report needs
+// pl_flash_lockout_timeout_count()/_active_count() in BOTH builds (see the
+// design doc's "Before CMakeLists.txt:322 flips OFF -> ON" step 1). The
+// counters themselves already read a harmless zero on a single-core
+// build/boot (flash_lockout.h's own doc comment).
+#include "flash_lockout.h"
+
 #ifdef PL_ENCODER_ON_CORE1
 // Bead pico-link-nli.4 (G3, epic pico-link-nli): the LDAC encoder moves to
-// core1. pico/multicore.h for multicore_launch_core1(); flash_lockout.h for
-// pl_flash_lockout_core1_init() (G1, pico-link-nli.2) -- see this file's
+// core1. pico/multicore.h for multicore_launch_core1() -- see this file's
 // "CORE1" section below, just above pl_a2dp_media_timer_handler.
 #include "pico/multicore.h"
-
-#include "flash_lockout.h"
 #endif
 
 // Bead pico-link-85v (D1): renamed from SBC_STORAGE_SIZE -- generous
@@ -734,11 +740,23 @@ typedef struct {
     int32_t abr_q_ema;
     uint64_t abr_last_step_us;
     uint32_t abr_qfull_snapshot;
+
+    // Bead pico-link-quzf: the resync trim's DECIDE/COMPLETE-side sequence
+    // cursor -- core0-private, written ONLY by pl_a2dp_resync_complete()
+    // (never by decide, never by the applier). Holds the last
+    // s_trim_ack_seq value COMPLETE has consumed; decide's "is a request
+    // already outstanding" check compares s_trim_req_seq against this, not
+    // against s_trim_ack_seq directly, so a request that has been applied
+    // but not yet completed still reads as outstanding. See this file's
+    // pl_a2dp_resync_decide/_apply/_complete doc comments (just above the
+    // CORE1 section) for the full design.
+    uint32_t trim_seen_ack;
 } pl_a2dp_ctx_t;
 
 static pl_a2dp_ctx_t s_ctx;
 
 #ifdef PL_DEBUG_REMOTE
+#ifndef PL_ENCODER_ON_CORE1
 // Bead pico-link-fhf, test A. Set by pl_a2dp_debug_skip_media_ticks()
 // (thread context, debug_remote.c's poll) and consumed at the top of the
 // drain step in pl_a2dp_media_timer_handler (the same 0xFF IRQ context that
@@ -747,6 +765,19 @@ static pl_a2dp_ctx_t s_ctx;
 // reader/decrementer, so no tear and no lock needed, same discipline as
 // pcm_ring's s_head/s_tail.
 static volatile uint32_t s_debug_skip_media_ticks;
+#else
+// Bead pico-link-quzf, "Debug injection under ON": the core1-side
+// equivalent of s_debug_skip_media_ticks above. Unlike the OFF one-shot
+// (a plain decrementing tick count, consumed by the same core that ticks
+// it), core1 runs asynchronously to the media timer, so this needs a
+// sequence number rather than a counter -- pl_a2dp_debug_skip_media_ticks()
+// writes the duration then bumps the seq; core1's loop (pl_a2dp_core1_entry)
+// detects the seq change and latches its own absolute deadline from it.
+// One thread-context writer, one core1-context reader, both single aligned
+// 32-bit words -- no tear, no lock.
+static volatile uint32_t s_dbg_core1_skip_us;
+static volatile uint32_t s_dbg_core1_skip_seq;
+#endif
 #endif
 
 // SDP service record buffers -- sized exactly like a2dp_source_demo.c's
@@ -1882,6 +1913,100 @@ static void pl_a2dp_accrue_credit(uint32_t elapsed_us) {
     }
 }
 
+// === RESYNC TRIM (bead pico-link-quzf, design
+// .planning/design/2026-09-23-core1-resync-trim.md): DECIDE on core0,
+// APPLY on the tail owner, COMPLETE on core0. Same split as the 7jol.3
+// LDAC ABR controller (DECIDE writes one request word on core0; APPLY runs
+// where the encoder lives) -- reuse of that pattern, not a second one.
+// Defined here, ABOVE the CORE1 section below, because
+// pl_a2dp_resync_apply() is called from pl_a2dp_core1_entry under
+// PL_ENCODER_ON_CORE1 and must already be visible to it; all three
+// functions are plain (non-ifdef'd) statics compiled in BOTH builds, with
+// the ifdef only at call sites (media timer handler below, and
+// pl_a2dp_core1_entry/pl_a2dp_core1_arm_running in the CORE1 section).
+//
+// Only the tail owner (core1 under ON, core0's own IRQ under OFF) ever
+// moves pcm_ring's s_tail via pl_pcm_trim_to -- the SPSC/single-writer
+// invariant pcm_ring.h's module doc requires. Only core0 ever touches
+// usb_audio state (pl_usb_audio_fb_fill_ema/_reset) and s_ctx's
+// resync_drops/resync_events/last_resync_us counters -- core1 must not
+// call into a module whose state it does not own (see s_enc_heartbeat's
+// doc comment). No lock: pico_cyw43_arch_threadsafe_background
+// (CMakeLists.txt) serializes BTstack timers/packet handlers into one
+// async_context, so the media timer (decide/complete) and STREAM_STARTED
+// (the cancel below) never run concurrently with each other on core0. Do
+// NOT add a critical section here.
+//
+// One writer per shared word: core0 writes s_trim_req_seq; the applier
+// (whoever it is per build) writes s_trim_dropped then s_trim_ack_seq. An
+// outstanding request is (s_trim_req_seq != s_ctx.trim_seen_ack) -- decide
+// refuses to fire again while true, so a stalled applier cannot bank
+// multiple cuts and release them in a burst later. No payload travels with
+// the request: the applier re-reads pl_pcm_target_fill_bytes() itself,
+// which STREAM_ESTABLISHED writes once before RUNNING is published and
+// never touches again while core1 runs, so it is stable to read from
+// either core without a barrier of its own.
+static volatile uint32_t s_trim_req_seq;
+static volatile uint32_t s_trim_ack_seq;
+static volatile uint32_t s_trim_dropped;
+
+// Media-timer DECIDE phase, BOTH builds, same call site the old ifndef'd
+// fhf trim block used to occupy: after the ABR block, before fill/send-
+// kick. Unchanged trip condition from fhf (evaluated on the EMA, never raw
+// fill -- see the historical doc comment this replaces, preserved in the
+// design doc) plus one new guard: refuse while a request is outstanding,
+// so decide can never stack a second cut ahead of the first one's COMPLETE.
+static void pl_a2dp_resync_decide(uint64_t now_us, bool host_silent) {
+    if (host_silent) {
+        return;
+    }
+    if (s_trim_req_seq != s_ctx.trim_seen_ack) {
+        // Outstanding request: the previous cut has not been COMPLETEd yet
+        // (or, under ON, not even APPLYed yet). Wait.
+        return;
+    }
+    int32_t fill_ema = pl_usb_audio_fb_fill_ema();
+    uint32_t target = pl_pcm_target_fill_bytes();
+    if (fill_ema > 0 && (uint32_t)fill_ema > target + PL_PCM_TRIM_BAND_BYTES &&
+        (now_us - s_ctx.last_resync_us) > PL_PCM_TRIM_MIN_INTERVAL_US) {
+        s_ctx.last_resync_us = now_us;
+        __dmb(); // publish-after-write: order last_resync_us before the request that signals the applier
+        s_trim_req_seq++;
+    }
+}
+
+// APPLY phase -- runs wherever the tail owner is: core1's RUNNING branch
+// under ON, inline on core0 right after decide under OFF. The applier is
+// s_trim_ack_seq's ONLY writer, so this compare-then-write is race-free
+// with no lock even though core0 also reads s_trim_ack_seq (in complete()).
+static void pl_a2dp_resync_apply(void) {
+    uint32_t req = s_trim_req_seq;
+    if (req == s_trim_ack_seq) {
+        return;
+    }
+    s_trim_dropped = pl_pcm_trim_to(pl_pcm_target_fill_bytes());
+    __dmb(); // release: publish dropped before the ack that lets core0's complete() observe it
+    s_trim_ack_seq = req;
+}
+
+// Media-timer COMPLETE phase, BOTH builds: folds the applier's dropped
+// count into the cumulative resync_drops/resync_events counters and
+// reseeds the EMA from the POST-trim fill, LAST -- fhf's ordering lesson,
+// now a cross-core release/acquire pair instead of an in-IRQ ordering
+// (core1 stores dropped, dmb, ack; core0 loads ack, dmb, fb_reset reads
+// pl_pcm_fill_bytes -- acquire). All words aligned 32-bit, no tear.
+static void pl_a2dp_resync_complete(void) {
+    uint32_t ack = s_trim_ack_seq;
+    if (ack == s_ctx.trim_seen_ack) {
+        return;
+    }
+    __dmb(); // acquire: order the ack read above before consuming s_trim_dropped and reseeding the EMA below
+    s_ctx.trim_seen_ack = ack;
+    s_ctx.resync_drops += s_trim_dropped;
+    s_ctx.resync_events++;
+    pl_usb_audio_fb_reset();
+}
+
 #ifdef PL_ENCODER_ON_CORE1
 // === CORE1: the LDAC encoder (bead pico-link-nli.4, epic pico-link-nli,
 // design of record .planning/decisions/2026-09-03-ldac-encoder-on-core1.md
@@ -2032,7 +2157,46 @@ static void pl_a2dp_core1_entry(void) {
         }
         s_enc_quiesced = false;
 
+        // Bead pico-link-quzf: this is the tail owner under ON -- APPLY
+        // the resync trim here, before credit accrual/fill, so a trim that
+        // fires this iteration is reflected in pl_pcm_read's very next
+        // call. See pl_a2dp_resync_apply's doc comment above.
+        pl_a2dp_resync_apply();
+
         uint64_t now = time_us_64();
+
+#if defined(PL_DEBUG_REMOTE) && defined(PL_ENCODER_ON_CORE1)
+        // Bead pico-link-quzf, "Debug injection under ON": the SKIPTICKS
+        // one-shot's core1-side latch. s_dbg_core1_skip_seq is written by
+        // pl_a2dp_debug_skip_media_ticks() (thread context, debug_remote.c)
+        // -- core1 keeps its own last-seen copy and, on change, latches an
+        // absolute deadline from THIS iteration's now, converting the
+        // request's tick-count into a wall-clock window once, here, rather
+        // than re-deriving it from a possibly-stale s_enc_last_tick_us.
+        // While inside the window this core skips BOTH accrue_credit and
+        // fill -- discarding the credit is deliberate (see
+        // pl_a2dp_debug_skip_media_ticks's doc comment): core1 drains
+        // faster than real time, so crediting through the skip would let
+        // it silently absorb the injected surplus itself and the trim
+        // might never be needed. s_enc_last_tick_us and the heartbeat still
+        // advance so the NEXT real tick's elapsed_us and PL_WDT_ENCODER
+        // stay correct -- only the fill/accrual work is skipped, not the
+        // loop's own liveness bookkeeping. No WFE: nobody would SEV this
+        // core out of it.
+        static uint32_t s_dbg_core1_seen_skip_seq;
+        static uint64_t s_dbg_core1_skip_until;
+        uint32_t skip_seq_now = s_dbg_core1_skip_seq;
+        if (skip_seq_now != s_dbg_core1_seen_skip_seq) {
+            s_dbg_core1_seen_skip_seq = skip_seq_now;
+            s_dbg_core1_skip_until = now + s_dbg_core1_skip_us;
+        }
+        if (now < s_dbg_core1_skip_until) {
+            s_enc_last_tick_us = now;
+            s_enc_heartbeat++;
+            continue;
+        }
+#endif
+
         uint32_t elapsed_us = (uint32_t)(now - s_enc_last_tick_us);
         s_enc_last_tick_us = now;
         pl_a2dp_accrue_credit(elapsed_us);
@@ -2146,6 +2310,16 @@ static void pl_a2dp_core1_quiesce_and_wait(void) {
 static void pl_a2dp_core1_arm_running(void) {
     s_ctx.samples_owed = 0;
     s_ctx.samples_owed_rem_us = 0;
+    // Bead pico-link-quzf, "Cancel at stream (re)arm -- REQUIRED": drop any
+    // resync request left outstanding across SUSPEND/RELEASE by declaring
+    // it already-seen, so pl_a2dp_resync_apply() never fires it on this
+    // fresh stream's first RUNNING iteration and trims the priming cushion
+    // (fhf's rule: no trim at STREAM_STARTED -- see the deleted C2-3 trim
+    // below). Safe here because core1 is quiesced: it only applies while
+    // RUNNING, and every path into this function passed through a quiesce
+    // or boot IDLE first (pl_a2dp_core1_quiesce_and_wait's doc comment).
+    s_trim_req_seq = s_trim_ack_seq;
+    s_ctx.trim_seen_ack = s_trim_ack_seq;
     __dmb();
     s_enc_state = PL_ENC_STATE_RUNNING;
     // Wake core1 out of the WFE it parks in while non-RUNNING (bead
@@ -2236,6 +2410,15 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
         return;
     }
 
+#ifdef PL_ENCODER_ON_CORE1
+    // Bead pico-link-quzf: COMPLETE phase, at the top of the STREAMING
+    // part of this handler, before decide -- consumes whatever core1's
+    // APPLY finished on a prior core1 iteration (at most one 2ms fill cap
+    // plus one encode, ~4ms, then this tick's ~11ms). See
+    // pl_a2dp_resync_complete's doc comment above.
+    pl_a2dp_resync_complete();
+#endif
+
     // Bead pico-link-7jol.3, design sec 2/3: the LDAC ABR controller's
     // DECIDE phase. Runs on core0's media-timer IRQ in BOTH build modes
     // (pl_a2dp_tx_count() is already read from this handler under core1
@@ -2290,58 +2473,24 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     // fhf trim immediately below (pico-link-0d2's lesson). All reporting
     // happens in pl_a2dp_report, at thread context.
 
+    // Bead pico-link-quzf: hysteresis-banded discrete resync, DECIDE phase,
+    // BOTH builds -- see pl_a2dp_resync_decide's doc comment above (just
+    // before the CORE1 section) for the trip condition (unchanged from
+    // fhf) and why it now also refuses while a request is outstanding. NO
+    // pl_log -- this file's module doc forbids it in the hot path, and it
+    // killed the ISO-OUT endpoint once already (pico-link-0d2). All
+    // reporting for this mechanism happens in pl_a2dp_report, at thread
+    // context.
+    pl_a2dp_resync_decide(pbv_now_us, host_silent);
+
 #ifndef PL_ENCODER_ON_CORE1
-    // Bead pico-link-fhf: hysteresis-banded discrete resync. Ring fill
-    // under credit pacing is a free integrator (drain is defined by our
-    // own crystal, the same crystal supply is regulated against, so there
-    // is no restoring force) -- the +-500ppm feedback loop is ~100x too
-    // weak to remove an offset in useful time, so a sustained offset must
-    // be removed discretely instead of left to integrate toward overflow
-    // (the ~5.4 minute collapse this bead exists to fix). Evaluated on the
-    // EMA, NEVER raw fill -- raw fill sawtooths by up to one tick's drain
-    // (~3840B), comparable to the band itself, so a raw-fill comparison
-    // would trip constantly. See the bead's design comment sec 1-3.
-    //
-    // Skip while the host is silent (a paused host must not be trimmed on
-    // its way to auto-pause) and while inside the minimum interval (the
-    // EMA holds a stale pre-trim value for ~5 tau after a reseed; an
-    // ungated second tick would cut another band's worth on a reading that
-    // no longer exists).
-    //
-    // GATED ON !PL_ENCODER_ON_CORE1 (code review, 2026-09-07): pl_pcm_trim_to
-    // writes pcm_ring's s_tail, which under PL_ENCODER_ON_CORE1 is owned by
-    // core1's pl_a2dp_core1_entry loop (it calls pl_pcm_read(), the other
-    // read-modify-write of s_tail) -- running this block unconditionally in
-    // core0's IRQ would race that write with no lock, exactly the hazard
-    // pcm_ring.h's module doc calls out for a genuinely cross-core consumer.
-    // This mirrors every other core1 carve-out in this function. Dormant
-    // today (PL_ENCODER_ON_CORE1 defaults OFF), but core1 mode currently has
-    // NO resync mechanism until pico-link-quzf lands a core1-safe design --
-    // do not remove this guard without that design in place.
-    if (!host_silent) {
-        int32_t fill_ema = pl_usb_audio_fb_fill_ema();
-        uint32_t target = pl_pcm_target_fill_bytes();
-        if (fill_ema > 0 && (uint32_t)fill_ema > target + PL_PCM_TRIM_BAND_BYTES &&
-            (pbv_now_us - s_ctx.last_resync_us) > PL_PCM_TRIM_MIN_INTERVAL_US) {
-            uint32_t dropped = pl_pcm_trim_to(target);
-            s_ctx.resync_drops += dropped;
-            s_ctx.resync_events++;
-            s_ctx.last_resync_us = pbv_now_us;
-            // Reseed the EMA LAST, from the post-trim fill -- ordering
-            // matters, this is what makes the min-interval lockout above
-            // sufficient rather than merely helpful. (A 0xC0 preemption of
-            // this 0xFF handler between the trim and the reseed can fold
-            // one stale pre-trim sample into the EMA first -- harmless,
-            // one >>6 step, ~340B of transient error against a 2880B band,
-            // and both values are single aligned 32-bit words so there is
-            // no tear; no critical section needed.)
-            pl_usb_audio_fb_reset();
-        }
-    }
-    // NO pl_log in this block -- this file's module doc forbids it in the
-    // hot path, and it killed the ISO-OUT endpoint once already
-    // (pico-link-0d2). All reporting for this mechanism happens in
-    // pl_a2dp_report, at thread context.
+    // Bead pico-link-quzf: under OFF, core0 IS the tail owner (this same
+    // IRQ is what pl_pcm_read runs from, via pl_a2dp_fill below) -- so
+    // APPLY and COMPLETE both run inline, back to back with decide, in the
+    // same tick. This is exactly today's (fhf's) behaviour: decide, apply,
+    // reseed, all in one handler invocation, no regression.
+    pl_a2dp_resync_apply();
+    pl_a2dp_resync_complete();
 
     // Bead pico-link-85v (D1): the old "only fill if not already waiting
     // on a grant" gate is GONE -- that was the actual ceiling mechanism
@@ -3301,6 +3450,17 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // -- the conservation check sums it across the whole session.
             s_ctx.resync_events = 0;
             s_ctx.last_resync_us = 0;
+#ifndef PL_ENCODER_ON_CORE1
+            // Bead pico-link-quzf, "Cancel at stream (re)arm": the OFF-
+            // build twin of pl_a2dp_core1_arm_running's cancel above --
+            // core0 IS the tail owner under OFF, so there is no separate
+            // arm function to put this in; it lives right here, next to
+            // the other STREAM_STARTED resets. Same reasoning: a request
+            // outstanding across SUSPEND/RELEASE must never be applied
+            // against this fresh stream's priming cushion.
+            s_trim_req_seq = s_trim_ack_seq;
+            s_ctx.trim_seen_ack = s_trim_ack_seq;
+#endif
             //
             // Bead pico-link-pbv round 2 (C2-5): (re)establish the
             // host-silence baseline exactly at the instant real streaming
@@ -3698,6 +3858,7 @@ void pl_a2dp_disconnect(void) {
 }
 
 #ifdef PL_DEBUG_REMOTE
+#ifndef PL_ENCODER_ON_CORE1
 // Bead pico-link-fhf, test A. Thread-context write (debug_remote.c's
 // poll, superloop) to the single aligned word the media-timer IRQ
 // decrements -- see s_debug_skip_media_ticks's doc comment above. A
@@ -3707,6 +3868,23 @@ void pl_a2dp_disconnect(void) {
 void pl_a2dp_debug_skip_media_ticks(uint32_t ticks) {
     s_debug_skip_media_ticks = ticks;
 }
+#else
+// Bead pico-link-quzf, "Debug injection under ON". Under OFF, SKIPTICKS
+// gates pl_a2dp_fill() directly (above) -- but under ON, pl_a2dp_fill()
+// runs on core1 and this write happens on core0's thread context, so this
+// is the two-word seq handoff core1's loop (pl_a2dp_core1_entry) consumes
+// instead: write the duration in microseconds THEN bump the seq (dmb
+// between so a reader that observes the new seq also observes the new
+// duration), same publish-after-write discipline as the resync trim's
+// s_trim_req_seq. Without this, SKIPTICKS was a no-op under ON (the
+// original bug this bead exists to fix -- see the design doc's "Debug
+// injection under ON" section): a test that cannot fail is not a test.
+void pl_a2dp_debug_skip_media_ticks(uint32_t ticks) {
+    s_dbg_core1_skip_us = ticks * PL_A2DP_AUDIO_TIMEOUT_MS * 1000u;
+    __dmb();
+    s_dbg_core1_skip_seq++;
+}
+#endif
 #endif
 
 void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
@@ -3846,6 +4024,25 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
         "fb_rail_ticks=%lu\r\n",
         (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_queue_full, (unsigned long)s_ctx.stop_ring_empty,
         (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read, (unsigned long)pl_usb_audio_fb_rail_ticks()
+    );
+    // Bead pico-link-quzf, design doc "Before CMakeLists.txt:322 flips
+    // OFF -> ON" step 1: quiesce_timeouts and the flash lockout timeout
+    // counters existed with NO call site in this reporter -- nli.9's "both
+    // 0" acceptance criterion was unreadable; an unprinted counter reads
+    // as zero whether or not it actually is. quiesce_timeouts is
+    // meaningful only where there is a second core to quiesce (ON); the
+    // flash lockout counters are printed in BOTH builds (they read a
+    // harmless zero on a single-core boot -- flash_lockout.h's own doc
+    // comment) so the same log-parsing tooling works unchanged across
+    // both arms of the A/B soak.
+    pl_log(
+        "a2dp: quiesce_timeouts=%lu flash_lockout_timeout_count=%lu flash_lockout_active_count=%lu\r\n",
+#ifdef PL_ENCODER_ON_CORE1
+        (unsigned long)pl_a2dp_encoder_quiesce_timeouts(),
+#else
+        0ul,
+#endif
+        (unsigned long)pl_flash_lockout_timeout_count(), (unsigned long)pl_flash_lockout_active_count()
     );
     // Bead pico-link-cz0.5.8 (Ada's step 4): stop_dwell is documented two
     // comments up as "must read 0 in a healthy run" -- it was, all session,
