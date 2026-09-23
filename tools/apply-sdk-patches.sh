@@ -423,4 +423,49 @@ elif STOCK5 in src5:
     print(f"APPLIED: 05-tinyusb-rp2040-reset-before-notify -> {f5}")
 else:
     sys.exit("FAIL: dcd_rp2040.c's hw_handle_buff_status done-branch matches neither stock nor patched form.")
+
+# --- 06: count bytes tu_fifo_write_n silently drops in audiod_xfer_isr ----
+# (bead pico-link-9ziq, F2). tu_fifo_write_n() returns the number of bytes it
+# ACTUALLY wrote, clamped to the FIFO's remaining room -- not a bool -- but
+# audiod_xfer_isr's `if (!tu_fifo_write_n(...)) return false;` only reacts to
+# a return of exactly 0 (a completely full FIFO). A PARTIAL write (FIFO had
+# room for some but not all of xferred_bytes) makes that condition false, so
+# the tail of the packet is dropped with nothing counting it -- Ada's finding
+# for this bead. This patch captures the return value and adds the shortfall
+# (xferred_bytes - written) to pl_usb_fifo_shortfall_bytes (defined in
+# firmware/src/usb_pump.c) whenever it is nonzero, covering both the partial
+# case and the full-FIFO (written == 0) case already handled by the existing
+# `return false`. Behaviour (what gets re-armed, what gets returned) is
+# UNCHANGED -- this is measurement only, per this bead's design doc.
+f6 = sdk / "lib/tinyusb/src/class/audio/audio_device.c"
+src6 = f6.read_text()
+STOCK6 = """    // Data currently is in the linear buffer -- copy into the EP OUT FIFO
+    // BEFORE re-arming, since re-arming lets TinyUSB overwrite lin_buf_out.
+    if (!tu_fifo_write_n(&audio->ep_out_ff, audio->lin_buf_out, (uint16_t) xferred_bytes)) {
+      return false;
+    }"""
+MARK6 = "pl_usb_fifo_shortfall_bytes"
+PATCHED6 = """    // Data currently is in the linear buffer -- copy into the EP OUT FIFO
+    // BEFORE re-arming, since re-arming lets TinyUSB overwrite lin_buf_out.
+    // pico-link (bead pico-link-9ziq, F2): tu_fifo_write_n() returns bytes
+    // ACTUALLY written (clamped on a non-overwritable FIFO), not a bool --
+    // a partial write silently drops the tail with the old `if (!...)` test
+    // alone. Count the shortfall either way. Defined in usb_pump.c. See
+    // firmware/sdk-patches/README.md (patch 06).
+    uint16_t written = tu_fifo_write_n(&audio->ep_out_ff, audio->lin_buf_out, (uint16_t) xferred_bytes);
+    if (written < (uint16_t) xferred_bytes) {
+      extern volatile uint32_t pl_usb_fifo_shortfall_bytes;
+      pl_usb_fifo_shortfall_bytes += (uint32_t)((uint16_t) xferred_bytes - written);
+    }
+    if (written == 0) {
+      return false;
+    }"""
+
+if MARK6 in src6:
+    print("ok: 06-tinyusb-audio-device-c-fifo-shortfall already applied")
+elif STOCK6 in src6:
+    f6.write_text(src6.replace(STOCK6, PATCHED6, 1))
+    print(f"APPLIED: 06-tinyusb-audio-device-c-fifo-shortfall -> {f6}")
+else:
+    sys.exit("FAIL: audio_device.c's audiod_xfer_isr tu_fifo_write_n call matches neither stock nor patched form.")
 PY
