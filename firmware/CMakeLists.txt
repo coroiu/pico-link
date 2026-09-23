@@ -329,18 +329,27 @@ if(PL_WATCHDOG)
 endif()
 
 # Bead pico-link-nli.4 (G3, epic pico-link-nli, "LDAC encoder on core1"):
-# moves the LDAC encoder + pcm-ring fill loop to core1. Default ON -- this
-# is the bead's whole point -- but kept a real option, per the epic's own
-# design doc sec 8 ("Behind a compile-time PL_ENCODER_ON_CORE1 so a bad
-# build is one flag from reverting"). Off reproduces the exact pre-G3
-# single-core behaviour: pl_a2dp_seal_head() calls
+# moves the LDAC encoder + pcm-ring fill loop to core1. Default ON as of
+# 2026-09-23 (pico-link-nli.10) -- this is the bead's whole point -- kept a
+# real option per the epic's own design doc sec 8 ("Behind a compile-time
+# PL_ENCODER_ON_CORE1 so a bad build is one flag from reverting"). It was
+# OFF by default from its introduction (pico-link-gmy) until 2026-09-23 as a
+# P0 mitigation while the root cause of core1's render-cost regression was
+# unknown; that root cause is now understood (nli.8/nli.9: libldac's .text
+# fighting core0's XIP cache -- see the objcopy-rename comment above) and
+# fixed on the core1 side (quzf: core1-safe resync trim; 9ziq: USB drain
+# moved outside pl_usb_mutex; rzqd: resume-edge credit reset + edge-counted
+# underruns), so ON is now the default. OFF remains a real, demoted A/B
+# fallback (-DPL_ENCODER_ON_CORE1=OFF) -- not deleted, per Ada's quzf
+# design -- and reproduces the exact pre-G3 single-core behaviour:
+# pl_a2dp_seal_head() calls
 # a2dp_source_stream_endpoint_request_can_send_now() directly again, the
 # media timer's credit-clock/dwell-budget/fill()/level-push call sites are
 # all restored, and core1 is never launched (pl_a2dp_launch_core1 does not
 # even exist in that build). pico_multicore is already linked below
 # unconditionally (G1, pico-link-nli.2, for the flash lockout) regardless of
 # this flag.
-option(PL_ENCODER_ON_CORE1 "Run the LDAC encoder on core1 instead of core0's media timer" OFF)
+option(PL_ENCODER_ON_CORE1 "Run the LDAC encoder on core1 instead of core0's media timer" ON)
 if(PL_ENCODER_ON_CORE1)
     target_compile_definitions(pico_link PRIVATE PL_ENCODER_ON_CORE1=1)
 endif()

@@ -10,7 +10,11 @@
   supersedes §11 where they disagree.** §11 remains the record of the post-G0
   re-scope; §9's table and §8's G0 entry are superseded by it. **Amends**
   `.planning/decisions/2026-09-02-core1-allocation-and-the-repaint-ceiling.md`
-  (see §1).
+  (see §1). **`PL_ENCODER_ON_CORE1` default flipped OFF→ON 2026-09-23**
+  (`pico-link-nli.10`), after nli.8/nli.9 found and fixed the XIP-cache root
+  cause of the render-cost regression and quzf/9ziq/rzqd closed the
+  core1-side stability gaps this ADR's performance-acceptance section flagged.
+  OFF is retained as a demoted A/B fallback, not deleted.
 - **Author:** Ada (architect)
 
 ## 0. The finding this is designed against (do not re-derive)
