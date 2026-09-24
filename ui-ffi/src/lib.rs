@@ -2862,11 +2862,11 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past DiscoveryStateChanged = 17, the highest legal
-            // PlEventTag as of bead pico-link-88xs -- moved from 17 (one
-            // past the old highest, AudioFault = 16) when this bead added
-            // tag 17.
-            tag: 18,
+            // One past DisplaySettingsLoaded = 18, the highest legal
+            // PlEventTag as of bead pico-link-qivj.2 -- moved from 18 (one
+            // past the old highest, DiscoveryStateChanged = 17) when this
+            // bead added tag 18.
+            tag: 19,
             payload: bogus_payload,
         };
         unsafe {
@@ -3234,7 +3234,11 @@ mod tests {
     }
 
     #[test]
-    fn muted_never_re_blanks_at_the_next_idle_timeout_while_it_holds() {
+    fn muted_lands_on_dim_at_the_next_idle_timeout_while_it_holds() {
+        // Andreas's Q1 ruling (pico-link-qivj.2): muted/zero + idle goes to
+        // Dim, not On and not Off -- same semantics as the equivalent
+        // `core::run::mute_or_zero_past_the_idle_timeout_lands_on_dim_not_on`
+        // and `mute_does_not_extend_the_idle_timer` tests.
         let ui = new_ui();
         let idle_timeout_us = pico_link_core::DEFAULT_IDLE_TIMEOUT.as_micros() as u64;
 
@@ -3243,8 +3247,8 @@ mod tests {
             pl_ui_push_event(ui, volume_event(0, true, PlVolumeSource::Sink));
             pl_ui_tick(ui, idle_timeout_us);
             assert!(
-                pl_ui_display_power(ui) == PlDisplayPower::On,
-                "the screensaver must never blank while muted holds, even once a full idle timeout elapses (section 5.4's floor)"
+                pl_ui_display_power(ui) == PlDisplayPower::Dim,
+                "the screensaver must land on Dim (never fully blank) while muted holds, once a full idle timeout elapses (section 5.4's floor)"
             );
 
             // And once un-muted with no further activity, the ordinary
@@ -3508,14 +3512,16 @@ mod tests {
             PlEventTag::LdacBitrateChanged,
             PlEventTag::AudioFault,
             PlEventTag::DiscoveryStateChanged,
+            PlEventTag::DisplaySettingsLoaded,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 18 -- one past DiscoveryStateChanged = 17, the highest legal
-        // PlEventTag as of bead pico-link-88xs (moved from 17, one past
-        // the old highest AudioFault = 16, when this bead added tag 17).
-        assert!(PlEventTag::try_from(18u32).is_err());
+        // 19 -- one past DisplaySettingsLoaded = 18, the highest legal
+        // PlEventTag as of bead pico-link-qivj.2 (moved from 18, one past
+        // the old highest DiscoveryStateChanged = 17, when this bead added
+        // tag 18).
+        assert!(PlEventTag::try_from(19u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
