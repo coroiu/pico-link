@@ -299,9 +299,17 @@ static void pl_codec_ldac_apply_pending_tuning(void *state) {
 // the two mappings can never drift -- see design sec 5.4's "one function"
 // rule (extended to this rung-flavoured sibling).
 static int32_t pl_ldac_quality_to_rung(uint8_t ldac_quality_1based) {
+    // Bead pico-link-dge6, secondary fix: the real libldac EQMID table
+    // (ldacBT_internal.c's tbl_ldacbt_eqmid_property, ASK THE LIBRARY per
+    // bead pico-link-qx8's doctrine) is HQ(0)=990, SQ(1)=660, Q0(2)=492,
+    // Q1(3)=396, MQ(4)=330 -- exactly the PL_LDAC_ADAPTIVE_LADDER_RUNGS==5
+    // rungs this ladder already has, one real alter_eqmid_priority step per
+    // rung. SQ is table position 1, NOT 2 -- the old mapping (SQ->2) walked
+    // one extra real step past SQ and landed on Q0 (492kbps) instead. MQ
+    // was already correct at 4.
     switch (ldac_quality_1based) {
         case 2: // 660 kbps / SQ
-            return 2;
+            return 1;
         case 3: // 330 kbps / MQ
             return 4;
         case 0: // never chosen -- same default as pinned 990/HQ
@@ -392,8 +400,19 @@ static bool pl_codec_ldac_init(
     s_ldac_adaptive = adaptive_out;
     // design sec 5.2: no carried-over controller state, ever -- this
     // init() call is one of the four reset events (codec re-negotiation).
-    s_ldac_applied_rung = 0;
-    s_ldac_target_rung = 0;
+    // Bead pico-link-dge6: "no carried-over state" means no state survives
+    // from the PREVIOUS stream, not "always reset to rung 0" -- rung 0 is
+    // only correct when initial_eqmid actually IS HQ. A pinned SQ/MQ device
+    // starts the real encoder at that EQMID via initial_eqmid above, so the
+    // rung bookkeeping must be seeded to match it, or a later pin to a
+    // *different* fixed quality can compute target_rung == applied_rung by
+    // coincidence and pl_codec_ldac_apply_pending_tuning's early-return
+    // (line ~239) silently no-ops -- exactly the "raising quality does
+    // nothing" bug this bead fixes. Adaptive streams still start correctly
+    // at rung 0 (pl_ldac_quality_to_rung's Adaptive/HQ default), so this is
+    // a pure correction of the seed value, not new carried-over state.
+    s_ldac_applied_rung = pl_ldac_quality_to_rung(s_pending_ldac_quality);
+    s_ldac_target_rung = s_ldac_applied_rung;
     // Bead pico-link-7jol.5: same "no carried-over state" rule extends to
     // the live-bitrate cache -- a stale reading from the PREVIOUS stream
     // must not survive into this one, however briefly (Home's live number
