@@ -3128,6 +3128,18 @@ impl App {
     /// If a `RefMut` borrow of the model is already held -- see
     /// [`ModelHandle`]'s doc comment for the borrow rule that's meant to
     /// make this never happen in practice.
+    ///
+    /// # Rule for unsafe FFI call sites (`ui-ffi`)
+    ///
+    /// In safe Rust the returned `Ref` is borrow-checked against `&App` and
+    /// cannot outlive it. But `ui-ffi` derefs a raw `*mut PlUi` to get at
+    /// `App`, which yields an *unbounded* lifetime -- so in `ui-ffi`, never
+    /// bind `app.model()` to a `let` and hold it across any `pl_ui_*` call
+    /// (especially `pl_ui_destroy`, which frees the `Rc<RefCell<BtModel>>`
+    /// this `Ref` borrows from). Scope it in an inner block instead, so
+    /// `Ref`'s `Drop` runs before the next `pl_ui_*` call. See the DECISION
+    /// comment on bead `pico-link-bgnd.7` (a real heap-use-after-free was
+    /// found and fixed this way in `ui-ffi/src/lib.rs`).
     #[must_use]
     pub fn model(&self) -> Ref<'_, BtModel> {
         self.model.borrow()
