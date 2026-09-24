@@ -44,9 +44,8 @@ pub(crate) use screens::device_page::build_device_page_screen;
 pub(crate) use screens::devices::build_devices_screen;
 #[cfg(test)]
 pub(crate) use screens::devices::DEVICES_TITLE;
-use screens::ldac_quality::build_ldac_quality_picker_screen;
 pub(crate) use screens::ldac_quality::LDAC_QUALITY_ADAPTIVE;
-pub(crate) use screens::settings::{build_settings_picker_screen, build_settings_screen};
+pub(crate) use screens::settings::build_settings_screen;
 pub(crate) use screens::why_page::build_why_page_screen;
 pub use ui_state::{DisplaySettingsState, HomeFace, WizardPhase};
 
@@ -216,15 +215,16 @@ impl App {
     /// Seeds the live setting (e.g. from `Event::DisplaySettingsLoaded`, or
     /// the emulator's own `DisplaySettings::load` at startup) -- sets
     /// `current` and marks it pending *application* to the live
-    /// `IdlePolicy` and a stack refresh, but deliberately does NOT mark it
-    /// pending *save*: seeding is "here is what's already stored/
-    /// defaulted," not a user edit, and re-saving a value that was just
-    /// loaded would be a pointless (if harmless) write on every boot.
+    /// `IdlePolicy`, but deliberately does NOT mark it pending *save*:
+    /// seeding is "here is what's already stored/defaulted," not a user
+    /// edit, and re-saving a value that was just loaded would be a
+    /// pointless (if harmless) write on every boot. No stack refresh to
+    /// mark either (bead `pico-link-bgnd` M3): the Settings screen/pickers
+    /// read this same `Rc<RefCell<_>>` handle live via `Widget::sync`.
     pub fn set_display_settings(&mut self, settings: DisplaySettings) {
         let mut state = self.display_settings.borrow_mut();
         state.current = settings;
         state.apply_pending = true;
-        state.refresh_pending = true;
     }
 
     /// Drains the "apply to `IdlePolicy`" latch -- `Some` at most once per
@@ -322,11 +322,31 @@ impl App {
             // rebuild that never happens (see `ScreenId::Home`'s arm just
             // above for the identical M1 shape).
             ScreenId::Devices => Refresh::Keep,
-            ScreenId::DevicePage(addr) => build_device_page_screen(&self.model.borrow(), addr, carry, &self.commands),
-            ScreenId::Picker(PickerKind::LdacQuality, addr) => build_ldac_quality_picker_screen(&self.model.borrow(), addr, carry, &self.commands),
+            // `DevicePageView`/the `QUALITY` picker's `PickerView` are each
+            // built once per push and never rebuilt again while they stay
+            // on the stack -- both read the live model themselves via
+            // `Widget::sync` every frame they're on top (bead
+            // `pico-link-bgnd` M3). `carry` is unused here for the same
+            // "nothing to carry forward into a rebuild that never happens"
+            // reason `ScreenId::Home`/`ScreenId::Devices` give above; the
+            // liveness check below is what `App::refresh_stack` still needs
+            // from this arm -- a forgotten device unwinds the stack exactly
+            // as it did when this arm rebuilt the whole screen.
+            ScreenId::DevicePage(addr) | ScreenId::Picker(PickerKind::LdacQuality, addr) => {
+                if self.model.borrow().paired.iter().any(|d| d.addr == addr) {
+                    Refresh::Keep
+                } else {
+                    Refresh::Gone
+                }
+            }
             ScreenId::WhyPage => build_why_page_screen(&self.model.borrow(), Instant::from_micros(self.now_us), &self.why_page_order, carry),
-            ScreenId::Settings => Refresh::Rebuild(build_settings_screen(&self.display_settings, carry)),
-            ScreenId::SettingsPicker(kind) => Refresh::Rebuild(build_settings_picker_screen(kind, &self.display_settings, carry)),
+            // The Settings screen and its two pickers are each built once
+            // per push and never rebuilt again while they stay on the stack
+            // -- all three read `display_settings` themselves via
+            // `Widget::sync` every frame they're on top (bead
+            // `pico-link-bgnd` M3). Nothing here can ever vanish (unlike a
+            // device), so there is no liveness check to make.
+            ScreenId::Settings | ScreenId::SettingsPicker(_) => Refresh::Keep,
         }
     }
 
@@ -369,17 +389,11 @@ impl App {
             self.navigator.sync_top(&ctx);
             self.navigator.dispatch(intent);
         }
-        // A Settings picker's `on_pick` may have set `refresh_pending`
-        // (design S6) -- the checkmark/row value must move on the SAME
-        // frame as the press, which needs `refresh_stack`, not anything
-        // `Runner`/`pl_ui_tick` does downstream.
-        let refresh_pending = {
-            let mut state = self.display_settings.borrow_mut();
-            core::mem::take(&mut state.refresh_pending)
-        };
-        if refresh_pending {
-            self.refresh_stack();
-        }
+        // The Settings screen/its pickers pick up a same-frame change to
+        // `display_settings` themselves via `Widget::sync` (bead
+        // `pico-link-bgnd` M3) -- there used to be a `refresh_pending` latch
+        // forcing a `refresh_stack` call here; it's gone, because nothing
+        // needs to force a rebuild any more.
         self.stamp_pending_wizard_timestamp();
         self.dirty = true;
     }

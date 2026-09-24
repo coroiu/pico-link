@@ -153,7 +153,7 @@ pub(crate) fn build_devices_screen(
                 let commands = Rc::clone(&commands_for_activate);
                 return Action::PushView(Box::new(move || {
                     let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
-                    match build_device_page_screen(&model.borrow(), addr, &carry, &commands) {
+                    match build_device_page_screen(&model, addr, &carry, &commands) {
                         Refresh::Rebuild(screen) => screen,
                         // The connected device we just resolved cannot
                         // have vanished between that read and this

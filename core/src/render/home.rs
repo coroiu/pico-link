@@ -529,7 +529,7 @@ impl Widget for HomeView {
                 if let Some(addr) = self.connected_addr {
                     let model = Rc::clone(&self.model);
                     let commands = Rc::clone(&self.commands);
-                    Action::PushView(Box::new(move || match build_device_page_screen(&model.borrow(), addr, &ScreenCarry::default(), &commands) {
+                    Action::PushView(Box::new(move || match build_device_page_screen(&model, addr, &ScreenCarry::default(), &commands) {
                         Refresh::Rebuild(screen) => screen,
                         // The device we just read `connected_addr` for
                         // cannot have vanished between that read and this

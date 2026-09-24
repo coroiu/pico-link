@@ -119,20 +119,23 @@ pub enum HomeFace {
 /// `Action::PushView`'s builder closures are `FnOnce` with no path back to
 /// a live `&mut App`.
 ///
-/// Three independent flags, deliberately NOT folded into one "dirty" bit:
+/// Two independent flags, deliberately NOT folded into one "dirty" bit:
 /// `apply_pending` (core's own `IdlePolicy` needs the new value applied
 /// next `Runner::step`/`pl_ui_tick`) and `save_pending` (the value needs
 /// persisting) fire together on a user pick but NOT on
 /// [`App::set_display_settings`]'s initial seed from a loaded/default
 /// value (seeding must never re-save what was just loaded).
-/// `refresh_pending` is a third, purely presentational latch: the Settings
-/// screen's rows and the open picker's checkmark must reflect the pick on
-/// the very same frame, which needs `App::refresh_stack`, not anything
-/// `Runner`/`pl_ui_tick` does.
+///
+/// There used to be a third, purely presentational `refresh_pending` latch
+/// forcing `App::refresh_stack` to rebuild the Settings screen/its open
+/// picker on the same frame as a pick -- bead `pico-link-bgnd` M3 deleted
+/// it: the Settings screen and its pickers are now long-lived views that
+/// read this same `Rc<RefCell<_>>` handle directly via `Widget::sync` every
+/// frame, so a pick is visible on the very next sync with nothing needing
+/// to force a rebuild.
 #[derive(Default)]
 pub struct DisplaySettingsState {
     pub(in crate::app) current: DisplaySettings,
     pub(in crate::app) apply_pending: bool,
     pub(in crate::app) save_pending: bool,
-    pub(in crate::app) refresh_pending: bool,
 }

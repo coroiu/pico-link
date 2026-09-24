@@ -2,34 +2,52 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::convert::Infallible;
+use core::time::Duration;
 
 use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::Size;
+use embedded_graphics::primitives::Rectangle;
 
+use crate::input::NavIntent;
 use crate::render::theme::icon;
-use crate::render::{Action, FieldList, FieldRow, ListItemKey, Screen, Verb};
+use crate::render::{Action, FieldList, FieldRow, FocusEvent, FrameBuffer565, ListItemKey, PaintKey, RenderCtx, Screen, Verb, Widget};
 
 use super::super::{ScreenCarry, ScreenId};
 
-/// A single row in a [`build_single_select_screen`] picker. Its first
-/// real caller is [`build_ldac_quality_picker_screen`].
+/// A single row in a [`PickerView`]. Its first real caller is
+/// [`build_ldac_quality_picker_screen`](super::ldac_quality::build_ldac_quality_picker_screen).
 pub(crate) struct PickerOption {
-    /// Stable identity -- carries focus and the check across rebuilds, and
-    /// is what [`build_single_select_screen`]'s `on_pick` callback is
-    /// invoked with.
+    /// Stable identity -- carries focus and the check across projections,
+    /// and is what a [`PickerView`]'s `on_pick` callback is invoked with.
     pub key: ListItemKey,
     pub label: String,
     /// The trailing note (e.g. `best audio`, `660 now`, `not offered`).
     pub note: Option<(String, Rgb565)>,
-    /// `false` -> [`FieldKind::Readonly`]: focusable, dim, no caret, `A`
-    /// dead -- an unavailable option cannot be picked, structurally (the
-    /// activation gate lives in [`FieldList`], not in `on_pick`).
+    /// `false` -> [`FieldKind::Readonly`](crate::render::fields::FieldKind::Readonly):
+    /// focusable, dim, no caret, `A` dead -- an unavailable option cannot be
+    /// picked, structurally (the activation gate lives in [`FieldList`], not
+    /// in `on_pick`).
     pub selectable: bool,
 }
 
-/// A generic single-select picker screen -- the codec picker and the LDAC
-/// quality picker are both this function with different `options`/
-/// `on_pick`, not two widgets. **Not a widget, not a `render/` module**
-/// -- composition of [`FieldList`] alone.
+/// Seed for [`projection_key_of`] -- only needs to differ from other
+/// widgets'/views' own seeds.
+const PICKER_PROJECTION_SEED: u64 = 51;
+
+/// A live-model-backed projection closure: re-derives this picker's options
+/// and the currently checked key, read fresh every [`Widget::sync`] call --
+/// see [`PickerView`]'s own doc comment.
+type PickerProjection = Box<dyn Fn() -> (Vec<PickerOption>, Option<ListItemKey>)>;
+
+/// Callback invoked with the picked row's [`ListItemKey`] -- see
+/// [`build_picker_view_screen`]'s doc comment.
+type OnPick = Box<dyn Fn(ListItemKey) -> Action>;
+
+/// Builds this picker's [`FieldRow`]s from a fresh `(options, checked)`
+/// projection -- shared between [`build_picker_view_screen`]'s initial
+/// construction and [`PickerView::sync`]'s in-place update, so the two can
+/// never drift into building rows two different ways.
 ///
 /// Five rules this shape makes structural rather than remembered:
 /// 1. **The check follows the stored value.** `checked` is read from the
@@ -49,39 +67,161 @@ pub(crate) struct PickerOption {
 /// `A`'s rail word is [`Verb::Select`]: the sketches say "pick", which
 /// would need a second `Verb::Exception` and sign-off for one word that
 /// means the same thing to the user.
-pub(crate) fn build_single_select_screen(
-    id: ScreenId,
-    title: impl Into<String>,
-    options: Vec<PickerOption>,
-    checked: Option<ListItemKey>,
-    carry: &ScreenCarry,
-    on_pick: impl Fn(ListItemKey) -> Action + 'static,
-) -> Screen {
-    let keys: Vec<ListItemKey> = options.iter().map(|option| option.key).collect();
-    let rows: Vec<FieldRow> = options
-        .into_iter()
+fn options_to_rows(options: &[PickerOption], checked: Option<ListItemKey>) -> Vec<FieldRow> {
+    options
+        .iter()
         .map(|option| {
             let checked_here = Some(option.key) == checked;
-            let mut row = if option.selectable { FieldRow::action(option.label) } else { FieldRow::readonly(option.label) };
+            let mut row = if option.selectable { FieldRow::action(option.label.clone()) } else { FieldRow::readonly(option.label.clone()) };
             if option.selectable {
                 row = row.with_verb(Verb::Select);
             }
-            if let Some((text, color)) = option.note {
-                row = row.with_value(text, color);
+            if let Some((text, color)) = &option.note {
+                row = row.with_value(text.clone(), *color);
             }
             if checked_here {
                 row = row.with_leading_glyph(icon::CHECK);
             }
             row.with_key(option.key)
         })
-        .collect();
+        .collect()
+}
 
-    let list = FieldList::new(rows)
-        .with_leading_gutter()
-        .with_selected_identity(carry.selected_key, carry.selected_index)
-        .on_activate_index(move |index| keys.get(index).map_or(Action::None, |key| on_pick(*key)));
+/// A cheap, total summary of every field [`options_to_rows`] reads --
+/// [`PickerView::sync`]'s allocation-saving skip check, the same
+/// projection-key shape `DevicesListView::projection_key` uses (design
+/// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md` §5's
+/// R2 vocabulary: "everything the view READS", never folded into a
+/// [`Widget::paint_key`]).
+fn projection_key_of(options: &[PickerOption], checked: Option<ListItemKey>) -> PaintKey {
+    let mut key = PaintKey::of(PICKER_PROJECTION_SEED).fold(options.len() as u64);
+    for option in options {
+        key = key.fold(option.key.as_u64());
+        key = key.fold_str(&option.label);
+        key = match &option.note {
+            Some((text, color)) => key.fold_str(text).fold_color(*color),
+            None => key.fold(0),
+        };
+        key = key.fold(u64::from(option.selectable));
+    }
+    // `checked` folded last, offset by 1 so "no checked row" (`None`) can
+    // never collide with a real key whose `as_u64()` happens to be `0`.
+    key = key.fold(checked.map_or(0, |k| k.as_u64().wrapping_add(1)));
+    key
+}
+
+/// A generic single-select picker screen's widget -- the LDAC quality
+/// picker and the two Settings pickers (idle-screen mode, idle-after
+/// timeout) are all this widget with a different [`PickerProjection`]/
+/// [`OnPick`], not three widgets (bead `pico-link-bgnd` M3, generalising
+/// `build_devices_screen`'s M2 live-list shape to `FieldList`-backed
+/// pickers). Long-lived for as long as its screen stays on the navigator's
+/// stack: [`Widget::sync`] re-reads `projection` every frame this screen is
+/// on top and updates `list`'s rows **in place** via
+/// [`FieldList::set_rows`] whenever [`projection_key_of`] changed --
+/// see [`build_picker_view_screen`]'s doc comment for the arm that stopped
+/// rebuilding this screen on every model event.
+pub(crate) struct PickerView {
+    list: FieldList,
+    projection: PickerProjection,
+    /// The last [`projection_key_of`]-shaped hash of the projection's
+    /// output -- see that function's own doc comment. Recomputed every
+    /// frame by [`Self::sync`]; [`FieldList::set_rows`] is only called when
+    /// it changed (an allocation-saving skip, not a correctness dependency
+    /// -- `set_rows` is itself selection-preserving).
+    projection_key: PaintKey,
+}
+
+impl Widget for PickerView {
+    fn measure(&self, constraints: Size, ctx: &RenderCtx) -> Size {
+        self.list.measure(constraints, ctx)
+    }
+
+    fn is_focusable(&self) -> bool {
+        self.list.is_focusable()
+    }
+
+    /// Forwards `list`'s own answer -- see `Widget::activation`'s doc
+    /// comment on why a wrapper must forward this rather than let the
+    /// default `None` silently swallow it.
+    fn activation(&self) -> Option<Verb> {
+        self.list.activation()
+    }
+
+    /// Re-reads `projection` and updates `list`'s rows **in place** via
+    /// [`FieldList::set_rows`] whenever [`projection_key_of`] changed since
+    /// the last call -- see this struct's own doc comment.
+    fn sync(&mut self, _ctx: &RenderCtx) {
+        let (options, checked) = (self.projection)();
+        let key = projection_key_of(&options, checked);
+        if key != self.projection_key {
+            self.list.set_rows(options_to_rows(&options, checked));
+            self.projection_key = key;
+        }
+    }
+
+    fn on_focus(&mut self, event: FocusEvent) -> Action {
+        self.list.on_focus(event)
+    }
+
+    fn on_intent(&mut self, intent: NavIntent) -> Action {
+        self.list.on_intent(intent)
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        Some(self.list.selected_index())
+    }
+
+    /// Forwards `list`'s own answer -- see this struct's doc comment.
+    fn selected_key(&self) -> Option<ListItemKey> {
+        self.list.selected_key()
+    }
+
+    /// Forwards `list`'s own answer -- see this struct's doc comment.
+    fn scroll_top(&self) -> Option<usize> {
+        self.list.scroll_top()
+    }
+
+    fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
+        self.list.render(area, ctx, target)
+    }
+
+    /// Forwards `list`'s own answer -- see this struct's doc comment.
+    fn redraw_after(&self, ctx: &RenderCtx) -> Option<Duration> {
+        self.list.redraw_after(ctx)
+    }
+
+    /// Folds `list`'s own key and nothing else -- `projection`/
+    /// `projection_key` are a projection, never a pixel this widget draws
+    /// (same rule `DevicePageView::paint_key`'s doc comment states).
+    fn paint_key(&self, ctx: &RenderCtx) -> PaintKey {
+        PaintKey::of(PICKER_PROJECTION_SEED).fold_key(self.list.paint_key(ctx))
+    }
+}
+
+/// Builds a [`PickerView`]-backed single-select picker screen -- the one
+/// place a picker screen is constructed, called once per push (from a
+/// device page's `QUALITY` row, or the Settings screen's two rows). Once
+/// pushed, [`crate::app::App::build_identified_screen`]'s
+/// `ScreenId::Picker`/`ScreenId::SettingsPicker` arms return
+/// [`crate::app::Refresh::Keep`] (bead `pico-link-bgnd` M3) -- this function
+/// is never re-invoked on every model/state event the way it used to be;
+/// [`PickerView::sync`] re-reads `projection` itself every frame instead.
+pub(crate) fn build_picker_view_screen(
+    id: ScreenId,
+    title: impl Into<String>,
+    carry: &ScreenCarry,
+    projection: impl Fn() -> (Vec<PickerOption>, Option<ListItemKey>) + 'static,
+    on_pick: impl Fn(ListItemKey) -> Action + 'static,
+) -> Screen {
+    let (options, checked) = projection();
+    let projection_key = projection_key_of(&options, checked);
+    let rows = options_to_rows(&options, checked);
+    let on_pick: OnPick = Box::new(on_pick);
+    let list = FieldList::new(rows).with_leading_gutter().with_selected_identity(carry.selected_key, carry.selected_index).on_activate_key(on_pick);
     let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
-    Screen::new(title, vec![Box::new(list)]).with_id(id)
+    let view = PickerView { list, projection: Box::new(projection), projection_key };
+    Screen::new(title, vec![Box::new(view)]).with_id(id)
 }
 
 #[cfg(test)]
@@ -99,23 +239,26 @@ mod tests {
 
     use super::*;
 
-    // --- build_single_select_screen (the general picker) ---
+    // --- build_picker_view_screen (the general picker) ---
 
     fn quality_like_test_id() -> ScreenId {
-        // `build_single_select_screen` is generic over `id`, so any
+        // `build_picker_view_screen` is generic over `id`, so any
         // ScreenId value exercises its contract identically. Standing in
         // with an address distinct from any real device used elsewhere in
         // this module's tests.
         ScreenId::DevicePage([0xAA; 6])
     }
 
-    fn three_option_picker(checked: Option<ListItemKey>, picked: Rc<RefCell<Vec<ListItemKey>>>, stay_open: bool) -> Screen {
-        let options = vec![
+    fn three_options() -> Vec<PickerOption> {
+        vec![
             PickerOption { key: ListItemKey::from_u64(1), label: String::from("Alpha"), note: Some((String::from("best"), palette::TEXT_SECONDARY)), selectable: true },
             PickerOption { key: ListItemKey::from_u64(2), label: String::from("Beta"), note: None, selectable: true },
             PickerOption { key: ListItemKey::from_u64(3), label: String::from("Gamma"), note: Some((String::from("not offered"), palette::TEXT_SECONDARY)), selectable: false },
-        ];
-        build_single_select_screen(quality_like_test_id(), "Test Picker", options, checked, &no_carry(), move |key| {
+        ]
+    }
+
+    fn three_option_picker(checked: Option<ListItemKey>, picked: Rc<RefCell<Vec<ListItemKey>>>, stay_open: bool) -> Screen {
+        build_picker_view_screen(quality_like_test_id(), "Test Picker", &no_carry(), move || (three_options(), checked), move |key| {
             picked.borrow_mut().push(key);
             if stay_open {
                 Action::None
@@ -182,9 +325,30 @@ mod tests {
         assert!(picked.borrow().is_empty(), "an unavailable option must not be pickable -- the activation gate lives in FieldList, not on_pick");
     }
 
+    /// Proves a picker reads the LIVE projection rather than a snapshot
+    /// frozen at construction -- the bead `pico-link-bgnd` M3 regression
+    /// net (mirrors devices.rs's own `a_paired_device_rename_is_reflected_
+    /// in_the_rendered_label`). The checked row moves to match a projection
+    /// change with no pop/re-push of the screen.
+    #[test]
+    fn the_checked_row_follows_a_live_projection_change_with_no_pop_or_repush() {
+        let checked = Rc::new(RefCell::new(Some(ListItemKey::from_u64(1))));
+        let checked_for_projection = Rc::clone(&checked);
+        let screen = build_picker_view_screen(quality_like_test_id(), "Test Picker", &no_carry(), move || (three_options(), *checked_for_projection.borrow()), |_key| Action::None);
+        let mut app = App::new(240, 240);
+        app.push_screen_for_test(screen);
+        app.render(); // establish a clean baseline
+        let depth_before = app.navigator_depth();
+
+        *checked.borrow_mut() = Some(ListItemKey::from_u64(2));
+        let output = app.render();
+        assert!(output.pixels().any(|p| p.1 != palette::BACKGROUND), "the live projection change must actually repaint something");
+        assert_eq!(app.navigator_depth(), depth_before, "the checked row must move in place, with no push/pop of the screen itself");
+    }
+
     /// Headless PNG dump of the picker, at zoom -- dumped from here since
     /// this module's tests are the only place with `pub(crate)` access to
-    /// `build_single_select_screen` itself.
+    /// `build_picker_view_screen` itself.
     #[test]
     fn picker_screenshot_at_zoom() {
         const ZOOM: u32 = 3;

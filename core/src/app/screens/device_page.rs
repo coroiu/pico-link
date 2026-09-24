@@ -23,7 +23,7 @@ use crate::render::{
 
 use super::devices::{build_forget_confirm_screen, paired_device_label};
 use super::ldac_quality::{build_ldac_quality_picker_screen, ldac_quality_fixed_kbps, LDAC_QUALITY_ADAPTIVE};
-use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, PairedDevice, Refresh, ScreenCarry, ScreenId};
+use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, ModelHandle, PairedDevice, Refresh, ScreenCarry, ScreenId};
 
 /// A placeholder for a live value this page cannot honestly report yet --
 /// `core` has no `SetDeviceCodecPref`/`CodecAvailability`/
@@ -41,10 +41,18 @@ use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, PairedDev
 /// should be. `-` is in range and renders.
 const DASH: &str = "-";
 
-/// Index of the `QUALITY` row within [`device_page_rows`]'s output, when
-/// present -- always right after `CODEC`: the row belongs directly under
-/// the codec it modifies.
-const DEVICE_PAGE_QUALITY_ROW_INDEX: usize = 1;
+/// [`ListItemKey`]s for each of [`device_page_rows`]'s fixed rows --
+/// stable identities, not positions, so [`DevicePageView`]'s activation can
+/// resolve "which row was pressed" the same way regardless of whether
+/// `QUALITY` (the one row whose presence varies) is showing (bead
+/// `pico-link-bgnd` M3: `on_activate_key`, not `on_activate_index`).
+const CODEC_ROW_KEY: ListItemKey = ListItemKey::from_u64(0);
+const SAMPLE_RATE_ROW_KEY: ListItemKey = ListItemKey::from_u64(1);
+const USB_IN_ROW_KEY: ListItemKey = ListItemKey::from_u64(2);
+const A2DP_ROW_KEY: ListItemKey = ListItemKey::from_u64(3);
+const ADDRESS_ROW_KEY: ListItemKey = ListItemKey::from_u64(4);
+const FORGET_ROW_KEY: ListItemKey = ListItemKey::from_u64(5);
+const QUALITY_ROW_KEY: ListItemKey = ListItemKey::from_u64(6);
 
 /// Whether the device page's `QUALITY` row (and its picker) should be
 /// shown at all -- "the row is absent, not dim" when LDAC isn't
@@ -109,13 +117,6 @@ fn device_page_quality_row_value(model: &BtModel, device: &PairedDevice, connect
     }
 }
 
-/// Index of the `Forget this device` row within [`device_page_rows`]'s
-/// output -- always the LAST row, whether or not `QUALITY` is present
-/// (`device_page_rows`'s doc comment).
-fn device_page_forget_row_index(rows_len: usize) -> usize {
-    rows_len - 1
-}
-
 /// The device page's rows, in order: `CODEC`, `QUALITY` (present only
 /// when LDAC is effective-or-pinned), `SAMPLE RATE`, `USB IN`, `A2DP`,
 /// `ADDRESS`, `Forget this device`.
@@ -137,7 +138,7 @@ fn device_page_rows(model: &BtModel, addr: DeviceAddr) -> Vec<FieldRow> {
     let codec_value =
         if connected { model.connected_codec.as_ref().map_or_else(|| String::from("Automatic"), |c| c.word.clone()) } else { String::from("Automatic") };
 
-    let mut rows = vec![FieldRow::readonly("CODEC").with_value(codec_value, palette::TEXT_PRIMARY).with_key(ListItemKey::from_u64(0))];
+    let mut rows = vec![FieldRow::readonly("CODEC").with_value(codec_value, palette::TEXT_PRIMARY).with_key(CODEC_ROW_KEY)];
 
     if device_page_quality_present(model, addr) {
         // `unwrap_or` fallback below only matters for the pathological
@@ -150,20 +151,20 @@ fn device_page_rows(model: &BtModel, addr: DeviceAddr) -> Vec<FieldRow> {
         rows.push(
             FieldRow::action("QUALITY")
                 .with_value(device_page_quality_row_value(model, device, connected), palette::TEXT_PRIMARY)
-                .with_key(ListItemKey::from_u64(6)),
+                .with_key(QUALITY_ROW_KEY),
         );
     }
 
-    rows.push(FieldRow::readonly("SAMPLE RATE").with_value(DASH, palette::TEXT_SECONDARY).with_key(ListItemKey::from_u64(1)));
-    rows.push(FieldRow::readonly("USB IN").with_value(DASH, palette::TEXT_SECONDARY).with_key(ListItemKey::from_u64(2)));
-    rows.push(FieldRow::readonly("A2DP").with_value(DASH, palette::TEXT_SECONDARY).with_key(ListItemKey::from_u64(3)));
+    rows.push(FieldRow::readonly("SAMPLE RATE").with_value(DASH, palette::TEXT_SECONDARY).with_key(SAMPLE_RATE_ROW_KEY));
+    rows.push(FieldRow::readonly("USB IN").with_value(DASH, palette::TEXT_SECONDARY).with_key(USB_IN_ROW_KEY));
+    rows.push(FieldRow::readonly("A2DP").with_value(DASH, palette::TEXT_SECONDARY).with_key(A2DP_ROW_KEY));
     rows.push(
         FieldRow::readonly("ADDRESS")
             .with_value(format_device_address(addr), palette::TEXT_PRIMARY)
             .with_small_value()
-            .with_key(ListItemKey::from_u64(4)),
+            .with_key(ADDRESS_ROW_KEY),
     );
-    rows.push(FieldRow::action("Forget this device").with_label_color(palette::STATUS_ERROR).with_key(ListItemKey::from_u64(5)));
+    rows.push(FieldRow::action("Forget this device").with_label_color(palette::STATUS_ERROR).with_key(FORGET_ROW_KEY));
     rows
 }
 
@@ -177,38 +178,40 @@ fn format_device_address(addr: DeviceAddr) -> String {
 }
 
 /// The connected-or-paired device's detail page. Returns
-/// [`Refresh::Gone`] when `addr` is no longer in
-/// [`BtModel::paired`] -- e.g. the device was forgotten from its own
-/// confirm screen, or from Devices while this page happened to be open one
-/// level up -- so [`App::refresh_stack`] can unwind the stack rather than
-/// leave a page open on a device that no longer exists.
-pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
-    let Some(device) = model.paired.iter().find(|d| d.addr == addr) else {
-        return Refresh::Gone;
+/// [`Refresh::Gone`] when `addr` is no longer in [`BtModel::paired`] at push
+/// time. Built once per push (bead `pico-link-bgnd` M3, generalising M2's
+/// `DevicesListView` shape): [`crate::app::App::build_identified_screen`]'s
+/// `ScreenId::DevicePage` arm returns [`Refresh::Keep`] once this is on the
+/// stack -- [`DevicePageView::sync`] re-reads the live model itself every
+/// frame this page is on top, and [`crate::app::App::refresh_stack`]'s own
+/// per-index liveness check (not this function) is what unwinds the stack
+/// if `addr` vanishes later.
+pub(crate) fn build_device_page_screen(model: &ModelHandle, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
+    let (title, rows, projection_key) = {
+        let snapshot = model.borrow();
+        let Some(device) = snapshot.paired.iter().find(|d| d.addr == addr) else {
+            return Refresh::Gone;
+        };
+        (paired_device_label(device), device_page_rows(&snapshot, addr), DevicePageView::projection_key(&snapshot, addr))
     };
-    let title = paired_device_label(device);
-    let connected = model.connected_addr == Some(addr);
-    let name = device.name.clone();
-    let forget_label = title.clone();
+
+    let model_for_activate = Rc::clone(model);
     let commands_for_activate = Rc::clone(commands);
-    let rows = device_page_rows(model, addr);
-    let quality_present = device_page_quality_present(model, addr);
-    let forget_row_index = device_page_forget_row_index(rows.len());
-    // Snapshot for the `QUALITY` row's push -- `Action::PushView`'s builder
-    // is `FnOnce` with no path back to a live `&BtModel` (same reasoning as
-    // `build_devices_screen`'s own `model_for_device_page` snapshot above
-    // it in this file). The very next model event (the write's
-    // `PairedDeviceUpserted` echo) replaces this picker with a live-read
-    // one via `App::build_identified_screen`'s `ScreenId::Picker` arm.
-    let model_for_quality_picker = model.clone();
-    let commands_for_quality_picker = Rc::clone(commands);
-    let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index).on_activate_index(move |index| {
-        if quality_present && index == DEVICE_PAGE_QUALITY_ROW_INDEX {
-            // Depth-2 push, fresh `ScreenCarry` -- `refresh_stack` owns
-            // carrying focus/scroll forward on every subsequent rebuild,
-            // same as the connected-row-to-device-page push above it does.
-            let model = model_for_quality_picker.clone();
-            let commands = Rc::clone(&commands_for_quality_picker);
+    let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index).on_activate_key(move |key| {
+        if key == QUALITY_ROW_KEY {
+            let quality_present = device_page_quality_present(&model_for_activate.borrow(), addr);
+            if !quality_present {
+                // The row is currently gone, but a race could still deliver
+                // a stale key from a frame where it was showing --
+                // structurally rare, not unreachable; `Action::None` is the
+                // harmless fallback rather than acting on a row that isn't
+                // there.
+                return Action::None;
+            }
+            // Depth-2 push, fresh `ScreenCarry` -- there is nothing to carry
+            // forward into a screen that has never been open before.
+            let model = Rc::clone(&model_for_activate);
+            let commands = Rc::clone(&commands_for_activate);
             return Action::PushView(Box::new(move || {
                 let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
                 match build_ldac_quality_picker_screen(&model, addr, &carry, &commands) {
@@ -217,21 +220,24 @@ pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry:
                     // vanished between the press and this closure running
                     // -- structurally unreachable, same reasoning as
                     // `build_devices_screen`'s own connected-row push.
-                    // `Refresh::Keep` is likewise unreachable here -- no
-                    // builder returns it yet.
+                    // `Refresh::Keep` is likewise unreachable here -- this
+                    // function never returns it.
                     Refresh::Gone | Refresh::Keep => Screen::new("Quality", vec![]),
                 }
             }));
         }
-        if index == forget_row_index {
+        if key == FORGET_ROW_KEY {
+            let label = {
+                let model = model_for_activate.borrow();
+                model.paired.iter().find(|d| d.addr == addr).map_or_else(|| String::from("device"), paired_device_label)
+            };
             let commands = Rc::clone(&commands_for_activate);
-            let label = forget_label.clone();
             return Action::PushView(Box::new(move || build_forget_confirm_screen(addr, &label, commands)));
         }
         Action::None
     });
     let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
-    let view = DevicePageView { list, addr, connected, name, commands: Rc::clone(commands) };
+    let view = DevicePageView { list, addr, model: Rc::clone(model), commands: Rc::clone(commands), projection_key };
     Refresh::Rebuild(Screen::new(title, vec![Box::new(Spacer::new(12)), Box::new(view)]).with_id(ScreenId::DevicePage(addr)))
 }
 
@@ -240,24 +246,63 @@ pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry:
 /// needed since neither is destructive/irreversible) -- the same "small
 /// wrapper widget intercepts one `NavIntent` variant, delegates the rest"
 /// shape [`DevicesListView`] already uses for its own `ShortcutX`
-/// handling, and every method below that isn't
-/// `on_intent`/`chrome_contribution` is a forward, not an override -- see
+/// handling, and every method below that isn't `sync`/`on_intent`/
+/// `chrome_contribution` is a forward, not an override -- see
 /// [`Widget::activation`]'s doc comment for why a wrapper must forward
 /// rather than let the default silently swallow one.
+///
+/// Long-lived for as long as this page stays on the navigator's stack (bead
+/// `pico-link-bgnd` M3) -- holds a [`ModelHandle`], not a `connected`/`name`
+/// snapshot: `on_intent`'s `ShortcutX` arm and `chrome_contribution` both
+/// read the model fresh at the moment they run, and [`Self::sync`] re-reads
+/// it every frame to keep `list`'s rows current, the same "resolve against
+/// the live model at press/sync time, never a captured snapshot" rule
+/// `DevicesListView` already follows.
 struct DevicePageView {
     list: FieldList,
     addr: DeviceAddr,
-    connected: bool,
-    /// Needed only for the `link` (reconnect) path -- [`Command::Connect`]
-    /// carries a name, same as every other reconnect call site
-    /// ([`build_devices_screen`]'s own paired-row activation).
-    name: String,
+    /// See [`crate::app::ModelHandle`]'s doc comment for the borrow rule.
+    model: ModelHandle,
     commands: Rc<RefCell<VecDeque<Command>>>,
+    /// The last [`Self::projection_key`]-shaped hash of every model field
+    /// [`device_page_rows`] reads for `addr` -- see that method's own doc
+    /// comment. [`Self::sync`] recomputes this every frame and only calls
+    /// [`FieldList::set_rows`] when it changed (allocation-saving skip, not
+    /// a correctness dependency).
+    projection_key: PaintKey,
 }
 
 /// Seed for [`DevicePageView::paint_key`] -- only needs to differ from
 /// other widgets' own seeds.
 const DEVICE_PAGE_PAINT_KEY_SEED: u64 = 15;
+
+/// Seed for [`DevicePageView::projection_key`] -- deliberately a different
+/// constant than [`DEVICE_PAGE_PAINT_KEY_SEED`] even though nothing requires
+/// it: a projection key and a paint key are never compared against each
+/// other, but keeping their seeds distinct is the same defensive habit
+/// `devices.rs`'s `DEVICES_PROJECTION_SEED` follows.
+const DEVICE_PAGE_PROJECTION_SEED: u64 = 16;
+
+impl DevicePageView {
+    /// A cheap, total summary of every field [`device_page_rows`] reads for
+    /// `addr` -- connectedness, the live codec word while connected, the
+    /// paired device's name/`ldac_quality`, and the live LDAC kbps reading.
+    /// Reused `PaintKey` purely as an allocation-free hash accumulator, same
+    /// shape as `DevicesListView::projection_key` (see that method's own
+    /// doc comment for the full "projection key, never a paint key" rule
+    /// this follows).
+    fn projection_key(model: &BtModel, addr: DeviceAddr) -> PaintKey {
+        let connected = model.connected_addr == Some(addr);
+        let mut key = PaintKey::of(DEVICE_PAGE_PROJECTION_SEED).fold(u64::from(connected));
+        key = key.fold_opt_str(if connected { model.connected_codec.as_ref().map(|c| c.word.as_str()) } else { None });
+        if let Some(device) = model.paired.iter().find(|d| d.addr == addr) {
+            key = key.fold_str(&device.name);
+            key = key.fold(u64::from(device.ldac_quality));
+        }
+        key = key.fold(u64::from(model.ldac_live_kbps.unwrap_or(0)));
+        key
+    }
+}
 
 impl Widget for DevicePageView {
     fn measure(&self, constraints: Size, ctx: &RenderCtx) -> Size {
@@ -273,16 +318,34 @@ impl Widget for DevicePageView {
         self.list.activation()
     }
 
+    /// Re-reads the live model and updates `list`'s rows **in place** via
+    /// [`FieldList::set_rows`] whenever [`Self::projection_key`] changed
+    /// since the last call -- see this struct's own doc comment.
+    fn sync(&mut self, _ctx: &RenderCtx) {
+        let model = self.model.borrow();
+        let key = Self::projection_key(&model, self.addr);
+        if key != self.projection_key {
+            let rows = device_page_rows(&model, self.addr);
+            drop(model);
+            self.list.set_rows(rows);
+            self.projection_key = key;
+        }
+    }
+
     fn on_focus(&mut self, event: FocusEvent) -> Action {
         self.list.on_focus(event)
     }
 
     fn on_intent(&mut self, intent: NavIntent) -> Action {
         if intent == NavIntent::ShortcutX {
-            if self.connected {
+            let (connected, name) = {
+                let model = self.model.borrow();
+                (model.connected_addr == Some(self.addr), model.paired.iter().find(|d| d.addr == self.addr).map(|d| d.name.clone()).unwrap_or_default())
+            };
+            if connected {
                 self.commands.borrow_mut().push_back(Command::Disconnect);
             } else {
-                self.commands.borrow_mut().push_back(Command::Connect { addr: self.addr, name: truncate_device_name(&self.name) });
+                self.commands.borrow_mut().push_back(Command::Connect { addr: self.addr, name: truncate_device_name(&name) });
             }
             return Action::None;
         }
@@ -290,7 +353,8 @@ impl Widget for DevicePageView {
     }
 
     fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
-        let label = if self.connected { "drop" } else { "link" };
+        let connected = self.model.borrow().connected_addr == Some(self.addr);
+        let label = if connected { "drop" } else { "link" };
         Some(ChromeContribution { x: Some(ButtonLabel::Live(String::from(label))), ..ChromeContribution::default() })
     }
 
@@ -603,9 +667,11 @@ mod tests {
         // Not connected.
         let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
         let commands = Rc::new(RefCell::new(VecDeque::new()));
-        let Refresh::Rebuild(_screen) = build_ldac_quality_picker_screen(&model, addr, &carry, &commands) else {
+        let handle: ModelHandle = Rc::new(RefCell::new(model));
+        let Refresh::Rebuild(_screen) = build_ldac_quality_picker_screen(&handle, addr, &carry, &commands) else {
             panic!("a paired, disconnected device's picker must build, not vanish");
         };
+        let mut model = handle.borrow_mut();
         // Behavioural check via the row-building helper the picker itself
         // uses for Adaptive's note -- disconnected must never read "N now".
         model.paired[0].ldac_quality = LDAC_QUALITY_ADAPTIVE;
