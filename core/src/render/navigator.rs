@@ -168,14 +168,6 @@ impl Navigator {
         self.stack.get(index).and_then(Screen::selected_index)
     }
 
-    /// Generalizes [`Navigator::root_selected_key`] to any stack depth --
-    /// see [`Navigator::selected_index_at`]'s doc comment for why this is
-    /// needed once Devices is no longer the root screen.
-    #[must_use]
-    pub fn selected_key_at(&self, index: usize) -> Option<super::list::ListItemKey> {
-        self.stack.get(index).and_then(Screen::selected_key)
-    }
-
     /// Generalizes scroll-position carry-forward to any stack depth —
     /// see `Widget::scroll_top`'s doc comment and
     /// [`Navigator::selected_index_at`]'s for why the "any stack depth"
@@ -186,21 +178,12 @@ impl Navigator {
         self.stack.get(index).and_then(Screen::scroll_top)
     }
 
-    /// The screen title at `index`, if any -- used by a caller (e.g.
-    /// `crate::app::App::refresh_stack`) to check whether a specific
-    /// live-data-backed screen (e.g. Devices) is currently sitting at a
-    /// known stack position before refreshing it via
-    /// [`Navigator::replace_at`].
-    #[must_use]
-    pub fn title_at(&self, index: usize) -> Option<&str> {
-        self.stack.get(index).map(|screen| screen.title.as_str())
-    }
-
     /// The [`crate::app::ScreenId`] of the screen at `index`, if any --
     /// `None` both for an out-of-range `index` and for a screen that never
-    /// called [`Screen::with_id`] (the "never refresh me" sentinel -- see
-    /// that method's doc comment). [`crate::app::App::refresh_stack`]'s
-    /// replacement for the old `title_at(1) == Some(DEVICES_TITLE)` check.
+    /// called [`Screen::with_id`] (the "not identity/liveness-tracked"
+    /// sentinel -- see that method's doc comment). Used by
+    /// [`crate::app::App`]'s `prune_stack` to find a device-scoped screen
+    /// whose subject vanished from the model.
     #[must_use]
     pub fn id_at(&self, index: usize) -> Option<ScreenId> {
         self.stack.get(index).and_then(Screen::id)
@@ -208,9 +191,9 @@ impl Navigator {
 
     /// Drops every screen above `index`, leaving `stack[index]` as the new
     /// top of the stack -- `index == 0` is equivalent to
-    /// [`Navigator::pop_to_root`]. Used by
-    /// [`crate::app::App::refresh_stack`] when a live-rebuild discovers a
-    /// pushed screen's subject no longer exists (e.g. the device shown by a
+    /// [`Navigator::pop_to_root`]. Used by [`crate::app::App`]'s
+    /// `prune_stack` when a model change discovers a pushed screen's
+    /// subject no longer exists (e.g. the device shown by a
     /// [`crate::app::ScreenId::DevicePage`] was forgotten): the whole
     /// unwind from that point up is one atomic stack op, same shape as
     /// [`Navigator::pop_to_root`], rather than repeated [`Navigator::pop`]
@@ -230,39 +213,19 @@ impl Navigator {
     /// and their own focus/selection state all survive unchanged.
     ///
     /// This is deliberately *not* [`Navigator::new`] followed by re-pushing
-    /// the rest of the stack: it exists specifically so a live-data-backed
-    /// root screen (the devices list, driven by Bluetooth events — see
-    /// `pico_link_core::app::App::refresh_stack`) can be refreshed on every
-    /// model change without evicting the user from whatever screen they've
-    /// navigated to. Rebuilding the whole `Navigator` here was a real
-    /// defect: any Bluetooth event while browsing a pushed screen would
-    /// silently pop the user back to root and reset their selection.
+    /// the rest of the stack -- rebuilding the whole `Navigator` on a root
+    /// change was a real defect (any Bluetooth event while browsing a
+    /// pushed screen would silently pop the user back to root and reset
+    /// their selection). As of the live-widgets refactor (bead
+    /// `pico-link-bgnd`) every screen kind reads live model state itself
+    /// via `Widget::sync` rather than being rebuilt on model change, so
+    /// this method's production caller is gone -- it survives as a
+    /// `#[cfg(test)]`-only helper (`App::replace_root_for_test`) for tests
+    /// that need to exercise generic run-loop behavior at Home root without
+    /// going through real navigation.
     pub fn replace_root(&mut self, mut screen: Screen) {
         screen.initialize_focus();
         self.stack[0] = screen;
-        self.force_full_damage = true;
-    }
-
-    /// Generalizes [`Navigator::replace_root`] to any stack depth --
-    /// refreshes the screen at `index` in place, leaving every other
-    /// stack entry (above or below it) untouched, same non-negotiable
-    /// property `replace_root` has for `index == 0`. A no-op if `index`
-    /// is out of range (the caller -- `crate::app::App::refresh_stack` --
-    /// is expected to have checked [`Navigator::title_at`] first, but this
-    /// stays defensive rather than panicking on a stale index).
-    ///
-    /// Exists because Devices is no longer always the root
-    /// (`pico-link-znb.8`/E7 makes Home the root and pushes Devices onto
-    /// it): a live Bluetooth event must still be able to refresh the
-    /// Devices screen while it's sitting one level down, exactly the way
-    /// `replace_root` already refreshes whatever *is* the root, without
-    /// disturbing anything pushed above it (e.g. the wizard, at index 2).
-    pub fn replace_at(&mut self, index: usize, mut screen: Screen) {
-        if index >= self.stack.len() {
-            return;
-        }
-        screen.initialize_focus();
-        self.stack[index] = screen;
         self.force_full_damage = true;
     }
 
@@ -375,7 +338,7 @@ impl Navigator {
     /// resize (this call's `target.size()` differing from the last call's)
     /// is still one of the full-damage triggers this method detects and
     /// forwards, alongside the stack-structural ops (`push`/`pop`/
-    /// `replace_root`/`replace_at`/`pop_to_root`) and
+    /// `replace_root`/`truncate_to`/`pop_to_root`) and
     /// [`Navigator::force_full_damage`] -- so the "a widget only paints
     /// its own selected-row background, not every row" hazard the old doc
     /// comment here warned about is still covered: a screen whose own

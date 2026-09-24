@@ -9,7 +9,8 @@ use crate::render::theme::palette;
 use crate::render::{Action, ListItemKey};
 
 use super::picker::{build_picker_view_screen, PickerOption};
-use super::super::{BtModel, Command, DeviceAddr, ModelHandle, PickerKind, Refresh, ScreenCarry, ScreenId};
+use super::super::{BtModel, Command, DeviceAddr, ModelHandle, PickerKind, ScreenId};
+use crate::render::Screen;
 
 /// LDAC's ADAPTIVE identity, 1-based, for [`PairedDevice::ldac_quality`]
 /// (`persist.c`'s convention: 0 = never chosen, 1/2/3 = pinned, 4 =
@@ -109,18 +110,18 @@ fn ldac_quality_options(model: &BtModel, addr: DeviceAddr) -> (Vec<PickerOption>
 }
 
 /// Builds the `QUALITY` picker screen -- called once, at push time
-/// (`DevicePageView`'s `QUALITY` row activation). Returns [`Refresh::Gone`]
-/// when `addr` is no longer in [`BtModel::paired`] at push time -- same
-/// reasoning as [`build_device_page_screen`]'s own doc comment (the picker
-/// sits one level above the page that already unwinds on this). Once
-/// pushed, this is never re-invoked on a model event -- the
+/// (`DevicePageView`'s `QUALITY` row activation). Returns `None` when `addr`
+/// is no longer in [`BtModel::paired`] at push time -- same reasoning as
+/// [`build_device_page_screen`]'s own doc comment (the picker sits one
+/// level above the page that already unwinds on this). Once pushed, this
+/// is never re-invoked on a model event -- the
 /// [`PickerView`](super::picker::PickerView) it builds re-reads
 /// [`ldac_quality_options`] itself every frame via its own `sync` (bead
-/// `pico-link-bgnd` M3); [`crate::app::App::build_identified_screen`]'s
-/// `ScreenId::Picker` arm only checks liveness now.
-pub(in crate::app) fn build_ldac_quality_picker_screen(model: &ModelHandle, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
+/// `pico-link-bgnd` M3); [`crate::app::App`]'s per-fold liveness check
+/// (`prune_stack`) only checks liveness now.
+pub(in crate::app) fn build_ldac_quality_picker_screen(model: &ModelHandle, addr: DeviceAddr, commands: &Rc<RefCell<VecDeque<Command>>>) -> Option<Screen> {
     if !model.borrow().paired.iter().any(|d| d.addr == addr) {
-        return Refresh::Gone;
+        return None;
     }
     let model_for_projection = Rc::clone(model);
     let projection = move || {
@@ -142,7 +143,7 @@ pub(in crate::app) fn build_ldac_quality_picker_screen(model: &ModelHandle, addr
         // optimistically here.
         Action::None
     };
-    Refresh::Rebuild(build_picker_view_screen(ScreenId::Picker(PickerKind::LdacQuality, addr), "Quality", carry, projection, on_pick))
+    Some(build_picker_view_screen(ScreenId::Picker(PickerKind::LdacQuality, addr), "Quality", projection, on_pick))
 }
 
 #[cfg(test)]
@@ -209,8 +210,7 @@ mod tests {
         let addr = [31; 6];
         // No paired push at all -- simulates the device having just been
         // forgotten out from under an open picker.
-        let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
         let commands = Rc::new(RefCell::new(VecDeque::new()));
-        assert!(matches!(build_ldac_quality_picker_screen(&model, addr, &carry, &commands), Refresh::Gone));
+        assert!(build_ldac_quality_picker_screen(&model, addr, &commands).is_none());
     }
 }

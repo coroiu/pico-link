@@ -379,19 +379,22 @@ pub trait Widget {
     /// **This must be compared across frames by the CALLER (`Screen`,
     /// via its own [`PaintKey`]-caching mechanism -- the same one that
     /// already tracks [`Self::paint_key`]), never by the widget itself.**
-    /// A widget instance does not survive frames in this codebase: a
-    /// composite screen widget backed by live model data (the motivating
-    /// case, `HeroStatusView`) is routinely a brand-new instance every
-    /// time its owning screen is rebuilt from fresh data, which happens
-    /// far more often than once per widget lifetime. A widget-local
-    /// `Cell` attempting to remember "my own key last frame" is comparing
-    /// a freshly-constructed instance's key against itself the very first
-    /// time it is asked -- structurally always "unchanged", regardless of
-    /// what actually differs from the *previous* instance's last-painted
-    /// state. `Screen`'s [`PaintSlot`] cache is the only thing that
-    /// genuinely spans frames here, exactly the reasoning that already
-    /// gave `paint_key` its own external cache rather than a widget-local
-    /// one -- see `pico-link-7h5.9`'s postmortem for the concrete bug this
+    /// As of the live-widgets refactor (bead `pico-link-bgnd`) an
+    /// interactive widget on a long-lived screen (`FieldList`,
+    /// `VerticalList`, and the app-level views wrapping them) *is* the same
+    /// instance across frames, updated in place via `set_rows`/`set_items`
+    /// rather than reconstructed -- but a leaf display widget projected
+    /// fresh from live state each `Widget::sync` call (the motivating case,
+    /// `HeroStatusView`) can still be a brand-new instance every sync. A
+    /// widget-local `Cell` attempting to remember "my own key last frame"
+    /// would, for that leaf case, compare a freshly-constructed instance's
+    /// key against itself the very first time it is asked -- structurally
+    /// always "unchanged", regardless of what actually differs from the
+    /// *previous* instance's last-painted state. `Screen`'s [`PaintSlot`]
+    /// cache is the only thing that's guaranteed to genuinely span frames
+    /// for every widget shape here, exactly the reasoning that already gave
+    /// `paint_key` its own external cache rather than a widget-local one --
+    /// see `pico-link-7h5.9`'s postmortem for the concrete bug this
     /// prevents (a stale device name/codec word after `damage_hint`
     /// wrongly narrowed a real body change down to a sub-region).
     ///
@@ -528,12 +531,13 @@ pub trait Widget {
     /// (e.g. `VerticalList`'s selected row). `None` for widgets with no
     /// such concept (static labels, dividers).
     ///
-    /// Exists so a caller that rebuilds a screen's widgets from scratch on
-    /// every model change (e.g. `App::refresh_stack` over live device/link
-    /// data — see `pico_link_core::app`'s doc comments) can read back the
-    /// *old* widget's selection before discarding it, and carry it forward
-    /// into the freshly built replacement (`VerticalList::with_selected`)
-    /// instead of resetting the user's place in the list on every event.
+    /// Read-only test/diagnostic introspection -- the rebuild-era reason
+    /// this existed (a caller rebuilding a screen's widgets from scratch on
+    /// every model change reading back the *old* widget's selection to
+    /// carry it into the replacement) no longer applies now that
+    /// interactive widgets on a long-lived screen are updated in place via
+    /// `set_items`/`set_rows` rather than rebuilt (bead `pico-link-bgnd`,
+    /// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md`).
     fn selected_index(&self) -> Option<usize> {
         None
     }
@@ -543,15 +547,14 @@ pub trait Widget {
     /// `None` for widgets with no keyed-identity concept (the default),
     /// or when the currently selected row was never tagged with a key.
     ///
-    /// Exists for the same reason [`Self::selected_index`] does, one
-    /// level more robust: a caller that rebuilds a screen's widgets from
-    /// scratch on every model change can read this back before discarding
-    /// the old widget, then carry it into the freshly built replacement's
-    /// selection-resolution call (`VerticalList::with_selected_identity`)
-    /// so a rebuild that reorders, inserts, or removes *other* rows
-    /// doesn't move the selection away from the row the user was actually
-    /// looking at — the failure mode a plain index-based carry-forward
-    /// has.
+    /// Read-only test/diagnostic introspection, one level more robust than
+    /// [`Self::selected_index`] -- see that method's doc comment for why
+    /// the original rebuild-carry-forward reason no longer applies. When it
+    /// still mattered (a rebuilt replacement's `VerticalList::
+    /// with_selected_identity`/`FieldList::with_selected_identity` call, or
+    /// today's in-place `set_items`/`set_rows`), the identity key is what
+    /// survives a reorder/insert/remove of *other* rows that a plain
+    /// index-based carry-forward would get wrong.
     fn selected_key(&self) -> Option<ListItemKey> {
         None
     }
@@ -559,16 +562,12 @@ pub trait Widget {
     /// Projects live state (a model handle, a shared clock, ...) into this
     /// widget's own plain fields, once per frame, before `render`/
     /// `on_intent`/`measure`/the paint-key methods are consulted -- see
-    /// `Navigator::sync_top`'s doc comment and the M0 step of
+    /// `Navigator::sync_top`'s doc comment and
     /// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md`
-    /// (bead `pico-link-bgnd`) for the full design this seam is the start
-    /// of. Defaults to a no-op: **as of this bead, nothing calls this on
-    /// any widget with a live handle to project from, and no widget
-    /// overrides it** -- `App` still rebuilds screens from scratch on every
-    /// model change (`App::refresh_stack`), so `sync` is currently called
-    /// on freshly-built, already-up-to-date widgets. It becomes load-
-    /// bearing screen by screen as later beads in the same epic migrate
-    /// each view to be long-lived instead of rebuilt.
+    /// (bead `pico-link-bgnd`) for the full design this seam implements.
+    /// Defaults to a no-op for widgets with no live state to project (static
+    /// labels, dividers, generic list/field widgets driven entirely by
+    /// their owning view's `set_items`/`set_rows` calls).
     ///
     /// **A widget that wraps other widgets must forward this to its
     /// children** -- same rule, same hazard, as `redraw_after`/

@@ -170,9 +170,7 @@ fn projection_key_of(model: &BtModel, now: Instant, order: &[FaultKey]) -> Paint
 /// As of bead `pico-link-bgnd` M4, long-lived for as long as the `why?`
 /// page stays on the navigator's stack -- [`Widget::sync`] re-reads the
 /// live model itself every frame this screen is on top, instead of
-/// [`build_why_page_screen`] being re-invoked on every fault event (see
-/// `App::build_identified_screen`'s `ScreenId::WhyPage` arm, which now
-/// returns `Refresh::Keep`).
+/// [`build_why_page_screen`] being re-invoked on every fault event.
 ///
 /// **Ordering discipline is the load-bearing part of this widget.**
 /// `order` is seeded once by `render::home`'s `ShortcutX` handler (a fresh
@@ -303,11 +301,10 @@ impl Widget for WhyPageView {
 /// Builds the `why?` page screen -- the one place it is constructed,
 /// called once per push from `render::home`'s `ShortcutX` handler, which
 /// computes the fresh most-recently-active-first `order` right before
-/// calling this. Once pushed, `App::build_identified_screen`'s
-/// `ScreenId::WhyPage` arm returns [`crate::app::Refresh::Keep`] (bead
-/// `pico-link-bgnd` M4) -- this function is never re-invoked on every
-/// fault event the way it used to be; [`WhyPageView::sync`] re-reads the
-/// live model itself every frame instead.
+/// calling this. Once pushed, this function is never re-invoked on every
+/// fault event the way it used to be (bead `pico-link-bgnd` M4) --
+/// [`WhyPageView::sync`] re-reads the live model itself every frame
+/// instead.
 pub(crate) fn build_why_page_screen(model: &ModelHandle, order: Vec<FaultKey>) -> Screen {
     let view = WhyPageView::new(model, Instant::from_micros(0), order);
     Screen::new(WHY_PAGE_TITLE, vec![Box::new(view)]).with_id(ScreenId::WhyPage)

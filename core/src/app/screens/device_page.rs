@@ -23,7 +23,7 @@ use crate::render::{
 
 use super::devices::{build_forget_confirm_screen, paired_device_label};
 use super::ldac_quality::{build_ldac_quality_picker_screen, ldac_quality_fixed_kbps, LDAC_QUALITY_ADAPTIVE};
-use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, ModelHandle, PairedDevice, Refresh, ScreenCarry, ScreenId};
+use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, ModelHandle, PairedDevice, ScreenId};
 
 /// A placeholder for a live value this page cannot honestly report yet --
 /// `core` has no `SetDeviceCodecPref`/`CodecAvailability`/
@@ -143,9 +143,9 @@ fn device_page_rows(model: &BtModel, addr: DeviceAddr) -> Vec<FieldRow> {
     if device_page_quality_present(model, addr) {
         // `unwrap_or` fallback below only matters for the pathological
         // case of a present-but-not-actually-paired addr (never happens
-        // via `build_device_page_screen`, which bails to `Refresh::Gone`
-        // first) -- kept defensive since this function is pure and called
-        // directly by tests with hand-built models.
+        // via `build_device_page_screen`, which bails to `None` first) --
+        // kept defensive since this function is pure and called directly
+        // by tests with hand-built models.
         let default_device = PairedDevice { addr, name: String::new(), mru_seq: 0, ldac_quality: 0 };
         let device = model.paired.iter().find(|d| d.addr == addr).unwrap_or(&default_device);
         rows.push(
@@ -177,27 +177,24 @@ fn format_device_address(addr: DeviceAddr) -> String {
     )
 }
 
-/// The connected-or-paired device's detail page. Returns
-/// [`Refresh::Gone`] when `addr` is no longer in [`BtModel::paired`] at push
-/// time. Built once per push (bead `pico-link-bgnd` M3, generalising M2's
-/// `DevicesListView` shape): [`crate::app::App::build_identified_screen`]'s
-/// `ScreenId::DevicePage` arm returns [`Refresh::Keep`] once this is on the
-/// stack -- [`DevicePageView::sync`] re-reads the live model itself every
-/// frame this page is on top, and [`crate::app::App::refresh_stack`]'s own
-/// per-index liveness check (not this function) is what unwinds the stack
-/// if `addr` vanishes later.
-pub(crate) fn build_device_page_screen(model: &ModelHandle, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
+/// The connected-or-paired device's detail page. Returns `None` when `addr`
+/// is no longer in [`BtModel::paired`] at push time. Built once per push
+/// (bead `pico-link-bgnd` M3, generalising M2's `DevicesListView` shape) and
+/// never rebuilt again while it stays on the navigator's stack --
+/// [`DevicePageView::sync`] re-reads the live model itself every frame this
+/// page is on top, and [`crate::app::App`]'s own per-fold liveness check
+/// (`prune_stack`, not this function) is what unwinds the stack if `addr`
+/// vanishes later.
+pub(crate) fn build_device_page_screen(model: &ModelHandle, addr: DeviceAddr, commands: &Rc<RefCell<VecDeque<Command>>>) -> Option<Screen> {
     let (title, rows, projection_key) = {
         let snapshot = model.borrow();
-        let Some(device) = snapshot.paired.iter().find(|d| d.addr == addr) else {
-            return Refresh::Gone;
-        };
+        let device = snapshot.paired.iter().find(|d| d.addr == addr)?;
         (paired_device_label(device), device_page_rows(&snapshot, addr), DevicePageView::projection_key(&snapshot, addr))
     };
 
     let model_for_activate = Rc::clone(model);
     let commands_for_activate = Rc::clone(commands);
-    let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index).on_activate_key(move |key| {
+    let list = FieldList::new(rows).on_activate_key(move |key| {
         if key == QUALITY_ROW_KEY {
             let quality_present = device_page_quality_present(&model_for_activate.borrow(), addr);
             if !quality_present {
@@ -208,22 +205,16 @@ pub(crate) fn build_device_page_screen(model: &ModelHandle, addr: DeviceAddr, ca
                 // there.
                 return Action::None;
             }
-            // Depth-2 push, fresh `ScreenCarry` -- there is nothing to carry
-            // forward into a screen that has never been open before.
+            // A fresh push -- there is nothing to carry forward into a
+            // screen that has never been open before.
             let model = Rc::clone(&model_for_activate);
             let commands = Rc::clone(&commands_for_activate);
             return Action::PushView(Box::new(move || {
-                let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
-                match build_ldac_quality_picker_screen(&model, addr, &carry, &commands) {
-                    Refresh::Rebuild(screen) => screen,
-                    // The device we just descended from cannot have
-                    // vanished between the press and this closure running
-                    // -- structurally unreachable, same reasoning as
-                    // `build_devices_screen`'s own connected-row push.
-                    // `Refresh::Keep` is likewise unreachable here -- this
-                    // function never returns it.
-                    Refresh::Gone | Refresh::Keep => Screen::new("Quality", vec![]),
-                }
+                // The device we just descended from cannot have vanished
+                // between the press and this closure running --
+                // structurally unreachable, but a same-titled empty screen
+                // is a harmless fallback rather than a panic if it ever is.
+                build_ldac_quality_picker_screen(&model, addr, &commands).unwrap_or_else(|| Screen::new("Quality", vec![]))
             }));
         }
         if key == FORGET_ROW_KEY {
@@ -236,9 +227,8 @@ pub(crate) fn build_device_page_screen(model: &ModelHandle, addr: DeviceAddr, ca
         }
         Action::None
     });
-    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
     let view = DevicePageView { list, addr, model: Rc::clone(model), commands: Rc::clone(commands), projection_key };
-    Refresh::Rebuild(Screen::new(title, vec![Box::new(Spacer::new(12)), Box::new(view)]).with_id(ScreenId::DevicePage(addr)))
+    Some(Screen::new(title, vec![Box::new(Spacer::new(12)), Box::new(view)]).with_id(ScreenId::DevicePage(addr)))
 }
 
 /// Wraps [`FieldList`] to add the device page's `X` action (`drop` when
@@ -494,8 +484,8 @@ mod tests {
         // Reach a disconnected device's page the only way it's wired:
         // connect once (so the page is reachable via the connected row),
         // then let the link drop while the page stays open --
-        // `refresh_stack` must flip `connected` (and therefore the X
-        // binding) live.
+        // `DevicePageView`'s live model read must flip `connected` (and
+        // therefore the X binding) live, no screen rebuild involved.
         let mut app = App::new(240, 240);
         let addr = [9; 6];
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
@@ -503,7 +493,7 @@ mod tests {
         app.handle_event(upsert(addr, "Cans", 1));
         open_devices(&mut app);
         app.handle_input(vec![NavIntent::Select]); // -> device page, connected
-        app.handle_event(Event::LinkStateChanged(LinkState::Idle)); // drops -- refresh_stack must catch up in place
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle)); // drops -- the live model read must catch up in place
 
         app.handle_input(vec![NavIntent::ShortcutX]);
         assert_eq!(
@@ -524,8 +514,9 @@ mod tests {
         app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // focus row 2 (USB IN)
 
         // An unrelated model event must not reset the user's focus on the
-        // page they're looking at (the whole reason `refresh_stack` reads
-        // `ScreenCarry` before replacing).
+        // page they're looking at -- `DevicePageView` is never rebuilt
+        // while it stays on the stack (bead `pico-link-bgnd` M3), so there
+        // is nothing to reset it.
         app.handle_event(Event::LevelsChanged { peak_l: 10, peak_r: 10, rms_l: 10, rms_r: 10 });
 
         assert_eq!(app.navigator.selected_index_at(2), Some(2), "focus must survive a live refresh of the page underneath it");
@@ -653,7 +644,7 @@ mod tests {
         assert_eq!(rows_before_echo.iter().find(|r| r.label == "QUALITY").unwrap().value(), Some("990 kbps"), "no optimistic update before the echo");
 
         // The echo lands (C's PairedDeviceUpserted, same write that
-        // produced the command above) -- refresh_stack must now show 660.
+        // produced the command above) -- the live model read must now show 660.
         app.handle_event(upsert_with_quality(addr, "Cans", 2, 2));
         let rows_after_echo = device_page_rows(&app.model(), addr);
         assert_eq!(rows_after_echo.iter().find(|r| r.label == "QUALITY").unwrap().value(), Some("660 kbps"), "the check follows the stored echo");
@@ -665,10 +656,9 @@ mod tests {
         let addr = [30; 6];
         model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 1 });
         // Not connected.
-        let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let handle: ModelHandle = Rc::new(RefCell::new(model));
-        let Refresh::Rebuild(_screen) = build_ldac_quality_picker_screen(&handle, addr, &carry, &commands) else {
+        let Some(_screen) = build_ldac_quality_picker_screen(&handle, addr, &commands) else {
             panic!("a paired, disconnected device's picker must build, not vanish");
         };
         let mut model = handle.borrow_mut();

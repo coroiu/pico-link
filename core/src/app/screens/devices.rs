@@ -21,10 +21,7 @@ use crate::render::{
 
 use super::device_page::build_device_page_screen;
 use super::super::model::MAX_PAIRED_DEVICES;
-use super::super::{
-    truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, ModelHandle, PairedDevice, Refresh, ScreenCarry, ScreenId,
-    WizardPhase,
-};
+use super::super::{truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, ModelHandle, PairedDevice, ScreenId, WizardPhase};
 
 /// The devices screen's "Pair new headphones" row's identity key. Not
 /// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
@@ -61,11 +58,10 @@ const DEVICES_PROJECTION_SEED: u64 = 41;
 /// calls this (Devices isn't the root), but once pushed (from Home's
 /// Bluetooth row, `render::home`'s menu closure) the resulting
 /// [`DevicesListView`] is long-lived for as long as Devices stays on the
-/// navigator's stack: `App::refresh_stack`'s `ScreenId::Devices` arm
-/// returns [`Refresh::Keep`] (bead `pico-link-bgnd` M2), so a Bluetooth
-/// event no longer rebuilds this screen -- `DevicesListView::sync` re-reads
-/// the live model itself every frame Devices is on top of the stack
-/// instead (same shape as `render::home`'s M1).
+/// navigator's stack (bead `pico-link-bgnd` M2): a Bluetooth event no
+/// longer rebuilds this screen -- `DevicesListView::sync` re-reads the live
+/// model itself every frame Devices is on top of the stack instead (same
+/// shape as `render::home`'s M1).
 ///
 /// The connected device (if any) is pinned first, sublabelled `Connected`;
 /// then every other paired device, MRU-descending, sublabelled `Paired`;
@@ -153,20 +149,12 @@ pub(crate) fn build_devices_screen(
                 let model = Rc::clone(&model_for_activate);
                 let commands = Rc::clone(&commands_for_activate);
                 return Action::PushView(Box::new(move || {
-                    let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
-                    match build_device_page_screen(&model, addr, &carry, &commands) {
-                        Refresh::Rebuild(screen) => screen,
-                        // The connected device we just resolved cannot
-                        // have vanished between that read and this
-                        // closure running on the very same press --
-                        // `Refresh::Gone` is structurally unreachable
-                        // here, but a same-titled empty screen is a
-                        // harmless fallback rather than a panic if it
-                        // ever is. `Refresh::Keep` is likewise
-                        // unreachable: `build_device_page_screen` never
-                        // returns it -- no builder does yet.
-                        Refresh::Gone | Refresh::Keep => Screen::new(fallback_title, vec![]),
-                    }
+                    // The connected device we just resolved cannot have
+                    // vanished between that read and this closure running
+                    // on the very same press -- structurally unreachable,
+                    // but a same-titled empty screen is a harmless
+                    // fallback rather than a panic if it ever is.
+                    build_device_page_screen(&model, addr, &commands).unwrap_or_else(|| Screen::new(fallback_title, vec![]))
                 }));
             }
             // A on any other paired row: switch to it, reusing the

@@ -15,7 +15,7 @@ use crate::power::{DisplaySettings, ScreensaverMode, ScreensaverTimeout};
 use crate::render::theme::palette;
 use crate::render::{Action, FieldList, FieldRow, FocusEvent, FrameBuffer565, ListItemKey, PaintKey, RenderCtx, Screen, Verb, Widget};
 
-use super::super::{DisplaySettingsState, ScreenCarry, ScreenId, SettingsPickerKind};
+use super::super::{DisplaySettingsState, ScreenId, SettingsPickerKind};
 use super::picker::{build_picker_view_screen, PickerOption};
 
 /// The Settings screen's fixed title.
@@ -42,30 +42,28 @@ fn settings_projection_key(current: DisplaySettings) -> PaintKey {
 
 /// The Settings screen's two rows -- `IDLE SCREEN` (mode) and `IDLE AFTER`
 /// (timeout), each pushing its own picker. Built once per push (bead
-/// `pico-link-bgnd` M3): [`crate::app::App::build_identified_screen`]'s
-/// `ScreenId::Settings` arm returns [`crate::app::Refresh::Keep`] once this
-/// is on the stack -- [`SettingsView::sync`] re-reads `state` itself every
-/// frame this screen is on top, so a pick made in either picker (which
-/// shares this same `Rc<RefCell<DisplaySettingsState>>`) is reflected here
-/// with no rebuild.
-pub(crate) fn build_settings_screen(state: &Rc<RefCell<DisplaySettingsState>>, carry: &ScreenCarry) -> Screen {
+/// `pico-link-bgnd` M3) and never rebuilt again while it stays on the
+/// stack -- [`SettingsView::sync`] re-reads `state` itself every frame this
+/// screen is on top, so a pick made in either picker (which shares this
+/// same `Rc<RefCell<DisplaySettingsState>>`) is reflected here with no
+/// rebuild.
+pub(crate) fn build_settings_screen(state: &Rc<RefCell<DisplaySettingsState>>) -> Screen {
     let (rows, projection_key) = {
         let current = state.borrow().current;
         (settings_rows(current), settings_projection_key(current))
     };
     let state_for_activate = Rc::clone(state);
-    let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index).on_activate_key(move |key| {
+    let list = FieldList::new(rows).on_activate_key(move |key| {
         if key == ROW_MODE_KEY {
             let state = Rc::clone(&state_for_activate);
-            return Action::PushView(Box::new(move || build_settings_picker_screen(SettingsPickerKind::ScreensaverMode, &state, &ScreenCarry::default())));
+            return Action::PushView(Box::new(move || build_settings_picker_screen(SettingsPickerKind::ScreensaverMode, &state)));
         }
         if key == ROW_TIMEOUT_KEY {
             let state = Rc::clone(&state_for_activate);
-            return Action::PushView(Box::new(move || build_settings_picker_screen(SettingsPickerKind::ScreensaverTimeout, &state, &ScreenCarry::default())));
+            return Action::PushView(Box::new(move || build_settings_picker_screen(SettingsPickerKind::ScreensaverTimeout, &state)));
         }
         Action::None
     });
-    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
     let view = SettingsView { list, state: Rc::clone(state), projection_key };
     Screen::new(SETTINGS_TITLE, vec![Box::new(view)]).with_id(ScreenId::Settings)
 }
@@ -185,7 +183,7 @@ fn screensaver_timeout_options(current: DisplaySettings) -> (Vec<PickerOption>, 
 /// any more, because nothing needs to force a rebuild: both this picker and
 /// the Settings screen underneath it read the same live `state` handle
 /// directly.
-pub(crate) fn build_settings_picker_screen(kind: SettingsPickerKind, state: &Rc<RefCell<DisplaySettingsState>>, carry: &ScreenCarry) -> Screen {
+pub(crate) fn build_settings_picker_screen(kind: SettingsPickerKind, state: &Rc<RefCell<DisplaySettingsState>>) -> Screen {
     match kind {
         SettingsPickerKind::ScreensaverMode => {
             let state_for_projection = Rc::clone(state);
@@ -199,7 +197,7 @@ pub(crate) fn build_settings_picker_screen(kind: SettingsPickerKind, state: &Rc<
                 s.save_pending = true;
                 Action::None
             };
-            build_picker_view_screen(ScreenId::SettingsPicker(kind), "Idle screen", carry, projection, on_pick)
+            build_picker_view_screen(ScreenId::SettingsPicker(kind), "Idle screen", projection, on_pick)
         }
         SettingsPickerKind::ScreensaverTimeout => {
             let state_for_projection = Rc::clone(state);
@@ -213,7 +211,7 @@ pub(crate) fn build_settings_picker_screen(kind: SettingsPickerKind, state: &Rc<
                 s.save_pending = true;
                 Action::None
             };
-            build_picker_view_screen(ScreenId::SettingsPicker(kind), "Idle after", carry, projection, on_pick)
+            build_picker_view_screen(ScreenId::SettingsPicker(kind), "Idle after", projection, on_pick)
         }
     }
 }

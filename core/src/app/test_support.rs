@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use crate::input::NavIntent;
 
-use super::{App, ConnectedCodec, DeviceAddr, Event, LinkState, PairedDevice, ScreenCarry};
+use super::{App, ConnectedCodec, DeviceAddr, Event, LinkState, PairedDevice};
 
 /// Home(1) -> Devices(2): reaching the Devices screen takes two
 /// `Select`s -- centre toggles Home to its menu face (Bluetooth
@@ -99,8 +99,4 @@ pub(in crate::app) fn assert_home_hero_renders_connected(app: &mut App) {
         !fb.pixels().any(|p| p.1 == palette::STATUS_ERROR),
         "STATUS_ERROR ink anywhere means Home rendered NO LINK despite a connected model"
     );
-}
-
-pub(in crate::app) fn no_carry() -> ScreenCarry {
-    ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None }
 }

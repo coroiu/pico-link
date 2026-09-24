@@ -13,7 +13,7 @@ use crate::input::NavIntent;
 use crate::render::theme::icon;
 use crate::render::{Action, FieldList, FieldRow, FocusEvent, FrameBuffer565, ListItemKey, PaintKey, RenderCtx, Screen, Verb, Widget};
 
-use super::super::{ScreenCarry, ScreenId};
+use super::super::ScreenId;
 
 /// A single row in a [`PickerView`]. Its first real caller is
 /// [`build_ldac_quality_picker_screen`](super::ldac_quality::build_ldac_quality_picker_screen).
@@ -202,15 +202,15 @@ impl Widget for PickerView {
 /// Builds a [`PickerView`]-backed single-select picker screen -- the one
 /// place a picker screen is constructed, called once per push (from a
 /// device page's `QUALITY` row, or the Settings screen's two rows). Once
-/// pushed, [`crate::app::App::build_identified_screen`]'s
-/// `ScreenId::Picker`/`ScreenId::SettingsPicker` arms return
-/// [`crate::app::Refresh::Keep`] (bead `pico-link-bgnd` M3) -- this function
-/// is never re-invoked on every model/state event the way it used to be;
-/// [`PickerView::sync`] re-reads `projection` itself every frame instead.
+/// pushed, `ScreenId::Picker`/`ScreenId::SettingsPicker` are never rebuilt
+/// again while they stay on the navigator's stack (bead `pico-link-bgnd`
+/// M3) -- this function is never re-invoked on every model/state event the
+/// way it used to be; [`PickerView::sync`] re-reads `projection` itself
+/// every frame instead. No selection/scroll to carry forward: a freshly
+/// pushed picker always starts at row 0.
 pub(crate) fn build_picker_view_screen(
     id: ScreenId,
     title: impl Into<String>,
-    carry: &ScreenCarry,
     projection: impl Fn() -> (Vec<PickerOption>, Option<ListItemKey>) + 'static,
     on_pick: impl Fn(ListItemKey) -> Action + 'static,
 ) -> Screen {
@@ -218,8 +218,7 @@ pub(crate) fn build_picker_view_screen(
     let projection_key = projection_key_of(&options, checked);
     let rows = options_to_rows(&options, checked);
     let on_pick: OnPick = Box::new(on_pick);
-    let list = FieldList::new(rows).with_leading_gutter().with_selected_identity(carry.selected_key, carry.selected_index).on_activate_key(on_pick);
-    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
+    let list = FieldList::new(rows).with_leading_gutter().on_activate_key(on_pick);
     let view = PickerView { list, projection: Box::new(projection), projection_key };
     Screen::new(title, vec![Box::new(view)]).with_id(id)
 }
@@ -232,7 +231,6 @@ mod tests {
 
     use embedded_graphics::prelude::RgbColor;
 
-    use crate::app::test_support::no_carry;
     use crate::app::App;
     use crate::input::NavIntent;
     use crate::render::theme::palette;
@@ -258,7 +256,7 @@ mod tests {
     }
 
     fn three_option_picker(checked: Option<ListItemKey>, picked: Rc<RefCell<Vec<ListItemKey>>>, stay_open: bool) -> Screen {
-        build_picker_view_screen(quality_like_test_id(), "Test Picker", &no_carry(), move || (three_options(), checked), move |key| {
+        build_picker_view_screen(quality_like_test_id(), "Test Picker", move || (three_options(), checked), move |key| {
             picked.borrow_mut().push(key);
             if stay_open {
                 Action::None
@@ -334,7 +332,7 @@ mod tests {
     fn the_checked_row_follows_a_live_projection_change_with_no_pop_or_repush() {
         let checked = Rc::new(RefCell::new(Some(ListItemKey::from_u64(1))));
         let checked_for_projection = Rc::clone(&checked);
-        let screen = build_picker_view_screen(quality_like_test_id(), "Test Picker", &no_carry(), move || (three_options(), *checked_for_projection.borrow()), |_key| Action::None);
+        let screen = build_picker_view_screen(quality_like_test_id(), "Test Picker", move || (three_options(), *checked_for_projection.borrow()), |_key| Action::None);
         let mut app = App::new(240, 240);
         app.push_screen_for_test(screen);
         app.render(); // establish a clean baseline

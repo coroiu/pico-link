@@ -29,7 +29,6 @@ mod fault;
 mod fold;
 mod inspect;
 mod model;
-mod refresh;
 mod screen_id;
 mod screens;
 mod ui_state;
@@ -38,7 +37,6 @@ pub use events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus,
 pub use fault::{FaultEntry, FaultGlyphClass, FaultKey, FaultLog, FaultSeverity, FaultValue};
 pub use model::{BtModel, ConnectedCodec, DeviceAddr, DeviceEntry, LinkState, OutLevelSample, PairedDevice};
 pub(crate) use model::{decay_peak, is_audio_sink, truncate_device_name, MAX_SCAN_LIST_ITEMS};
-pub(crate) use refresh::{Refresh, ScreenCarry};
 pub use screen_id::{PickerKind, ScreenId, SettingsPickerKind};
 pub(crate) use screens::device_page::build_device_page_screen;
 pub(crate) use screens::devices::build_devices_screen;
@@ -76,7 +74,7 @@ const MIN_REDRAW_DELAY: Duration = Duration::from_millis(16);
 /// render/sync time instead of being rebuilt from a snapshot. `RefCell`,
 /// not a plain `Rc<BtModel>`: `App`'s own event-folding methods need to
 /// mutate through it. **Borrow rule**: never hold a live `Ref`/`RefMut`
-/// across a call back into `App` (e.g. `refresh_stack`) -- borrow,
+/// across a call back into `App` (e.g. `mark_model_changed`) -- borrow,
 /// read/write, drop, *then* call back in, or the `RefCell` panics at
 /// runtime. Model writes happen only inside `App::handle_event`'s fold
 /// methods, never during `sync`/`render`/`dispatch`, so such a panic would
@@ -127,23 +125,22 @@ pub struct App {
     /// directly from C events (`on_connect_step_changed` and friends) --
     /// either side's write is picked up by the widget's next `render`
     /// because it reads through the same `Rc` rather than a snapshot, so
-    /// **no screen replacement is needed** for a phase transition alone
-    /// (contrast [`App::refresh_stack`], which fully rebuilds the *devices*
-    /// screen on every model change -- the wizard screen, once pushed, is
-    /// never rebuilt or replaced; only its shared state changes underneath
-    /// it).
+    /// **no screen replacement is needed** for a phase transition alone --
+    /// the wizard screen, once pushed, is never rebuilt or replaced; only
+    /// its shared state changes underneath it (the same "long-lived, reads
+    /// live state" shape every screen has followed since bead
+    /// `pico-link-bgnd`'s M1-M4).
     wizard_phase: Rc<RefCell<WizardPhase>>,
     /// Which of Home's two faces is currently showing -- shared with
     /// whatever `HomeView` widget instance is currently the root screen's
     /// content, the same `Rc<RefCell<_>>`-mailbox shape [`App::wizard_phase`]
-    /// uses. Required, not just consistent-for-its-own-sake: unlike the
-    /// wizard (pushed once, never rebuilt -- see `wizard.rs`'s module doc),
-    /// Home *is* rebuilt on every model change (it's the root screen, see
-    /// [`App::refresh_stack`]), so a face toggle recorded only on a
-    /// `HomeView` field would be silently discarded the next time a
-    /// Bluetooth event fires while the menu face is showing. Read (not
-    /// written) fresh by every freshly built `HomeView`, so the toggle
-    /// survives a rebuild with no navigator involvement.
+    /// uses. Required not because `HomeView` is rebuilt (it isn't -- built
+    /// once at [`App::new`] and never again, see `render::home`'s module
+    /// doc), but because `App` itself is a genuine *second writer*:
+    /// `on_wizard_auto_dismiss` forces the face back to `Status` from a
+    /// fold method, with no other path back to the live `HomeView` instance
+    /// sitting inside the `Navigator`'s stack -- the same shape
+    /// [`App::wizard_phase`] has for its own second-writer fold methods.
     home_face: Rc<RefCell<HomeFace>>,
     /// The screensaver dim/off + timeout setting's shared mailbox -- same
     /// `Rc<RefCell<_>>` shape as `home_face`/`wizard_phase`, for the same
@@ -231,113 +228,47 @@ impl App {
         }
     }
 
-    /// Refreshes every screen on the [`Navigator`]'s stack that carries a
-    /// [`ScreenId`] to reflect the current [`BtModel`], via
-    /// [`Navigator::replace_at`] one index at a time. Screens that never
-    /// call [`Screen::with_id`] (the wizard, `ConfirmView`s, Settings) are
-    /// skipped: [`Navigator::id_at`] returns `None` for those.
-    ///
-    /// If a screen's subject has vanished from the model (e.g. a
-    /// [`ScreenId::DevicePage`] for a device that was just forgotten from
-    /// one level up), [`Self::build_identified_screen`] returns
-    /// [`Refresh::Gone`] and the stack unwinds to just below it via
-    /// [`Navigator::truncate_to`] -- this fires from *either* route a
-    /// device can disappear by, not only the one the user is looking at.
-    fn refresh_stack(&mut self) {
+    /// Drops any screen on the [`Navigator`]'s stack (and everything above
+    /// it) whose subject has vanished from the model -- e.g. a
+    /// [`ScreenId::DevicePage`]/[`ScreenId::Picker`]`(LdacQuality, _)` for a
+    /// device that was just forgotten. Called by [`Self::mark_model_changed`]
+    /// after every `BtModel`-mutating fold, since a device can vanish via
+    /// *any* such event, not only the one the user is looking at. Screens
+    /// that never call [`Screen::with_id`] (the wizard, `ConfirmView`s) are
+    /// skipped: [`Navigator::id_at`] returns `None` for those. Every other
+    /// identified screen kind (`Home`, `Devices`, `WhyPage`, `Settings`,
+    /// `SettingsPicker`) has no subject that can vanish, so this is a no-op
+    /// for them -- see [`ScreenId`]'s doc comment for the full "identity/
+    /// liveness tag, not a rebuild trigger" rule.
+    fn prune_stack(&mut self) {
         let mut truncate_at: Option<usize> = None;
         for index in 0..self.navigator.depth() {
-            let Some(id) = self.navigator.id_at(index) else { continue };
-            let carry = ScreenCarry {
-                selected_key: self.navigator.selected_key_at(index),
-                selected_index: self.navigator.selected_index_at(index).unwrap_or(0),
-                scroll_top: self.navigator.scroll_top_at(index),
-            };
-            match self.build_identified_screen(id, &carry) {
-                Refresh::Rebuild(screen) => self.navigator.replace_at(index, screen),
-                Refresh::Gone => {
-                    truncate_at = Some(index);
-                    break;
+            let gone = match self.navigator.id_at(index) {
+                Some(ScreenId::DevicePage(addr) | ScreenId::Picker(PickerKind::LdacQuality, addr)) => {
+                    !self.model.borrow().paired.iter().any(|d| d.addr == addr)
                 }
-                // Leave the screen already on the stack in place -- no
-                // `replace_at`, no forced full-frame damage. `ScreenId::
-                // Home`'s arm below is the first (and, as of this bead,
-                // only) case that returns this: `HomeView` stays live and
-                // reads the model itself via `Widget::sync` on every
-                // frame it's on top of the stack (bead `pico-link-bgnd`
-                // M1) -- there is nothing left for a rebuild to do.
-                Refresh::Keep => {}
+                _ => false,
+            };
+            if gone {
+                truncate_at = Some(index);
+                break;
             }
         }
         if let Some(index) = truncate_at {
             self.navigator.truncate_to(index.saturating_sub(1));
         }
-        self.dirty = true;
     }
 
-    /// The one mapping from [`ScreenId`] to screen builder --
-    /// [`Self::refresh_stack`]'s only caller. Every screen kind that can be
-    /// live-refreshed is one match arm here; adding a new refreshable
-    /// screen kind means adding a [`ScreenId`] variant and one arm, nothing
-    /// else.
-    // `carry` is unused as of bead `pico-link-bgnd` M4 -- every arm below
-    // now says so individually (M1-M4, one at a time). Left as a parameter
-    // rather than deleted: `ScreenCarry`/`Self::refresh_stack`'s caller
-    // still builds one per stack index, and M5 (design §6/§7) is the step
-    // that deletes `ScreenCarry`/`Refresh`/`refresh_stack` themselves --
-    // this function's signature is part of that same deletion, not this
-    // bead's to make alone.
-    fn build_identified_screen(&self, id: ScreenId, _carry: &ScreenCarry) -> Refresh {
-        match id {
-            // `HomeView` is built exactly once (`App::new`) and never
-            // rebuilt again -- it reads the live model itself via
-            // `Widget::sync` every frame it's on top of the stack (bead
-            // `pico-link-bgnd` M1). `carry` is unused here: there is
-            // nothing to carry forward into a rebuild that never happens.
-            ScreenId::Home => Refresh::Keep,
-            // `DevicesListView` is built once per push (`build_devices_
-            // screen`, invoked from `render::home`'s Bluetooth-row
-            // closure) and never rebuilt again while it stays on the
-            // stack -- it reads the live model itself via `Widget::sync`
-            // every frame it's on top (bead `pico-link-bgnd` M2). `carry`
-            // is unused here: there is nothing to carry forward into a
-            // rebuild that never happens (see `ScreenId::Home`'s arm just
-            // above for the identical M1 shape).
-            ScreenId::Devices => Refresh::Keep,
-            // `DevicePageView`/the `QUALITY` picker's `PickerView` are each
-            // built once per push and never rebuilt again while they stay
-            // on the stack -- both read the live model themselves via
-            // `Widget::sync` every frame they're on top (bead
-            // `pico-link-bgnd` M3). `carry` is unused here for the same
-            // "nothing to carry forward into a rebuild that never happens"
-            // reason `ScreenId::Home`/`ScreenId::Devices` give above; the
-            // liveness check below is what `App::refresh_stack` still needs
-            // from this arm -- a forgotten device unwinds the stack exactly
-            // as it did when this arm rebuilt the whole screen.
-            ScreenId::DevicePage(addr) | ScreenId::Picker(PickerKind::LdacQuality, addr) => {
-                if self.model.borrow().paired.iter().any(|d| d.addr == addr) {
-                    Refresh::Keep
-                } else {
-                    Refresh::Gone
-                }
-            }
-            // `WhyPageView` is built once per push and never rebuilt again
-            // while it stays on the stack -- it reads the live model
-            // itself via `Widget::sync` every frame it's on top (bead
-            // `pico-link-bgnd` M4). `carry` is unused here for the same
-            // "nothing to carry forward into a rebuild that never happens"
-            // reason `ScreenId::Home`/`ScreenId::Devices` give above.
-            // Nothing here can ever vanish (this page has no subject that
-            // can disappear, unlike a device), so there is no liveness
-            // check to make.
-            ScreenId::WhyPage => Refresh::Keep,
-            // The Settings screen and its two pickers are each built once
-            // per push and never rebuilt again while they stay on the stack
-            // -- all three read `display_settings` themselves via
-            // `Widget::sync` every frame they're on top (bead
-            // `pico-link-bgnd` M3). Nothing here can ever vanish (unlike a
-            // device), so there is no liveness check to make.
-            ScreenId::Settings | ScreenId::SettingsPicker(_) => Refresh::Keep,
-        }
+    /// Every `BtModel`-mutating fold method calls this exactly once, in
+    /// place of the old `refresh_stack` rebuild -- runs [`Self::prune_stack`]
+    /// (a forgotten device's page/picker must still unwind cleanly) and
+    /// marks the app dirty so the next [`Self::render`] picks up the
+    /// change. No screen is rebuilt or replaced here: every identified
+    /// screen kind reads the live model itself via `Widget::sync` on the
+    /// next render/input dispatch (see [`Navigator::sync_top`]).
+    fn mark_model_changed(&mut self) {
+        self.prune_stack();
+        self.dirty = true;
     }
 
     /// Pops the oldest queued user command, if any
