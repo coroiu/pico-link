@@ -223,4 +223,12 @@ void pl_bt_enqueue_persist_write(void);
 // superloop).
 void pl_bt_enqueue_ldac_quality_write(void);
 
+// Bead pico-link-qivj.5 (S11): same idiom as pl_bt_enqueue_persist_write
+// above, for persist.c's PL:S:0 display-settings write -- see persist.h's
+// doc comment on pl_persist_request_display_settings/
+// pl_persist_execute_pending_display_settings_write for the full
+// rationale. Called from persist.c's pl_persist_service() (thread context,
+// the superloop).
+void pl_bt_enqueue_display_settings_write(void);
+
 #endif // PL_BT_H

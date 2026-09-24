@@ -439,6 +439,24 @@ int main(void) {
 
     pl_bt_init(ui);
 
+    // Bead pico-link-qivj.5 (S11): push the PL:S:0 boot snapshot into core,
+    // if one was persisted -- thread context, before the superloop, same
+    // context a2dp.c's own direct pl_ui_push_event calls use. No-op (core
+    // keeps its own default) if pl_persist_boot_display_settings() returns
+    // false -- see that function's doc comment for every reason it can.
+    {
+        uint8_t boot_display_mode;
+        uint16_t boot_display_timeout_s;
+        if (pl_persist_boot_display_settings(&boot_display_mode, &boot_display_timeout_s)) {
+            struct PlEvent event = {
+                .version = PL_EVENT_ABI_VERSION,
+                .tag = PL_EVENT_TAG_DISPLAY_SETTINGS_LOADED,
+                .payload = {.display_settings = {.mode = boot_display_mode, .timeout_s = boot_display_timeout_s}},
+            };
+            pl_ui_push_event(ui, event);
+        }
+    }
+
 #ifdef PL_ENCODER_ON_CORE1
     // Bead pico-link-nli.4 (G3, epic pico-link-nli): launch core1 into the
     // LDAC encoder loop, after cyw43/BTstack init per design sec 8 -- core1
