@@ -21,16 +21,15 @@ use core::cell::{Ref, RefCell};
 use core::convert::Infallible;
 use core::time::Duration;
 
-use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::{Point, Size};
 use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
 use crate::input::NavIntent;
-use crate::power::{DisplaySettings, ScreensaverMode, ScreensaverTimeout};
+use crate::power::DisplaySettings;
 use crate::render::home::build_home_screen;
-use crate::render::theme::{self, icon, palette};
+use crate::render::theme::{self, palette};
 use crate::render::wizard::build_wizard_screen;
 use crate::render::{
     Action, ButtonLabel, ChromeContribution, ConfirmView, FieldList, FieldRow, FocusEvent, FrameBuffer565, Instant, ListItem, ListItemKey,
@@ -42,6 +41,7 @@ mod fault;
 mod model;
 mod refresh;
 mod screen_id;
+mod screens;
 mod ui_state;
 
 pub use events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus, VolumeSource, VolumeState};
@@ -51,6 +51,9 @@ pub(crate) use model::{decay_peak, is_audio_sink, truncate_device_name, MAX_SCAN
 use model::{MAX_PAIRED_DEVICES, OUT_LEVEL_HOLD_DURATION};
 pub(crate) use refresh::{Refresh, ScreenCarry};
 pub use screen_id::{PickerKind, ScreenId, SettingsPickerKind};
+pub(crate) use screens::picker::{build_single_select_screen, PickerOption};
+pub(crate) use screens::settings::{build_settings_picker_screen, build_settings_screen};
+pub(crate) use screens::why_page::build_why_page_screen;
 pub use ui_state::{DisplaySettingsState, HomeFace, WizardPhase};
 use ui_state::PENDING_TIMESTAMP;
 
@@ -786,252 +789,6 @@ impl Widget for DevicePageView {
     }
 }
 
-/// A single row in a [`build_single_select_screen`] picker.
-///
-/// `#[allow(dead_code)]` on this and on [`build_single_select_screen`]
-/// itself: this bead (`pico-link-7jol.4`) builds and tests the general
-/// picker mechanism ahead of its first real caller, the `QUALITY` row
-/// (`pico-link-7jol.5`) -- see
-/// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
-/// §7 step 4. Its first real caller is
-/// [`build_ldac_quality_picker_screen`] (pico-link-7jol.5).
-pub(crate) struct PickerOption {
-    /// Stable identity -- carries focus and the check across rebuilds, and
-    /// is what [`build_single_select_screen`]'s `on_pick` callback is
-    /// invoked with.
-    pub key: ListItemKey,
-    pub label: String,
-    /// The trailing note (e.g. `best audio`, `660 now`, `not offered`).
-    pub note: Option<(String, Rgb565)>,
-    /// `false` -> [`FieldKind::Readonly`]: focusable, dim, no caret, `A`
-    /// dead -- an unavailable option cannot be picked, structurally (the
-    /// activation gate lives in [`FieldList`], not in `on_pick`).
-    pub selectable: bool,
-}
-
-/// A generic single-select picker screen -- the codec picker and the LDAC
-/// quality picker (`pico-link-7jol.5`) are both this function with
-/// different `options`/`on_pick`, not two widgets
-/// (`.planning/design/2026-09-07-device-page-and-single-select-picker.md`
-/// §2). **Not a widget, not a `render/` module** -- composition of
-/// [`FieldList`] alone, per that design's §0.1 verdict.
-///
-/// Five rules this shape makes structural rather than remembered (design
-/// §2.1):
-/// 1. **The check follows the stored value.** `checked` is read from the
-///    model by the caller, not from a local "pressed" bit -- there is no
-///    place in this function to put an optimistic check by accident.
-/// 2. **Pop-vs-stay-open is entirely `on_pick`'s return value**
-///    (`Action::None` stays open, `Action::PopView` pops) -- there is no
-///    `stays_open` flag.
-/// 3. **The gutter is on the list, not the row** (`with_leading_gutter`),
-///    so every label aligns at the same `L` whether checked or not.
-/// 4. **An unavailable option cannot be picked** -- `selectable: false`
-///    produces `FieldKind::Readonly`, whose activation gate lives in
-///    `FieldList`, not in `on_pick`.
-/// 5. **`A` never lies** -- [`Verb::Select`] on selectable rows, no verb
-///    (dim `A`) on unavailable ones, both from `FieldList::activation`.
-///
-/// `A`'s rail word is [`Verb::Select`] (orchestrator ruling on
-/// `pico-link-7jol.4`: Uma's sketches say "pick", which would need a
-/// second `Verb::Exception` and her sign-off for one word that means the
-/// same thing to the user).
-pub(crate) fn build_single_select_screen(
-    id: ScreenId,
-    title: impl Into<String>,
-    options: Vec<PickerOption>,
-    checked: Option<ListItemKey>,
-    carry: &ScreenCarry,
-    on_pick: impl Fn(ListItemKey) -> Action + 'static,
-) -> Screen {
-    let keys: Vec<ListItemKey> = options.iter().map(|option| option.key).collect();
-    let rows: Vec<FieldRow> = options
-        .into_iter()
-        .map(|option| {
-            let checked_here = Some(option.key) == checked;
-            let mut row = if option.selectable { FieldRow::action(option.label) } else { FieldRow::readonly(option.label) };
-            if option.selectable {
-                row = row.with_verb(Verb::Select);
-            }
-            if let Some((text, color)) = option.note {
-                row = row.with_value(text, color);
-            }
-            if checked_here {
-                row = row.with_leading_glyph(icon::CHECK);
-            }
-            row.with_key(option.key)
-        })
-        .collect();
-
-    let list = FieldList::new(rows)
-        .with_leading_gutter()
-        .with_selected_identity(carry.selected_key, carry.selected_index)
-        .on_activate_index(move |index| keys.get(index).map_or(Action::None, |key| on_pick(*key)));
-    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
-    Screen::new(title, vec![Box::new(list)]).with_id(id)
-}
-
-/// The `why?` page's fixed title (design
-/// `.planning/design/2026-09-07-home-fault-strip.md` §8.2: "Header: `WHY?`").
-const WHY_PAGE_TITLE: &str = "WHY?";
-
-/// Formats `elapsed_since(at)` as a short relative age -- `"8s ago"`,
-/// `"4m ago"`, `"2h ago"` -- **never an absolute timestamp**, per design
-/// §8.2's "Relative times only. Never absolute timestamps -- no RTC." This
-/// board has no RTC (`.planning/design/2026-09-01-idle-policy-across-the-
-/// ffi-seam.md`'s own note, restated here because it is easy to
-/// rediscover as a missing feature rather than a hard constraint) --
-/// `now`/`at` are both [`crate::run::FAULT_LIVE_WINDOW`]-scale
-/// [`Instant`]s derived from the FFI seam's monotonic microsecond clock,
-/// never wall-clock time.
-fn relative_time(now: Instant, at: Instant) -> String {
-    let elapsed = now.saturating_duration_since(at);
-    let secs = elapsed.as_secs();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else {
-        format!("{}h ago", secs / 3600)
-    }
-}
-
-/// The Home fault strip's `why?` detail page (design
-/// `.planning/design/2026-09-07-home-fault-strip.md` §8, bead
-/// `pico-link-9eq2.3.3`) -- a scrollable list of **kinds, not events**
-/// (orchestrator ruling on this bead): one aggregated two-line block per
-/// [`FaultKey`] that has ever fired, in `order`'s sequence, including
-/// retired keys (design §8.2: "including retired keys -- this is the
-/// session history").
-///
-/// **Ordering discipline is the load-bearing part of this function**
-/// (orchestrator ruling, restated because it is easy to miss): `order` is
-/// the caller's frozen block order, established once by `render::home`'s
-/// `ShortcutX` handler (a fresh most-recently-active-first sort, written
-/// directly into the shared `Rc<RefCell<_>>` at push time) and never
-/// re-sorted by this function on any subsequent call. What this function
-/// DOES do, every call (including the very first, harmlessly, since
-/// `order` starts empty then): **append** any key that has an entry in
-/// [`BtModel::fault_log`] but is not yet present in `order`, at the END --
-/// "a key that fires for the first time while the page is open appends at
-/// the bottom rather than jumping to the top." A live re-sort under a
-/// scrolling thumb is exactly the moving-target problem design §6.2
-/// rejects for Home's own rows, worse here because the user is reading,
-/// not glancing.
-///
-/// Never returns [`Refresh::Gone`] -- this page has no subject that can
-/// vanish out from under it (unlike [`ScreenId::DevicePage`]'s device).
-/// The `why?` page's line 3 (design §8.2): "one plain-language consequence
-/// sentence plus the raw number." Neither design doc dictates exact
-/// wording -- the audio-fault-model design (`.planning/design/2026-09-07-
-/// audio-fault-model.md` §3.1's "Reads" column) only specifies each key's
-/// value KIND and what it measures; Uma's sketch (§10.7) gives two worked
-/// examples in her own prose. This function is that prose, one sentence
-/// per key, filled in with the actual raw value -- never the saturated/
-/// rounded figure Home's own count slot uses (§8.2: "no saturation here").
-/// `None` (a key whose value has never been wired -- e.g. the USB supply
-/// ratio before `pl_usb_supply_q8()` lands) means no line 3 at all, never a
-/// guessed number.
-fn fault_consequence_text(key: FaultKey, value: Option<FaultValue>) -> Option<String> {
-    let value = value?;
-    // Every arm below is measured against the why? page's real row budget
-    // (`font::value()`, ~194px -- `core/examples/fault_strip_probe.rs`'s
-    // `measure_why_page_consequence_texts`) and kept under it: `FieldList`
-    // CLIPS an overlong label rather than ellipsising it (field-list ruling
-    // §4.6), which for a full sentence reads as a confusing mid-word cut
-    // rather than the name truncation this render core uses everywhere
-    // else -- so these stay short by construction, not by luck.
-    Some(match (key, value) {
-        (FaultKey::BufStarved, FaultValue::Millis(ms)) => format!("ring dry, min fill {ms}ms"),
-        (FaultKey::BufOverflow, FaultValue::Count(frames)) => format!("ring full, {frames} dropped"),
-        (FaultKey::UsbSupplyLow, FaultValue::Ratio(q8)) => {
-            // q8: 256 == 1.00x nominal -- rendered to 2 decimal places
-            // without a float format dependency, matching this codebase's
-            // "no_std + alloc" discipline (u8g2-fonts/core::fmt integer
-            // formatting only).
-            let whole = u32::from(q8) / 256;
-            let frac = (u32::from(q8) % 256) * 100 / 256;
-            format!("supply {whole}.{frac:02}x nominal")
-        }
-        (FaultKey::AirCongested, FaultValue::Count(deferred)) => format!("air busy, x{deferred} deferred"),
-        (FaultKey::AirLinkLost, FaultValue::Count(occurrences)) => format!("link dropped x{occurrences}"),
-        (FaultKey::EncResync, FaultValue::Count(frames)) => format!("trim dropped x{frames}"),
-        // A key paired with a `FaultValue` variant the audio-fault-model
-        // design's own table (§3.1) never assigns it -- e.g. a firmware
-        // bug sending the wrong `value_kind` tag. Never fabricate a
-        // sentence for a combination the design doesn't define; the
-        // count/name/times on lines 1-2 still show, just no line 3.
-        _ => return None,
-    })
-}
-
-pub(crate) fn build_why_page_screen(model: &BtModel, now: Instant, order: &Rc<RefCell<Vec<FaultKey>>>, carry: &ScreenCarry) -> Refresh {
-    {
-        let mut order = order.borrow_mut();
-        for key in FaultKey::ALL {
-            if model.fault_log.entry(key).is_some() && !order.contains(&key) {
-                order.push(key);
-            }
-        }
-    }
-    let ordered_keys = order.borrow().clone();
-
-    let mut rows = Vec::new();
-    let mut next_key = 0_u64;
-    for key in ordered_keys {
-        let Some(entry) = model.fault_log.entry(key) else {
-            // Structurally unreachable: every key in `order` was inserted
-            // above (or on a prior call) only after confirming
-            // `fault_log.entry(key).is_some()`, and entries are never
-            // removed once raised (`FaultLog`'s own doc comment) --
-            // defensive rather than a panic, matching this crate's own
-            // convention elsewhere (e.g. `device_page_rows`'s
-            // `unwrap_or(&default_device)`).
-            continue;
-        };
-        let glyph_char = match key.glyph() {
-            FaultGlyphClass::Filled => '^',
-            FaultGlyphClass::Starved => 'v',
-            FaultGlyphClass::Neutral => '#',
-        };
-        let color = match key.severity() {
-            FaultSeverity::Audible => palette::STATUS_ERROR,
-            FaultSeverity::Concealed => palette::STATUS_WARNING,
-        };
-        // Line 1: glyph, name, TOTAL count -- "no saturation here, show the
-        // real number" (design §8.2), unlike Home's own `x99+` cap.
-        rows.push(
-            FieldRow::readonly(format!("{glyph_char} {}", key.name()))
-                .with_label_color(color)
-                .with_value(format!("x{}", entry.count), color)
-                .with_key(ListItemKey::from_u64(next_key)),
-        );
-        next_key += 1;
-        // Line 2: relative times only, `TEXT_SECONDARY` (readonly's default
-        // label color -- no override needed).
-        rows.push(
-            FieldRow::readonly(format!("last {} . first {}", relative_time(now, entry.last_seen), relative_time(now, entry.first_seen)))
-                .with_key(ListItemKey::from_u64(next_key)),
-        );
-        next_key += 1;
-        // Line 3 (design §8.2): "one plain-language consequence sentence
-        // plus the raw number, which is where pico-link-8jp's supply
-        // ratio and every other counter value now lives." Absent when
-        // `entry.value` is `None` -- some keys have never had a value
-        // wired (e.g. the USB supply ratio, per the audio-fault-model
-        // design §6.3, "absent (`None`) until `pl_usb_supply_q8()`
-        // exists") -- absent, never faked (parent design §15).
-        if let Some(text) = fault_consequence_text(key, entry.value) {
-            rows.push(FieldRow::readonly(text).with_key(ListItemKey::from_u64(next_key)));
-            next_key += 1;
-        }
-    }
-
-    let list = FieldList::new(rows).with_selected_identity(carry.selected_key, carry.selected_index);
-    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
-    Refresh::Rebuild(Screen::new(WHY_PAGE_TITLE, vec![Box::new(list)]).with_id(ScreenId::WhyPage))
-}
-
 /// The `QUALITY` picker's four entries, per design §4.1: numbers leading,
 /// highest first, `HQ`/`SQ`/`MQ` never shown
 /// (`.planning/design/2026-09-07-ldac-quality-selector.md`). Returns
@@ -1091,110 +848,6 @@ fn build_ldac_quality_picker_screen(model: &BtModel, addr: DeviceAddr, carry: &S
         carry,
         on_pick,
     ))
-}
-
-/// The Settings screen's fixed title. Originally a placeholder (bead
-/// `pico-link-znb.8`/E7, giving Home's menu-face "Settings" row a real,
-/// reachable destination); real content landed with the screensaver
-/// dim/off + timeout setting (bead pico-link-qivj.2).
-pub(crate) const SETTINGS_TITLE: &str = "Settings";
-
-/// The Settings screen's two rows -- `IDLE SCREEN` (mode) and `IDLE AFTER`
-/// (timeout), each pushing its own picker. Design pico-link-qivj.1 S6.
-pub(crate) fn build_settings_screen(state: &Rc<RefCell<DisplaySettingsState>>, carry: &ScreenCarry) -> Screen {
-    const ROW_MODE: u64 = 0;
-    const ROW_TIMEOUT: u64 = 1;
-
-    let current = state.borrow().current;
-    let rows = vec![
-        FieldRow::action("IDLE SCREEN")
-            .with_value(current.mode.label(), palette::TEXT_PRIMARY)
-            .with_key(ListItemKey::from_u64(ROW_MODE)),
-        FieldRow::action("IDLE AFTER")
-            .with_value(current.timeout.label(), palette::TEXT_PRIMARY)
-            .with_key(ListItemKey::from_u64(ROW_TIMEOUT)),
-    ];
-    let state_for_activate = Rc::clone(state);
-    let list = FieldList::new(rows)
-        .with_selected_identity(carry.selected_key, carry.selected_index)
-        .on_activate_index(move |index| {
-            match index {
-                0 => Action::PushView(Box::new({
-                    let state = Rc::clone(&state_for_activate);
-                    move || build_settings_picker_screen(SettingsPickerKind::ScreensaverMode, &state, &ScreenCarry::default())
-                })),
-                1 => Action::PushView(Box::new({
-                    let state = Rc::clone(&state_for_activate);
-                    move || build_settings_picker_screen(SettingsPickerKind::ScreensaverTimeout, &state, &ScreenCarry::default())
-                })),
-                _ => Action::None,
-            }
-        });
-    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
-    Screen::new(SETTINGS_TITLE, vec![Box::new(list)]).with_id(ScreenId::Settings)
-}
-
-/// The two Settings pickers (mode, timeout) -- both built via
-/// [`build_single_select_screen`], picking straight into the shared
-/// [`DisplaySettingsState`] mailbox. Applies live (`Action::None`, stays
-/// open, per that function's rule 2); the checkmark itself moves only once
-/// `App::refresh_stack` rebuilds this screen from the freshly stored
-/// value (`refresh_pending`), never optimistically here.
-pub(crate) fn build_settings_picker_screen(kind: SettingsPickerKind, state: &Rc<RefCell<DisplaySettingsState>>, carry: &ScreenCarry) -> Screen {
-    let current = state.borrow().current;
-    match kind {
-        SettingsPickerKind::ScreensaverMode => {
-            let options = vec![
-                PickerOption {
-                    key: ListItemKey::from_u64(u64::from(ScreensaverMode::Dim.to_wire())),
-                    label: String::from(ScreensaverMode::Dim.label()),
-                    note: Some((String::from("stays readable"), palette::TEXT_SECONDARY)),
-                    selectable: true,
-                },
-                PickerOption {
-                    key: ListItemKey::from_u64(u64::from(ScreensaverMode::Off.to_wire())),
-                    label: String::from(ScreensaverMode::Off.label()),
-                    note: Some((String::from("saves power"), palette::TEXT_SECONDARY)),
-                    selectable: true,
-                },
-            ];
-            let checked = Some(ListItemKey::from_u64(u64::from(current.mode.to_wire())));
-            let state_for_pick = Rc::clone(state);
-            let on_pick = move |key: ListItemKey| {
-                let mode = ScreensaverMode::from_wire(u8::try_from(key.as_u64()).unwrap_or(1));
-                let mut s = state_for_pick.borrow_mut();
-                s.current.mode = mode;
-                s.apply_pending = true;
-                s.save_pending = true;
-                s.refresh_pending = true;
-                Action::None
-            };
-            build_single_select_screen(ScreenId::SettingsPicker(kind), "Idle screen", options, checked, carry, on_pick)
-        }
-        SettingsPickerKind::ScreensaverTimeout => {
-            let options: Vec<PickerOption> = ScreensaverTimeout::ALL
-                .iter()
-                .map(|timeout| PickerOption {
-                    key: ListItemKey::from_u64(u64::from(timeout.as_secs())),
-                    label: String::from(timeout.label()),
-                    note: None,
-                    selectable: true,
-                })
-                .collect();
-            let checked = Some(ListItemKey::from_u64(u64::from(current.timeout.as_secs())));
-            let state_for_pick = Rc::clone(state);
-            let on_pick = move |key: ListItemKey| {
-                let timeout = ScreensaverTimeout::from_secs(u16::try_from(key.as_u64()).unwrap_or(60));
-                let mut s = state_for_pick.borrow_mut();
-                s.current.timeout = timeout;
-                s.apply_pending = true;
-                s.save_pending = true;
-                s.refresh_pending = true;
-                Action::None
-            };
-            build_single_select_screen(ScreenId::SettingsPicker(kind), "Idle after", options, checked, carry, on_pick)
-        }
-    }
 }
 
 /// Shared, interior-mutable handle to the live [`BtModel`] -- the M0 step
@@ -2295,7 +1948,6 @@ mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use embedded_graphics::prelude::RgbColor;
     use super::test_support::*;
 
     // --- VT6 design section 5.4/6.1: `App::volume_requires_dim_floor` ---
@@ -3808,127 +3460,6 @@ mod tests {
         assert_eq!(app.navigator.scroll_top_at(0), None, "Home's menu has no scroll concept -- always None, carried or not");
     }
 
-    // --- pico-link-7jol.4: build_single_select_screen (the general picker) ---
-
-    fn quality_like_test_id() -> ScreenId {
-        // No ScreenId::Picker variant exists yet in this bead (it lands
-        // with pico-link-7jol.5, alongside its first real caller) --
-        // `build_single_select_screen` is generic over `id`, so any
-        // ScreenId value exercises its contract identically. Standing in
-        // with an address distinct from any real device used elsewhere in
-        // this module's tests.
-        ScreenId::DevicePage([0xAA; 6])
-    }
-
-    fn three_option_picker(checked: Option<ListItemKey>, picked: Rc<RefCell<Vec<ListItemKey>>>, stay_open: bool) -> Screen {
-        let options = vec![
-            PickerOption { key: ListItemKey::from_u64(1), label: String::from("Alpha"), note: Some((String::from("best"), palette::TEXT_SECONDARY)), selectable: true },
-            PickerOption { key: ListItemKey::from_u64(2), label: String::from("Beta"), note: None, selectable: true },
-            PickerOption { key: ListItemKey::from_u64(3), label: String::from("Gamma"), note: Some((String::from("not offered"), palette::TEXT_SECONDARY)), selectable: false },
-        ];
-        build_single_select_screen(quality_like_test_id(), "Test Picker", options, checked, &no_carry(), move |key| {
-            picked.borrow_mut().push(key);
-            if stay_open {
-                Action::None
-            } else {
-                Action::PopView
-            }
-        })
-    }
-
-    #[test]
-    fn picker_check_glyph_sits_on_the_checked_row_and_nowhere_else() {
-        let picked = Rc::new(RefCell::new(Vec::new()));
-        let screen = three_option_picker(Some(ListItemKey::from_u64(2)), picked, true);
-        let mut app = App::new(240, 240);
-        app.push_screen_for_test(screen);
-        let pixels: Vec<_> = app.render().pixels().collect();
-        // A pixel-level probe would duplicate `fields.rs`'s own leading-
-        // glyph tests; here the load-bearing fact is behavioural, proven
-        // below (`on_pick` receiving the pressed key, not a locally-
-        // tracked "checked" bit) -- this render call only proves the
-        // screen with a `checked` value actually renders without panicking.
-        assert!(!pixels.is_empty());
-    }
-
-    #[test]
-    fn picker_a_press_invokes_on_pick_with_the_focused_rows_key() {
-        let picked = Rc::new(RefCell::new(Vec::new()));
-        let mut app = App::new(240, 240);
-        app.push_screen_for_test(three_option_picker(Some(ListItemKey::from_u64(1)), Rc::clone(&picked), true));
-        app.handle_input(vec![NavIntent::Down]); // focus row 1 (Beta)
-        app.handle_input(vec![NavIntent::Select]);
-        assert_eq!(picked.borrow().as_slice(), &[ListItemKey::from_u64(2)], "on_pick must be called with the FOCUSED row's key");
-    }
-
-    #[test]
-    fn picker_stays_open_when_on_pick_returns_action_none() {
-        let picked = Rc::new(RefCell::new(Vec::new()));
-        let mut app = App::new(240, 240);
-        app.push_screen_for_test(three_option_picker(None, Rc::clone(&picked), true));
-        let depth_before = app.navigator_depth();
-        app.handle_input(vec![NavIntent::Select]); // Alpha
-        assert_eq!(picked.borrow().len(), 1, "on_pick must have fired");
-        assert_eq!(app.navigator_depth(), depth_before, "Action::None from on_pick must leave the picker open");
-    }
-
-    #[test]
-    fn picker_pops_when_on_pick_returns_action_pop_view() {
-        let picked = Rc::new(RefCell::new(Vec::new()));
-        let mut app = App::new(240, 240);
-        app.push_screen_for_test(three_option_picker(None, Rc::clone(&picked), false));
-        let depth_before = app.navigator_depth();
-        app.handle_input(vec![NavIntent::Select]); // Alpha
-        assert_eq!(picked.borrow().len(), 1, "on_pick must have fired");
-        assert_eq!(app.navigator_depth(), depth_before - 1, "Action::PopView from on_pick must pop the picker");
-    }
-
-    #[test]
-    fn picker_unselectable_row_cannot_be_activated() {
-        let picked = Rc::new(RefCell::new(Vec::new()));
-        let mut app = App::new(240, 240);
-        app.push_screen_for_test(three_option_picker(None, Rc::clone(&picked), true));
-        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // focus Gamma (selectable: false)
-        app.handle_input(vec![NavIntent::Select]);
-        assert!(picked.borrow().is_empty(), "an unavailable option must not be pickable -- the activation gate lives in FieldList, not on_pick");
-    }
-
-    /// Headless PNG dump of the picker, at zoom -- the picker has no
-    /// wired-in caller yet in this bead (`ScreenId::Picker` and its first
-    /// real content land with `pico-link-7jol.5`), so it can't be reached
-    /// through the public `App`/emulator surface the way the device page
-    /// can (see `core/examples/device_page_screenshots.rs`). Dumped from
-    /// here instead, since this module's tests are the only place with
-    /// `pub(crate)` access to `build_single_select_screen` itself.
-    #[test]
-    fn picker_screenshot_at_zoom() {
-        const ZOOM: u32 = 3;
-
-        let out_dir = std::env::temp_dir().join("pico-link-picker-screenshot");
-        std::fs::create_dir_all(&out_dir).expect("failed to create output dir");
-        let picked = Rc::new(RefCell::new(Vec::new()));
-        let mut app = App::new(240, 240);
-        app.push_screen_for_test(three_option_picker(Some(ListItemKey::from_u64(2)), picked, true));
-        app.handle_input(vec![NavIntent::Down]); // focus Beta (the checked row) so its caret is also visible
-
-        let framebuffer = app.render();
-        let mut image = image::RgbImage::new(framebuffer.width(), framebuffer.height());
-        for pixel in framebuffer.pixels() {
-            let color = pixel.1;
-            #[allow(clippy::cast_sign_loss)]
-            image.put_pixel(
-                pixel.0.x as u32,
-                pixel.0.y as u32,
-                image::Rgb([(color.r() << 3) | (color.r() >> 2), (color.g() << 2) | (color.g() >> 4), (color.b() << 3) | (color.b() >> 2)]),
-            );
-        }
-        let zoomed =
-            image::imageops::resize(&image, framebuffer.width() * ZOOM, framebuffer.height() * ZOOM, image::imageops::FilterType::Nearest);
-        let path = out_dir.join("picker.png");
-        zoomed.save(&path).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
-        println!("wrote {}", path.display());
-    }
-
     // --- pico-link-7jol.5: the QUALITY row, its picker, and Home's live
     // bitrate/ADAPTIVE tag. Design
     // `.planning/design/2026-09-07-ldac-quality-selector.md`. ---
@@ -4280,108 +3811,5 @@ mod tests {
             }
             other => panic!("expected WizardPhase::Scanning, got {other:?}"),
         }
-    }
-
-    // --- `why?` page (design `.planning/design/2026-09-07-home-fault-
-    // strip.md` §8, bead `pico-link-9eq2.3.3`) ---
-
-    #[test]
-    fn relative_time_formats_seconds_minutes_and_hours() {
-        let base = Instant::from_micros(0);
-        assert_eq!(relative_time(base + Duration::from_secs(8), base), "8s ago");
-        assert_eq!(relative_time(base + Duration::from_secs(59), base), "59s ago");
-        assert_eq!(relative_time(base + Duration::from_secs(60), base), "1m ago");
-        assert_eq!(relative_time(base + Duration::from_secs(240), base), "4m ago");
-        assert_eq!(relative_time(base + Duration::from_secs(3599), base), "59m ago");
-        assert_eq!(relative_time(base + Duration::from_secs(3600), base), "1h ago");
-        assert_eq!(relative_time(base + Duration::from_secs(7200), base), "2h ago");
-    }
-
-    #[test]
-    fn why_page_appends_a_newly_fired_key_at_the_bottom_rather_than_resorting() {
-        // Orchestrator ruling on this bead: "the page FREEZES its block
-        // ordering on entry ... A key that fires for the first time while
-        // the page is open appends at the BOTTOM rather than jumping to
-        // the top."
-        let mut model = BtModel::default();
-        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
-        let order = Rc::new(RefCell::new(vec![FaultKey::BufOverflow])); // simulates the page already open, frozen on entry
-        let carry = ScreenCarry::default();
-
-        // A second key fires while the page is open -- MORE recently than
-        // BufOverflow, which would sort first under a fresh most-recently-
-        // active-first re-sort.
-        model.fault_log.record(FaultKey::BufStarved, Instant::from_micros(1_000_000), None, 1);
-        let _ = build_why_page_screen(&model, Instant::from_micros(1_000_000), &order, &carry);
-
-        assert_eq!(
-            *order.borrow(),
-            vec![FaultKey::BufOverflow, FaultKey::BufStarved],
-            "the newly-fired key must append at the end, never jump ahead of the frozen order"
-        );
-    }
-
-    #[test]
-    fn why_page_does_not_reorder_already_present_keys_on_a_refresh() {
-        let mut model = BtModel::default();
-        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
-        model.fault_log.record(FaultKey::BufStarved, Instant::from_micros(1_000_000), None, 1);
-        // Order was frozen with BufStarved (the more recent) listed FIRST
-        // -- deliberately the opposite of first-seen, to prove a refresh
-        // doesn't silently re-derive it.
-        let order = Rc::new(RefCell::new(vec![FaultKey::BufStarved, FaultKey::BufOverflow]));
-        let carry = ScreenCarry::default();
-
-        // A repeat raise of an already-present key must not move it.
-        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(2_000_000), None, 5);
-        let _ = build_why_page_screen(&model, Instant::from_micros(2_000_000), &order, &carry);
-
-        assert_eq!(*order.borrow(), vec![FaultKey::BufStarved, FaultKey::BufOverflow], "a repeat raise of an already-ordered key must not reorder it");
-    }
-
-    #[test]
-    fn why_page_screen_is_identified_and_never_gone() {
-        let mut model = BtModel::default();
-        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
-        let order = Rc::new(RefCell::new(Vec::new()));
-        let refresh = build_why_page_screen(&model, Instant::from_micros(0), &order, &ScreenCarry::default());
-        match refresh {
-            Refresh::Rebuild(screen) => assert_eq!(screen.id(), Some(ScreenId::WhyPage)),
-            Refresh::Gone => panic!("the why? page has no subject that can vanish -- must never be Gone"),
-            Refresh::Keep => panic!("build_why_page_screen never returns Keep as of pico-link-bgnd M0"),
-        }
-    }
-
-    #[test]
-    fn fault_consequence_text_is_absent_when_no_value_was_ever_wired() {
-        assert_eq!(fault_consequence_text(FaultKey::UsbSupplyLow, None), None, "absent, never faked (parent design §15)");
-    }
-
-    #[test]
-    fn fault_consequence_text_renders_the_real_count_not_a_saturated_one() {
-        let text = fault_consequence_text(FaultKey::BufOverflow, Some(FaultValue::Count(140))).expect("BufOverflow+Count must produce text");
-        assert!(text.contains("140"), "line 3 must show the REAL number, unlike Home's x99+ saturation: got {text:?}");
-    }
-
-    #[test]
-    fn fault_consequence_text_renders_the_supply_ratio_as_a_decimal() {
-        // q8: 256 == 1.00x nominal.
-        let text = fault_consequence_text(FaultKey::UsbSupplyLow, Some(FaultValue::Ratio(159))).expect("UsbSupplyLow+Ratio must produce text");
-        assert!(text.contains("0.62"), "159/256 = 0.621... must render as 0.62x: got {text:?}");
-    }
-
-    #[test]
-    fn why_page_builds_without_panicking_when_some_keys_have_a_value_and_some_dont() {
-        // Structural smoke test for the wiring itself (the row-presence
-        // logic is proven directly via `fault_consequence_text`'s own
-        // tests above): a mix of a valueless key (AirCongested) and a
-        // valued one (BufOverflow) must build cleanly with no line 3 for
-        // the former and one for the latter.
-        let mut model = BtModel::default();
-        model.fault_log.record(FaultKey::AirCongested, Instant::from_micros(0), None, 3);
-        model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(1), Some(FaultValue::Count(14)), 14);
-        let order = Rc::new(RefCell::new(Vec::new()));
-        let refresh = build_why_page_screen(&model, Instant::from_micros(1), &order, &ScreenCarry::default());
-        assert!(matches!(refresh, Refresh::Rebuild(_)));
     }
 }
