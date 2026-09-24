@@ -61,7 +61,7 @@ pub(in crate::app) fn assert_link_still_connected(app: &App) {
     assert_eq!(
         app.model().connected_codec.as_ref().map(|c| c.word.as_str()),
         Some("LDAC"),
-        "connected_codec must survive the navigation -- this is what the hero word keys off"
+        "connected_codec must survive the navigation -- this is what pico-link-1v5 keys the hero word off"
     );
 }
 

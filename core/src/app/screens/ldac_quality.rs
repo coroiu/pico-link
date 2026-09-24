@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn ldac_quality_fixed_kbps_maps_never_chosen_to_the_same_default_as_a_990_pin() {
-        assert_eq!(ldac_quality_fixed_kbps(0, None), ldac_quality_fixed_kbps(1, None), "0 renders as the effective default");
+        assert_eq!(ldac_quality_fixed_kbps(0, None), ldac_quality_fixed_kbps(1, None), "design §7: 0 renders as the effective default");
         assert_eq!(ldac_quality_fixed_kbps(0, None), Some(990));
         assert_eq!(ldac_quality_fixed_kbps(2, None), Some(660));
         assert_eq!(ldac_quality_fixed_kbps(3, None), Some(330));
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(app.current_screen_title(), "Cans");
         app.handle_input(vec![NavIntent::Down]); // focus QUALITY (row 1)
         app.handle_input(vec![NavIntent::Select]); // -> picker
-        assert_eq!(app.current_screen_title(), "Quality", "A on QUALITY must push the picker");
+        assert_eq!(app.current_screen_title(), "Quality", "A on QUALITY must push the picker (design §2)");
 
         // Pick "660 kbps" (the second row).
         app.handle_input(vec![NavIntent::Down]);
@@ -180,7 +180,7 @@ mod tests {
             Some(Command::SetDeviceLdacQuality { addr, ldac_quality: 2 }),
             "A on a picker row must queue the pin, 1-based"
         );
-        assert_eq!(app.current_screen_title(), "Quality", "the picker stays open, no confirm, no pop");
+        assert_eq!(app.current_screen_title(), "Quality", "design §5: the picker stays open, no confirm, no pop");
     }
 
     #[test]

@@ -226,13 +226,13 @@ mod tests {
         match refresh {
             Refresh::Rebuild(screen) => assert_eq!(screen.id(), Some(ScreenId::WhyPage)),
             Refresh::Gone => panic!("the why? page has no subject that can vanish -- must never be Gone"),
-            Refresh::Keep => panic!("build_why_page_screen never returns Keep"),
+            Refresh::Keep => panic!("build_why_page_screen never returns Keep as of pico-link-bgnd M0"),
         }
     }
 
     #[test]
     fn fault_consequence_text_is_absent_when_no_value_was_ever_wired() {
-        assert_eq!(fault_consequence_text(FaultKey::UsbSupplyLow, None), None, "absent, never faked");
+        assert_eq!(fault_consequence_text(FaultKey::UsbSupplyLow, None), None, "absent, never faked (parent design §15)");
     }
 
     #[test]

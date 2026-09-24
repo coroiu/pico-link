@@ -243,7 +243,7 @@ fn dirty_gate_freshness_invariant_holds_for_every_screen() {
                 assert_eq!(
                     t0, t1,
                     "{name}: pixels changed after 10 minutes with no input/event -- a widget is reading the \
-                     clock without a matching Widget::redraw_after"
+                     clock without a matching Widget::redraw_after (pico-link-vxc D1/D2)"
                 );
             }
             Freshness::Live { redraw_after, assert_differs_after } => {
@@ -407,7 +407,10 @@ fn a_rail_liveness_matches_activation_for_every_screen() {
                 "wizard: scanning" => Some(Verb::Pair),
                 "wizard: nothing found" => Some(Verb::Scan),
                 "wizard: connecting" | "wizard: not responding" | "wizard: failed" | "wizard: succeeded" => None,
-                other => panic!("{other}: no expected A-verb entry in this test -- add one, don't skip it"),
+                other => panic!(
+                    "{other}: no expected A-verb entry in this test -- add one from design doc \
+                     .planning/design/2026-09-02-a-button-label-rule.md section 4's assignment table, don't skip it"
+                ),
             };
             (name, build, expected)
         })
@@ -430,6 +433,9 @@ fn a_rail_liveness_matches_activation_for_every_screen() {
             "{name}: rail A liveness ({rendered_live}) disagrees with focused_activation \
              ({activation:?}) -- design rule 4 says these are the same fact"
         );
-        assert_eq!(activation, expected, "{name}: A's verb is {activation:?}, expected {expected:?}");
+        assert_eq!(
+            activation, expected,
+            "{name}: A's verb is {activation:?}, expected {expected:?} per design doc section 4's assignment table"
+        );
     }
 }

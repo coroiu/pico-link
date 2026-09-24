@@ -423,7 +423,7 @@ fn up_and_down_do_nothing_on_homes_status_face_in_tier_1() {
     let frame_after = sample_row(&mut app);
     assert_eq!(
         frame_before, frame_after,
-        "Up/Down are unbound on Home's status face (no volume gauge, no binding -- 'absent together, not inert')"
+        "Up/Down are unbound on Home's status face in Tier 1 (no volume gauge, no binding -- design section 13's 'absent together, not inert')"
     );
 }
 

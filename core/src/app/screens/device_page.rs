@@ -365,7 +365,7 @@ mod tests {
         // Not connected: `connected_addr` stays `None`.
 
         let rows = device_page_rows(&model, addr);
-        assert_eq!(rows[0].value(), Some("Automatic"), "CODEC is a stored-setting-shaped row: it never dashes");
+        assert_eq!(rows[0].value(), Some("Automatic"), "CODEC is a stored-setting-shaped row: it never dashes (design §3.0)");
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         // open yet (see `device_page_rows`'s doc comment).
         let mut list = FieldList::new(rows);
         for _ in 0..row_count - 1 {
-            assert_eq!(list.activation(), None, "only Forget should be pressable on the device page");
+            assert_eq!(list.activation(), None, "only Forget should be pressable on this bead's device page");
             list.on_intent(NavIntent::Down);
         }
         assert_eq!(list.activation(), Some(Verb::Open), "the focused last row (Forget) must be pressable");
@@ -487,7 +487,7 @@ mod tests {
         model.connected_codec = Some(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 });
         let rows = device_page_rows(&model, addr);
         let row = rows.iter().find(|r| r.label == "QUALITY").expect("QUALITY must be present when the live codec is LDAC");
-        assert_eq!(row.value(), Some("990 kbps"), "ldac_quality==0 (never chosen) renders the effective default, checked");
+        assert_eq!(row.value(), Some("990 kbps"), "ldac_quality==0 (never chosen) renders the effective default, checked, per design §7");
     }
 
     #[test]
@@ -510,7 +510,7 @@ mod tests {
         // allowed", and a previously pinned device stays visible.
         let rows = device_page_rows(&model, addr);
         let row = rows.iter().find(|r| r.label == "QUALITY").expect("a previously-pinned device must show QUALITY even while disconnected");
-        assert_eq!(row.value(), Some("660 kbps"), "a stored pin never dashes, any link state");
+        assert_eq!(row.value(), Some("660 kbps"), "a stored pin never dashes, any link state (design §4.2)");
     }
 
     #[test]
@@ -560,7 +560,7 @@ mod tests {
         let rows = device_page_rows(&model, addr);
         assert_eq!(rows.len(), 7, "CODEC, QUALITY, SAMPLE RATE, USB IN, A2DP, ADDRESS, Forget");
         assert_eq!(rows.last().unwrap().label, "Forget this device");
-        assert_eq!(rows[1].label, "QUALITY", "QUALITY sits directly under CODEC");
+        assert_eq!(rows[1].label, "QUALITY", "QUALITY sits directly under CODEC (design §2/§4.2)");
     }
 
     #[test]
