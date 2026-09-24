@@ -2102,8 +2102,8 @@ static volatile uint32_t s_trim_hard_band_bytes = PL_PCM_TRIM_BAND_BYTES;
 // derivation) so decide() below never does unit conversion in its hot
 // path. Clamped to keep the hard band inside the ring's own headroom
 // (design sec 3: target 30ms + hard 70ms + ~64ms EMA ramp lag ~= 164ms <
-// the 32KB ring's 170ms capacity -- 120ms leaves the same kind of margin
-// for a value S2 hasn't chosen yet) and the hold time to a sane upper
+// the 32KB ring's 170ms capacity; anything above 70ms makes the
+// drop-newest overflow reachable before the hard trip) and the hold time to a sane upper
 // bound (a policy that never trips is a latent overflow, not a feature).
 // Thread-context caller only (debug_remote.c's poll, superloop) -- same
 // single-writer contract as s_debug_skip_media_ticks above.
@@ -2111,8 +2111,8 @@ void pl_a2dp_debug_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms) {
     if (hold_ms > 10000u) {
         hold_ms = 10000u;
     }
-    if (hard_band_ms > 120u) {
-        hard_band_ms = 120u;
+    if (hard_band_ms > 70u) {
+        hard_band_ms = 70u;
     }
     s_trim_hold_ms = hold_ms;
     s_trim_hard_band_bytes = hard_band_ms * 192u;
