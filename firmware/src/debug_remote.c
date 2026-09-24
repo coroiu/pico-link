@@ -444,6 +444,51 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                     for (long i = 0; i < n; i++) {
                         pl_media_keys_push_tap(usage);
                     }
+                } else if (strcmp(s_line, "TRIM POLICY GET") == 0) {
+                    // Bead pico-link-8pp1.1, design sec 5: the round needs
+                    // to confirm which policy is live before/after a
+                    // switch, without waiting for the next 1Hz report line.
+                    uint32_t hold_ms;
+                    uint32_t hard_band_ms;
+                    pl_a2dp_debug_trim_policy(&hold_ms, &hard_band_ms);
+                    pl_log(
+                        "debug-remote: TRIM POLICY GET -> hold_ms=%lu hard_band_ms=%lu\r\n", (unsigned long)hold_ms,
+                        (unsigned long)hard_band_ms
+                    );
+                } else if (strcmp(s_line, "TRIM POLICY LOW") == 0) {
+                    // Design sec 3/5's "Low latency" preset -- bit-identical
+                    // to pre-8pp1.1 behaviour (hold 0, hard 15ms), the same
+                    // values pl_a2dp_debug_set_trim_policy defaults to.
+                    pl_a2dp_debug_set_trim_policy(0, 15);
+                    pl_log("debug-remote: TRIM POLICY LOW -> hold_ms=0 hard_band_ms=15\r\n");
+                } else if (strcmp(s_line, "TRIM POLICY STABLE") == 0) {
+                    // Design sec 3/5's "Stable" preset -- hold 3s, hard
+                    // 70ms (capped by the 32KB ring's headroom, see the
+                    // design doc's own arithmetic).
+                    pl_a2dp_debug_set_trim_policy(3000, 70);
+                    pl_log("debug-remote: TRIM POLICY STABLE -> hold_ms=3000 hard_band_ms=70\r\n");
+                } else if (strncmp(s_line, "TRIM POLICY ", 12) == 0) {
+                    // Raw override: "TRIM POLICY <hold_ms> <hard_band_ms>"
+                    // -- lets S2's round dial in values the two named
+                    // presets above don't cover, without a reflash.
+                    char *end1 = NULL;
+                    long hold_ms = strtol(s_line + 12, &end1, 10);
+                    bool hold_ok = end1 != s_line + 12;
+                    char *end2 = NULL;
+                    long hard_band_ms = hold_ok ? strtol(end1, &end2, 10) : 0;
+                    bool hard_ok = hold_ok && end2 != end1;
+                    if (!hold_ok || !hard_ok || hold_ms < 0 || hard_band_ms < 0) {
+                        pl_log("debug-remote: TRIM POLICY requires \"<hold_ms> <hard_band_ms>\", got \"%s\"\r\n", s_line + 12);
+                    } else {
+                        pl_a2dp_debug_set_trim_policy((uint32_t)hold_ms, (uint32_t)hard_band_ms);
+                        uint32_t applied_hold_ms;
+                        uint32_t applied_hard_band_ms;
+                        pl_a2dp_debug_trim_policy(&applied_hold_ms, &applied_hard_band_ms);
+                        pl_log(
+                            "debug-remote: TRIM POLICY %ld %ld -> hold_ms=%lu hard_band_ms=%lu (clamped)\r\n", hold_ms,
+                            hard_band_ms, (unsigned long)applied_hold_ms, (unsigned long)applied_hard_band_ms
+                        );
+                    }
                 } else if (emitted < max) {
                     PlIntent intent;
                     if (parse_line(s_line, &intent)) {
