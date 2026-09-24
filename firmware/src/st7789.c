@@ -10,8 +10,10 @@
 #include <assert.h>
 #include <stdio.h>
 
+#include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
+#include "hardware/pwm.h"
 #include "pico/stdlib.h"
 
 #include "usb_pump.h"
@@ -28,6 +30,16 @@
 
 static spi_inst_t *s_spi;
 static int s_dma_chan = -1;
+
+// PWM backlight (pico-link-qivj.2, S9). wrap=999 makes the PWM level a
+// direct permille value (level 1000 == wrap+1 == 100% duty), matching
+// pl_ui_backlight_permille's units one-for-one so no scaling is needed at
+// the call site. ~1000 is cached to skip redundant pwm_set_gpio_level
+// calls -- see st7789_set_backlight_permille.
+#define ST7789_BL_PWM_WRAP 999u
+static uint s_bl_pwm_slice;
+static uint s_bl_pwm_chan;
+static uint16_t s_bl_last_permille = 0xffffu; // sentinel: force the first apply
 
 static inline void cs_low(void) { gpio_put(ST7789_PIN_CS, 0); }
 static inline void cs_high(void) { gpio_put(ST7789_PIN_CS, 1); }
@@ -78,9 +90,23 @@ void st7789_init(spi_inst_t *spi) {
     gpio_put(ST7789_PIN_CS, 1);
     gpio_init(ST7789_PIN_RST);
     gpio_set_dir(ST7789_PIN_RST, GPIO_OUT);
-    gpio_init(ST7789_PIN_BL);
-    gpio_set_dir(ST7789_PIN_BL, GPIO_OUT);
-    gpio_put(ST7789_PIN_BL, 0);
+    // Backlight PWM (pico-link-qivj.2, S9): GP13 driven by hardware PWM
+    // instead of a plain GPIO, so the idle-screensaver Dim level
+    // (core::power::DIM_BACKLIGHT_PERMILLE) can be a real brightness, not
+    // just on/off. clkdiv targets ~25kHz -- above audible whine, no visible
+    // flicker (matches the Waveshare Pico-LCD demo's own backlight PWM
+    // rate). wrap=999 makes the level == permille directly.
+    gpio_set_function(ST7789_PIN_BL, GPIO_FUNC_PWM);
+    s_bl_pwm_slice = pwm_gpio_to_slice_num(ST7789_PIN_BL);
+    s_bl_pwm_chan = pwm_gpio_to_channel(ST7789_PIN_BL);
+    pwm_config bl_cfg = pwm_get_default_config();
+    pwm_config_set_wrap(&bl_cfg, ST7789_BL_PWM_WRAP);
+    float bl_clkdiv = (float)clock_get_hz(clk_sys) / 25000000.0f;
+    pwm_config_set_clkdiv(&bl_cfg, bl_clkdiv);
+    pwm_init(s_bl_pwm_slice, &bl_cfg, true);
+    pwm_set_chan_level(s_bl_pwm_slice, s_bl_pwm_chan, 0);
+    pl_log("st7789: backlight PWM slice=%u chan=%u clkdiv=%.3f wrap=%u\r\n", s_bl_pwm_slice, s_bl_pwm_chan,
+           (double)bl_clkdiv, ST7789_BL_PWM_WRAP);
 
     gpio_set_function(ST7789_PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(ST7789_PIN_MOSI, GPIO_FUNC_SPI);
@@ -193,9 +219,9 @@ void st7789_init_and_fill(spi_inst_t *spi, uint16_t color) {
     st7789_command(ST7789_CMD_DISPON, NULL, 0);
     sleep_ms(20);
 
-    // Backlight on. The panel is otherwise driven correctly with the
-    // backlight off, but nothing would be visible.
-    gpio_put(ST7789_PIN_BL, 1);
+    // Backlight on, full brightness. The panel is otherwise driven
+    // correctly with the backlight off, but nothing would be visible.
+    st7789_set_backlight_permille(1000);
 }
 
 void st7789_blit_rect(const uint16_t *fb, uint16_t stride, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -337,9 +363,20 @@ void st7789_diag_fill_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1,
     cs_high();
 }
 
-void st7789_set_backlight(bool on) {
-    // A plain gpio_put -- see st7789.h's doc comment for why this is
-    // deliberately not DISPOFF/SLPIN (out of band from SPI1, cannot race
-    // st7789_blit_framebuffer's DMA). Idempotent by construction.
-    gpio_put(ST7789_PIN_BL, on ? 1 : 0);
+void st7789_set_backlight_permille(uint16_t permille) {
+    // Clamp then skip-if-unchanged -- see st7789.h's doc comment for why
+    // this is deliberately not DISPOFF/SLPIN (out of band from SPI1,
+    // cannot race st7789_blit_framebuffer's DMA). Idempotent by
+    // construction: safe to call every superloop iteration.
+    if (permille > 1000u) {
+        permille = 1000u;
+    }
+    if (permille == s_bl_last_permille) {
+        return;
+    }
+    s_bl_last_permille = permille;
+    // permille in [0,1000], wrap=999 -> level in [0,999]; 1000 maps to
+    // wrap+1 (1000), which pwm_set_chan_level treats as 100% duty (the
+    // counter never reaches a compare value one past the wrap).
+    pwm_set_chan_level(s_bl_pwm_slice, s_bl_pwm_chan, permille);
 }
