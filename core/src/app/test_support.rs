@@ -8,11 +8,9 @@ use crate::input::NavIntent;
 
 use super::{App, ConnectedCodec, DeviceAddr, Event, LinkState, PairedDevice, ScreenCarry};
 
-/// Home(1) -> Devices(2): since `pico-link-znb.8` (E7) made Home the
-/// navigator root, reaching the Devices screen (whose list rows this
-/// module's older tests exercise) takes two `Select`s -- centre
-/// toggles Home to its menu face (Bluetooth pre-selected), centre
-/// again activates that row.
+/// Home(1) -> Devices(2): reaching the Devices screen takes two
+/// `Select`s -- centre toggles Home to its menu face (Bluetooth
+/// pre-selected), centre again activates that row.
 pub(in crate::app) fn open_devices(app: &mut App) {
     app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
     app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
@@ -30,17 +28,16 @@ pub(in crate::app) fn open_wizard(app: &mut App) {
     app.handle_input(vec![NavIntent::Select]); // "Pair new headphones" row -> pushes the wizard
 }
 
-/// Bead pico-link-4vb.4 (T5): the Devices screen no longer reads
-/// `BtModel::discovered` (the wizard's own scan list, see that field's
-/// doc comment) -- it reads `BtModel::paired`, mutated only by
-/// [`Event::PairedDeviceUpserted`]/[`Event::PairedDeviceForgotten`].
+/// The Devices screen reads `BtModel::paired` (not `BtModel::discovered`,
+/// the wizard's own scan list -- see that field's doc comment), mutated
+/// only by [`Event::PairedDeviceUpserted`]/[`Event::PairedDeviceForgotten`].
 /// Shorthand for building one such event in these tests.
 pub(in crate::app) fn upsert(addr: [u8; 6], name: &str, mru_seq: u32) -> Event {
     Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality: 0 })
 }
 
-/// Like [`upsert`] but with a real `ldac_quality` -- pico-link-7jol.5's
-/// tests for the `QUALITY` row/picker's stored-echo behaviour.
+/// Like [`upsert`] but with a real `ldac_quality`, for tests of the
+/// `QUALITY` row/picker's stored-echo behaviour.
 pub(in crate::app) fn upsert_with_quality(addr: [u8; 6], name: &str, mru_seq: u32, ldac_quality: u8) -> Event {
     Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality })
 }
@@ -64,7 +61,7 @@ pub(in crate::app) fn assert_link_still_connected(app: &App) {
     assert_eq!(
         app.model().connected_codec.as_ref().map(|c| c.word.as_str()),
         Some("LDAC"),
-        "connected_codec must survive the navigation -- this is what pico-link-1v5 keys the hero word off"
+        "connected_codec must survive the navigation -- this is what the hero word keys off"
     );
 }
 
@@ -88,8 +85,7 @@ pub(in crate::app) fn assert_no_commands_queued(app: &mut App) {
 /// -- `STATUS_ERROR` is exactly what `CodecStatus::NoLink` uses for the
 /// "NO LINK" word (`render/hero.rs`'s `no_link_renders_the_hero_word_
 /// in_status_error`), so its presence would mean Home rendered
-/// disconnected even though the model says otherwise -- exactly the
-/// failure mode this bead worried about.
+/// disconnected even though the model says otherwise.
 pub(in crate::app) fn assert_home_hero_renders_connected(app: &mut App) {
     use crate::render::theme::palette;
 
