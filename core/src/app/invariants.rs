@@ -8,18 +8,16 @@ use super::model::MAX_PAIRED_DEVICES;
 use super::*;
 use super::test_support::*;
 
-// --- pico-link-vxc, design doc §6.1: the freshness invariant ---
+// --- The freshness invariant ---
 //
 // This is the acceptance mechanism for the FFI dirty gate
-// (`pl_ui_dirty`, `ui-ffi/src/lib.rs`): C is now allowed to skip
-// render+blit whenever `App::dirty()` is false, so every screen the
-// product can build must be provably safe to leave unrendered for an
-// arbitrary stretch of wall-clock time unless it has explicitly opted
-// into a `Widget::redraw_after` request. This table is what proves it,
-// and is exactly the test Ada's audit (see the design doc) says would
-// have caught D2 (a composite widget silently swallowing a child's
-// `redraw_after`) had that bug shipped instead of being fixed in the
-// same change.
+// (`pl_ui_dirty`, `ui-ffi/src/lib.rs`): C is allowed to skip render+blit
+// whenever `App::dirty()` is false, so every screen the product can
+// build must be provably safe to leave unrendered for an arbitrary
+// stretch of wall-clock time unless it has explicitly opted into a
+// `Widget::redraw_after` request. This table is what proves it -- a
+// composite widget silently swallowing a child's `redraw_after` is
+// exactly the bug class this catches.
 //
 // ADD YOUR NEW SCREEN BUILDER TO `freshness_cases()` BELOW whenever you
 // add one -- see that function's doc comment.
@@ -44,21 +42,19 @@ enum Freshness {
     /// *different* pixels (proving the request isn't spurious). The
     /// two durations can differ: the wizard's elapsed-seconds readout
     /// requests a redraw every 250ms but only actually changes on a
-    /// whole-second boundary (§8's "minor, non-blocking" risk note),
-    /// so its assertion window is 2s, matching the exact scenario
-    /// `wizard.rs`'s own
+    /// whole-second boundary, so its assertion window is 2s, matching
+    /// the exact scenario `wizard.rs`'s own
     /// `connecting_phase_liveness_end_to_end_tick_alone_marks_dirty_and_the_elapsed_readout_changes`
-    /// test already proves -- folded in here per the design doc's
-    /// §6.1 instruction, not duplicated.
+    /// test already proves.
     Live { redraw_after: Duration, assert_differs_after: Duration },
 }
 
 /// Every screen builder the product has, paired with its
 /// [`Freshness`] promise. **Add every new screen builder here** --
-/// this table is the single place pico-link-vxc's freshness-invariant
-/// test (`dirty_gate_freshness_invariant_holds_for_every_screen`)
-/// draws its cases from, and an entry missing here is an entry the
-/// dirty gate has no proof about.
+/// this table is the single place the freshness-invariant test
+/// (`dirty_gate_freshness_invariant_holds_for_every_screen`) draws its
+/// cases from, and an entry missing here is an entry the dirty gate has
+/// no proof about.
 /// One row of [`freshness_cases`]'s table: a case name, a builder that
 /// constructs the `App` already navigated to the screen under test,
 /// and that screen's [`Freshness`] promise.
@@ -93,10 +89,10 @@ fn freshness_cases() -> Vec<FreshnessCase> {
     fn wizard_nothing_found() -> App {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        // Bead pico-link-88xs: a genuine end-of-inquiry, not a
-        // `LinkStateChanged(Idle)` -- see `on_scan_ended_if_applicable`'s
-        // doc comment for why `LinkStateChanged(Idle)` alone must no
-        // longer trigger this transition.
+        // A genuine end-of-inquiry, not a `LinkStateChanged(Idle)` -- see
+        // `on_scan_ended_if_applicable`'s doc comment for why
+        // `LinkStateChanged(Idle)` alone must not trigger this
+        // transition.
         app.handle_event(Event::DiscoveryStateChanged { scanning: false });
         app
     }
@@ -154,14 +150,14 @@ fn freshness_cases() -> Vec<FreshnessCase> {
         let mut app = App::new(240, 240);
         let addr = [6; 6];
         // `ConnectSucceeded` before `upsert` deliberately: the former
-        // sets `connected_addr` but does not itself `rebuild_root`
+        // sets `connected_addr` but does not itself `refresh_stack`
         // (see `on_connect_succeeded`'s doc comment), so `HomeView`'s
         // captured `model` snapshot would otherwise still read
         // `connected_addr: None` when `open_devices` pushes the
         // Devices screen off of it, and `on_activate_index` would take
         // the reconnect-to-a-non-connected-row branch (pushing the
         // wizard's Connecting phase) instead of device detail. Ordered
-        // this way, the `upsert` event's own `rebuild_root` is the one
+        // this way, the `upsert` event's own `refresh_stack` is the one
         // that captures the fresh, already-connected model.
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         app.handle_event(upsert(addr, "Cans", 1));
@@ -171,15 +167,13 @@ fn freshness_cases() -> Vec<FreshnessCase> {
     }
     fn settings() -> App {
         let mut app = App::new(240, 240);
-        // `pico-link-hr30` repurposed Home's `ShortcutY` to the device
-        // page, so Settings is reached the ordinary way now: A/centre
-        // to the menu face, Down to the Settings row, A/centre to
-        // activate it.
+        // Settings is reached the ordinary way: A/centre to the menu
+        // face, Down to the Settings row, A/centre to activate it.
         app.handle_input(vec![NavIntent::Select, NavIntent::Down, NavIntent::Select]);
         app
     }
-    /// Bead pico-link-du0: Home's status face, connected, with a live
-    /// OUT-meter reading. Deliberately `tick`s to a nonzero `now_us`
+    /// Home's status face, connected, with a live OUT-meter reading.
+    /// Deliberately `tick`s to a nonzero `now_us`
     /// *before* the `LevelsChanged` event so `OutLevelSample::
     /// received_at` isn't `Instant::from_micros(0)` -- otherwise this
     /// case couldn't be told apart from "app never ticked at all",
@@ -225,8 +219,8 @@ fn freshness_cases() -> Vec<FreshnessCase> {
                 redraw_after: crate::render::hero::OUT_LEVEL_REFRESH_INTERVAL,
                 // Past `OUT_LEVEL_STALE_AFTER` (600ms) so the meter
                 // has gone from drawn to absent by t1 -- proving the
-                // "absent, never frozen" rule (design section 15)
-                // actually fires via `redraw_after` with no new event.
+                // "absent, never frozen" rule actually fires via
+                // `redraw_after` with no new event.
                 assert_differs_after: Duration::from_millis(700),
             },
         ),
@@ -249,7 +243,7 @@ fn dirty_gate_freshness_invariant_holds_for_every_screen() {
                 assert_eq!(
                     t0, t1,
                     "{name}: pixels changed after 10 minutes with no input/event -- a widget is reading the \
-                     clock without a matching Widget::redraw_after (pico-link-vxc D1/D2)"
+                     clock without a matching Widget::redraw_after"
                 );
             }
             Freshness::Live { redraw_after, assert_differs_after } => {
@@ -271,12 +265,10 @@ fn dirty_gate_freshness_invariant_holds_for_every_screen() {
     }
 }
 
-/// Bead `pico-link-7h5.4`'s acceptance criterion A4 (the damage-rect
-/// render design, `.planning/design/2026-09-06-damage-rect-render-and-
-/// partial-blit.md` section 10): for every screen, a damage-rendered
-/// frame must be pixel-identical to a full-frame render of the same
-/// state, and every pixel *outside* the reported damage rect must be
-/// byte-identical to the previous frame. Modeled on
+/// For every screen, a damage-rendered frame must be pixel-identical to
+/// a full-frame render of the same state, and every pixel *outside* the
+/// reported damage rect must be byte-identical to the previous frame.
+/// Modeled on
 /// [`dirty_gate_freshness_invariant_holds_for_every_screen`] just
 /// above -- same "prove it for every screen, not the one you thought
 /// of" table-driven shape, reusing [`freshness_cases`] itself: each
@@ -352,10 +344,9 @@ fn damage_rendered_frame_matches_a_full_frame_render_of_the_same_state_for_every
     }
 }
 
-/// Design rule 4 (`.planning/design/2026-09-02-a-button-label-rule.md`
-/// §5(d)): "A's liveness and A's label are the same fact." This is the
-/// **one central test**, not one per screen -- a per-screen assertion
-/// is the exact scatter that caused the bug this rule fixes.
+/// "A's liveness and A's label are the same fact." This is the **one
+/// central test**, not one per screen -- a per-screen assertion is the
+/// exact scatter that caused the bug this rule fixes.
 ///
 /// Two things are checked per screen state, both against
 /// [`Screen::focused_activation`] as the single source of truth:
@@ -365,12 +356,11 @@ fn damage_rendered_frame_matches_a_full_frame_render_of_the_same_state_for_every
 ///    on the *mechanism*: today the two are one call apart by
 ///    construction (`screen.rs`'s `activate_focused`/`resolve_a` both
 ///    read `focused_activation`), so this cannot fail without someone
-///    reintroducing a second channel for A -- see the design doc's "what
-///    is NOT enforceable" note on `Box<dyn Widget>` wrapper forwarding,
-///    which is exactly the gap this line stands guard over.
-/// 2. The rendered word matches Uma's assignment table (design doc §4)
-///    verbatim, which *is* capable of failing on an ordinary per-screen
-///    regression (wrong verb, or a screen silently losing its verb).
+///    reintroducing a second channel for A -- `Box<dyn Widget>` wrapper
+///    forwarding is the one gap this line stands guard over.
+/// 2. The rendered word matches the assignment table verbatim, which
+///    *is* capable of failing on an ordinary per-screen regression
+///    (wrong verb, or a screen silently losing its verb).
 ///
 /// Reuses [`freshness_cases`]'s table of screen-state builders rather
 /// than hand-rolling a second one -- one table of "every production
@@ -384,9 +374,8 @@ fn a_rail_liveness_matches_activation_for_every_screen() {
         app
     }
 
-    // A paired device row focused on Devices -- design section 4's
-    // `open` row (row 3 of the audit table), distinct from
-    // `devices_list`'s empty-store "Pair new headphones" row.
+    // A paired device row focused on Devices -- the `open` row, distinct
+    // from `devices_list`'s empty-store "Pair new headphones" row.
     fn devices_list_paired_row_focused() -> App {
         let mut app = App::new(240, 240);
         app.handle_event(upsert([9; 6], "Cans", 1));
@@ -404,37 +393,28 @@ fn a_rail_liveness_matches_activation_for_every_screen() {
                 "home, menu face" => Some(Verb::Open),
                 // `devices_list`'s builder (see `freshness_cases`) has
                 // no paired devices, so the only row is "Pair new
-                // headphones" -- design doc section 4's `pair` row, not
-                // its `open` row. `devices_list_paired_row_focused`
-                // below covers the `open` case with an actual device
-                // row focused.
+                // headphones" -- the `pair` row, not `open`.
+                // `devices_list_paired_row_focused` below covers the
+                // `open` case with an actual device row focused.
                 "devices list" => Some(Verb::Pair),
                 "forget picker" => Some(Verb::Select),
                 "forget confirm" => Some(Verb::Select),
                 "device detail" => None,
-                // Settings gained real rows with pico-link-qivj.2 (the
-                // screensaver dim/off + timeout setting) -- its first
-                // row ("IDLE SCREEN") is a focusable `Action` row that
-                // pushes a picker, so `A` is correctly live now (design
-                // doc's own rule: a real destination behind a row means
-                // `A` must say so).
+                // Settings' first row ("IDLE SCREEN") is a focusable
+                // `Action` row that pushes a picker, so `A` is live: a
+                // real destination behind a row means `A` must say so.
                 "settings" => Some(Verb::Open),
                 "wizard: scanning" => Some(Verb::Pair),
                 "wizard: nothing found" => Some(Verb::Scan),
                 "wizard: connecting" | "wizard: not responding" | "wizard: failed" | "wizard: succeeded" => None,
-                other => panic!(
-                    "{other}: no expected A-verb entry in this test -- add one from design doc \
-                     .planning/design/2026-09-02-a-button-label-rule.md section 4's assignment table, don't skip it"
-                ),
+                other => panic!("{other}: no expected A-verb entry in this test -- add one, don't skip it"),
             };
             (name, build, expected)
         })
         .collect();
     // No devices survive a corrupt store, so (like `devices_list`) the
     // only row is "Pair new headphones" -- `pair`, not `open`. This
-    // case exists to cover design row 14 (same defect class as row 3,
-    // a Devices screen with A silent), not to exercise a different
-    // verb.
+    // case covers a Devices screen with A silent, not a different verb.
     cases.push(("store-corrupt boot, devices", store_corrupt_boot_devices, Some(Verb::Pair)));
     cases.push(("devices list, paired row focused", devices_list_paired_row_focused, Some(Verb::Open)));
 
@@ -450,9 +430,6 @@ fn a_rail_liveness_matches_activation_for_every_screen() {
             "{name}: rail A liveness ({rendered_live}) disagrees with focused_activation \
              ({activation:?}) -- design rule 4 says these are the same fact"
         );
-        assert_eq!(
-            activation, expected,
-            "{name}: A's verb is {activation:?}, expected {expected:?} per design doc section 4's assignment table"
-        );
+        assert_eq!(activation, expected, "{name}: A's verb is {activation:?}, expected {expected:?}");
     }
 }
