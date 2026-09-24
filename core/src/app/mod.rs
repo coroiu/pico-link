@@ -313,15 +313,15 @@ impl App {
             // `pico-link-bgnd` M1). `carry` is unused here: there is
             // nothing to carry forward into a rebuild that never happens.
             ScreenId::Home => Refresh::Keep,
-            ScreenId::Devices => Refresh::Rebuild(build_devices_screen(
-                &self.model.borrow(),
-                carry.selected_key,
-                carry.selected_index,
-                carry.scroll_top,
-                &self.commands,
-                &self.wizard_phase,
-                &self.wizard_devices,
-            )),
+            // `DevicesListView` is built once per push (`build_devices_
+            // screen`, invoked from `render::home`'s Bluetooth-row
+            // closure) and never rebuilt again while it stays on the
+            // stack -- it reads the live model itself via `Widget::sync`
+            // every frame it's on top (bead `pico-link-bgnd` M2). `carry`
+            // is unused here: there is nothing to carry forward into a
+            // rebuild that never happens (see `ScreenId::Home`'s arm just
+            // above for the identical M1 shape).
+            ScreenId::Devices => Refresh::Keep,
             ScreenId::DevicePage(addr) => build_device_page_screen(&self.model.borrow(), addr, carry, &self.commands),
             ScreenId::Picker(PickerKind::LdacQuality, addr) => build_ldac_quality_picker_screen(&self.model.borrow(), addr, carry, &self.commands),
             ScreenId::WhyPage => build_why_page_screen(&self.model.borrow(), Instant::from_micros(self.now_us), &self.why_page_order, carry),
