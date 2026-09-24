@@ -498,8 +498,11 @@ impl Widget for HomeView {
                         // empty screen is a harmless fallback rather than
                         // a panic if it ever is (same shape as
                         // `build_devices_screen`'s own `fallback_title`
-                        // handling).
-                        Refresh::Gone => Screen::new(NO_DEVICE_TITLE, vec![]),
+                        // handling). `Refresh::Keep` is likewise
+                        // unreachable: `build_device_page_screen` never
+                        // returns it (bead pico-link-bgnd M0 -- no builder
+                        // does yet).
+                        Refresh::Gone | Refresh::Keep => Screen::new(NO_DEVICE_TITLE, vec![]),
                     }))
                 } else {
                     Action::PushView(Box::new(|| {
@@ -541,8 +544,10 @@ impl Widget for HomeView {
                     Refresh::Rebuild(screen) => screen,
                     // Never actually returned (see that function's doc
                     // comment) -- defensive fallback only, same shape as
-                    // `ShortcutY`'s above.
-                    Refresh::Gone => Screen::new("Why?", vec![]),
+                    // `ShortcutY`'s above. `Refresh::Keep` is likewise
+                    // unreachable (bead pico-link-bgnd M0 -- no builder
+                    // returns it yet).
+                    Refresh::Gone | Refresh::Keep => Screen::new("Why?", vec![]),
                 }))
             }
             // `Left`/`Right` have no meaning on Home (design section 4:
