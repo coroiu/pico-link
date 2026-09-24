@@ -1373,9 +1373,9 @@ pub enum PickerKind {
 /// pre-refactor, generalized to any identified screen at any depth.
 #[derive(Default)]
 pub(crate) struct ScreenCarry {
-    selected_key: Option<ListItemKey>,
-    selected_index: usize,
-    scroll_top: Option<usize>,
+    pub(crate) selected_key: Option<ListItemKey>,
+    pub(crate) selected_index: usize,
+    pub(crate) scroll_top: Option<usize>,
 }
 
 /// What [`App::build_identified_screen`] found for a given [`ScreenId`] --
@@ -2498,6 +2498,7 @@ impl App {
             &wizard_devices,
             Instant::from_micros(0),
             &why_page_order,
+            &ScreenCarry::default(),
         ));
         Self {
             navigator,
@@ -2582,6 +2583,7 @@ impl App {
                 &self.wizard_devices,
                 Instant::from_micros(self.now_us),
                 &self.why_page_order,
+                carry,
             )),
             ScreenId::Devices => Refresh::Rebuild(build_devices_screen(
                 &self.model,
@@ -5178,6 +5180,28 @@ mod tests {
         app.handle_event(Event::LevelsChanged { peak_l: 10, peak_r: 10, rms_l: 10, rms_r: 10 });
 
         assert_eq!(app.navigator.selected_index_at(2), Some(2), "focus must survive a live refresh of the page underneath it");
+    }
+
+    #[test]
+    fn home_menu_selection_survives_a_live_refresh_while_streaming() {
+        // Bead pico-link-hu97: while music plays, volume/codec/meter
+        // events fire `refresh_stack` constantly (audio events, not user
+        // input). Before the fix, `ScreenId::Home`'s arm rebuilt
+        // `HomeView` without the `ScreenCarry` it had just read, so every
+        // one of those refreshes snapped the menu face back to row 0
+        // (Bluetooth) even while the user was looking at Settings.
+        let mut app = App::new(240, 240);
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected, row 0)
+        app.handle_input(vec![NavIntent::Down]); // move to Settings (row 1) -- not activated
+        assert_eq!(app.navigator.selected_index_at(0), Some(1), "Down must move the menu's own selection to row 1 before any refresh");
+
+        // A model event that runs `refresh_stack` but has nothing to do
+        // with the user's navigation -- the exact shape of the events that
+        // fire continuously while streaming.
+        app.handle_event(Event::LevelsChanged { peak_l: 10, peak_r: 10, rms_l: 10, rms_r: 10 });
+
+        assert_eq!(app.navigator.selected_index_at(0), Some(1), "a live refresh must not reset the Home menu's selection to row 0");
+        assert_eq!(app.navigator.scroll_top_at(0), None, "Home's menu has no scroll concept -- always None, carried or not");
     }
 
     // --- pico-link-7jol.4: build_single_select_screen (the general picker) ---
