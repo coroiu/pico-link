@@ -127,7 +127,8 @@ const MENU_ROW_SETTINGS: usize = 1;
 /// this screen on every Bluetooth model change, for the same reason it
 /// always has: the status face's hero widget needs to reflect live data).
 #[must_use]
-pub fn build_home_screen(
+#[allow(clippy::too_many_arguments)] // Mirrors `HomeView::new`'s own allow -- this is a straight passthrough into it, plus the wizard/why-page Rcs every other screen builder in this crate threads through too.
+pub(crate) fn build_home_screen(
     model: &BtModel,
     home_face: &Rc<RefCell<HomeFace>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
@@ -135,8 +136,9 @@ pub fn build_home_screen(
     wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
     now: Instant,
     why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
+    carry: &ScreenCarry,
 ) -> Screen {
-    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order);
+    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order, carry);
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
@@ -221,6 +223,7 @@ impl HomeView {
         wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
         now: Instant,
         why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
+        carry: &ScreenCarry,
     ) -> Self {
         // The status face's hero widget: `NO LINK` whenever there is no
         // live codec (design section 15's "absent, never frozen or
@@ -353,7 +356,17 @@ impl HomeView {
                 MENU_ROW_SETTINGS => Action::PushView(Box::new(build_settings_screen)),
                 _ => Action::None,
             },
-        );
+        )
+        // Carries the menu row forward across every live `refresh_stack`
+        // rebuild while streaming (bead `pico-link-hu97`) -- mirrors
+        // `build_devices_screen`'s `with_selected_identity`/
+        // `with_scroll_top` carry-forward, minus the scroll/identity
+        // machinery this two-row, never-reordering menu has no need of.
+        // `carry.selected_index` is `0` both on the very first build (no
+        // widget has reported a selection yet) and once `HomeView::
+        // selected_index` below starts reporting the real value, so this
+        // is safe on every call site, not just refreshes.
+        .with_selected(carry.selected_index);
 
         Self {
             home_face,
@@ -602,6 +615,21 @@ impl Widget for HomeView {
         self.face() == HomeFace::Menu
     }
 
+    /// Reports the menu face's selected row so [`Navigator::selected_index_at`]
+    /// / [`crate::app::App::refresh_stack`] can carry it forward into the
+    /// next rebuild (bead `pico-link-hu97`) -- mirrors `DevicesListView::
+    /// selected_index` forwarding to its wrapped list. `None` on the status
+    /// face: there is nothing selected there (the module doc's Home input
+    /// exception), and reporting the menu's index anyway would make a
+    /// status-face rebuild spuriously seed the menu's selection from a
+    /// value the user never actually chose on this face.
+    fn selected_index(&self) -> Option<usize> {
+        match self.face() {
+            HomeFace::Status => None,
+            HomeFace::Menu => Some(self.menu.selected_index()),
+        }
+    }
+
     fn render(&self, area: Rectangle, ctx: &RenderCtx, target: &mut FrameBuffer565) -> Result<(), Infallible> {
         match self.face() {
             HomeFace::Status => self.hero.render(area, ctx, target),
@@ -672,7 +700,7 @@ mod tests {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &ScreenCarry::default())
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -685,7 +713,7 @@ mod tests {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &ScreenCarry::default())
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting
@@ -788,7 +816,7 @@ mod tests {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &ScreenCarry::default())
     }
 
     #[test]
