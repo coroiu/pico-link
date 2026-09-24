@@ -7,25 +7,24 @@ use crate::render::Instant;
 use super::events::{ConnectFailureReason, StoreStatus, VolumeState};
 use super::fault::FaultLog;
 
-/// How many devices the flash store can remember (design section 6: slots
-/// `PL:D:0`..`PL:D:7`). The Devices screen gates opening the wizard on this
-/// *before* any radio work (design section 4) -- fullness must be
-/// discoverable without `BTstack` ever attempting a pairing that a full store
-/// would then refuse to persist.
+/// How many devices the flash store can remember (slots `PL:D:0`..`PL:D:7`).
+/// The Devices screen gates opening the wizard on this *before* any radio
+/// work -- fullness must be discoverable without `BTstack` ever attempting
+/// a pairing that a full store would then refuse to persist.
 pub(in crate::app) const MAX_PAIRED_DEVICES: usize = 8;
 
 /// The remembered-device name's on-flash/on-wire cap -- matches
 /// `firmware/src/persist.c`'s `pl_persist_device_record_t::name[32]` and
 /// [`PlConnectPayload::name`]/[`PlPairedDeviceUpsertedPayload::name`]'s wire
-/// buffers exactly (design section 5.1/5.3).
+/// buffers exactly.
 const MAX_DEVICE_NAME_BYTES: usize = 32;
 
 /// Truncates `name` to at most [`MAX_DEVICE_NAME_BYTES`], respecting a
-/// UTF-8 **character** boundary -- design section 5.3, "Rust owns text; C
-/// owns bytes": `core` is the only side of the FFI seam that can safely
-/// find a char boundary (C only ever sees bytes), so this must happen
-/// before a name is ever placed on a [`Command::Connect`], not after it
-/// crosses into `ui-ffi`'s fixed-size wire buffer.
+/// UTF-8 **character** boundary -- "Rust owns text; C owns bytes": `core`
+/// is the only side of the FFI seam that can safely find a char boundary
+/// (C only ever sees bytes), so this must happen before a name is ever
+/// placed on a [`Command::Connect`], not after it crosses into `ui-ffi`'s
+/// fixed-size wire buffer.
 pub(crate) fn truncate_device_name(name: &str) -> String {
     if name.len() <= MAX_DEVICE_NAME_BYTES {
         return String::from(name);
@@ -43,16 +42,14 @@ pub(crate) fn truncate_device_name(name: &str) -> String {
 /// three labels.
 ///
 /// Describes **exactly one thing**: the A2DP connection lifecycle of
-/// [`BtModel::connected_addr`] (bead `pico-link-88xs`, design
-/// `.planning/design/2026-09-08-link-state-vs-discovery-axis.md` INVARIANT
-/// L1). Whether the radio is currently running a GAP inquiry is a second,
-/// independent axis -- [`BtModel::discovering`] -- and is deliberately **not
-/// representable** as a `LinkState`: this enum used to carry a `Scanning`
-/// variant, and because an inquiry does not disconnect A2DP, that variant
-/// was a lie every time it reached [`App::set_link_state`], which wiped the
-/// connected model out from under a link that was still up. Removing the
-/// variant makes that unreachable through the type rather than merely
-/// undocumented -- see the design doc section 2.1.
+/// [`BtModel::connected_addr`]. Whether the radio is currently running a
+/// GAP inquiry is a second, independent axis -- [`BtModel::discovering`] --
+/// and is deliberately **not representable** as a `LinkState`: this enum
+/// used to carry a `Scanning` variant, and because an inquiry does not
+/// disconnect A2DP, that variant was a lie every time it reached
+/// [`App::set_link_state`], which wiped the connected model out from under
+/// a link that was still up. Removing the variant makes that unreachable
+/// through the type rather than merely undocumented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkState {
     #[default]
@@ -77,17 +74,15 @@ pub struct DeviceEntry {
     /// blindly" rule as `addr` above. `0` means BTstack reported nothing
     /// (there is no separate "available" flag for this field, unlike
     /// `name`/`rssi`) and must be treated as *unknown*, never *non-audio*
-    /// -- see [`is_audio_sink`]'s doc comment. Added by bead
-    /// pico-link-znb.11 (E9, design section 21 Tier 1).
+    /// -- see [`is_audio_sink`]'s doc comment.
     pub class_of_device: u32,
 }
 
 /// Decodes BTstack's raw Class-of-Device into "should this show up in the
-/// pairing wizard's scan list" (design section 9 phase 2 rule 3: "Filter by
-/// Class-of-Device to audio sinks" -- every phone and laptop in the room is
-/// noise the user cannot disambiguate, and design section 2's hard ~12-item
-/// list cap makes an unfiltered inquiry a real usability failure, not a
-/// cosmetic one).
+/// pairing wizard's scan list" -- every phone and laptop in the room is
+/// noise the user cannot disambiguate, and the hard ~12-item list cap
+/// makes an unfiltered inquiry a real usability failure, not a cosmetic
+/// one.
 ///
 /// Decodes the major device class (bits 8-12 of the 24-bit CoD, i.e.
 /// `(cod >> 8) & 0x1F` -- see the Bluetooth Assigned Numbers "Baseband"
@@ -95,10 +90,9 @@ pub struct DeviceEntry {
 /// (`0x04`), which covers headphones/headsets/speakers alongside a handful
 /// of things that also plausibly want audio.
 ///
-/// **Judgement call (this bead): filter, not rank, but with an explicit
-/// unknown-is-included escape hatch.** Design section 9 already settled on
-/// a hard filter over a ranked/demoted list. The risk that filter alone
-/// creates: a device whose CoD is `0` (not reported, no "available" flag
+/// **Filter, not rank, with an explicit unknown-is-included escape
+/// hatch.** The risk a hard filter alone creates: a device whose CoD is
+/// `0` (not reported, no "available" flag
 /// exists for this field) or one that reports its major class oddly would
 /// otherwise be a device the user can see in the room but can never
 /// select, with nothing on screen explaining why -- silently unpairable.
@@ -116,22 +110,18 @@ pub(crate) fn is_audio_sink(class_of_device: u32) -> bool {
     ((class_of_device >> 8) & MAJOR_DEVICE_CLASS_MASK) == MAJOR_AUDIO_VIDEO
 }
 
-/// Backstop cap on the pairing wizard's scan list (design section 21 Tier 1
-/// row E9 / section 13's Class-of-Device row): "cap the scan list at 12
+/// Backstop cap on the pairing wizard's scan list: "cap the scan list at 12
 /// with a 'showing 12 of N' readout" -- built regardless of whether
-/// [`is_audio_sink`] filtering is working, since Class-of-Device is only
-/// marked *Expected*, not *Confirmed*, in the design doc, and a crowded
-/// room can in principle still exceed 12 audio-classed devices. Matches
-/// design section 2's hard ~12-item list rule, which exists because
+/// [`is_audio_sink`] filtering is working, since a crowded room can in
+/// principle still exceed 12 audio-classed devices. Exists because
 /// press-edge-only input (no key repeat) makes a longer list a genuine
 /// navigation failure, not a scrolling inconvenience.
 pub(crate) const MAX_SCAN_LIST_ITEMS: usize = 12;
 
 /// How long a channel's OUT-meter peak-hold cap stays pinned at its
-/// highest recent reading before a lower peak is allowed to replace it
-/// (bead pico-link-du0, design section 21 E17's "peak-hold cap"). 1.5s is
-/// the conventional VU-meter hold time -- long enough to actually read a
-/// transient peak at a glance, short enough not to look stuck.
+/// highest recent reading before a lower peak is allowed to replace it.
+/// 1.5s is the conventional VU-meter hold time -- long enough to actually
+/// read a transient peak at a glance, short enough not to look stuck.
 pub(in crate::app) const OUT_LEVEL_HOLD_DURATION: Duration = Duration::from_millis(1500);
 
 /// The Bluetooth-domain state screens read to render themselves --
@@ -144,146 +134,122 @@ pub(in crate::app) const OUT_LEVEL_HOLD_DURATION: Duration = Duration::from_mill
 /// screen's own widget state.
 ///
 /// Deliberately grows by adding fields here, not by adding new `App`
-/// methods per field or new FFI setters per field -- see the module doc's
-/// "sustainable path" rationale (bead pico-link-a67 / pico-link-aii.1).
+/// methods per field or new FFI setters per field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BtModel {
     pub link_state: LinkState,
     /// Whether the radio is currently running a GAP inquiry -- the SECOND,
-    /// independent axis (bead `pico-link-88xs`, design `.planning/design/
-    /// 2026-09-08-link-state-vs-discovery-axis.md` section 2.2): an
-    /// inquiry does not disconnect A2DP, so scanning must never be
-    /// expressible as a [`LinkState`] (see that type's doc comment).
-    /// `bool`, not an enum -- there are exactly two observable states and
-    /// no producer for a third (design section 2.2). Written only by
+    /// independent axis: an inquiry does not disconnect A2DP, so scanning
+    /// must never be expressible as a [`LinkState`] (see that type's doc
+    /// comment). `bool`, not an enum -- there are exactly two observable
+    /// states and no producer for a third. Written only by
     /// [`App::set_discovering`].
     pub discovering: bool,
-    /// Inquiry-scan results. **Wizard-only reader** -- renamed from
-    /// `devices` by bead pico-link-4vb.4 (T4), design section 3: the rename
-    /// is the point, not cosmetics, because it turns "the Devices screen
-    /// reads scan results" from a habit into a compile error. Mutated only
-    /// by [`App::add_device`]/[`App::clear_devices`] (via
+    /// Inquiry-scan results. **Wizard-only reader** -- named distinctly
+    /// from `paired` so "the Devices screen reads scan results" is a
+    /// compile error, not a habit. Mutated only by
+    /// [`App::add_device`]/[`App::clear_devices`] (via
     /// [`Event::DeviceDiscovered`]/[`Event::DevicesCleared`]).
     pub discovered: Vec<DeviceEntry>,
     /// Remembered (paired) devices, restored from C's flash store --
-    /// **Devices-screen-only reader** (design section 4). The single
-    /// source of truth is C's flash: `core` never invents a row here, and
-    /// mutates this list only by folding [`Event::PairedDeviceUpserted`]/
+    /// **Devices-screen-only reader**. The single source of truth is C's
+    /// flash: `core` never invents a row here, and mutates this list only
+    /// by folding [`Event::PairedDeviceUpserted`]/
     /// [`Event::PairedDeviceForgotten`] -- see those variants' doc comments
-    /// for the single-writer rule (design section 3). Deliberately carries
-    /// no codec/volume/preset fields -- those are per-device *settings*
-    /// with no screen yet (Tier 2, design section 9's task table), and
-    /// their flash bytes are already reserved; adding model fields nobody
-    /// reads would be gold-plating. Bead pico-link-4vb.4 (T4).
+    /// for the single-writer rule. Deliberately carries no codec/volume/
+    /// preset fields -- those are per-device *settings* with no screen
+    /// yet, and their flash bytes are already reserved; adding model
+    /// fields nobody reads would be gold-plating.
     pub paired: Vec<PairedDevice>,
     /// Which [`PairedDevice::addr`] (if any) the live A2DP link is
     /// currently connected to -- lets the Devices screen pin that device
-    /// at the top (design section 4). Set by [`App::on_connect_succeeded`]
-    /// and cleared by [`App::set_link_state`] whenever the link leaves
+    /// at the top. Set by [`App::on_connect_succeeded`] and cleared by
+    /// [`App::set_link_state`] whenever the link leaves
     /// [`LinkState::Connected`], the exact same lifecycle
     /// [`BtModel::connected_codec`] already follows and for the same
     /// reason (see that field's doc comment) -- every path off `Connected`
     /// already flows through `set_link_state`, so this can't race a
-    /// disconnect C forgot to send. Bead pico-link-4vb.4 (T4/T5).
+    /// disconnect C forgot to send.
     pub connected_addr: Option<DeviceAddr>,
     /// The most recent connect failure, if any (and not yet superseded by
-    /// a new attempt). Not yet rendered by any screen in this bead's scope
-    /// -- populated so the data exists and is representable ahead of the
-    /// screen that will read it, per pico-link-a67's explicit ask.
+    /// a new attempt).
     pub last_connect_failure: Option<(DeviceAddr, ConnectFailureReason)>,
     /// The currently-negotiated codec on the live A2DP link, if any --
-    /// `None` whenever there is no connected codec to show (design section
-    /// 15: absent, never frozen or faked). Populated from
-    /// [`Event::CodecChanged`] (C's signaling codec-configuration handler,
-    /// `firmware/src/a2dp.c`) and cleared by [`App::set_link_state`]
-    /// whenever the link leaves [`LinkState::Connected`] -- see that
-    /// method's doc comment for why clearing keys off the *link state*
-    /// rather than a dedicated disconnect event (bead pico-link-1v5).
+    /// `None` whenever there is no connected codec to show (absent, never
+    /// frozen or faked). Populated from [`Event::CodecChanged`] (C's
+    /// signaling codec-configuration handler, `firmware/src/a2dp.c`) and
+    /// cleared by [`App::set_link_state`] whenever the link leaves
+    /// [`LinkState::Connected`] -- see that method's doc comment for why
+    /// clearing keys off the *link state* rather than a dedicated
+    /// disconnect event.
     pub connected_codec: Option<ConnectedCodec>,
-    /// What C's flash-backed store looked like at boot (bead pico-link-cz0.6,
-    /// M5 persistence) -- `None` until [`Event::StoreLoaded`] has arrived
-    /// (i.e. before the radio has finished powering on). Not yet rendered
-    /// by any screen in this bead's scope -- populated so a reset/corrupt
-    /// store is representable ahead of the screen that will surface it
-    /// (design point 5's "never renders identically to a new one"),
-    /// mirroring `last_connect_failure`'s own "populated ahead of its
-    /// screen" precedent above.
+    /// What C's flash-backed store looked like at boot -- `None` until
+    /// [`Event::StoreLoaded`] has arrived (i.e. before the radio has
+    /// finished powering on).
     pub store_status: Option<StoreStatus>,
     /// Whether the flash store most recently refused a save because every
     /// slot held a different address (see [`Event::PairedStoreFull`]'s doc
-    /// comment). Not yet rendered by any screen -- the Devices screen
-    /// already gates pairing on `paired.len() < MAX_PAIRED_DEVICES` before
-    /// any radio work, so this is populated ahead of the screen that will
-    /// eventually surface the race this can't fully close, mirroring
-    /// `last_connect_failure`/`store_status`'s own precedent above. Bead
-    /// pico-link-4vb.4 (T4).
+    /// comment). The Devices screen already gates pairing on
+    /// `paired.len() < MAX_PAIRED_DEVICES` before any radio work, so this
+    /// exists for the race that gate can't fully close.
     pub store_full: bool,
     /// The most recent live [`Event::LevelsChanged`] reading, if any --
-    /// `None` whenever there is no PCM to measure (design section 15:
-    /// absent, never frozen or faked -- see [`OutLevelSample`]'s doc
-    /// comment for how staleness on top of a live value is handled, since
-    /// "no *new* reading has arrived" and "there is no PCM" are the same
-    /// observable fact from `core`'s side once C stops streaming).
-    /// Populated by [`App::on_levels_changed`], cleared by
-    /// [`App::set_link_state`] on the same lifecycle as `connected_codec`.
-    /// Bead pico-link-du0.
+    /// `None` whenever there is no PCM to measure (absent, never frozen or
+    /// faked -- see [`OutLevelSample`]'s doc comment for how staleness on
+    /// top of a live value is handled, since "no *new* reading has
+    /// arrived" and "there is no PCM" are the same observable fact from
+    /// `core`'s side once C stops streaming). Populated by
+    /// [`App::on_levels_changed`], cleared by [`App::set_link_state`] on
+    /// the same lifecycle as `connected_codec`.
     pub out_level: Option<OutLevelSample>,
     /// The most recent canonical volume reading, if any -- `None` until
-    /// the first [`Event::VolumeChanged`] arrives (design section 7).
-    /// Unlike `out_level`/`connected_codec`, this is NOT cleared by
+    /// the first [`Event::VolumeChanged`] arrives. Unlike
+    /// `out_level`/`connected_codec`, this is NOT cleared by
     /// [`App::set_link_state`] on disconnect: the host feature-unit
     /// volume this most commonly reflects is a USB-side concept, not an
-    /// A2DP-link-lifetime one (design section 7 names no such clearing
-    /// rule, unlike `out_level`/`connected_codec`'s explicit ones).
-    /// Populated by [`App::on_volume_changed`]. Bead pico-link-4v2.5 (VT5).
+    /// A2DP-link-lifetime one. Populated by [`App::on_volume_changed`].
     pub volume: Option<VolumeState>,
     /// The LDAC encoder's live effective rate, in kbps, if a live figure
     /// has been reported since the current connection came up --
     /// [`Event::LdacBitrateChanged`]'s payload, folded by
     /// [`App::on_ldac_bitrate_changed`]. `None` until the first reading
     /// arrives (fresh connect: the row/hero fall back to the codec table's
-    /// *nominal* figure, design section 15's "absent, never faked" —
-    /// there is simply no live figure yet, not a faked one), and cleared
-    /// whenever the link leaves [`LinkState::Connected`] or the connected
-    /// codec changes away from LDAC (same lifecycle class as
-    /// `connected_codec`/`out_level` — see [`App::set_link_state`]/
+    /// *nominal* figure -- there is simply no live figure yet, not a faked
+    /// one), and cleared whenever the link leaves [`LinkState::Connected`]
+    /// or the connected codec changes away from LDAC (same lifecycle class
+    /// as `connected_codec`/`out_level` -- see [`App::set_link_state`]/
     /// [`App::set_connected_codec`]). This is deliberately **not** snapped
     /// to the nominal 990/660/330 ladder: libldac can report a transient
-    /// non-ladder rate mid-step (bead pico-link-qx8's trap), and the
-    /// quality-selector design (`.planning/design/2026-09-07-ldac-quality-
-    /// selector.md` §5.1) requires showing exactly what the encoder
-    /// reports, not the nearest rung. Bead pico-link-7jol.5.
+    /// non-ladder rate mid-step, and the quality-selector design requires
+    /// showing exactly what the encoder reports, not the nearest rung.
     pub ldac_live_kbps: Option<u32>,
-    /// The audio fault strip's model (design `.planning/design/2026-09-07-
-    /// audio-fault-model.md` §7.4, home-fault-strip §12 Ruby item 1) --
-    /// folded by [`App::on_fault_raised`] from [`Event::FaultRaised`].
-    /// Deliberately NOT cleared by [`App::set_link_state`] on disconnect,
-    /// unlike `out_level`/`connected_codec`/`ldac_live_kbps` above: a
-    /// fault raised on the connection that just dropped is still relevant
-    /// history for the `why?` page (S3, `pico-link-9eq2.3.3`) after a
-    /// reconnect, and C's own evaluator already re-snapshots and clears
-    /// its *own* fault state at every stream transition (§5.6 rule 3) --
-    /// `core`'s log just reflects whatever C tells it, per doctrine (§2:
-    /// "faults are a view, never a second source of truth").
+    /// The audio fault strip's model -- folded by [`App::on_fault_raised`]
+    /// from [`Event::FaultRaised`]. Deliberately NOT cleared by
+    /// [`App::set_link_state`] on disconnect, unlike
+    /// `out_level`/`connected_codec`/`ldac_live_kbps` above: a fault raised
+    /// on the connection that just dropped is still relevant history for
+    /// the `why?` page after a reconnect, and C's own evaluator already
+    /// re-snapshots and clears its *own* fault state at every stream
+    /// transition -- `core`'s log just reflects whatever C tells it
+    /// ("faults are a view, never a second source of truth").
     pub fault_log: FaultLog,
 }
 
 /// One [`Event::LevelsChanged`] reading, timestamped and peak-held at the
-/// moment it folded into [`BtModel`] (bead pico-link-du0, design section
-/// 21 E17). `core` never derives "is the meter live" from a boolean flag
-/// C sends -- there isn't one -- but from comparing `received_at` against
+/// moment it folded into [`BtModel`]. `core` never derives "is the meter
+/// live" from a boolean flag C sends -- there isn't one -- but from
+/// comparing `received_at` against
 /// [`crate::render::hero::HeroStatusView`]'s own render-time clock
 /// (`RenderCtx::now`): once too much time has passed since the last
 /// reading, the meter stops drawing rather than showing a frozen last
-/// value (design section 15's rule, applied here for the same reason the
-/// hero word and bitrate line already apply it).
+/// value.
 ///
-/// `hold_l`/`hold_r`/`hold_l_at`/`hold_r_at` implement the design's
-/// "peak-hold cap" (section 6, section 21 E17): the highest peak seen
-/// within the last hold window, decided once per incoming reading (not
-/// re-decayed every render frame, which would need a render-time mutation
-/// this `&self`-rendered widget tree has no way to make) -- see
-/// [`App::on_levels_changed`] for the hold-update rule.
+/// `hold_l`/`hold_r`/`hold_l_at`/`hold_r_at` implement the "peak-hold
+/// cap": the highest peak seen within the last hold window, decided once
+/// per incoming reading (not re-decayed every render frame, which would
+/// need a render-time mutation this `&self`-rendered widget tree has no
+/// way to make) -- see [`App::on_levels_changed`] for the hold-update
+/// rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutLevelSample {
     pub peak_l: u8,
@@ -295,10 +261,9 @@ pub struct OutLevelSample {
     pub(in crate::app) hold_l_at: Instant,
     pub(in crate::app) hold_r_at: Instant,
     pub received_at: Instant,
-    /// Release-ballistic attack anchor (bead pico-link-ajj, design
-    /// requirement C; switched from rms to peak by bead pico-link-53c so the
-    /// ballistic anchors on the same quantity the bar now draws): the
-    /// `peak_l`/`peak_r` value in effect at the moment it was last set by an
+    /// Release-ballistic attack anchor -- anchors on `peak_l`/`peak_r`
+    /// (not rms), the same quantity the bar draws: the value in effect
+    /// at the moment it was last set by an
     /// instantaneous attack, i.e. the last time a fresh reading was at or
     /// above the then-current decayed value. `crate::render::hero`'s render
     /// function decays *from* this anchor at render time (via
@@ -312,8 +277,8 @@ pub struct OutLevelSample {
     pub(crate) attack_peak_r_at: Instant,
 }
 
-/// Exponential-release rate for the vertical OUT meter's ballistics (bead
-/// pico-link-ajj, design requirement C): approximately 20 dB per second —
+/// Exponential-release rate for the vertical OUT meter's ballistics:
+/// approximately 20 dB per second —
 /// amplitude falls to roughly 10% of its value after one second of
 /// continuous release. Expressed as a Q16.16 fixed-point ratio-per-
 /// millisecond (`10^(-1/1000)`, precomputed offline as a constant) rather
@@ -384,9 +349,7 @@ pub type DeviceAddr = [u8; 6];
 
 /// One remembered (paired) device, as reported by C over
 /// [`Event::PairedDeviceUpserted`] -- restored from the flash store at boot
-/// or freshly persisted after a successful pairing. Bead pico-link-4vb.4
-/// (T4), design `.planning/design/2026-09-01-remembered-devices.md`
-/// section 3.
+/// or freshly persisted after a successful pairing.
 ///
 /// Deliberately carries no codec/volume/flags/preset fields -- see
 /// [`BtModel::paired`]'s doc comment.
@@ -394,21 +357,18 @@ pub type DeviceAddr = [u8; 6];
 pub struct PairedDevice {
     pub addr: DeviceAddr,
     /// Possibly empty -- rendered `(unknown device)` plus the address's
-    /// last three bytes as the discriminator (design section 4/13).
+    /// last three bytes as the discriminator.
     pub name: String,
     /// Monotonic use-sequence C assigns (never a wall clock -- this board
-    /// has no RTC). The Devices screen's ordering key (design section 4:
-    /// MRU-descending), and what [`App::on_store_loaded`]'s auto-reconnect
-    /// policy maximizes over.
+    /// has no RTC). The Devices screen's ordering key (MRU-descending),
+    /// and what [`App::on_store_loaded`]'s auto-reconnect policy
+    /// maximizes over.
     pub mru_seq: u32,
     /// The persisted LDAC quality pick, 1-based (`firmware/src/persist.c`'s
-    /// `ldac_quality`, design
-    /// `.planning/design/2026-09-02-device-page-seam.md` §1.2): `0` = never
-    /// chosen, `1`/`2`/`3` = pinned 990/660/330 kbps, `4` = Adaptive. This
-    /// is the **stored echo** [`build_single_select_screen`]'s `checked`
-    /// parameter and the `QUALITY` row's check both read -- never the
-    /// local press (`.planning/design/2026-09-07-ldac-quality-selector.md`
-    /// §5.1). Bead pico-link-7jol.5.
+    /// `ldac_quality`): `0` = never chosen, `1`/`2`/`3` = pinned
+    /// 990/660/330 kbps, `4` = Adaptive. This is the **stored echo**
+    /// [`build_single_select_screen`]'s `checked` parameter and the
+    /// `QUALITY` row's check both read -- never the local press.
     pub ldac_quality: u8,
 }
 
@@ -424,9 +384,8 @@ pub struct PairedDevice {
 /// displays whatever the one C-side codec table (Andreas's ruling: a
 /// table, never a per-call-site branch on codec identity) already decided.
 /// `nominal_bitrate_bps` is deliberately the table's *nominal* figure, not
-/// a live/adaptive one -- design section 13 confirms only the nominal
-/// number, and section 15's "absent, never faked" rule means a live figure
-/// this product cannot honestly measure yet must not be synthesized.
+/// a live/adaptive one -- "absent, never faked" means a live figure this
+/// product cannot honestly measure yet must not be synthesized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedCodec {
     /// Which device this codec applies to. Carried for forward
@@ -475,10 +434,8 @@ mod tests {
 
     #[test]
     fn truncate_device_name_backs_off_to_a_utf8_character_boundary_instead_of_panicking() {
-        // Code review on pico-link-4vb.4: every prior test used a pure-ASCII
-        // name, so the exact bug class the design called out ("a
-        // byte-boundary truncation would panic or corrupt on any non-ASCII
-        // device name") had zero coverage. U+65E5 ("日") is 3 bytes; 11 of
+        // A byte-boundary truncation would panic or corrupt on any
+        // non-ASCII device name. U+65E5 ("日") is 3 bytes; 11 of
         // them is 33 bytes, one over MAX_DEVICE_NAME_BYTES (32), and byte 32
         // lands one byte into the 11th character -- exactly the mid-character
         // cut that a naive `&name[..32]` would panic on.
@@ -498,13 +455,11 @@ mod tests {
         assert!(truncated.len() <= MAX_DEVICE_NAME_BYTES);
     }
 
-    // --- decay_peak / vertical OUT meter release ballistics (bead
-    // pico-link-ajj): code review found the render-side floor
-    // (`.max(level.rms_l)` in `render::hero`) pinned the displayed value
-    // to the last raw reading for a sample's whole life, defeating the
-    // release entirely -- these tests exercise decay over elapsed time
-    // WITHOUT a new sample arriving, which is exactly the case that bug
-    // was invisible to (no prior test drove `decay_peak` at all). ---
+    // --- decay_peak / vertical OUT meter release ballistics: a
+    // render-side floor (`.max(level.rms_l)` in `render::hero`) once
+    // pinned the displayed value to the last raw reading for a sample's
+    // whole life, defeating the release entirely -- these tests exercise
+    // decay over elapsed time WITHOUT a new sample arriving. ---
 
     #[test]
     fn decay_peak_at_zero_elapsed_is_unchanged() {
@@ -534,8 +489,8 @@ mod tests {
 
     #[test]
     fn decay_peak_after_one_second_is_roughly_ten_percent() {
-        // ~20 dB/s release (design requirement C) means amplitude falls
-        // to roughly 10% after one second of continuous release.
+        // ~20 dB/s release means amplitude falls to roughly 10% after one
+        // second of continuous release.
         let decayed = decay_peak(200, Duration::from_millis(1000));
         assert!((15..=25).contains(&decayed), "expected ~20 (10% of 200), got {decayed}");
     }
