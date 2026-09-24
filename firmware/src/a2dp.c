@@ -772,6 +772,52 @@ typedef struct {
     // pl_a2dp_resync_decide/_apply/_complete doc comments (just above the
     // CORE1 section) for the full design.
     uint32_t trim_seen_ack;
+
+    // Bead pico-link-8pp1.1 (design .planning/design/2026-09-24-congestion-
+    // cushion.md sec 5): S1 instrumentation, gap-only additions -- none of
+    // these feed any decision, they exist purely so S2's hardware round has
+    // something to read. All written from core0's media-timer IRQ (grant
+    // gap: pl_a2dp_send_media_packet, same 0xFF context, called from the
+    // same A2DP packet handler as the rest of this file's IRQ-context
+    // writers), read from pl_a2dp_report at thread context -- same
+    // single-writer discipline as resync_drops/resync_events above.
+
+    // Widest gap between two consecutive CAN_SEND_MEDIA_PACKET_NOW grants
+    // this stream, and how many of those gaps crossed each of three
+    // thresholds (design sec 5's "stall histogram (>20/50/100ms)"; each
+    // bucket is cumulative -- a >100ms gap also counts in the >50/>20
+    // buckets). stall_episodes is every gap that crossed the lowest
+    // threshold (>20ms) -- the same count as stall_gap_over_20ms, kept as
+    // a separate named field because the design doc calls out "stall
+    // episodes" as its own top-line stat.
+    volatile uint32_t max_grant_gap_us;
+    volatile uint32_t stall_episodes;
+    volatile uint32_t stall_gap_over_20ms;
+    volatile uint32_t stall_gap_over_50ms;
+    volatile uint32_t stall_gap_over_100ms;
+
+    // High-water mark of pl_usb_audio_fb_fill_ema() as read by
+    // pl_a2dp_resync_decide -- design sec 5's "fill_ema peak". Signed in
+    // the EMA's own units (bytes) but only ever compared/stored when
+    // positive (a negative EMA reading is not a fill level -- see the
+    // decide() trip condition's own `fill_ema > 0` guard).
+    volatile uint32_t fill_ema_peak_bytes;
+
+    // Largest single trim's dropped-frame count -- design sec 5's "max
+    // single trim". resync_drops (above) is the cumulative sum across
+    // every trim; this is the high-water mark of one cut, folded in by
+    // pl_a2dp_resync_complete alongside resync_drops/resync_events.
+    volatile uint32_t max_trim_frames;
+
+    // AVDTP delay report (design sec 1's instrument gap: "AVDTP delay
+    // reports are received and ignored, a2dp.c:3204"). S1 only stores and
+    // prints the sink's own stated buffer, in the wire unit
+    // (A2DP_SUBEVENT_SIGNALING_DELAY_REPORT's delay_100us, i.e. 1/10ms) --
+    // acting on it (e.g. sizing the cushion from it) is out of scope here.
+    // have_delay_report distinguishes "never reported" (prints as such,
+    // not a false zero) from "reported exactly 0".
+    volatile uint32_t last_delay_100us;
+    volatile bool have_delay_report;
 } pl_a2dp_ctx_t;
 
 static pl_a2dp_ctx_t s_ctx;
@@ -1825,7 +1871,41 @@ static void pl_a2dp_fill(void) {
 //   `slot` above it before the tx_tail update that tells core1 the slot
 //   is free to reuse. Without it core1 could start overwriting the slot
 //   while this function is still mid-read of it.
+// Bead pico-link-8pp1.1, design sec 5: "no stall-duration counter (grant
+// gap)". 0 means "no grant observed yet this stream" (set at STREAM_STARTED
+// alongside the other high-water-mark resets) -- the first real grant of a
+// stream must not be measured against a stale timestamp from before it.
+// Single-writer (this function, core0's 0xFF IRQ context, same as every
+// other s_ctx write in this function), single-reader-never (nothing else
+// touches it), so a plain static needs no volatile/lock, same as
+// s_starve_episode_start_us below.
+static uint64_t s_last_grant_us;
+
 static void pl_a2dp_send_media_packet(void) {
+    // Bead pico-link-8pp1.1: measure the gap BEFORE any early return below,
+    // so a spurious grant (tx_count==0) still counts toward the real grant
+    // cadence -- what's being measured is "is the radio granting us
+    // CAN_SEND_MEDIA_PACKET_NOW at all", not "did we have something to
+    // send when it did".
+    uint64_t now_us = time_us_64();
+    if (s_last_grant_us != 0) {
+        uint32_t gap_us = (uint32_t)(now_us - s_last_grant_us);
+        if (gap_us > s_ctx.max_grant_gap_us) {
+            s_ctx.max_grant_gap_us = gap_us;
+        }
+        if (gap_us > 20000u) {
+            s_ctx.stall_episodes++;
+            s_ctx.stall_gap_over_20ms++;
+            if (gap_us > 50000u) {
+                s_ctx.stall_gap_over_50ms++;
+                if (gap_us > 100000u) {
+                    s_ctx.stall_gap_over_100ms++;
+                }
+            }
+        }
+    }
+    s_last_grant_us = now_us;
+
     s_ctx.grants++;
 
     if (pl_a2dp_tx_count() == 0) {
@@ -1988,14 +2068,85 @@ static volatile uint32_t s_trim_req_seq;
 static volatile uint32_t s_trim_ack_seq;
 static volatile uint32_t s_trim_dropped;
 
+// Bead pico-link-8pp1.1, design sec 3 ("The mechanism: a hold timer, not a
+// bigger target"): the trim's policy, core0-private, read only by
+// pl_a2dp_resync_decide below -- APPLY/COMPLETE and the trim-to-target
+// value are untouched by this bead (design sec 3's "Invariants"). Two
+// separate aligned 32-bit words, not a struct, matching this file's
+// existing convention for a value crossed between contexts without a lock
+// (e.g. s_debug_skip_media_ticks above): the writer is
+// pl_a2dp_debug_set_trim_policy(), called from debug_remote.c's poll
+// (PL_DEBUG_REMOTE, thread context, superloop); the reader is decide()
+// below, core0's media-timer IRQ. Each field is a single aligned word, so
+// a read can never observe a torn value, only a slightly-stale one (one
+// field updated, the other not yet) -- harmless for a live-tunable policy
+// knob with no safety property resting on the two fields changing
+// atomically together.
+//
+// Defaults are bit-identical to pre-8pp1.1 behaviour: hold_ms=0 means
+// soft_trip in decide() below fires on the SAME tick over_soft first turns
+// true (see decide()'s comment), and hard_band_bytes defaults to
+// PL_PCM_TRIM_BAND_BYTES -- the same 15ms band decide() has always used --
+// so with defaults, over_hard and soft_trip both become true at exactly
+// the same instant decide() used to trip, and the trim fires on the same
+// tick as before.
+static volatile uint32_t s_trim_hold_ms;
+static volatile uint32_t s_trim_hard_band_bytes = PL_PCM_TRIM_BAND_BYTES;
+
+#ifdef PL_DEBUG_REMOTE
+// Bead pico-link-8pp1.1: the CDC knob (debug_remote.c) calls this to
+// switch the policy live, no reflash -- design sec 5's measurement round
+// needs arms A1/B1/A2/B2 to share one build and one RF environment.
+// hard_band_ms is converted to bytes here (192 B/ms, same conversion this
+// file already uses inline at a2dp.c's STREAM_ESTABLISHED jitter_bytes
+// derivation) so decide() below never does unit conversion in its hot
+// path. Clamped to keep the hard band inside the ring's own headroom
+// (design sec 3: target 30ms + hard 70ms + ~64ms EMA ramp lag ~= 164ms <
+// the 32KB ring's 170ms capacity; anything above 70ms makes the
+// drop-newest overflow reachable before the hard trip) and the hold time to a sane upper
+// bound (a policy that never trips is a latent overflow, not a feature).
+// Thread-context caller only (debug_remote.c's poll, superloop) -- same
+// single-writer contract as s_debug_skip_media_ticks above.
+void pl_a2dp_debug_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms) {
+    if (hold_ms > 10000u) {
+        hold_ms = 10000u;
+    }
+    if (hard_band_ms > 70u) {
+        hard_band_ms = 70u;
+    }
+    s_trim_hold_ms = hold_ms;
+    s_trim_hard_band_bytes = hard_band_ms * 192u;
+}
+
+// Reports the CURRENT policy back in the same units the setter takes, for
+// the CDC "TRIM POLICY GET" command -- thread-context caller only, same
+// contract as the setter above.
+void pl_a2dp_debug_trim_policy(uint32_t *hold_ms, uint32_t *hard_band_ms) {
+    *hold_ms = s_trim_hold_ms;
+    *hard_band_ms = s_trim_hard_band_bytes / 192u;
+}
+#endif
+
 // Media-timer DECIDE phase, BOTH builds, same call site the old ifndef'd
-// fhf trim block used to occupy: after the ABR block, before fill/send-
-// kick. Unchanged trip condition from fhf (evaluated on the EMA, never raw
-// fill -- see the historical doc comment this replaces, preserved in the
-// design doc) plus one new guard: refuse while a request is outstanding,
-// so decide can never stack a second cut ahead of the first one's COMPLETE.
+// fhf trim block used to occupy. Bead pico-link-8pp1.1, design sec 3:
+// replaces the single fhf trip with two -- soft_trip (fill_ema over
+// today's 15ms band, continuously for s_trim_hold_ms) and over_hard
+// (fill_ema over target + s_trim_hard_band_bytes, immediate, an overflow
+// guard) -- either one fires the same trim-to-target this file has always
+// done. s_soft_over_since_us is this decide loop's own hold-timer state:
+// 0 means "not currently over the soft band"; any other value is the
+// instant it most recently became true. Reset to 0 on host_silent (a
+// paused host must not accrue hold time toward a trim it will never need
+// -- same reasoning as the ABR controller's host_silent gate above) and
+// whenever the EMA drops back under the soft band. The outstanding-request
+// guard is UNCHANGED from fhf/quzf: refuse to fire (or to update
+// last_resync_us) while a request is outstanding, so decide can never
+// stack a second cut ahead of the first one's COMPLETE.
+static uint64_t s_soft_over_since_us;
+
 static void pl_a2dp_resync_decide(uint64_t now_us, bool host_silent) {
     if (host_silent) {
+        s_soft_over_since_us = 0;
         return;
     }
     if (s_trim_req_seq != s_ctx.trim_seen_ack) {
@@ -2005,8 +2156,30 @@ static void pl_a2dp_resync_decide(uint64_t now_us, bool host_silent) {
     }
     int32_t fill_ema = pl_usb_audio_fb_fill_ema();
     uint32_t target = pl_pcm_target_fill_bytes();
-    if (fill_ema > 0 && (uint32_t)fill_ema > target + PL_PCM_TRIM_BAND_BYTES &&
-        (now_us - s_ctx.last_resync_us) > PL_PCM_TRIM_MIN_INTERVAL_US) {
+
+    // Bead pico-link-8pp1.1, design sec 5 instrumentation: fill_ema peak,
+    // updated whenever this decide loop actually reads a fresh EMA (i.e.
+    // not host_silent, no outstanding request) -- a no-op write when the
+    // EMA hasn't grown, so this costs nothing extra on the healthy-tick
+    // path below.
+    if (fill_ema > 0 && (uint32_t)fill_ema > s_ctx.fill_ema_peak_bytes) {
+        s_ctx.fill_ema_peak_bytes = (uint32_t)fill_ema;
+    }
+
+    bool over_soft = fill_ema > 0 && (uint32_t)fill_ema > target + PL_PCM_TRIM_BAND_BYTES;
+    if (!over_soft) {
+        s_soft_over_since_us = 0;
+    } else if (s_soft_over_since_us == 0) {
+        s_soft_over_since_us = now_us;
+    }
+    bool over_hard = fill_ema > 0 && (uint32_t)fill_ema > target + s_trim_hard_band_bytes;
+    // now_us - s_soft_over_since_us is 0 on the very tick over_soft first
+    // becomes true (s_soft_over_since_us was just set to now_us above), so
+    // with the default hold_ms=0 this is >= true immediately -- the
+    // bit-identical-to-today case the doc comment above promises.
+    bool soft_trip = over_soft && (now_us - s_soft_over_since_us) >= (uint64_t)s_trim_hold_ms * 1000u;
+
+    if ((over_hard || soft_trip) && (now_us - s_ctx.last_resync_us) > PL_PCM_TRIM_MIN_INTERVAL_US) {
         s_ctx.last_resync_us = now_us;
         __dmb(); // publish-after-write: order last_resync_us before the request that signals the applier
         s_trim_req_seq++;
@@ -2071,6 +2244,11 @@ static void pl_a2dp_resync_complete(void) {
     s_ctx.trim_seen_ack = ack;
     s_ctx.resync_drops += s_trim_dropped;
     s_ctx.resync_events++;
+    // Bead pico-link-8pp1.1, design sec 5: "max single trim" -- the
+    // high-water mark alongside resync_drops's running sum.
+    if (s_trim_dropped > s_ctx.max_trim_frames) {
+        s_ctx.max_trim_frames = s_trim_dropped;
+    }
     pl_usb_audio_fb_reset();
 }
 
@@ -3201,11 +3379,24 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
 
         case A2DP_SUBEVENT_SIGNALING_CAPABILITIES_DONE:
         case A2DP_SUBEVENT_SIGNALING_DELAY_REPORTING_CAPABILITY:
+            // Not acted on (no explicit negotiation -- the original a2dp
+            // pipeline design sec 4.1) but harmless to receive; no logging
+            // (would flood at signalling time) beyond what BTstack's own
+            // ENABLE_LOG_INFO already does.
+            break;
+
         case A2DP_SUBEVENT_SIGNALING_DELAY_REPORT:
-            // Not acted on in S1 (no explicit negotiation -- design sec
-            // 4.1) but harmless to receive; no logging (would flood at
-            // signalling time) beyond what BTstack's own ENABLE_LOG_INFO
-            // already does.
+            // Bead pico-link-8pp1.1, design sec 1's instrument gap: "AVDTP
+            // delay reports are received and ignored". S1 stores the
+            // sink's own stated buffer for pl_a2dp_report to print -- still
+            // not acted on (sizing anything from it is out of scope here),
+            // just no longer silently dropped. Thread context does not
+            // reach this handler (it's the same IRQ-context packet handler
+            // as every other A2DP_SUBEVENT_* case in this switch), so this
+            // is the same single-writer/thread-context-reader discipline as
+            // resync_drops etc above.
+            s_ctx.last_delay_100us = a2dp_subevent_signaling_delay_report_get_delay_100us(packet);
+            s_ctx.have_delay_report = true;
             break;
 
         case A2DP_SUBEVENT_STREAM_ESTABLISHED: {
@@ -3550,6 +3741,23 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // -- the conservation check sums it across the whole session.
             s_ctx.resync_events = 0;
             s_ctx.last_resync_us = 0;
+            // Bead pico-link-8pp1.1: same "a stall from a PRIOR stream must
+            // not poison this one's test window" reasoning, for S1's new
+            // high-water marks -- resync_drops's own precedent just above
+            // (a cumulative counter is NOT reset; a high-water mark IS).
+            // last_delay_100us/have_delay_report are deliberately NOT reset
+            // here: the sink reports its buffer at signalling time, which
+            // can predate this STREAM_STARTED, and a fresh connection's
+            // negotiation happens again before this point regardless.
+            s_ctx.max_grant_gap_us = 0;
+            s_ctx.stall_episodes = 0;
+            s_ctx.stall_gap_over_20ms = 0;
+            s_ctx.stall_gap_over_50ms = 0;
+            s_ctx.stall_gap_over_100ms = 0;
+            s_ctx.fill_ema_peak_bytes = 0;
+            s_ctx.max_trim_frames = 0;
+            s_last_grant_us = 0;
+            s_soft_over_since_us = 0;
 #ifndef PL_ENCODER_ON_CORE1
             // Bead pico-link-quzf, "Cancel at stream (re)arm": the OFF-
             // build twin of pl_a2dp_core1_arm_running's cancel above --
@@ -4217,6 +4425,47 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
         (unsigned long)s_ctx.level_push_count, (unsigned long)s_ctx.level_push_skip_empty,
         (unsigned long)s_ctx.level_push_skip_interval
     );
+    // Bead pico-link-8pp1.1, design sec 5: S1's stall/trim instrumentation
+    // -- stall episodes/max gap/histogram (grant-gap proxy for "was the
+    // radio congested"), fill_ema peak, max single trim size. Printed
+    // every report window, same cumulative-since-STREAM_STARTED convention
+    // as tx_depth_max/dwell_max_us above (all reset at STREAM_STARTED, see
+    // that handler's comment).
+    pl_log(
+        "a2dp: stall_episodes=%lu max_grant_gap_us=%lu stall_gap_over_20ms=%lu stall_gap_over_50ms=%lu "
+        "stall_gap_over_100ms=%lu fill_ema_peak_bytes=%lu max_trim_frames=%lu\r\n",
+        (unsigned long)s_ctx.stall_episodes, (unsigned long)s_ctx.max_grant_gap_us,
+        (unsigned long)s_ctx.stall_gap_over_20ms, (unsigned long)s_ctx.stall_gap_over_50ms,
+        (unsigned long)s_ctx.stall_gap_over_100ms, (unsigned long)s_ctx.fill_ema_peak_bytes,
+        (unsigned long)s_ctx.max_trim_frames
+    );
+    // Bead pico-link-8pp1.1: the trim policy currently in effect (design
+    // sec 5: arms need this in the log to know which one a given stretch
+    // of the capture belongs to) and the sink's own AVDTP delay report, if
+    // one has ever arrived -- design sec 1's instrument gap, now readable
+    // instead of silently dropped.
+#ifdef PL_DEBUG_REMOTE
+    uint32_t trim_hold_ms;
+    uint32_t trim_hard_band_ms;
+    pl_a2dp_debug_trim_policy(&trim_hold_ms, &trim_hard_band_ms);
+#else
+    // Bead pico-link-8pp1.1: the policy still exists (and still defaults to
+    // bit-identical-to-today) outside PL_DEBUG_REMOTE builds -- only the
+    // live-switch getters/setters are debug-only. Report it directly.
+    uint32_t trim_hold_ms = s_trim_hold_ms;
+    uint32_t trim_hard_band_ms = s_trim_hard_band_bytes / 192u;
+#endif
+    if (s_ctx.have_delay_report) {
+        pl_log(
+            "a2dp: trim_hold_ms=%lu trim_hard_band_ms=%lu sink_delay_100us=%lu\r\n", (unsigned long)trim_hold_ms,
+            (unsigned long)trim_hard_band_ms, (unsigned long)s_ctx.last_delay_100us
+        );
+    } else {
+        pl_log(
+            "a2dp: trim_hold_ms=%lu trim_hard_band_ms=%lu sink_delay_100us=none\r\n", (unsigned long)trim_hold_ms,
+            (unsigned long)trim_hard_band_ms
+        );
+    }
 }
 
 // Bead pico-link-auh, section 1: see a2dp.h's doc comment on this

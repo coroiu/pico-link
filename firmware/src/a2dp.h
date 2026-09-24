@@ -215,6 +215,21 @@ uint32_t pl_a2dp_credit_clamp_events(void);
 // only (debug_remote.c's poll, superloop). Compiled only when
 // PL_DEBUG_REMOTE is set; entirely absent from a shipping build.
 void pl_a2dp_debug_skip_media_ticks(uint32_t ticks);
+
+// Bead pico-link-8pp1.1, design sec 5: switches the resync trim's hold/
+// hard-band policy live, no reflash -- see a2dp.c's s_trim_hold_ms/
+// s_trim_hard_band_bytes doc comment for the single-writer discipline and
+// default-preserving clamp. hold_ms/hard_band_ms are both in milliseconds
+// (the setter converts hard_band_ms to bytes internally). Thread-context
+// caller only (debug_remote.c's poll, superloop). Compiled only when
+// PL_DEBUG_REMOTE is set.
+void pl_a2dp_debug_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms);
+
+// Reads back the policy pl_a2dp_debug_set_trim_policy last set (or the
+// compiled-in default, bit-identical to pre-8pp1.1 behaviour, if it was
+// never called) -- both units milliseconds, same as the setter. Thread-
+// context caller only, same contract as the setter above.
+void pl_a2dp_debug_trim_policy(uint32_t *hold_ms, uint32_t *hard_band_ms);
 #endif
 
 #endif // PL_A2DP_H
