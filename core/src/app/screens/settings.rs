@@ -12,14 +12,11 @@ use crate::render::{Action, FieldList, FieldRow, ListItemKey, Screen};
 use super::super::{DisplaySettingsState, ScreenCarry, ScreenId, SettingsPickerKind};
 use super::picker::{build_single_select_screen, PickerOption};
 
-/// The Settings screen's fixed title. Originally a placeholder (bead
-/// `pico-link-znb.8`/E7, giving Home's menu-face "Settings" row a real,
-/// reachable destination); real content landed with the screensaver
-/// dim/off + timeout setting (bead pico-link-qivj.2).
+/// The Settings screen's fixed title.
 pub(crate) const SETTINGS_TITLE: &str = "Settings";
 
 /// The Settings screen's two rows -- `IDLE SCREEN` (mode) and `IDLE AFTER`
-/// (timeout), each pushing its own picker. Design pico-link-qivj.1 S6.
+/// (timeout), each pushing its own picker.
 pub(crate) fn build_settings_screen(state: &Rc<RefCell<DisplaySettingsState>>, carry: &ScreenCarry) -> Screen {
     const ROW_MODE: u64 = 0;
     const ROW_TIMEOUT: u64 = 1;
