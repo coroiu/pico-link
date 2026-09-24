@@ -210,6 +210,11 @@ impl FieldRow {
 
 type OnActivateIndex = Box<dyn Fn(usize) -> Action>;
 
+/// Callback invoked with the selected row's **identity key** on activation.
+/// See [`FieldList::on_activate_key`]'s doc comment for why this exists
+/// alongside [`OnActivateIndex`] -- mirrors `list::OnActivateKey`.
+type OnActivateKey = Box<dyn Fn(ListItemKey) -> Action>;
+
 /// A focusable, scrolling field list — see the module doc for the shape
 /// this fills relative to `MenuList`/`VerticalList`.
 pub struct FieldList {
@@ -224,12 +229,19 @@ pub struct FieldList {
     focused: bool,
     style: RowStyle,
     on_activate_index: Option<OnActivateIndex>,
+    /// A live-model-backed alternative to [`Self::on_activate_index`] --
+    /// invoked with the selected row's [`ListItemKey`] rather than its
+    /// index, for a long-lived list (bead `pico-link-bgnd` M3) whose rows
+    /// are replaced in place via [`Self::set_rows`] and whose callback
+    /// resolves that key back to a live value at *press time* -- the exact
+    /// `VerticalList::on_activate_key` shape, mirrored here.
+    on_activate_key: Option<OnActivateKey>,
 }
 
 impl FieldList {
     #[must_use]
     pub fn new(rows: Vec<FieldRow>) -> Self {
-        Self { rows, selected: 0, top_index: Cell::new(0), focused: false, style: RowStyle::FIELD, on_activate_index: None }
+        Self { rows, selected: 0, top_index: Cell::new(0), focused: false, style: RowStyle::FIELD, on_activate_index: None, on_activate_key: None }
     }
 
     /// Registers a callback invoked with the selected row's index when
@@ -240,6 +252,39 @@ impl FieldList {
     pub fn on_activate_index(mut self, callback: impl Fn(usize) -> Action + 'static) -> Self {
         self.on_activate_index = Some(Box::new(callback));
         self
+    }
+
+    /// Registers a callback invoked with the selected row's **identity
+    /// key** (not its index) when the list is activated while focused **on
+    /// an [`FieldKind::Action`] row** -- same activation gate as
+    /// [`Self::on_activate_index`], see [`Self::on_focus`]'s `Activated`
+    /// arm. Takes precedence over `on_activate_index` if both are set --
+    /// mirrors `VerticalList::on_activate_key`'s doc comment for the full
+    /// reasoning (a long-lived list updated via [`Self::set_rows`] can have
+    /// its selected *index* mean a different row than at construction, but
+    /// keys don't drift).
+    #[must_use]
+    pub fn on_activate_key(mut self, callback: impl Fn(ListItemKey) -> Action + 'static) -> Self {
+        self.on_activate_key = Some(Box::new(callback));
+        self
+    }
+
+    /// Replaces this list's rows **in place**, preserving the current
+    /// selection by [`ListItemKey`] identity with an index-based fallback --
+    /// mirrors `VerticalList::set_items`'s exact rule (see that method's doc
+    /// comment for the full reasoning), so a long-lived field list (bead
+    /// `pico-link-bgnd` M3) can be updated on a live state change instead of
+    /// being reconstructed from scratch. The scroll-top row is left
+    /// untouched for the same reason `set_items` leaves it untouched --
+    /// `Widget::render`'s own `reconcile_top_index` call clamps it to the
+    /// new row count/viewport on the very next render.
+    pub fn set_rows(&mut self, rows: Vec<FieldRow>) {
+        let prev_key = self.selected_key();
+        let prev_index = self.selected;
+        self.rows = rows;
+        self.selected = prev_key
+            .and_then(|key| self.rows.iter().position(|row| row.key == Some(key)))
+            .unwrap_or_else(|| prev_index.min(self.rows.len().saturating_sub(1)));
     }
 
     /// Sets the initially selected row, clamped to the row list's bounds
@@ -347,6 +392,19 @@ impl Widget for FieldList {
             // cannot make an inert row act (field-list ruling §4.4).
             FocusEvent::Activated => match self.rows.get(self.selected).map(|row| row.kind) {
                 Some(FieldKind::Action) => {
+                    if let Some(callback) = &self.on_activate_key {
+                        return match self.rows.get(self.selected).and_then(|row| row.key) {
+                            Some(key) => callback(key),
+                            // Every real row this widget draws is expected
+                            // to carry a key when `on_activate_key` is in
+                            // use (mirrors `VerticalList::on_focus`'s
+                            // identical fallback) -- a keyless selected row
+                            // is not reachable in practice, but `Action::
+                            // None` is the harmless fallback rather than a
+                            // panic.
+                            None => Action::None,
+                        };
+                    }
                     self.on_activate_index.as_ref().map_or(Action::None, |callback| callback(self.selected))
                 }
                 Some(FieldKind::Readonly) | None => Action::None,
