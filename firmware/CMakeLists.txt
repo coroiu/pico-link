@@ -526,6 +526,8 @@ target_link_libraries(pico_link
     hardware_spi
     hardware_dma
     hardware_gpio
+    hardware_pwm
+    hardware_clocks
     hardware_watchdog
     ui_ffi
     # Bead pico-link-nli.2 (G1): needed ONLY for multicore_lockout_* (see

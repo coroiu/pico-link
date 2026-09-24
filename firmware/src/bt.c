@@ -768,6 +768,12 @@ typedef enum {
     // has the pending settings staged in its own s_settings_pending_addr,
     // same convention as PL_BT_PENDING_PERSIST_WRITE.
     PL_BT_PENDING_SET_DEVICE_LDAC_QUALITY,
+    // Bead pico-link-qivj.5 (S11): reuses this exact queue/heartbeat idiom
+    // for persist.c's PL:S:0 display-settings write -- same reentrancy
+    // reason as the other PL_BT_PENDING_* persist entries. Carries no
+    // addr -- persist.c already has the pending record staged in its own
+    // s_display_pending_mode/s_display_pending_timeout_s.
+    PL_BT_PENDING_SET_DISPLAY_SETTINGS,
 } pl_bt_pending_tag_t;
 
 typedef struct {
@@ -802,6 +808,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "FORGET_DEVICE";
         case PL_BT_PENDING_SET_DEVICE_LDAC_QUALITY:
             return "SET_DEVICE_LDAC_QUALITY";
+        case PL_BT_PENDING_SET_DISPLAY_SETTINGS:
+            return "SET_DISPLAY_SETTINGS";
         default:
             return "?";
     }
@@ -884,6 +892,11 @@ static void pl_bt_pending_service(void) {
                 // (persist.c's pl_persist_rmw, the shared RMW core).
                 pl_persist_execute_pending_ldac_quality_write();
                 break;
+            case PL_BT_PENDING_SET_DISPLAY_SETTINGS:
+                // Bead pico-link-qivj.5 (S11): same reentrancy contract as
+                // PL_BT_PENDING_PERSIST_WRITE above.
+                pl_persist_execute_pending_display_settings_write();
+                break;
         }
     }
 }
@@ -902,6 +915,11 @@ void pl_bt_enqueue_persist_write(void) {
 // Bead pico-link-7jol.5. See bt.h's doc comment.
 void pl_bt_enqueue_ldac_quality_write(void) {
     pl_bt_pending_push(PL_BT_PENDING_SET_DEVICE_LDAC_QUALITY, NULL);
+}
+
+// Bead pico-link-qivj.5 (S11). See bt.h's doc comment.
+void pl_bt_enqueue_display_settings_write(void) {
+    pl_bt_pending_push(PL_BT_PENDING_SET_DISPLAY_SETTINGS, NULL);
 }
 
 // Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the
@@ -1131,6 +1149,18 @@ void pl_bt_poll_commands(struct PlUi *ui) {
                 );
             }
             pl_persist_request_ldac_quality(addr, ldac_quality);
+            break;
+        }
+
+        case PL_COMMAND_TAG_SET_DISPLAY_SETTINGS: {
+            // Bead pico-link-qivj.5 (S11): C only persists -- core owns the
+            // live value and applies it itself via pl_ui_tick's own
+            // take_display_settings_to_apply() (S3/S4/S8, already landed).
+            // This handler's only job is staging the flash write.
+            uint8_t mode = command.payload.display_settings.mode;
+            uint16_t timeout_s = command.payload.display_settings.timeout_s;
+            pl_log("BT: PL_CMD_SET_DISPLAY_SETTINGS mode=%u timeout_s=%u\r\n", (unsigned)mode, (unsigned)timeout_s);
+            pl_persist_request_display_settings(mode, timeout_s);
             break;
         }
 

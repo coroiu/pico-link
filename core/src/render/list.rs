@@ -64,6 +64,17 @@ impl ListItemKey {
     pub const fn from_u64(id: u64) -> Self {
         Self(id.to_le_bytes())
     }
+
+    /// Recovers the `u64` id a [`Self::from_u64`]-built key was constructed
+    /// from. Meaningless for a key built any other way (e.g.
+    /// [`Self::from`]'s device-address widening) -- callers only use this
+    /// on keys they know came from `from_u64` in the first place (e.g. a
+    /// settings picker's `on_pick`, which only ever sees keys it minted
+    /// itself via `from_u64`).
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        u64::from_le_bytes(self.0)
+    }
 }
 
 impl From<[u8; 6]> for ListItemKey {

@@ -21,12 +21,30 @@ pub use crate::render::FrameBuffer565;
 
 /// Requested display power state, for the idle-screensaver seam. `Off`
 /// means "blank the display to save power / avoid burn-in while idle";
-/// `On` means "restore normal output". `crate::run::run` is the caller
-/// that drives these transitions off its idle-input clock.
+/// `Dim` means "keep content visible at a reduced backlight level"; `On`
+/// means "restore normal output". `crate::run::run` is the caller that
+/// drives these transitions off its idle-input clock, per
+/// `crate::power::ScreensaverMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayPower {
     On,
+    /// Backlight reduced to `crate::power::DIM_BACKLIGHT_PERMILLE`; content
+    /// still rendered and visible.
+    Dim,
     Off,
+}
+
+impl DisplayPower {
+    /// Backlight level, out of 1000 (permille): `On` = 1000, `Off` = 0,
+    /// `Dim` = `crate::power::DIM_BACKLIGHT_PERMILLE`.
+    #[must_use]
+    pub const fn backlight_permille(self) -> u16 {
+        match self {
+            Self::On => 1000,
+            Self::Dim => crate::power::DIM_BACKLIGHT_PERMILLE,
+            Self::Off => 0,
+        }
+    }
 }
 
 /// Transfers the shared framebuffer to a physical or virtual display.

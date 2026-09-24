@@ -305,6 +305,17 @@ pub struct IdlePolicy {
     deep_sleep_triggered: bool,
     idle_timeout: Option<Duration>,
     deep_sleep_timeout: Option<Duration>,
+    /// What the screensaver does once `Asleep` -- `Off` blanks, `Dim`
+    /// keeps content visible at a reduced backlight (design
+    /// `.planning/design/2026-09-24-screensaver-dim-and-timeout.md`,
+    /// Andreas's decisions on pico-link-qivj.2). Set via
+    /// [`IdlePolicy::configure`]; `Off` at construction.
+    mode: crate::power::ScreensaverMode,
+    /// The literal mute/zero-volume floor: `true` whenever the most recent
+    /// `tick` observed `mute_or_zero`. While set, `Asleep` renders as
+    /// `Dim` regardless of `mode` (Andreas's Q1 ruling: muted/zero volume
+    /// + idle always lands on Dim, never Off).
+    dim_floor: bool,
     /// The wake-on-fault floor's expiry, if a fault wake is currently
     /// holding the display on (design §7.5's third, *expiring* floor,
     /// alongside the mute/zero floor above). `Some(until)` while active;
@@ -339,10 +350,24 @@ impl IdlePolicy {
             deep_sleep_triggered: false,
             idle_timeout,
             deep_sleep_timeout,
+            mode: crate::power::ScreensaverMode::Off,
+            dim_floor: false,
             fault_hold_until: None,
             fault_wake_last: None,
             fault_wake_session_count: 0,
         }
+    }
+
+    /// Overwrites `idle_timeout`, `deep_sleep_timeout` and `mode` in place
+    /// -- everything else (`power_state`, `last_input`, the fault-wake
+    /// bookkeeping) is left untouched, so applying a settings change
+    /// mid-run never resets the idle clock or drops an in-progress fault
+    /// hold. The next arm decision (screensaver or deep-sleep) picks up
+    /// the new values immediately.
+    pub fn configure(&mut self, idle_timeout: Option<Duration>, deep_sleep_timeout: Option<Duration>, mode: crate::power::ScreensaverMode) {
+        self.idle_timeout = idle_timeout;
+        self.deep_sleep_timeout = deep_sleep_timeout;
+        self.mode = mode;
     }
 
     /// The wake half. Call synchronously when a non-empty input batch has
@@ -378,8 +403,8 @@ impl IdlePolicy {
     /// Lazily initializes `last_input` to `now` on the very first call
     /// (see the type doc). Any frame with `had_input == true` resets
     /// `last_input` to `now`, mirroring the module doc's "Idle/wake"
-    /// pseudocode. Every frame first evaluates the `mute_or_zero` floor
-    /// (see below), independent of `had_input` -- a volume event is never
+    /// pseudocode. Every frame first records the `mute_or_zero` floor (see
+    /// below), independent of `had_input` -- a volume event is never
     /// itself routed through the `had_input`/[`IdlePolicy::on_input`] path
     /// (see [`crate::app::VolumeState::wakes_idle`]'s doc comment for why
     /// that's a *separate*, event-driven wake), so a mute/zero reading
@@ -387,13 +412,14 @@ impl IdlePolicy {
     /// waiting for the next real input. A frame with no input then
     /// evaluates, in order:
     ///
-    /// - the screensaver tier: blanks (`power_transition = Some(Off)`) once
-    ///   `Active && at_home_root && !mute_or_zero && now - last_input >=
-    ///   idle_timeout`. `mute_or_zero` gates this exactly like
-    ///   `at_home_root` already does -- design section 5.4: entering mute
-    ///   or zero must never itself cause a blank, and an idle timeout that
-    ///   elapses while already muted/zero must land on the dim floor
-    ///   (i.e. stay `On`), not `Off`.
+    /// - the screensaver tier: goes `Asleep` once `Active && at_home_root
+    ///   && !fault_hold && now - last_input >= idle_timeout`, rendering as
+    ///   [`DisplayPower::Dim`] or [`DisplayPower::Off`] per
+    ///   [`IdlePolicy::display_power`] (mode and the mute/zero floor,
+    ///   below). Unlike the fault-hold floor, the mute/zero floor no
+    ///   longer gates *arming* -- entering mute/zero never itself blanks
+    ///   or un-blanks the screen; it only changes what an already-`Asleep`
+    ///   screen renders as.
     /// - the deep-sleep tier (independent of the screensaver's own
     ///   `PowerState`, per the module doc's "Deep sleep" section): fires
     ///   at most once, when `!deep_sleep_triggered && now - last_input >=
@@ -402,22 +428,20 @@ impl IdlePolicy {
     /// Either tier is permanently disabled by passing `None` for its
     /// timeout.
     ///
-    /// # The mute/zero floor (design section 5.4) -- "dim", not a new
-    /// `DisplayPower` variant
+    /// # The mute/zero floor -- a literal `Dim`
     ///
-    /// This project's backlight is a plain digital GPIO (see
-    /// `firmware/src/st7789.c`'s `st7789_set_backlight`) -- there is no PWM
-    /// brightness control to build a literal dimmer physical level from.
-    /// "Dim" is therefore implemented as a *policy* floor, not a third
-    /// [`DisplayPower`] variant: the screen is simply never allowed to
-    /// reach `Off` while `mute_or_zero` holds, and an already-`Off` screen
-    /// self-heals straight back to `On` the moment `mute_or_zero` becomes
-    /// true (the block below, evaluated before the `had_input` early
-    /// return). Both read as ordinary `On` at the `DisplaySurface` level --
-    /// the behavioral distinction the design cares about (never blank,
-    /// don't extend the idle timer) is fully captured without it. If real
-    /// PWM brightness ever lands, this is the one place that would gain a
-    /// genuine dim level.
+    /// As of pico-link-qivj.2 the backlight is real PWM (GP13, see
+    /// `firmware/src/st7789.c`'s `st7789_set_backlight_permille`), so
+    /// "dim" is a literal [`DisplayPower::Dim`] level, not a policy floor
+    /// that merely stayed `On`. `dim_floor` (set every tick from
+    /// `mute_or_zero`) forces `display_power()` to return `Dim` instead of
+    /// `Off` whenever the screen is `Asleep`, regardless of
+    /// [`ScreensaverMode`](crate::power::ScreensaverMode) -- Andreas's Q1
+    /// ruling on pico-link-qivj.2: muted/zero volume + idle always lands
+    /// on `Dim`, never `Off`, in either screensaver mode. It never
+    /// promotes `Asleep` back to `Active` (that would extend the idle
+    /// timer) and never arms the screensaver early either -- it only
+    /// changes what an already-idle screen renders as.
     // Four independent boolean inputs, not a bitflags/enum bundle: each
     // one is read from a different source at the call site (input poll,
     // `App::is_at_home_root`, `PowerControl::on_external_power`,
@@ -439,6 +463,14 @@ impl IdlePolicy {
         let last_input = *self.last_input.get_or_insert(now);
         let mut decision = IdleDecision::default();
 
+        // The literal mute/zero floor (Andreas's Q1): recorded every tick,
+        // independent of `had_input` -- a volume event never itself routes
+        // through `had_input`/`on_input` (see `VolumeState::wakes_idle`'s
+        // doc comment), so a mute/zero reading that arrived between ticks
+        // must still surface here rather than waiting for the next real
+        // input.
+        self.dim_floor = mute_or_zero;
+
         // The fault-wake floor: expire it first (clearing it if `now` has
         // reached it) so the screensaver-arm check below sees an
         // up-to-date value in the SAME tick the hold expires -- this is
@@ -446,17 +478,18 @@ impl IdlePolicy {
         // (design `.planning/design/2026-09-07-home-fault-strip.md` §7.3).
         let fault_hold = self.fault_hold_active(now);
 
-        // The mute/zero and fault-hold floors: an already-blanked screen
-        // must never stay blank while either holds (design section 5.4 for
-        // mute/zero; audio-fault-model §7.5 for the fault hold) --
-        // checked unconditionally, ahead of the `had_input` early return,
-        // since neither promotion is "input" and must not reset
-        // `last_input` (see `VolumeState::wakes_idle`'s doc comment:
-        // that's the separate, event-driven "wakes to full" case, which
-        // goes through the ordinary `on_input`/`had_input` path instead).
-        if self.power_state == PowerState::Asleep && (mute_or_zero || fault_hold) {
+        // The fault-hold floor: an already-Asleep screen must never stay
+        // that way while a fault wake holds it on (audio-fault-model
+        // §7.5) -- checked unconditionally, ahead of the `had_input` early
+        // return, since a fault-hold promotion is not "input" and must not
+        // reset `last_input`. The mute/zero floor no longer needs a
+        // separate self-heal branch here: it is now a literal `Dim`
+        // level applied by `display_power()` below, not a `PowerState`
+        // promotion (Andreas's Q1 ruling on pico-link-qivj.2 -- muted/zero
+        // + idle stays `Asleep`, just rendered as `Dim`).
+        if self.power_state == PowerState::Asleep && fault_hold {
             self.power_state = PowerState::Active;
-            decision.power_transition = Some(DisplayPower::On);
+            decision.power_transition = Some(self.display_power());
         }
 
         if had_input {
@@ -473,12 +506,11 @@ impl IdlePolicy {
         if let Some(idle_timeout) = self.idle_timeout {
             if self.power_state == PowerState::Active
                 && at_home_root
-                && !mute_or_zero
                 && !fault_hold
                 && now.saturating_duration_since(last_input) >= idle_timeout
             {
                 self.power_state = PowerState::Asleep;
-                decision.power_transition = Some(DisplayPower::Off);
+                decision.power_transition = Some(self.display_power());
             }
         }
 
@@ -566,7 +598,13 @@ impl IdlePolicy {
     pub fn display_power(&self) -> DisplayPower {
         match self.power_state {
             PowerState::Active => DisplayPower::On,
-            PowerState::Asleep => DisplayPower::Off,
+            PowerState::Asleep => {
+                if self.mode == crate::power::ScreensaverMode::Dim || self.dim_floor {
+                    DisplayPower::Dim
+                } else {
+                    DisplayPower::Off
+                }
+            }
         }
     }
 }
@@ -644,6 +682,13 @@ pub struct Runner {
     /// The idle/deep-sleep decision, extracted into a `Platform`-free unit
     /// shared with `ui-ffi` -- see [`IdlePolicy`]'s doc comment.
     idle: IdlePolicy,
+    /// The display power level last applied to `platform.display()`. Used
+    /// to diff against `self.idle.display_power()` every step so a level
+    /// change (`On` -> `Dim`, `Dim` -> `Off`, etc.) is applied exactly
+    /// once, regardless of which of the three levels it started or ended
+    /// on -- replaces the old edge-triggered `IdleDecision::power_transition`
+    /// consumption, which only knew about two levels.
+    applied_power: DisplayPower,
 }
 
 impl Runner {
@@ -664,6 +709,7 @@ impl Runner {
             flush_errors: FlushErrorTracker::new("DisplaySurface::flush"),
             power_errors: FlushErrorTracker::new("DisplaySurface::set_power"),
             idle: IdlePolicy::new(idle_timeout, deep_sleep_timeout),
+            applied_power: DisplayPower::On,
         }
     }
 
@@ -696,11 +742,25 @@ impl Runner {
                     Ok(()) => self.power_errors.on_ok(),
                     Err(error) => self.power_errors.on_err(&error),
                 }
+                self.applied_power = DisplayPower::On;
                 app.mark_dirty();
             } else {
                 app.handle_input(intents);
                 outcome = StepOutcome::InputHandled;
             }
+        }
+
+        // A settings change picked on the Settings screen this step: apply
+        // it to the live `IdlePolicy` (so the very next arm decision uses
+        // it) and, separately, persist it if the save latch is set. Two
+        // independent latches on `App` (see `DisplaySettingsState`'s doc
+        // comment) -- `configure` never itself triggers a save, and a save
+        // never re-seeds `configure` a second time.
+        if let Some(settings) = app.take_display_settings_to_apply() {
+            self.idle.configure(settings.idle_timeout(), settings.deep_sleep_timeout(), settings.mode);
+        }
+        if let Some(settings) = app.take_display_settings_to_save() {
+            let _ = settings.save(platform.storage());
         }
 
         // `IdlePolicy::tick` updates `last_input` (if `had_input`) and
@@ -719,11 +779,27 @@ impl Runner {
             platform.power().on_external_power(),
             app.volume_requires_dim_floor(),
         );
-        if let Some(power) = decision.power_transition {
-            match platform.display().set_power(power) {
+        // Level-diff, not edge: `IdleDecision::power_transition` still
+        // exists for callers that want the "did anything change" signal,
+        // but `Runner::step` now re-derives the target level from
+        // `display_power()` every step and applies it exactly when it
+        // differs from what was last applied -- the only shape that
+        // handles three levels correctly (an On->Dim->Off sequence with
+        // no edge in between the tick that decided Dim and the tick that
+        // decided Off would otherwise be missed).
+        let level = self.idle.display_power();
+        if level != self.applied_power {
+            match platform.display().set_power(level) {
                 Ok(()) => self.power_errors.on_ok(),
                 Err(error) => self.power_errors.on_err(&error),
             }
+            if level != DisplayPower::Off {
+                // Dim still renders content -- force a fresh flush on the
+                // On<->Dim transition even if nothing else changed this
+                // step (mirrors the wake-from-Off `mark_dirty` above).
+                app.mark_dirty();
+            }
+            self.applied_power = level;
         }
         if decision.enter_deep_sleep {
             platform.power().enter_deep_sleep();
@@ -745,7 +821,7 @@ impl Runner {
         // deliberately stays untouched by this gate (not cleared, not
         // read via `render()`) — a dirty flag survives blanked frames so
         // the next real wake renders it immediately.
-        if app.dirty() && self.idle.display_power() == DisplayPower::On {
+        if app.dirty() && self.idle.display_power() != DisplayPower::Off {
             #[cfg(feature = "frame-timing")]
             let render_start = platform.clock().now();
 
@@ -1161,18 +1237,36 @@ mod tests {
         }
     }
 
+    /// Like [`StubStorage`] (`get` always `None`), but records every `set`
+    /// call -- used by the display-settings save-latch tests below to
+    /// prove `Runner::step` actually calls `DisplaySettings::save`.
+    #[derive(Default, Clone)]
+    struct RecordingStorage {
+        sets: Rc<RefCell<Vec<(alloc::string::String, Vec<u8>)>>>,
+    }
+    impl crate::platform::Storage for RecordingStorage {
+        type Error = Infallible;
+        fn get(&self, _key: &str) -> Option<Vec<u8>> {
+            None
+        }
+        fn set(&mut self, key: &str, value: Vec<u8>) -> Result<(), Self::Error> {
+            self.sets.borrow_mut().push((key.into(), value));
+            Ok(())
+        }
+    }
+
     struct RecordingPlatform {
         display: RecordingDisplay,
         input: QueuedInput,
         clock: ControllableClock,
-        storage: StubStorage,
+        storage: RecordingStorage,
         power: RecordingPower,
     }
     impl Platform for RecordingPlatform {
         type Display = RecordingDisplay;
         type Input = QueuedInput;
         type Clock = ControllableClock;
-        type Storage = StubStorage;
+        type Storage = RecordingStorage;
         type Power = RecordingPower;
 
         fn display(&mut self) -> &mut Self::Display {
@@ -1202,6 +1296,7 @@ mod tests {
         clock: ControllableClock,
         power_calls: Rc<RefCell<Vec<crate::platform::DisplayPower>>>,
         flush_count: Rc<RefCell<u32>>,
+        storage_sets: Rc<RefCell<Vec<(alloc::string::String, Vec<u8>)>>>,
     }
 
     /// `inputs` is the exact per-iteration `NavIntent` script `QueuedInput`
@@ -1210,14 +1305,15 @@ mod tests {
         let clock = ControllableClock::new();
         let power_calls = Rc::new(RefCell::new(Vec::new()));
         let flush_count = Rc::new(RefCell::new(0));
+        let storage_sets = Rc::new(RefCell::new(Vec::new()));
         let platform = RecordingPlatform {
             display: RecordingDisplay { power_calls: Rc::clone(&power_calls), flush_count: Rc::clone(&flush_count) },
             input: QueuedInput(inputs),
             clock: clock.clone(),
-            storage: StubStorage,
+            storage: RecordingStorage { sets: Rc::clone(&storage_sets) },
             power: RecordingPower::new(false),
         };
-        RecordingSetup { platform, clock, power_calls, flush_count }
+        RecordingSetup { platform, clock, power_calls, flush_count, storage_sets }
     }
 
     #[test]
@@ -1255,7 +1351,7 @@ mod tests {
     fn no_input_past_the_idle_timeout_blanks_the_display_exactly_once_and_stops_flushing() {
         let idle_timeout = Duration::from_secs(120);
         // Never any input at all -- every poll returns empty.
-        let RecordingSetup { mut platform, clock, power_calls, flush_count } = recording_platform(vec![Vec::new(); 3]);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count, .. } = recording_platform(vec![Vec::new(); 3]);
         let mut app = App::new(240, 240);
 
         let mut iterations = 0;
@@ -1286,7 +1382,7 @@ mod tests {
         // the clock jumps past the timeout first -> Off. Iteration 3: a
         // `Next` intent arrives while Asleep -> should wake (On) and be
         // dropped, NOT reach `app.handle_input`.
-        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(), Vec::new(), vec![NavIntent::Down]]);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count: _, .. } = recording_platform(vec![Vec::new(), Vec::new(), vec![NavIntent::Down]]);
         let mut app = App::new(240, 240);
         // Home (the root screen since `pico-link-znb.8`/E7) has no
         // focusable list on its default status face -- `Down` is
@@ -1333,7 +1429,7 @@ mod tests {
         // where the first call left off) with one more `Next` proves input
         // delivery still works normally once Active: this time the intent
         // reaches `app.handle_input` and moves the selection.
-        let RecordingSetup { mut platform, clock: _, power_calls: power_calls2, flush_count: _ } = recording_platform(vec![vec![NavIntent::Down]]);
+        let RecordingSetup { mut platform, clock: _, power_calls: power_calls2, flush_count: _, .. } = recording_platform(vec![vec![NavIntent::Down]]);
         let mut iterations2 = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), Some(idle_timeout), None, || {
             iterations2 += 1;
@@ -1355,7 +1451,7 @@ mod tests {
         // idle-timeout-sized step (well past any timeout that would
         // matter) -- with `idle_timeout: None`, none of that may ever
         // result in a `set_power` call.
-        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(); 10]);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count: _, .. } = recording_platform(vec![Vec::new(); 10]);
         let mut app = App::new(240, 240);
 
         let mut iterations = 0;
@@ -1379,7 +1475,7 @@ mod tests {
         // see `waking_input_is_swallowed_but_the_next_input_reaches_the_app`
         // above for the same pattern.
         let idle_timeout = Duration::from_secs(60);
-        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(); 3]);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count: _, .. } = recording_platform(vec![Vec::new(); 3]);
         let mut app = App::new(240, 240);
         app.push_screen_for_test(crate::render::Screen::new("probe", alloc::vec![]));
         assert_eq!(app.navigator_depth(), 2, "sanity: not at Home root");
@@ -1405,7 +1501,7 @@ mod tests {
         // in for "the user opened Devices, then backed out to Home",
         // without depending on the real Devices/wizard screens.
         let idle_timeout = Duration::from_secs(60);
-        let RecordingSetup { mut platform, clock, power_calls, flush_count: _ } = recording_platform(vec![Vec::new(); 3]);
+        let RecordingSetup { mut platform, clock, power_calls, flush_count: _, .. } = recording_platform(vec![Vec::new(); 3]);
         let mut app = App::new(240, 240);
         app.push_screen_for_test(crate::render::Screen::new("probe", alloc::vec![]));
         app.pop_screen_for_test();
@@ -1532,6 +1628,83 @@ mod tests {
 
         assert_eq!(power.deep_sleep_call_count(), 0, "deep_sleep_timeout: None must disable the tier entirely");
     }
+
+    // --- pico-link-qivj.2: `Runner::step`'s `DisplaySettings` apply/save
+    // wiring (S4) -- proves `App::take_display_settings_to_apply`/`_to_save`
+    // are actually drained and acted on, using `ControllableClock` so a
+    // 30-second `ScreensaverTimeout` option can be crossed with zero real
+    // wall-clock time (the emulator's own e2e test, which only has a real
+    // `HostClock` available, cannot do this -- see that test module's doc
+    // comment).
+
+    #[test]
+    fn a_picked_display_setting_is_applied_to_the_live_idle_policy_the_very_next_step() {
+        let idle_timeout = crate::power::ScreensaverTimeout::Sec30.as_secs();
+        let RecordingSetup { mut platform, clock, power_calls, .. } = recording_platform(vec![Vec::new(); 3]);
+        let mut app = App::new(240, 240);
+        app.set_display_settings(crate::power::DisplaySettings {
+            mode: crate::power::ScreensaverMode::Dim,
+            timeout: crate::power::ScreensaverTimeout::Sec30,
+        });
+
+        // `run`'s own `idle_timeout` param is `None` here -- the point of
+        // this test is that the *applied* setting (Dim, 30s), not this
+        // param, is what actually governs the screensaver.
+        let mut iterations = 0;
+        run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {
+            iterations += 1;
+            if iterations == 2 {
+                clock.advance(Duration::from_secs(u64::from(idle_timeout)) + Duration::from_millis(1));
+            }
+            iterations <= 3
+        });
+
+        assert_eq!(
+            *power_calls.borrow(),
+            vec![crate::platform::DisplayPower::Dim],
+            "the picked Dim mode + 30s timeout must be applied and drive the screensaver, proving `None` (run's own param) was overridden"
+        );
+    }
+
+    #[test]
+    fn picking_a_screensaver_mode_on_the_settings_screen_persists_it_exactly_once() {
+        // Drives the real Settings picker through ordinary input, end to
+        // end: Home status -> menu face, Down to Settings, Select opens
+        // it, Select opens the ScreensaverMode picker (row 0, "IDLE
+        // SCREEN"), Select picks its first option -- proving
+        // `Runner::step` actually persists a real user pick, not just a
+        // hand-built `DisplaySettings` value.
+        let RecordingSetup { mut platform, storage_sets, .. } = recording_platform(vec![
+            vec![NavIntent::Select],
+            vec![NavIntent::Down],
+            vec![NavIntent::Select],
+            vec![NavIntent::Select],
+            vec![NavIntent::Select],
+            Vec::new(),
+        ]);
+        let mut app = App::new(240, 240);
+
+        let mut iterations = 0;
+        run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {
+            iterations += 1;
+            iterations <= 6
+        });
+
+        let sets = storage_sets.borrow();
+        assert_eq!(sets.len(), 1, "exactly one save, for the one pick made");
+        assert_eq!(sets[0].0, crate::power::DisplaySettings::STORAGE_KEY);
+    }
+
+    #[test]
+    fn set_display_settings_seeds_apply_but_never_save() {
+        // Same assertion as the test above, phrased directly against
+        // `App`'s own latch semantics rather than through `Runner::step`,
+        // so a future change to either side breaks the right test.
+        let mut app = App::new(240, 240);
+        app.set_display_settings(crate::power::DisplaySettings::default());
+        assert!(app.take_display_settings_to_apply().is_some(), "seeding must mark apply_pending");
+        assert!(app.take_display_settings_to_save().is_none(), "seeding must NOT mark save_pending");
+    }
 }
 
 /// Direct [`IdlePolicy`] unit tests -- no `Platform` stub needed at all,
@@ -1627,50 +1800,101 @@ mod idle_policy_tests {
     // section 5.4's `mute_or_zero` floor, at the `IdlePolicy` level ---
 
     #[test]
-    fn mute_or_zero_prevents_blanking_even_past_the_idle_timeout() {
+    fn mute_or_zero_past_the_idle_timeout_lands_on_dim_not_on() {
+        // Andreas's Q1 ruling (pico-link-qivj.2): muted/zero + idle goes to
+        // Dim, never stays On and never goes Off.
         let idle_timeout = Duration::from_secs(60);
         let mut policy = IdlePolicy::new(Some(idle_timeout), None);
         let t0 = Instant::from_micros(0);
         policy.tick(t0, false, true, true, false);
 
         let decision = policy.tick(t0 + idle_timeout, false, true, true, true);
-        assert_eq!(decision.power_transition, None, "must not blank while mute_or_zero holds");
-        assert_eq!(policy.display_power(), DisplayPower::On);
+        assert_eq!(decision.power_transition, Some(DisplayPower::Dim));
+        assert_eq!(policy.display_power(), DisplayPower::Dim);
     }
 
     #[test]
-    fn mute_or_zero_promotes_an_already_asleep_policy_back_to_on() {
+    fn mute_or_zero_while_asleep_in_off_mode_reads_as_dim_and_unmuting_returns_to_off() {
         let idle_timeout = Duration::from_secs(60);
         let mut policy = IdlePolicy::new(Some(idle_timeout), None);
         let t0 = Instant::from_micros(0);
         policy.tick(t0, false, true, true, false);
         policy.tick(t0 + idle_timeout, false, true, true, false);
-        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
+        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep in Off mode");
 
+        // Mute/zero arrives while already Asleep: no `PowerState` promotion
+        // (still Asleep), but the rendered level becomes Dim.
         let decision = policy.tick(t0 + idle_timeout + Duration::from_secs(1), false, true, true, true);
-        assert_eq!(decision.power_transition, Some(DisplayPower::On), "an already-blank display must self-heal once mute_or_zero holds");
-        assert_eq!(policy.display_power(), DisplayPower::On);
+        assert_eq!(decision.power_transition, None, "mute/zero is a rendering floor, not a PowerState promotion");
+        assert_eq!(policy.display_power(), DisplayPower::Dim);
+
+        // Unmuting with no other activity returns to Off immediately.
+        let decision = policy.tick(t0 + idle_timeout + Duration::from_secs(2), false, true, true, false);
+        assert_eq!(decision.power_transition, None, "display_power() is polled by level, not edge-signalled here");
+        assert_eq!(policy.display_power(), DisplayPower::Off);
     }
 
     #[test]
-    fn mute_or_zero_promotion_does_not_extend_the_idle_timer() {
+    fn mute_does_not_extend_the_idle_timer() {
         let idle_timeout = Duration::from_secs(60);
         let mut policy = IdlePolicy::new(Some(idle_timeout), None);
         let t0 = Instant::from_micros(0);
         policy.tick(t0, false, true, true, false);
-        policy.tick(t0 + idle_timeout, false, true, true, false);
-        assert_eq!(policy.display_power(), DisplayPower::Off, "sanity: asleep");
 
-        // Promote back on while mute/zero holds...
-        policy.tick(t0 + idle_timeout + Duration::from_secs(1), false, true, true, true);
+        // Mute/zero holds continuously from before the timeout through
+        // after it; the idle clock must still be anchored to `t0`, not
+        // reset by the mute/zero reads themselves.
+        policy.tick(t0 + Duration::from_secs(30), false, true, true, true);
+        assert_eq!(policy.display_power(), DisplayPower::On, "not yet idle");
+
+        policy.tick(t0 + idle_timeout, false, true, true, true);
+        assert_eq!(policy.display_power(), DisplayPower::Dim, "idle timeout elapsed on schedule despite mute/zero reads");
+    }
+
+    #[test]
+    fn dim_mode_past_the_idle_timeout_reads_as_dim() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        policy.configure(Some(idle_timeout), None, crate::power::ScreensaverMode::Dim);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+
+        let decision = policy.tick(t0 + idle_timeout, false, true, true, false);
+        assert_eq!(decision.power_transition, Some(DisplayPower::Dim));
+        assert_eq!(policy.display_power(), DisplayPower::Dim);
+    }
+
+    #[test]
+    fn configure_mid_run_changes_the_next_arm() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+
+        // Switch to Dim mode before the timeout elapses.
+        policy.configure(Some(idle_timeout), None, crate::power::ScreensaverMode::Dim);
+
+        let decision = policy.tick(t0 + idle_timeout, false, true, true, false);
+        assert_eq!(decision.power_transition, Some(DisplayPower::Dim), "the new mode applies to the very next arm");
+    }
+
+    #[test]
+    fn fault_wake_from_dim_goes_on_then_hold_expiry_returns_to_dim() {
+        let idle_timeout = Duration::from_secs(60);
+        let mut policy = IdlePolicy::new(Some(idle_timeout), None);
+        policy.configure(Some(idle_timeout), None, crate::power::ScreensaverMode::Dim);
+        let t0 = Instant::from_micros(0);
+        policy.tick(t0, false, true, true, false);
+        policy.tick(t0 + idle_timeout, false, true, true, false);
+        assert_eq!(policy.display_power(), DisplayPower::Dim, "sanity: asleep, dim mode");
+
+        let fault_wake_at = t0 + idle_timeout + Duration::from_secs(1);
+        assert!(policy.on_fault_wake(fault_wake_at));
         assert_eq!(policy.display_power(), DisplayPower::On);
 
-        // ...then un-mute with no other activity: the very next tick must
-        // blank again almost immediately (the original idle timeout has
-        // already long elapsed since `t0`) -- the promotion above must not
-        // have reset `last_input`.
-        let decision = policy.tick(t0 + idle_timeout + Duration::from_secs(2), false, true, true, false);
-        assert_eq!(decision.power_transition, Some(DisplayPower::Off), "un-muting must not have extended the idle timer");
+        let decision = policy.tick(fault_wake_at + FAULT_WAKE_HOLD + Duration::from_secs(1), false, true, true, false);
+        assert_eq!(decision.power_transition, Some(DisplayPower::Dim), "hold expiry returns to the configured Dim mode, not Off");
+        assert_eq!(policy.display_power(), DisplayPower::Dim);
     }
 
     #[test]

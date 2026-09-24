@@ -26,7 +26,7 @@
 //!   widgets.
 //! - [`power`]: [`power::DEFAULT_IDLE_TIMEOUT`] (the idle-screensaver
 //!   timeout, `Ta`), [`power::DEFAULT_DEEP_SLEEP_TIMEOUT`] (`Tb`), and
-//!   [`power::IdlePowerSetting`] (the single persisted toggle covering
+//!   [`power::DisplaySettings`] (the single persisted setting covering
 //!   both power tiers).
 //! - [`app::App`]: the platform-free application state — a `Navigator`
 //!   built once over a placeholder root screen.
@@ -67,5 +67,8 @@ pub use app::{
 };
 pub use input::NavIntent;
 pub use panel::{Button, Edge, PanelOrientation, PANEL};
-pub use power::{IdlePowerSetting, DEFAULT_DEEP_SLEEP_TIMEOUT, DEFAULT_IDLE_TIMEOUT};
+pub use power::{
+    DisplaySettings, ScreensaverMode, ScreensaverTimeout, DEFAULT_DEEP_SLEEP_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
+    DIM_BACKLIGHT_PERMILLE,
+};
 pub use run::run;

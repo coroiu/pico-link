@@ -102,6 +102,23 @@ typedef struct __attribute__((packed)) {
     uint16_t crc16;
 } pl_persist_device_record_t;
 
+// Bead pico-link-qivj.5 (S11): PL:S:0, the global display-settings record.
+// Self-versioned SEPARATELY from PL_PERSIST_SCHEMA_VERSION (the device/
+// marker schema) -- design point D10: a device-schema mismatch must not
+// wipe display prefs, and this record's own version byte must not force a
+// device-schema bump either. `screensaver_mode`/`screensaver_timeout_s` are
+// the raw wire bytes core's `DisplaySettings::to_wire`/`from_wire` already
+// define (1=Off, 2=Dim; timeout_s 0=Never/30/60/120/300) -- this module
+// stores and moves the bytes, never interprets them (same discipline as
+// ldac_quality above).
+#define PL_PERSIST_SETTINGS_VERSION 1u
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint8_t screensaver_mode;
+    uint16_t screensaver_timeout_s;
+    uint16_t crc16;
+} pl_persist_display_settings_record_t;
+
 // CRC16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over every field of
 // pl_persist_device_record_t EXCEPT crc16 itself. A bit-loop, not a table --
 // records are tiny (50 bytes) and written at most once per ~10s, so table
@@ -205,6 +222,23 @@ static uint8_t s_settings_pending_addr[6];
 static uint8_t s_settings_pending_ldac_quality;
 static volatile bool s_settings_write_enqueued;
 
+// Bead pico-link-qivj.5 (S11): a THIRD, independent staging slot -- global
+// display settings (screensaver mode + idle timeout), not per-device, so it
+// shares neither the pairing-write slot above nor the per-device-settings
+// slot above it. Same short-critical-section RAM-only staging idiom; no
+// addr, since this is a singleton record (PL:S:0).
+static bool s_display_pending;
+static uint8_t s_display_pending_mode;
+static uint16_t s_display_pending_timeout_s;
+static volatile bool s_display_write_enqueued;
+
+// Bead pico-link-qivj.5 (S11): the PL:S:0 record loaded at boot (see
+// pl_persist_init's load, which runs before the PL:M:0 marker check) --
+// mirrors s_boot_status's role for the device store, but independent of it.
+static bool s_display_settings_loaded;
+static uint8_t s_display_settings_mode;
+static uint16_t s_display_settings_timeout_s;
+
 // Unconditional (NOT #ifndef NDEBUG-gated) firmware/storage-region collision
 // check -- replaces btstack_flash_bank.c:53-58's assert, which pico-sdk's
 // forced-Release build (CMAKE_BUILD_TYPE unset -> NDEBUG defined) silently
@@ -253,6 +287,45 @@ void pl_persist_init(void) {
     // design point 1 -- distinct tag namespace (BTL/BTD/BTC vs our
     // 'P','L',kind,index), so no collision is possible.
     hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(s_tlv_impl, &s_tlv_context));
+
+    // --- Bead pico-link-qivj.5 (S11), design D10: load PL:S:0 (display
+    // settings) HERE -- BEFORE the PL:M:0 marker check below, and
+    // unconditionally (not gated on that check's outcome) -- so neither a
+    // first-boot early-return nor a device-schema version-mismatch
+    // early-return (both a few lines down) can ever skip it. Self-versioned
+    // independently of PL_PERSIST_SCHEMA_VERSION; a bad length, wrong
+    // version or failed CRC just leaves s_display_settings_loaded false
+    // (pl_persist_boot_display_settings returns false, main.c falls back to
+    // core's own default) -- this record is never deleted here even when
+    // invalid, unlike the device-store mismatch path, since a truncated/
+    // corrupt PL:S:0 isn't evidence the whole store needs resetting.
+    {
+        pl_persist_display_settings_record_t rec;
+        int rec_len = s_tlv_impl->get_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, 0), (uint8_t *)&rec, sizeof(rec));
+        if (rec_len != (int)sizeof(rec)) {
+            pl_log("persist: no PL:S:0 display-settings record -- using core defaults\r\n");
+        } else if (rec.version != PL_PERSIST_SETTINGS_VERSION) {
+            pl_log(
+                "persist: PL:S:0 version mismatch (got %u, expected %u) -- using core defaults\r\n", rec.version,
+                PL_PERSIST_SETTINGS_VERSION
+            );
+        } else {
+            uint16_t crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_display_settings_record_t, crc16));
+            if (crc != rec.crc16) {
+                pl_log(
+                    "persist: PL:S:0 CRC mismatch (got 0x%04x, computed 0x%04x) -- using core defaults\r\n", rec.crc16, crc
+                );
+            } else {
+                s_display_settings_loaded = true;
+                s_display_settings_mode = rec.screensaver_mode;
+                s_display_settings_timeout_s = rec.screensaver_timeout_s;
+                pl_log(
+                    "persist: loaded display settings mode=%u timeout_s=%u\r\n", (unsigned)rec.screensaver_mode,
+                    (unsigned)rec.screensaver_timeout_s
+                );
+            }
+        }
+    }
 
     // --- Marker: distinguishes first-boot (tag absent) from a version we
     // understand vs. one we don't (design point 5) ---
@@ -903,6 +976,14 @@ void pl_persist_service(void) {
         s_settings_write_enqueued = true;
         pl_bt_enqueue_ldac_quality_write();
     }
+    if (s_display_pending && !s_display_write_enqueued) {
+        // Bead pico-link-qivj.5 (S11), design D11 (Andreas's xcmx ruling,
+        // extended to this record): same "just write, no streaming gate"
+        // treatment as the per-device-settings block above -- a Settings
+        // row pick is a user-initiated write, not background persistence.
+        s_display_write_enqueued = true;
+        pl_bt_enqueue_display_settings_write();
+    }
 }
 
 // Bead pico-link-7jol.5. See persist.h's doc comment.
@@ -941,6 +1022,62 @@ void pl_persist_execute_pending_ldac_quality_write(void) {
     pl_persist_get_device_settings(addr, &existing_codec_id, &existing_ldac_quality_unused);
     pl_persist_write_device_settings(addr, existing_codec_id, ldac_quality);
     s_settings_write_enqueued = false;
+}
+
+// Bead pico-link-qivj.5 (S11). See persist.h's doc comment.
+bool pl_persist_boot_display_settings(uint8_t *mode, uint16_t *timeout_s) {
+    if (!s_display_settings_loaded) {
+        return false;
+    }
+    *mode = s_display_settings_mode;
+    *timeout_s = s_display_settings_timeout_s;
+    return true;
+}
+
+// Bead pico-link-qivj.5 (S11). See persist.h's doc comment.
+void pl_persist_request_display_settings(uint8_t mode, uint16_t timeout_s) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    s_display_pending_mode = mode;
+    s_display_pending_timeout_s = timeout_s;
+    s_display_pending = true;
+    restore_interrupts(irq_state);
+}
+
+// Bead pico-link-qivj.5 (S11). See persist.h's doc comment.
+void pl_persist_execute_pending_display_settings_write(void) {
+    if (!s_display_pending) {
+        s_display_write_enqueued = false;
+        return;
+    }
+    // Design D11: no streaming re-check here, matching the enqueue side
+    // above (pl_persist_service) -- this is the user-initiated write
+    // Andreas ruled should just go through, streaming or not.
+
+    uint8_t mode;
+    uint16_t timeout_s;
+    uint32_t irq_state = save_and_disable_interrupts();
+    mode = s_display_pending_mode;
+    timeout_s = s_display_pending_timeout_s;
+    s_display_pending = false;
+    restore_interrupts(irq_state);
+
+    pl_persist_display_settings_record_t rec = {
+        .version = PL_PERSIST_SETTINGS_VERSION,
+        .screensaver_mode = mode,
+        .screensaver_timeout_s = timeout_s,
+        .crc16 = 0,
+    };
+    rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_display_settings_record_t, crc16));
+    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, 0), (const uint8_t *)&rec, sizeof(rec));
+    // Keep the live boot-snapshot mirror in sync too, so a re-read within
+    // the same session (there isn't one today, but matches the device
+    // record's RMW discipline of never lagging what was actually written)
+    // reflects this write immediately.
+    s_display_settings_loaded = true;
+    s_display_settings_mode = mode;
+    s_display_settings_timeout_s = timeout_s;
+    pl_log("persist: wrote display settings mode=%u timeout_s=%u\r\n", (unsigned)mode, (unsigned)timeout_s);
+    s_display_write_enqueued = false;
 }
 
 void pl_persist_request_urgent_flush(void) {

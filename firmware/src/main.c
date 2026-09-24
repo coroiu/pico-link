@@ -439,6 +439,24 @@ int main(void) {
 
     pl_bt_init(ui);
 
+    // Bead pico-link-qivj.5 (S11): push the PL:S:0 boot snapshot into core,
+    // if one was persisted -- thread context, before the superloop, same
+    // context a2dp.c's own direct pl_ui_push_event calls use. No-op (core
+    // keeps its own default) if pl_persist_boot_display_settings() returns
+    // false -- see that function's doc comment for every reason it can.
+    {
+        uint8_t boot_display_mode;
+        uint16_t boot_display_timeout_s;
+        if (pl_persist_boot_display_settings(&boot_display_mode, &boot_display_timeout_s)) {
+            struct PlEvent event = {
+                .version = PL_EVENT_ABI_VERSION,
+                .tag = PL_EVENT_TAG_DISPLAY_SETTINGS_LOADED,
+                .payload = {.display_settings = {.mode = boot_display_mode, .timeout_s = boot_display_timeout_s}},
+            };
+            pl_ui_push_event(ui, event);
+        }
+    }
+
 #ifdef PL_ENCODER_ON_CORE1
     // Bead pico-link-nli.4 (G3, epic pico-link-nli): launch core1 into the
     // LDAC encoder loop, after cyw43/BTstack init per design sec 8 -- core1
@@ -656,9 +674,10 @@ int main(void) {
         pl_a2dp_poll_ldac_bitrate(ui);
 #endif
 
-        // Idle-screensaver seam (pico-link-i3e): a LEVEL, read once per
-        // iteration right after pl_ui_tick and applied idempotently to the
-        // backlight GPIO -- see pl_ui_display_power's doc comment and
+        // Idle-screensaver seam (pico-link-i3e, extended by pico-link-
+        // qivj.2 with a Dim level): a LEVEL, read once per iteration right
+        // after pl_ui_tick and applied idempotently to the backlight PWM
+        // -- see pl_ui_display_power's doc comment and
         // .planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md.
         // No blit_wait to preserve here (pico-link-3uq's split is not
         // merged -- st7789_blit_framebuffer below is still one blocking
@@ -666,8 +685,13 @@ int main(void) {
         // render+blit while blanked. If 3uq lands first, its unconditional
         // blit_wait for the PREVIOUS frame's DMA must stay ABOVE this
         // gate -- see the design doc's §3.3 ordering rule.
-        bool display_on = pl_ui_display_power(ui) == PL_DISPLAY_POWER_ON;
-        st7789_set_backlight(display_on);
+        //
+        // display_on means "render+blit allowed", which stays true at Dim
+        // (the meter and fault strip must keep drawing, just dimmer) --
+        // only Off skips rendering. The backlight itself always tracks
+        // core's requested permille exactly, independent of display_on.
+        bool display_on = pl_ui_display_power(ui) != PL_DISPLAY_POWER_OFF;
+        st7789_set_backlight_permille(pl_ui_backlight_permille(ui));
 
         // Bead pico-link-vxc: the dirty gate. `pl_ui_dirty` is read AFTER
         // pl_ui_tick (above), since tick is what turns a due

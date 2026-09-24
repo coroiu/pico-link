@@ -123,16 +123,18 @@ void st7789_set_caset_offset(uint16_t x0);
 // framebuffer's RAMWR-only fast path assumes that never needs to happen.
 void st7789_reset_window(void);
 
-// Sets the backlight GPIO (GP13) only -- `true` for on, `false` for off.
-// Deliberately NOT DISPOFF/SLPIN (the panel-controller sleep commands):
-// GP13 is a plain GPIO wired straight to the backlight driver, entirely
-// out of band from the SPI1 bus st7789_blit_framebuffer's DMA uses, so
-// toggling it can never race an in-flight blit and needs no panel
-// re-init on the next wake (see pico-link-i3e /
-// .planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md). Safe
-// to call every superloop iteration -- idempotent, just a `gpio_put`.
-// Requires st7789_init to have run first (it owns GP13's init/direction).
-void st7789_set_backlight(bool on);
+// Sets the backlight PWM level (GP13) only -- `permille` in [0,1000],
+// clamped above 1000; 0 = off, 1000 = full brightness. Deliberately NOT
+// DISPOFF/SLPIN (the panel-controller sleep commands): GP13 is a hardware
+// PWM output wired straight to the backlight driver, entirely out of band
+// from the SPI1 bus st7789_blit_framebuffer's DMA uses, so changing it can
+// never race an in-flight blit and needs no panel re-init on the next wake
+// (see pico-link-i3e / pico-link-qivj.2 /
+// .planning/design/2026-09-01-idle-policy-across-the-ffi-seam.md). Safe to
+// call every superloop iteration -- idempotent, skips the PWM write when
+// the level is unchanged from the last call. Requires st7789_init to have
+// run first (it owns GP13's PWM init/config).
+void st7789_set_backlight_permille(uint16_t permille);
 
 // Diagnostic-only (pico-link-7h5.1, M-1): sets CASET/RASET to the RAW
 // [x0,x1]x[y0,y1] window (inclusive, no MADCTL/axis correction applied --

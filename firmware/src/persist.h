@@ -254,6 +254,38 @@ void pl_persist_request_ldac_quality(const uint8_t addr[6], uint8_t ldac_quality
 // ever changes.
 void pl_persist_execute_pending_ldac_quality_write(void);
 
+// Bead pico-link-qivj.5 (S11), design `.planning/design/2026-09-24-
+// screensaver-dim-and-timeout.md` (bead pico-link-qivj.1 closed comment):
+// reads the PL:S:0 display-settings record loaded at boot -- see
+// pl_persist_init's doc comment for why this load happens BEFORE the
+// PL:M:0 marker check, independently of the device-store lifecycle.
+// Returns false (leaving the outputs untouched) if the record was never
+// written, was the wrong length, failed its version check, or failed CRC
+// -- callers (main.c) treat false as "use core's own default", same
+// fallback shape as core's `DisplaySettings::from_wire`'s per-field
+// fallback for an invalid mode/timeout byte.
+bool pl_persist_boot_display_settings(uint8_t *mode, uint16_t *timeout_s);
+
+// Stages a display-settings write -- called from bt.c's
+// PL_COMMAND_TAG_SET_DISPLAY_SETTINGS handler (thread context, the
+// superloop). Same short-critical-section RAM-only staging idiom as
+// pl_persist_request_ldac_quality above; a SEPARATE staging slot from both
+// the pairing-write slot and the per-device-settings slot (design point 11
+// D9/D11: this is a global, not per-device, record).
+void pl_persist_request_display_settings(uint8_t mode, uint16_t timeout_s);
+
+// Performs the actual flash write for whatever display-settings save is
+// currently staged by pl_persist_request_display_settings -- same calling
+// contract as pl_persist_execute_pending_ldac_quality_write (bt.c's
+// pending-queue drain, async_context ONLY).
+//
+// Bead pico-link-xcmx / this design's D11 (Andreas's ruling): deliberately
+// NOT gated on pl_usb_audio_streaming()/pl_a2dp_streaming() -- this is a
+// user-initiated write (the user just picked a Settings row) and, like the
+// LDAC-quality write above, is allowed to skip audio rather than silently
+// delay the picker's own feedback.
+void pl_persist_execute_pending_display_settings_write(void);
+
 // Andreas's ruling, 2026-09-01: writes the device record SYNCHRONOUSLY, as
 // part of establishing the connection -- see this header's module doc
 // (ORDERING) for the full rationale and the one carve-out
@@ -370,6 +402,12 @@ bool pl_persist_get_device_settings(const uint8_t addr[6], uint8_t *out_codec_id
 #define PL_PERSIST_KIND_MARKER 0x4Du // 'M'
 #define PL_PERSIST_KIND_DEVICE 0x44u // 'D'
 #define PL_PERSIST_KIND_PRESET 0x50u // 'P' -- reserved, not yet implemented
+// Bead pico-link-qivj.5 (S11): PL:S:0, the global display-settings record
+// (screensaver mode + idle timeout) -- its own kind byte, its own version
+// byte (see PL_PERSIST_SETTINGS_VERSION in persist.c), loaded independently
+// of PL_PERSIST_KIND_MARKER/PL_PERSIST_KIND_DEVICE's lifecycle so a
+// device-store first-boot or version-mismatch can never wipe it.
+#define PL_PERSIST_KIND_SETTINGS 0x53u // 'S'
 
 // Number of PL:D:<i> device slots the store holds, i in [0, PL_PERSIST_DEVICE_SLOTS).
 // Widened from a single slot (index 0 only) to 8 by bead pico-link-4vb.6

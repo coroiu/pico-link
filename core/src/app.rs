@@ -28,6 +28,7 @@ use u8g2_fonts::types::{HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
 use crate::input::NavIntent;
+use crate::power::{DisplaySettings, ScreensaverMode, ScreensaverTimeout};
 use crate::render::home::build_home_screen;
 use crate::render::theme::{self, icon, palette};
 use crate::render::wizard::build_wizard_screen;
@@ -624,6 +625,15 @@ pub enum Event {
         value: Option<FaultValue>,
         count: u16,
     },
+    /// C's flash-backed store finished loading the screensaver dim/off +
+    /// timeout setting at boot (bead pico-link-qivj.2), or -- in the
+    /// emulator, which has no separate boot-load event of its own --
+    /// pushed synthetically right after `App::new` from
+    /// `DisplaySettings::load`. Wire values, not [`DisplaySettings`]
+    /// itself: `core` decodes with [`DisplaySettings::from_wire`] (D8 --
+    /// `core` owns the live value, unlike the LDAC-quality picker, where C
+    /// owns the device record).
+    DisplaySettingsLoaded { mode: u8, timeout_s: u16 },
 }
 
 /// The audio fault catalogue's six keys (design `.planning/design/2026-09-
@@ -1356,6 +1366,14 @@ pub enum ScreenId {
     /// counts/times/tier in place (see [`build_why_page_screen`]'s doc
     /// comment for the append-only ordering rule this refresh enforces).
     WhyPage,
+    /// The Settings screen (bead pico-link-qivj.2) -- a singleton, no
+    /// payload, reached only from Home's menu-face "Settings" row.
+    Settings,
+    /// A depth-3 single-select picker pushed from [`ScreenId::Settings`] --
+    /// same shape as [`ScreenId::Picker`], just rooted under Settings
+    /// instead of a device page (there is no device address in scope
+    /// here).
+    SettingsPicker(SettingsPickerKind),
 }
 
 /// Which picker a [`ScreenId::Picker`] identifies -- distinguishes screens
@@ -1364,6 +1382,13 @@ pub enum ScreenId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     LdacQuality,
+}
+
+/// Which picker a [`ScreenId::SettingsPicker`] identifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPickerKind {
+    ScreensaverMode,
+    ScreensaverTimeout,
 }
 
 /// The focus/scroll state [`App::refresh_stack`] reads from a screen
@@ -2386,19 +2411,131 @@ fn build_ldac_quality_picker_screen(model: &BtModel, addr: DeviceAddr, carry: &S
     ))
 }
 
-/// The Settings screen's fixed title. Placeholder content only (no rows)
-/// -- this bead (`pico-link-znb.8`/E7) exists to give Home's "Y"/menu-face
-/// "Settings" row a real, reachable destination so that affordance isn't
-/// labelled-but-broken (design section 4 rule 2), not to build Settings'
-/// actual content, which is separate, not-yet-scheduled work (the design's
-/// screen inventory lists it; persistence is Tier 2 E15). An empty
-/// [`Screen`] is a fully supported, already-tested shape --
-/// `Screen::new(title, vec![])` is exactly what
-/// `App::push_screen_for_test` uses today.
+/// The Settings screen's fixed title. Originally a placeholder (bead
+/// `pico-link-znb.8`/E7, giving Home's menu-face "Settings" row a real,
+/// reachable destination); real content landed with the screensaver
+/// dim/off + timeout setting (bead pico-link-qivj.2).
 pub(crate) const SETTINGS_TITLE: &str = "Settings";
 
-pub(crate) fn build_settings_screen() -> Screen {
-    Screen::new(SETTINGS_TITLE, vec![])
+/// The mailbox `App` shares with the Settings screen and its two pickers --
+/// the same `Rc<RefCell<_>>` shape `home_face`/`wizard_phase` use, since
+/// `Action::PushView`'s builder closures are `FnOnce` with no path back to
+/// a live `&mut App`.
+///
+/// Three independent flags, deliberately NOT folded into one "dirty" bit:
+/// `apply_pending` (core's own `IdlePolicy` needs the new value applied
+/// next `Runner::step`/`pl_ui_tick`) and `save_pending` (the value needs
+/// persisting) fire together on a user pick but NOT on
+/// [`App::set_display_settings`]'s initial seed from a loaded/default
+/// value (D9: seeding must never re-save what was just loaded).
+/// `refresh_pending` is a third, purely presentational latch: the Settings
+/// screen's rows and the open picker's checkmark must reflect the pick on
+/// the very same frame (design S6), which needs `App::refresh_stack`, not
+/// anything `Runner`/`pl_ui_tick` does.
+#[derive(Default)]
+pub struct DisplaySettingsState {
+    current: DisplaySettings,
+    apply_pending: bool,
+    save_pending: bool,
+    refresh_pending: bool,
+}
+
+/// The Settings screen's two rows -- `IDLE SCREEN` (mode) and `IDLE AFTER`
+/// (timeout), each pushing its own picker. Design pico-link-qivj.1 S6.
+pub(crate) fn build_settings_screen(state: &Rc<RefCell<DisplaySettingsState>>, carry: &ScreenCarry) -> Screen {
+    const ROW_MODE: u64 = 0;
+    const ROW_TIMEOUT: u64 = 1;
+
+    let current = state.borrow().current;
+    let rows = vec![
+        FieldRow::action("IDLE SCREEN")
+            .with_value(current.mode.label(), palette::TEXT_PRIMARY)
+            .with_key(ListItemKey::from_u64(ROW_MODE)),
+        FieldRow::action("IDLE AFTER")
+            .with_value(current.timeout.label(), palette::TEXT_PRIMARY)
+            .with_key(ListItemKey::from_u64(ROW_TIMEOUT)),
+    ];
+    let state_for_activate = Rc::clone(state);
+    let list = FieldList::new(rows)
+        .with_selected_identity(carry.selected_key, carry.selected_index)
+        .on_activate_index(move |index| {
+            match index {
+                0 => Action::PushView(Box::new({
+                    let state = Rc::clone(&state_for_activate);
+                    move || build_settings_picker_screen(SettingsPickerKind::ScreensaverMode, &state, &ScreenCarry::default())
+                })),
+                1 => Action::PushView(Box::new({
+                    let state = Rc::clone(&state_for_activate);
+                    move || build_settings_picker_screen(SettingsPickerKind::ScreensaverTimeout, &state, &ScreenCarry::default())
+                })),
+                _ => Action::None,
+            }
+        });
+    let list = if let Some(top) = carry.scroll_top { list.with_scroll_top(top) } else { list };
+    Screen::new(SETTINGS_TITLE, vec![Box::new(list)]).with_id(ScreenId::Settings)
+}
+
+/// The two Settings pickers (mode, timeout) -- both built via
+/// [`build_single_select_screen`], picking straight into the shared
+/// [`DisplaySettingsState`] mailbox. Applies live (`Action::None`, stays
+/// open, per that function's rule 2); the checkmark itself moves only once
+/// `App::refresh_stack` rebuilds this screen from the freshly stored
+/// value (`refresh_pending`), never optimistically here.
+pub(crate) fn build_settings_picker_screen(kind: SettingsPickerKind, state: &Rc<RefCell<DisplaySettingsState>>, carry: &ScreenCarry) -> Screen {
+    let current = state.borrow().current;
+    match kind {
+        SettingsPickerKind::ScreensaverMode => {
+            let options = vec![
+                PickerOption {
+                    key: ListItemKey::from_u64(u64::from(ScreensaverMode::Dim.to_wire())),
+                    label: String::from(ScreensaverMode::Dim.label()),
+                    note: Some((String::from("stays readable"), palette::TEXT_SECONDARY)),
+                    selectable: true,
+                },
+                PickerOption {
+                    key: ListItemKey::from_u64(u64::from(ScreensaverMode::Off.to_wire())),
+                    label: String::from(ScreensaverMode::Off.label()),
+                    note: Some((String::from("saves power"), palette::TEXT_SECONDARY)),
+                    selectable: true,
+                },
+            ];
+            let checked = Some(ListItemKey::from_u64(u64::from(current.mode.to_wire())));
+            let state_for_pick = Rc::clone(state);
+            let on_pick = move |key: ListItemKey| {
+                let mode = ScreensaverMode::from_wire(u8::try_from(key.as_u64()).unwrap_or(1));
+                let mut s = state_for_pick.borrow_mut();
+                s.current.mode = mode;
+                s.apply_pending = true;
+                s.save_pending = true;
+                s.refresh_pending = true;
+                Action::None
+            };
+            build_single_select_screen(ScreenId::SettingsPicker(kind), "Idle screen", options, checked, carry, on_pick)
+        }
+        SettingsPickerKind::ScreensaverTimeout => {
+            let options: Vec<PickerOption> = ScreensaverTimeout::ALL
+                .iter()
+                .map(|timeout| PickerOption {
+                    key: ListItemKey::from_u64(u64::from(timeout.as_secs())),
+                    label: String::from(timeout.label()),
+                    note: None,
+                    selectable: true,
+                })
+                .collect();
+            let checked = Some(ListItemKey::from_u64(u64::from(current.timeout.as_secs())));
+            let state_for_pick = Rc::clone(state);
+            let on_pick = move |key: ListItemKey| {
+                let timeout = ScreensaverTimeout::from_secs(u16::try_from(key.as_u64()).unwrap_or(60));
+                let mut s = state_for_pick.borrow_mut();
+                s.current.timeout = timeout;
+                s.apply_pending = true;
+                s.save_pending = true;
+                s.refresh_pending = true;
+                Action::None
+            };
+            build_single_select_screen(ScreenId::SettingsPicker(kind), "Idle after", options, checked, carry, on_pick)
+        }
+    }
 }
 
 /// Shared, interior-mutable handle to the live [`BtModel`] -- the M0 step
@@ -2510,6 +2647,12 @@ pub struct App {
     /// fault event while it's open, only ever appending, never re-sorting
     /// (see [`build_why_page_screen`]'s doc comment).
     why_page_order: Rc<RefCell<Vec<FaultKey>>>,
+    /// The screensaver dim/off + timeout setting's shared mailbox (bead
+    /// pico-link-qivj.2) -- same `Rc<RefCell<_>>` shape as `home_face`/
+    /// `wizard_phase`, for the same reason (the Settings screen and its
+    /// pickers are pushed `Action::PushView` closures with no path back to
+    /// `App`).
+    display_settings: Rc<RefCell<DisplaySettingsState>>,
 }
 
 impl App {
@@ -2525,6 +2668,7 @@ impl App {
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
+        let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
         let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
         let navigator = Navigator::new(build_home_screen(
             &model.borrow(),
@@ -2534,6 +2678,7 @@ impl App {
             &wizard_devices,
             Instant::from_micros(0),
             &why_page_order,
+            &display_settings,
             &ScreenCarry::default(),
         ));
         Self {
@@ -2548,6 +2693,57 @@ impl App {
             wizard_devices,
             home_face,
             why_page_order,
+            display_settings,
+        }
+    }
+
+    /// The live screensaver dim/off + timeout setting.
+    #[must_use]
+    pub fn display_settings(&self) -> DisplaySettings {
+        self.display_settings.borrow().current
+    }
+
+    /// Seeds the live setting (e.g. from `Event::DisplaySettingsLoaded`, or
+    /// the emulator's own `DisplaySettings::load` at startup) -- sets
+    /// `current` and marks it pending *application* to the live
+    /// `IdlePolicy` and a stack refresh, but deliberately does NOT mark it
+    /// pending *save*: seeding is "here is what's already stored/
+    /// defaulted," not a user edit, and re-saving a value that was just
+    /// loaded would be a pointless (if harmless) write on every boot.
+    pub fn set_display_settings(&mut self, settings: DisplaySettings) {
+        let mut state = self.display_settings.borrow_mut();
+        state.current = settings;
+        state.apply_pending = true;
+        state.refresh_pending = true;
+    }
+
+    /// Drains the "apply to `IdlePolicy`" latch -- `Some` at most once per
+    /// change, consumed by `crate::run::Runner::step`/`ui-ffi`'s
+    /// `pl_ui_tick`. `pub`, not `pub(crate)`, because `ui-ffi` is a
+    /// separate crate that needs this exact seam -- see
+    /// `crate::run::Runner::step`'s own doc comment for the shape both
+    /// callers share (design D9).
+    pub fn take_display_settings_to_apply(&mut self) -> Option<DisplaySettings> {
+        let mut state = self.display_settings.borrow_mut();
+        if state.apply_pending {
+            state.apply_pending = false;
+            Some(state.current)
+        } else {
+            None
+        }
+    }
+
+    /// Drains the "persist" latch -- `Some` at most once per user pick,
+    /// consumed by `crate::run::Runner::step`'s `Storage` adapter / `ui-
+    /// ffi`'s `pl_ui_poll_command`. `pub` for the same cross-crate reason
+    /// as [`App::take_display_settings_to_apply`].
+    pub fn take_display_settings_to_save(&mut self) -> Option<DisplaySettings> {
+        let mut state = self.display_settings.borrow_mut();
+        if state.save_pending {
+            state.save_pending = false;
+            Some(state.current)
+        } else {
+            None
         }
     }
 
@@ -2624,6 +2820,7 @@ impl App {
                 &self.wizard_devices,
                 Instant::from_micros(self.now_us),
                 &self.why_page_order,
+                &self.display_settings,
                 carry,
             )),
             ScreenId::Devices => Refresh::Rebuild(build_devices_screen(
@@ -2638,6 +2835,8 @@ impl App {
             ScreenId::DevicePage(addr) => build_device_page_screen(&self.model.borrow(), addr, carry, &self.commands),
             ScreenId::Picker(PickerKind::LdacQuality, addr) => build_ldac_quality_picker_screen(&self.model.borrow(), addr, carry, &self.commands),
             ScreenId::WhyPage => build_why_page_screen(&self.model.borrow(), Instant::from_micros(self.now_us), &self.why_page_order, carry),
+            ScreenId::Settings => Refresh::Rebuild(build_settings_screen(&self.display_settings, carry)),
+            ScreenId::SettingsPicker(kind) => Refresh::Rebuild(build_settings_picker_screen(kind, &self.display_settings, carry)),
         }
     }
 
@@ -2669,6 +2868,10 @@ impl App {
             Event::VolumeChanged { level, muted, source } => self.on_volume_changed(level, muted, source),
             Event::LdacBitrateChanged { kbps } => self.on_ldac_bitrate_changed(kbps),
             Event::FaultRaised { key, value, count } => self.on_fault_raised(key, value, count),
+            Event::DisplaySettingsLoaded { mode, timeout_s } => {
+                self.set_display_settings(DisplaySettings::from_wire(mode, timeout_s));
+                self.refresh_stack();
+            }
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -3329,6 +3532,17 @@ impl App {
             self.navigator.sync_top(&ctx);
             self.navigator.dispatch(intent);
         }
+        // A Settings picker's `on_pick` may have set `refresh_pending`
+        // (design S6) -- the checkmark/row value must move on the SAME
+        // frame as the press, which needs `refresh_stack`, not anything
+        // `Runner`/`pl_ui_tick` does downstream.
+        let refresh_pending = {
+            let mut state = self.display_settings.borrow_mut();
+            core::mem::take(&mut state.refresh_pending)
+        };
+        if refresh_pending {
+            self.refresh_stack();
+        }
         self.stamp_pending_wizard_timestamp();
         self.dirty = true;
     }
@@ -3985,7 +4199,14 @@ mod tests {
                     "devices list" => Some(Verb::Pair),
                     "forget picker" => Some(Verb::Select),
                     "forget confirm" => Some(Verb::Select),
-                    "device detail" | "settings" => None,
+                    "device detail" => None,
+                    // Settings gained real rows with pico-link-qivj.2 (the
+                    // screensaver dim/off + timeout setting) -- its first
+                    // row ("IDLE SCREEN") is a focusable `Action` row that
+                    // pushes a picker, so `A` is correctly live now (design
+                    // doc's own rule: a real destination behind a row means
+                    // `A` must say so).
+                    "settings" => Some(Verb::Open),
                     "wizard: scanning" => Some(Verb::Pair),
                     "wizard: nothing found" => Some(Verb::Scan),
                     "wizard: connecting" | "wizard: not responding" | "wizard: failed" | "wizard: succeeded" => None,

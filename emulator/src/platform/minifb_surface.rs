@@ -74,6 +74,18 @@ fn argb8888(color: Rgb565) -> u32 {
     (u32::from(color.r() << 3) << 16) | (u32::from(color.g() << 2) << 8) | u32::from(color.b() << 3)
 }
 
+/// Scales one packed `0x00RRGGBB` value's three channels by `factor`,
+/// rounding -- the live-window counterpart of `HeadlessSurface::
+/// encode_png`'s `Dim` branch, sharing the same `super::dim_factor()`
+/// input so the two surfaces stay pixel-identical while dimmed.
+fn scale_argb(argb: u32, factor: f32) -> u32 {
+    let r = (argb >> 16) & 0xFF;
+    let g = (argb >> 8) & 0xFF;
+    let b = argb & 0xFF;
+    let scale = |c: u32| (f32::from(c as u8) * factor).round() as u32;
+    (scale(r) << 16) | (scale(g) << 8) | scale(b)
+}
+
 pub struct MinifbSurface {
     window: Rc<RefCell<Window>>,
     width: u32,
@@ -81,16 +93,16 @@ pub struct MinifbSurface {
     scale: u32,
     argb_buffer: Vec<u32>,
     /// Idle-screensaver display power state.
-    /// Defaults to `true` (on). Unlike `HeadlessSurface` (which
-    /// reconstructs the blanked output on demand in `encode_png`), going
-    /// `Off` here actively pushes one zeroed buffer to the live
-    /// `minifb::Window` (see `set_power`) since there's no "encode on
-    /// demand" step to intercept -- the window paints immediately. This
-    /// flag itself is only bookkeeping (tests/introspection); it does not
-    /// gate `flush`, which `crate::run::run` simply stops calling while
-    /// off, restoring the picture via `set_power(On)` plus one forced
-    /// render on wake (`App::mark_dirty`).
-    powered_on: bool,
+    /// Defaults to `On`. Unlike `HeadlessSurface` (which reconstructs the
+    /// blanked/dimmed output on demand in `encode_png`), going `Off` here
+    /// actively pushes one zeroed buffer to the live `minifb::Window` (see
+    /// `set_power`) since there's no "encode on demand" step to intercept
+    /// -- the window paints immediately. `Dim` only sets this field --
+    /// `flush` applies `super::dim_factor()` to every pixel it rasterizes
+    /// while it holds `Dim`, so the dimmed picture appears on the very
+    /// next `flush` (which `Runner::step`'s `mark_dirty`-on-level-change
+    /// guarantees happens promptly on an On<->Dim transition).
+    power: DisplayPower,
 }
 
 impl MinifbSurface {
@@ -101,7 +113,7 @@ impl MinifbSurface {
     pub fn new(window: Rc<RefCell<Window>>, width: u32, height: u32, scale: u32) -> Self {
         assert!(scale >= 1, "scale must be at least 1");
         let buffer_len = (width * scale * height * scale) as usize;
-        Self { window, width, height, scale, argb_buffer: vec![0; buffer_len], powered_on: true }
+        Self { window, width, height, scale, argb_buffer: vec![0; buffer_len], power: DisplayPower::On }
     }
 
     /// Whether the last `set_power` call left this surface on. Exposed for
@@ -109,7 +121,13 @@ impl MinifbSurface {
     /// rather than poll this).
     #[must_use]
     pub fn is_powered_on(&self) -> bool {
-        self.powered_on
+        self.power == DisplayPower::On
+    }
+
+    /// The most recently requested display power level.
+    #[must_use]
+    pub fn power(&self) -> DisplayPower {
+        self.power
     }
 }
 
@@ -122,6 +140,13 @@ impl DisplaySurface for MinifbSurface {
 
         rasterize_scaled(framebuffer, self.scale, &mut self.argb_buffer);
 
+        if self.power == DisplayPower::Dim {
+            let f = super::dim_factor();
+            for pixel in &mut self.argb_buffer {
+                *pixel = scale_argb(*pixel, f);
+            }
+        }
+
         let window_width = (self.width * self.scale) as usize;
         let window_height = (self.height * self.scale) as usize;
         self.window.borrow_mut().update_with_buffer(&self.argb_buffer, window_width, window_height)
@@ -131,24 +156,20 @@ impl DisplaySurface for MinifbSurface {
     /// visibly goes black and stays black (nothing else touches the
     /// window again until the next `flush`/`set_power` call) -- matching
     /// `HeadlessSurface::encode_png`'s all-black-when-off behavior for
-    /// parity. `On` only clears the flag: it deliberately does NOT
+    /// parity. `On`/`Dim` only set the field: `On` deliberately does NOT
     /// re-push `self.argb_buffer` (which still holds the last real
     /// frame's pixels, since `flush` was never told to touch it while
     /// off) -- restoring the actual picture is `crate::run::run`'s job,
-    /// via a forced `App::mark_dirty` + `flush` on wake, not this seam.
+    /// via a forced `App::mark_dirty` + `flush` on wake, not this seam;
+    /// `Dim` similarly waits for the next `flush` to apply the dim factor.
     fn set_power(&mut self, power: DisplayPower) -> Result<(), Self::Error> {
-        match power {
-            DisplayPower::Off => {
-                let window_width = (self.width * self.scale) as usize;
-                let window_height = (self.height * self.scale) as usize;
-                let blank = vec![0u32; self.argb_buffer.len()];
-                self.window.borrow_mut().update_with_buffer(&blank, window_width, window_height)?;
-                self.powered_on = false;
-            }
-            DisplayPower::On => {
-                self.powered_on = true;
-            }
+        if power == DisplayPower::Off {
+            let window_width = (self.width * self.scale) as usize;
+            let window_height = (self.height * self.scale) as usize;
+            let blank = vec![0u32; self.argb_buffer.len()];
+            self.window.borrow_mut().update_with_buffer(&blank, window_width, window_height)?;
         }
+        self.power = power;
         Ok(())
     }
 }
