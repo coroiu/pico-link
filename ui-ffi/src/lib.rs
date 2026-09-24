@@ -3556,12 +3556,19 @@ mod tests {
         };
         unsafe {
             pl_ui_push_event(ui, event);
-            let model = (*ui).app.model();
-            assert_eq!(model.discovered.len(), 1, "the device must have been folded into BtModel::discovered");
-            assert_eq!(
-                model.discovered[0].class_of_device, class_of_device,
-                "class_of_device must round-trip byte-for-byte, not just its top bits"
-            );
+            // The Ref borrowed from app.model() must drop before pl_ui_destroy
+            // frees the underlying Rc<RefCell<BtModel>> allocation -- see the
+            // DECISION comment on bead pico-link-bgnd.7. Scoping it in this
+            // inner block ensures Drop runs here, not at the end of the
+            // outer unsafe block (i.e. after destroy).
+            {
+                let model = (*ui).app.model();
+                assert_eq!(model.discovered.len(), 1, "the device must have been folded into BtModel::discovered");
+                assert_eq!(
+                    model.discovered[0].class_of_device, class_of_device,
+                    "class_of_device must round-trip byte-for-byte, not just its top bits"
+                );
+            }
             pl_ui_destroy(ui);
         }
     }

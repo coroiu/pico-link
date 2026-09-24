@@ -98,7 +98,7 @@ pub use framebuffer::FrameBuffer565;
 pub use crate::platform::Instant;
 pub use fields::{FieldKind, FieldList, FieldRow, ValueFont};
 pub use hero::{BitrateStatus, CodecStatus, HeroStatusView, HeroVolume, HeroVolumeSource};
-pub use home::{build_home_screen, HOME_TITLE};
+pub use home::HOME_TITLE;
 pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};
 pub use menu::{MenuItem, MenuList};
 pub use message::MessageView;

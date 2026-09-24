@@ -556,6 +556,25 @@ pub trait Widget {
         None
     }
 
+    /// Projects live state (a model handle, a shared clock, ...) into this
+    /// widget's own plain fields, once per frame, before `render`/
+    /// `on_intent`/`measure`/the paint-key methods are consulted -- see
+    /// `Navigator::sync_top`'s doc comment and the M0 step of
+    /// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md`
+    /// (bead `pico-link-bgnd`) for the full design this seam is the start
+    /// of. Defaults to a no-op: **as of this bead, nothing calls this on
+    /// any widget with a live handle to project from, and no widget
+    /// overrides it** -- `App` still rebuilds screens from scratch on every
+    /// model change (`App::refresh_stack`), so `sync` is currently called
+    /// on freshly-built, already-up-to-date widgets. It becomes load-
+    /// bearing screen by screen as later beads in the same epic migrate
+    /// each view to be long-lived instead of rebuilt.
+    ///
+    /// **A widget that wraps other widgets must forward this to its
+    /// children** -- same rule, same hazard, as `redraw_after`/
+    /// `scroll_top`/`activation` above.
+    fn sync(&mut self, _ctx: &RenderCtx) {}
+
     /// This widget's scroll-top row index, if it scrolls. `None` for
     /// widgets with no scrolling concept (the default): static labels,
     /// `MenuList` (deliberately never scrolls — see `menu::MenuList`'s

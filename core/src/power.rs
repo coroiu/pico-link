@@ -124,9 +124,10 @@ impl Default for ScreensaverMode {
 /// How long the device waits for input before the screensaver acts.
 /// `Never` disables the screensaver (and, by construction, deep sleep) --
 /// this replaces the old `IdlePowerSetting.enabled == false` case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScreensaverTimeout {
     Sec30,
+    #[default]
     Min1,
     Min2,
     Min5,
@@ -182,12 +183,6 @@ impl ScreensaverTimeout {
         } else {
             Some(Duration::from_secs(u64::from(self.as_secs())))
         }
-    }
-}
-
-impl Default for ScreensaverTimeout {
-    fn default() -> Self {
-        Self::Min1
     }
 }
 
