@@ -182,7 +182,7 @@ impl App {
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
         let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
         let navigator = Navigator::new(build_home_screen(
-            &model.borrow(),
+            &model,
             &home_face,
             &commands,
             &wizard_phase,
@@ -190,7 +190,6 @@ impl App {
             Instant::from_micros(0),
             &why_page_order,
             &display_settings,
-            &ScreenCarry::default(),
         ));
         Self {
             navigator,
@@ -286,9 +285,12 @@ impl App {
                     break;
                 }
                 // Leave the screen already on the stack in place -- no
-                // `replace_at`, no forced full-frame damage. Dead in
-                // practice today: no `build_identified_screen` arm
-                // returns `Keep` yet.
+                // `replace_at`, no forced full-frame damage. `ScreenId::
+                // Home`'s arm below is the first (and, as of this bead,
+                // only) case that returns this: `HomeView` stays live and
+                // reads the model itself via `Widget::sync` on every
+                // frame it's on top of the stack (bead `pico-link-bgnd`
+                // M1) -- there is nothing left for a rebuild to do.
                 Refresh::Keep => {}
             }
         }
@@ -305,17 +307,12 @@ impl App {
     /// else.
     fn build_identified_screen(&self, id: ScreenId, carry: &ScreenCarry) -> Refresh {
         match id {
-            ScreenId::Home => Refresh::Rebuild(build_home_screen(
-                &self.model.borrow(),
-                &self.home_face,
-                &self.commands,
-                &self.wizard_phase,
-                &self.wizard_devices,
-                Instant::from_micros(self.now_us),
-                &self.why_page_order,
-                &self.display_settings,
-                carry,
-            )),
+            // `HomeView` is built exactly once (`App::new`) and never
+            // rebuilt again -- it reads the live model itself via
+            // `Widget::sync` every frame it's on top of the stack (bead
+            // `pico-link-bgnd` M1). `carry` is unused here: there is
+            // nothing to carry forward into a rebuild that never happens.
+            ScreenId::Home => Refresh::Keep,
             ScreenId::Devices => Refresh::Rebuild(build_devices_screen(
                 &self.model.borrow(),
                 carry.selected_key,

@@ -749,6 +749,41 @@ fn home_menu_selection_survives_a_live_refresh_while_streaming() {
     assert_eq!(app.navigator.scroll_top_at(0), None, "Home's menu has no scroll concept -- always None, carried or not");
 }
 
+/// The design's T3 (`pico-link-bgnd` M1 / `pico-link-yn5i.1` B1): a
+/// `LevelsChanged` event on Home's connected status face must damage only
+/// the OUT meter's footprint, not the whole frame -- and in particular
+/// must not touch the title bar, which nothing about an OUT-level reading
+/// ever redraws. Fails on `main` before this bead (every model event
+/// forced `force_full_damage` via the old `ScreenId::Home` rebuild arm);
+/// passes once `HomeView` forwards `damage_hint`/`damage_region_key` to
+/// `hero` (`Widget::sync` + the M1 `Refresh::Keep` arm).
+#[test]
+fn home_level_event_does_not_damage_the_whole_frame_or_the_title_bar() {
+    use embedded_graphics::prelude::{OriginDimensions, Point};
+
+    let mut app = App::new(240, 240);
+    let addr = [21; 6];
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    app.handle_event(upsert(addr, "Cans", 1));
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+    app.tick(1);
+    // Establish a clean baseline frame -- the very first render is always
+    // a full-frame cache miss (`Screen::render`'s `cache_miss` branch), so
+    // it proves nothing about the OUT-level event's own damage on its own.
+    app.render();
+
+    app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
+    let output = app.render();
+    let damage = output.damage;
+    let whole_frame = Rectangle::new(Point::zero(), output.size());
+
+    assert_ne!(damage, whole_frame, "a live OUT-level reading must not damage the whole frame -- B1's damage forwarding is missing or broken");
+    assert!(
+        damage.top_left.y >= i32::try_from(crate::render::chrome::TITLE_BAR_HEIGHT).expect("TITLE_BAR_HEIGHT is a small constant, fits in i32"),
+        "a live OUT-level reading must not touch the title bar: damage={damage:?}"
+    );
+}
+
 
 
 

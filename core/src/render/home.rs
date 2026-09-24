@@ -16,16 +16,22 @@
 //!
 //! # Why the face lives in an `Rc<RefCell<_>>`, not a `HomeView` field
 //!
-//! Unlike the wizard (pushed once when the user opens it, then never
-//! rebuilt -- see `wizard.rs`'s module doc), Home *is* the root screen,
-//! rebuilt on every Bluetooth model change via
-//! `crate::app::App::refresh_stack`. A face stored only on a `HomeView`
-//! field would be silently discarded by the very next rebuild -- exactly
-//! the defect class `pico-link-a67`'s `Navigator::replace_root` fix
-//! already closed for screen-stack depth. [`crate::app::App::home_face`]
-//! is the shared, rebuild-surviving source of truth; [`HomeView`] only
-//! ever reads and writes through the `Rc` it's handed, the same shape
-//! `PairingWizardView` uses for `wizard_phase`.
+//! As of `pico-link-bgnd` M1, `HomeView` is built exactly once (at
+//! `App::new`) and lives for the app's lifetime -- it is no longer rebuilt
+//! on every Bluetooth model event (see [`build_home_screen`]'s doc comment
+//! and [`crate::app::App::refresh_stack`]'s `ScreenId::Home` arm, which now
+//! returns `Refresh::Keep`). A rebuild-survival reason for the indirection
+//! no longer applies, but a genuine *second writer* does:
+//! [`crate::app::App`]'s `on_wizard_auto_dismiss` fold method forces the
+//! face back to `Status` when the pairing wizard auto-dismisses, and it has
+//! no other path to reach the live `HomeView` instance sitting inside the
+//! `Navigator`'s stack (screens/widgets are opaque to `App` -- see
+//! `wizard_phase`'s doc comment for the identical shape). So
+//! [`crate::app::App::home_face`] stays the shared mailbox: not because a
+//! plain field would be discarded by a rebuild (it no longer would), but
+//! because `App` itself is the other writer, the same "genuine two-writer
+//! state, not a rebuild workaround" exemption the design's WHAT ScreenCarry
+//! BECOMES section grants `wizard_phase`.
 //!
 //! # The Home input exception (design section 4, stated once, only here)
 //!
@@ -87,7 +93,8 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
     build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, DeviceAddr, DeviceEntry,
-    DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
+    DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase,
+    LDAC_QUALITY_ADAPTIVE,
 };
 use crate::input::NavIntent;
 use crate::platform::Instant;
@@ -121,15 +128,19 @@ pub const HOME_TITLE: &str = "Pico Link";
 const MENU_ROW_BLUETOOTH: usize = 0;
 const MENU_ROW_SETTINGS: usize = 1;
 
-/// Builds the Home screen at whatever face `home_face` currently holds --
-/// see the module doc for why no further rebuild is needed as the face
-/// toggles (unlike `crate::app::App::refresh_stack`, which *does* rebuild
-/// this screen on every Bluetooth model change, for the same reason it
-/// always has: the status face's hero widget needs to reflect live data).
+/// Builds the Home screen exactly once -- `pico-link-bgnd`'s only caller is
+/// `App::new`; `App::refresh_stack`'s `ScreenId::Home` arm now returns
+/// `Refresh::Keep` and never calls this again (see that arm's doc comment).
+/// The status face's hero widget stays live by reading `model` (a live
+/// [`ModelHandle`], not a snapshot) inside [`HomeView::sync`] every frame
+/// Home is on top of the stack, not by this function being re-invoked --
+/// see the module doc's "why the face lives in an `Rc<RefCell<_>>`" section
+/// for what *does* still need rebuild-era-style sharing (a genuine second
+/// writer, not rebuild survival).
 #[must_use]
 #[allow(clippy::too_many_arguments)] // Mirrors `HomeView::new`'s own allow -- this is a straight passthrough into it, plus the wizard/why-page Rcs every other screen builder in this crate threads through too.
 pub(crate) fn build_home_screen(
-    model: &BtModel,
+    model: &ModelHandle,
     home_face: &Rc<RefCell<HomeFace>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     wizard_phase: &Rc<RefCell<WizardPhase>>,
@@ -137,9 +148,8 @@ pub(crate) fn build_home_screen(
     now: Instant,
     why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
     display_settings: &Rc<RefCell<DisplaySettingsState>>,
-    carry: &ScreenCarry,
 ) -> Screen {
-    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order, display_settings, carry);
+    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order, display_settings);
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
@@ -155,13 +165,22 @@ pub(crate) fn build_home_screen(
 /// stacking model has no notion of "hide this widget, show that one".
 struct HomeView {
     home_face: Rc<RefCell<HomeFace>>,
+    /// Re-projected from `model` every [`Widget::sync`] call (the "leaf
+    /// display widget" rule, design section 3: cheap enough to rebuild
+    /// fresh each frame rather than updated in place) -- see
+    /// [`Self::project_hero`].
     hero: HeroStatusView,
+    /// Built exactly once in [`Self::new`] and never rebuilt -- the row
+    /// order/labels never change, so there is nothing to re-project; its
+    /// own selection simply persists for `HomeView`'s lifetime now that
+    /// `HomeView` itself does (bead `pico-link-hu97`'s carry is no longer
+    /// needed for that reason -- see `build_home_screen`'s doc comment).
     menu: MenuList,
     /// The live Bluetooth link state, for the title bar's Bluetooth
-    /// glyph ([`ChromeContribution::link`]) -- the one piece of live
-    /// `BtModel` data this widget *does* have plumbed in (unlike the hero
-    /// widget's codec/bitrate fields; see [`HomeView::new`]'s doc
-    /// comment).
+    /// glyph ([`ChromeContribution::link`]) -- re-read from `model` by
+    /// [`Widget::sync`] every frame Home is visible, same staleness
+    /// tolerance ("never more than one frame stale") every field below
+    /// shares.
     link_state: LinkState,
     /// Whether the radio is currently running a GAP inquiry -- the second,
     /// independent input `chrome_contribution` resolves alongside
@@ -171,72 +190,60 @@ struct HomeView {
     discovering: bool,
     /// The connected device's address, if any -- read by `ShortcutY` to
     /// decide whether to push the device page or the explicit "no device"
-    /// message (bead `pico-link-hr30`). A snapshot, same staleness
-    /// tolerance as `HomeView::new`'s other `BtModel` reads: `HomeView` is
-    /// rebuilt on every model change (module doc), so this is never more
-    /// than one frame stale.
+    /// message (bead `pico-link-hr30`).
     connected_addr: Option<DeviceAddr>,
-    /// Snapshot of the model, for `ShortcutY`'s device-page push -- same
-    /// "`Action::PushView`'s builder is `FnOnce` with no path back to a
-    /// live `&BtModel`" reason `App::build_devices_screen`'s own
-    /// `model_for_device_page` snapshot exists for (`core/src/app.rs`).
-    model: BtModel,
+    /// The live model handle -- borrowed fresh inside `ShortcutY`/
+    /// `ShortcutX`'s `Action::PushView` closures and the menu's own
+    /// activation closures at the moment they actually run (press time,
+    /// not construction time), so a device forgotten/upserted between
+    /// `HomeView::new` and a much later press is never read stale. See
+    /// `crate::app::ModelHandle`'s doc comment for the shared-handle
+    /// shape and its borrow rule.
+    model: ModelHandle,
     /// For `ShortcutY`'s device-page push -- forwarded straight through to
     /// [`crate::app::build_device_page_screen`], same as every other
     /// `Command`-emitting `PushView` closure in this crate.
     commands: Rc<RefCell<VecDeque<Command>>>,
-    /// A snapshot of `model.fault_log`, for `ShortcutX`'s "is the strip
-    /// non-empty" gate (both `on_intent` and `chrome_contribution`) --
+    /// Re-read from `model.fault_log` every sync, for `ShortcutX`'s "is the
+    /// strip non-empty" gate (both `on_intent` and `chrome_contribution`) --
     /// design `.planning/design/2026-09-07-home-fault-strip.md` §8.1: "X is
     /// labelled and live only while the strip is non-empty." `Copy`, so
-    /// this is a plain field, not an `Rc` -- same staleness tolerance as
-    /// `connected_addr` above.
+    /// this is a plain field, not an `Rc`.
     fault_log: FaultLog,
-    /// A snapshot of the FFI seam's clock (`App`'s own `now_us`), for the
-    /// same two `ShortcutX` call sites `fault_log` serves -- freshness
-    /// tiers and retirement are otherwise always computed against
-    /// [`RenderCtx::now`] at render time (design §6.3), but `on_intent` has
-    /// no `RenderCtx` to read, so this is the one place in this bead that
-    /// falls back to a snapshot instead. Same "never more than one frame
-    /// stale" tolerance as every other field this struct snapshots from
-    /// `BtModel`/`App`.
+    /// The render-time clock, updated by every [`Widget::sync`] call from
+    /// `ctx.now()` -- `on_intent` has no `RenderCtx` of its own to read, so
+    /// this is what its two `ShortcutX` call sites fall back to instead.
+    /// Never more than one frame stale, the same tolerance every other
+    /// field on this struct has.
     now: Instant,
     /// The `why?` page's frozen block order (design §8.1/orchestrator
     /// ruling on `pico-link-9eq2.3.3`: ordering freezes on entry and only
     /// ever appends) -- `ShortcutX` overwrites this with a fresh
     /// most-recently-active-first sort every time it pushes the page;
-    /// [`crate::app::build_why_page_screen`] (called both by that push and
-    /// by every subsequent `App::refresh_stack` pass while the page is on
-    /// the stack) only ever appends to it, never re-sorts. Shared with
-    /// `App` via the same "long-lived `Rc<RefCell<_>>` threaded through
-    /// every rebuild" shape `home_face`/`wizard_phase`/`wizard_devices`
-    /// already use.
+    /// [`crate::app::build_why_page_screen`] only ever appends to it,
+    /// never re-sorts. Shared with `App` the same `Rc<RefCell<_>>` shape
+    /// `home_face`/`wizard_phase`/`wizard_devices` use.
     why_page_order: Rc<RefCell<Vec<FaultKey>>>,
 }
 
 impl HomeView {
-    #[allow(clippy::too_many_arguments)] // Mirrors every other screen builder in this crate that threads the wizard's shared Rcs through -- see `build_devices_screen`.
-    fn new(
-        model: &BtModel,
-        home_face: Rc<RefCell<HomeFace>>,
-        commands: &Rc<RefCell<VecDeque<Command>>>,
-        wizard_phase: &Rc<RefCell<WizardPhase>>,
-        wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
-        now: Instant,
-        why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
-        display_settings: &Rc<RefCell<DisplaySettingsState>>,
-        carry: &ScreenCarry,
-    ) -> Self {
-        // The status face's hero widget: `NO LINK` whenever there is no
-        // live codec (design section 15's "absent, never frozen or
-        // faked" rule -- this covers Idle/Scanning/Connecting alike, not
-        // just a bare disconnect), otherwise the connected device's name
-        // plus the codec word and nominal bitrate `BtModel::
-        // connected_codec` carries (bead pico-link-1v5). `fallback` stays
-        // `None` -- the data needed to say *why* a codec fell back to a
-        // lesser one (design section 6.2's amber banner) doesn't exist in
-        // `BtModel` yet; that's a separate, later bead, and `None` here is
-        // the honest "no reason recorded" value, not a guess.
+    /// Builds the status face's hero widget from a live `&BtModel` read --
+    /// called once by [`Self::new`] and once per [`Widget::sync`] call
+    /// (the "leaf display widget" rule, design section 3: `HeroStatusView`
+    /// has no interaction state of its own worth updating in place, so
+    /// rebuilding it fresh each sync is simpler than a setter and no more
+    /// expensive than the rebuild-on-every-event path it replaces).
+    fn project_hero(model: &BtModel) -> HeroStatusView {
+        // `NO LINK` whenever there is no live codec (design section 15's
+        // "absent, never frozen or faked" rule -- this covers Idle/
+        // Scanning/Connecting alike, not just a bare disconnect),
+        // otherwise the connected device's name plus the codec word and
+        // nominal bitrate `BtModel::connected_codec` carries (bead
+        // pico-link-1v5). `fallback` stays `None` -- the data needed to
+        // say *why* a codec fell back to a lesser one (design section
+        // 6.2's amber banner) doesn't exist in `BtModel` yet; that's a
+        // separate, later bead, and `None` here is the honest "no reason
+        // recorded" value, not a guess.
         //
         // Volume (design `.planning/design/2026-09-07-volume-on-display.md`
         // section 10, bead pico-link-4v2.6/VT6): built from `model.volume`
@@ -256,7 +263,7 @@ impl HomeView {
                 VolumeSource::Sink | VolumeSource::Device => HeroVolumeSource::Other,
             },
         });
-        let hero = match &model.connected_codec {
+        match &model.connected_codec {
             Some(codec) => {
                 // Bead pico-link-4vb.4 (T4): reads `paired` (the remembered
                 // list), not the old `discovered` scan list -- the whole
@@ -321,22 +328,28 @@ impl HomeView {
         // retirement/ordering are all derived at RENDER time from
         // `RenderCtx::now` (design §6.3) -- this builder only hands the raw
         // log across.
-        .with_fault_log(model.fault_log);
-        let link_state = model.link_state;
-        let discovering = model.discovering;
-        let connected_addr = model.connected_addr;
-        let fault_log = model.fault_log;
+        .with_fault_log(model.fault_log)
+    }
 
-        let model = model.clone();
-        // Snapshot for `ShortcutY`'s device-page push -- same reason
-        // `build_devices_screen`'s own `model_for_device_page`/
-        // `commands_for_activate` snapshots exist (`core/src/app.rs`):
-        // `Action::PushView`'s builder is `FnOnce` with no path back to a
-        // live `&BtModel`, and this is a `HomeView` field rather than a
-        // per-press clone because the same snapshot serves every
-        // `ShortcutY` press until the next `refresh_stack` replaces it.
-        let model_for_shortcut_y = model.clone();
+    #[allow(clippy::too_many_arguments)] // Mirrors every other screen builder in this crate that threads the wizard's shared Rcs through -- see `build_devices_screen`.
+    fn new(
+        model: &ModelHandle,
+        home_face: Rc<RefCell<HomeFace>>,
+        commands: &Rc<RefCell<VecDeque<Command>>>,
+        wizard_phase: &Rc<RefCell<WizardPhase>>,
+        wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
+        now: Instant,
+        why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
+        display_settings: &Rc<RefCell<DisplaySettingsState>>,
+    ) -> Self {
+        let (hero, link_state, discovering, connected_addr, fault_log) = {
+            let snapshot = model.borrow();
+            (Self::project_hero(&snapshot), snapshot.link_state, snapshot.discovering, snapshot.connected_addr, snapshot.fault_log)
+        };
+
+        let model_for_shortcut_y = Rc::clone(model);
         let commands_for_shortcut_y = Rc::clone(commands);
+        let model_for_bluetooth = Rc::clone(model);
         let commands_for_bluetooth = Rc::clone(commands);
         let wizard_phase_for_bluetooth = Rc::clone(wizard_phase);
         let wizard_devices_for_bluetooth = Rc::clone(wizard_devices);
@@ -350,11 +363,18 @@ impl HomeView {
             Verb::Open,
             move |index| match index {
                 MENU_ROW_BLUETOOTH => {
-                    let model = model.clone();
+                    // Borrowed fresh at press time, not captured as a
+                    // snapshot at `HomeView::new` time -- this menu is
+                    // built exactly once for the app's lifetime (bead
+                    // `pico-link-bgnd` M1), so a value snapshot captured
+                    // here would go stale forever after the first press.
+                    let model = Rc::clone(&model_for_bluetooth);
                     let commands = Rc::clone(&commands_for_bluetooth);
                     let wizard_phase = Rc::clone(&wizard_phase_for_bluetooth);
                     let wizard_devices = Rc::clone(&wizard_devices_for_bluetooth);
-                    Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, None, &commands, &wizard_phase, &wizard_devices)))
+                    Action::PushView(Box::new(move || {
+                        build_devices_screen(&model.borrow(), None, 0, None, &commands, &wizard_phase, &wizard_devices)
+                    }))
                 }
                 MENU_ROW_SETTINGS => {
                     let display_settings = Rc::clone(&display_settings_for_settings_row);
@@ -362,17 +382,13 @@ impl HomeView {
                 }
                 _ => Action::None,
             },
-        )
-        // Carries the menu row forward across every live `refresh_stack`
-        // rebuild while streaming (bead `pico-link-hu97`) -- mirrors
-        // `build_devices_screen`'s `with_selected_identity`/
-        // `with_scroll_top` carry-forward, minus the scroll/identity
-        // machinery this two-row, never-reordering menu has no need of.
-        // `carry.selected_index` is `0` both on the very first build (no
-        // widget has reported a selection yet) and once `HomeView::
-        // selected_index` below starts reporting the real value, so this
-        // is safe on every call site, not just refreshes.
-        .with_selected(carry.selected_index);
+        );
+        // No `with_selected` carry-forward needed any more (bead
+        // `pico-link-hu97`'s original fix): `HomeView` -- and therefore
+        // this `MenuList` -- is now built exactly once and lives for the
+        // app's lifetime, so its own `selected` field simply persists
+        // across every subsequent model event with no help from this
+        // constructor.
 
         Self {
             home_face,
@@ -418,6 +434,26 @@ impl Widget for HomeView {
     /// Home input exception).
     fn is_focusable(&self) -> bool {
         true
+    }
+
+    /// Re-projects every field this widget reads from the live model
+    /// (bead `pico-link-bgnd` M1) -- called once per frame Home is on top
+    /// of the navigator's stack, before render/input (see
+    /// [`super::navigator::Navigator::sync_top`]'s doc comment for exactly
+    /// when). `hero` is rebuilt fresh (the leaf rule, design section 3);
+    /// `menu` has no live-model state of its own but is still forwarded to
+    /// (the "wrappers must forward sync" rule, same as `redraw_after`/
+    /// `activation`).
+    fn sync(&mut self, ctx: &RenderCtx) {
+        self.now = ctx.now();
+        let model = self.model.borrow();
+        self.link_state = model.link_state;
+        self.discovering = model.discovering;
+        self.connected_addr = model.connected_addr;
+        self.fault_log = model.fault_log;
+        self.hero = Self::project_hero(&model);
+        drop(model);
+        self.menu.sync(ctx);
     }
 
     fn on_focus(&mut self, event: FocusEvent) -> Action {
@@ -493,9 +529,9 @@ impl Widget for HomeView {
             // there's nothing to open.
             NavIntent::ShortcutY => {
                 if let Some(addr) = self.connected_addr {
-                    let model = self.model.clone();
+                    let model = Rc::clone(&self.model);
                     let commands = Rc::clone(&self.commands);
-                    Action::PushView(Box::new(move || match build_device_page_screen(&model, addr, &ScreenCarry::default(), &commands) {
+                    Action::PushView(Box::new(move || match build_device_page_screen(&model.borrow(), addr, &ScreenCarry::default(), &commands) {
                         Refresh::Rebuild(screen) => screen,
                         // The device we just read `connected_addr` for
                         // cannot have vanished between that read and this
@@ -543,10 +579,10 @@ impl Widget for HomeView {
                     b_last.cmp(&a_last) // descending: most-recently-active first
                 });
                 *self.why_page_order.borrow_mut() = fresh_order;
-                let model = self.model.clone();
+                let model = Rc::clone(&self.model);
                 let now = self.now;
                 let why_page_order = Rc::clone(&self.why_page_order);
-                Action::PushView(Box::new(move || match build_why_page_screen(&model, now, &why_page_order, &ScreenCarry::default()) {
+                Action::PushView(Box::new(move || match build_why_page_screen(&model.borrow(), now, &why_page_order, &ScreenCarry::default()) {
                     Refresh::Rebuild(screen) => screen,
                     // Never actually returned (see that function's doc
                     // comment) -- defensive fallback only, same shape as
@@ -648,6 +684,51 @@ impl Widget for HomeView {
         }
     }
 
+    /// Forwards to `hero`'s own narrowing on the status face -- `HomeView`
+    /// is a composite (design section 5's R3, `pico-link-yn5i.1`'s B1):
+    /// `hero` occupies exactly `HomeView`'s own `area` when it's the
+    /// visible face, so its meter-footprint hint applies unchanged. The
+    /// menu face has no sub-widget narrowing of its own (`MenuList`
+    /// doesn't override this), so `None` there -- exactly the inherited
+    /// default, meaning a menu-face change damages the whole widget area,
+    /// same as before this override existed.
+    fn damage_hint(&self, area: Rectangle, ctx: &RenderCtx) -> Option<Rectangle> {
+        match self.face() {
+            HomeFace::Status => self.hero.damage_hint(area, ctx),
+            HomeFace::Menu => None,
+        }
+    }
+
+    /// The B1 half of `damage_hint`'s contract: "everything outside the
+    /// hint rectangle," diffed by `Screen` against its own cache, never by
+    /// this widget (see [`Widget::damage_region_key`]'s doc comment -- a
+    /// `HomeView` instance no longer dies every frame the way it used to,
+    /// but the contract is the same regardless: `Screen` owns the diff).
+    ///
+    /// Folds the active face into the key, the same shape [`Self::
+    /// paint_key`] uses just below, for the same reason: a face toggle is
+    /// itself a change to "everything outside the hint," so it must never
+    /// compare equal to the previous frame's key even though the folded
+    /// face bit isn't drawn by either child directly. On the status face
+    /// this forwards `hero`'s own `damage_region_key` (its "did anything
+    /// but the meter change" body key) unchanged. On the menu face there
+    /// is no hint to protect (`damage_hint` returns `None` there, so
+    /// `Screen` always falls back to the whole widget area regardless of
+    /// this value) -- folding `PaintKey::ALWAYS` keeps that path honest
+    /// rather than accidentally comparing equal across frames.
+    fn damage_region_key(&self, ctx: &RenderCtx) -> PaintKey {
+        let face = self.face();
+        PaintKey::of(HOME_PAINT_KEY_SEED)
+            .fold(match face {
+                HomeFace::Status => 0,
+                HomeFace::Menu => 1,
+            })
+            .fold_key(match face {
+                HomeFace::Status => self.hero.damage_region_key(ctx),
+                HomeFace::Menu => PaintKey::ALWAYS,
+            })
+    }
+
     /// Folds which face is active plus that active child's own
     /// [`Widget::paint_key`] (via [`PaintKey::fold_key`]) -- the same
     /// "forward to whichever child is actually showing" shape [`Self::
@@ -705,14 +786,14 @@ mod tests {
     }
 
     fn fresh_home_view() -> HomeView {
-        let model = BtModel::default();
+        let model = Rc::new(RefCell::new(BtModel::default()));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings, &ScreenCarry::default())
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -720,13 +801,14 @@ mod tests {
     fn connected_home_view(addr: crate::app::DeviceAddr) -> HomeView {
         let mut model = BtModel { connected_addr: Some(addr), ..BtModel::default() };
         model.paired.push(crate::app::PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        let model = Rc::new(RefCell::new(model));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings, &ScreenCarry::default())
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting
@@ -824,13 +906,14 @@ mod tests {
     fn home_view_with_one_fault() -> HomeView {
         let mut model = BtModel::default();
         model.fault_log.record(crate::app::FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
+        let model = Rc::new(RefCell::new(model));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings, &ScreenCarry::default())
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
     }
 
     #[test]
