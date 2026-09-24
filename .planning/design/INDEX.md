@@ -60,3 +60,4 @@ status in `.planning/progress.md`.
 | 2026-08-30 | `2026-08-30-watchdog.md` | Watchdog for the single-core superloop | Live |
 | 2026-09-01 | `2026-09-01-idle-policy-across-the-ffi-seam.md` | `pl_ui_display_power` as a pull-based level; **the firmware does not run `core/src/run.rs`** | Live |
 | 2026-09-01 | `2026-09-01-remembered-devices.md` | Remembered-device model, store schema, FFI delta | Live |
+| 2026-09-24 | `2026-09-24-congestion-cushion.md` | Cushioning audio against congested air: trim hold timer + ABR, measurement round, PL:S:1 setting (pico-link-8pp1) | Live |
