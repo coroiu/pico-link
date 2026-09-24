@@ -529,7 +529,7 @@ pub trait Widget {
     /// such concept (static labels, dividers).
     ///
     /// Exists so a caller that rebuilds a screen's widgets from scratch on
-    /// every model change (e.g. `App::rebuild_root` over live device/link
+    /// every model change (e.g. `App::refresh_stack` over live device/link
     /// data — see `pico_link_core::app`'s doc comments) can read back the
     /// *old* widget's selection before discarding it, and carry it forward
     /// into the freshly built replacement (`VerticalList::with_selected`)
