@@ -1990,7 +1990,7 @@ mod tests {
     // the real `Screen` diff. A widget-local memory of "my own body key
     // last frame" cannot answer that soundly, because a `HeroStatusView`
     // instance does not survive frames in production (`HomeView::new` is
-    // called fresh from `App::rebuild_root`, which every
+    // called fresh from `App::refresh_stack`, which every
     // `Event::LevelsChanged` triggers) -- see `Widget::damage_region_key`'s
     // doc comment. This test drives the real `Screen::render` with
     // `force_full_damage: false` on frame 2, deliberately NOT leaning on
@@ -2002,7 +2002,7 @@ mod tests {
     /// `HeroStatusView` -- `Rc<RefCell<_>>` so the test can hold its own
     /// handle to swap the widget's content between frames while `Screen`
     /// keeps the SAME widget slot identity, exactly reproducing the
-    /// "reconstructed-but-in-the-same-slot" shape `App::rebuild_root`
+    /// "reconstructed-but-in-the-same-slot" shape `App::refresh_stack`
     /// produces via `Navigator::replace_root` in production.
     struct HeroSlot(alloc::rc::Rc<core::cell::RefCell<HeroStatusView>>);
 

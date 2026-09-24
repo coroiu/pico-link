@@ -3,9 +3,9 @@ use crate::render::Instant;
 
 use super::events::{ConnectFailureReason, ConnectStep};
 
-/// The pairing wizard's own phase state (design section 9 / bead
-/// pico-link-znb.7 / E5), independent of [`BtModel`]: `BtModel` is "what
-/// core knows about the Bluetooth link and discovered devices", while this
+/// The pairing wizard's own phase state, independent of [`BtModel`]:
+/// `BtModel` is "what core knows about the Bluetooth link and discovered
+/// devices", while this
 /// is "which of the wizard's six phases is currently on screen and that
 /// phase's own local data" -- e.g. the scan list itself lives in
 /// `BtModel::discovered` (read live, not duplicated here), but "the user is
@@ -20,10 +20,8 @@ use super::events::{ConnectFailureReason, ConnectStep};
 /// one field.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum WizardPhase {
-    /// Phase 1 (formerly "instructions", now removed -- pico-link-4vb.2:
-    /// Andreas wanted the wizard to open straight into scanning rather
-    /// than requiring an A press first). Scanning (10.24s, C-timed)
-    /// and/or showing whatever's accumulated in `BtModel::discovered` so far
+    /// Phase 1: scanning (10.24s, C-timed) and/or showing whatever's
+    /// accumulated in `BtModel::discovered` so far
     /// -- this phase covers both "still actively scanning" and "scan
     /// finished, results on screen, user is choosing one", since nothing
     /// about the rendered content differs between them. `started` is when
@@ -53,16 +51,15 @@ pub enum WizardPhase {
     /// Phase 5: surfaced once a connect attempt has gone unanswered for
     /// ~6s (a C-timed threshold -- core never decides this itself, it
     /// only renders whatever [`Event::ConnectRetrying`] reports).
-    /// `attempt` is the free liveness counter design section 9 calls for.
+    /// `attempt` is the free liveness counter.
     NotResponding { addr: [u8; 6], attempt: u16 },
-    /// Phase 6, success outcome. `degraded` selects between the two
-    /// outcomes design section 9 draws a hard line between: plain success
+    /// Phase 6, success outcome. `degraded` selects between plain success
     /// (auto-dismisses via [`Event::WizardAutoDismiss`]) and degraded
     /// success (requires acknowledgement, never auto-dismisses).
     Succeeded { degraded: bool },
     /// Phase 6, failure outcome. `reason` selects which of the five named
-    /// messages/remedies (design section 9's table) to show, and whether
-    /// a retry is offered at all (`reason.retryable()`).
+    /// messages/remedies to show, and whether a retry is offered at all
+    /// (`reason.retryable()`).
     Failed { addr: [u8; 6], reason: ConnectFailureReason },
 }
 
@@ -99,22 +96,21 @@ impl WizardPhase {
     }
 }
 
-/// Home's two faces (design section 4's Home exception, section 7 --
-/// bead `pico-link-znb.8`/E7). A **face**, not a pushed screen: Home is
-/// [`crate::render::Navigator`] depth 1 (design's "depth 0") on both
-/// faces, never depth 2, which is what keeps `B, B` a reliable escape
-/// from anywhere in the app (see [`build_home_screen`]'s module-level
-/// doc comment for the full argument). Lives in an `Rc<RefCell<_>>`
-/// shared with the `HomeView` widget instance the same way
-/// [`WizardPhase`] does -- see [`App::home_face`]'s doc comment for why
-/// that indirection is required (a fresh `HomeView` is constructed on
-/// every [`App::rebuild_root`], and the face must survive that).
+/// Home's two faces. A **face**, not a pushed screen: Home is
+/// [`crate::render::Navigator`] depth 1 on both faces, never depth 2,
+/// which is what keeps `B, B` a reliable escape from anywhere in the app
+/// (see [`build_home_screen`]'s module-level doc comment for the full
+/// argument). Lives in an `Rc<RefCell<_>>` shared with the `HomeView`
+/// widget instance the same way [`WizardPhase`] does -- see
+/// [`App::home_face`]'s doc comment for why that indirection is required
+/// (a fresh `HomeView` is constructed on every [`App::refresh_stack`],
+/// and the face must survive that).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HomeFace {
-    /// The hero/status display -- design section 6.
+    /// The hero/status display.
     #[default]
     Status,
-    /// The two-row Bluetooth/Settings menu -- design section 7.
+    /// The two-row Bluetooth/Settings menu.
     Menu,
 }
 
@@ -128,11 +124,11 @@ pub enum HomeFace {
 /// next `Runner::step`/`pl_ui_tick`) and `save_pending` (the value needs
 /// persisting) fire together on a user pick but NOT on
 /// [`App::set_display_settings`]'s initial seed from a loaded/default
-/// value (D9: seeding must never re-save what was just loaded).
+/// value (seeding must never re-save what was just loaded).
 /// `refresh_pending` is a third, purely presentational latch: the Settings
 /// screen's rows and the open picker's checkmark must reflect the pick on
-/// the very same frame (design S6), which needs `App::refresh_stack`, not
-/// anything `Runner`/`pl_ui_tick` does.
+/// the very same frame, which needs `App::refresh_stack`, not anything
+/// `Runner`/`pl_ui_tick` does.
 #[derive(Default)]
 pub struct DisplaySettingsState {
     pub(in crate::app) current: DisplaySettings,

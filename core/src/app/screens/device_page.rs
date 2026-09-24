@@ -27,12 +27,10 @@ use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, PairedDev
 
 /// A placeholder for a live value this page cannot honestly report yet --
 /// `core` has no `SetDeviceCodecPref`/`CodecAvailability`/
-/// `A2dpStreamStateChanged` seam (Ada's
-/// `.planning/design/2026-09-02-device-page-seam.md`, none of it
-/// implemented -- verified: not present anywhere in `core`). Per that
-/// design's §3.0: a *live* field dashes when the value is unknown; a
-/// *stored* setting never dashes, because it is still true when nothing is
-/// connected. `CODEC`/`ADDRESS` are the latter and never use this.
+/// `A2dpStreamStateChanged` seam. A *live* field dashes when the value is
+/// unknown; a *stored* setting never dashes, because it is still true
+/// when nothing is connected. `CODEC`/`ADDRESS` are the latter and never
+/// use this.
 ///
 /// Plain ASCII hyphen-minus, not a typographic em dash (`\u{2014}`):
 /// `theme::font`'s `u8g2_font_helv*_tf` faces are built with
@@ -44,19 +42,19 @@ use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, PairedDev
 const DASH: &str = "-";
 
 /// Index of the `QUALITY` row within [`device_page_rows`]'s output, when
-/// present -- always right after `CODEC` (design §2/§4.2: the row belongs
-/// directly under the codec it modifies).
+/// present -- always right after `CODEC`: the row belongs directly under
+/// the codec it modifies.
 const DEVICE_PAGE_QUALITY_ROW_INDEX: usize = 1;
 
 /// Whether the device page's `QUALITY` row (and its picker) should be
-/// shown at all -- design §2/§8 rule 1: "the row is absent, not dim" when
-/// LDAC isn't effective-or-pinned. Connected: keyed off the *live* codec
-/// (the only truth available -- there is no real codec pin seam yet, same
-/// honesty rule [`device_page_rows`]'s `CODEC` value already follows).
+/// shown at all -- "the row is absent, not dim" when LDAC isn't
+/// effective-or-pinned. Connected: keyed off the *live* codec (the only
+/// truth available -- there is no real codec pin seam yet, same honesty
+/// rule [`device_page_rows`]'s `CODEC` value already follows).
 /// Disconnected: keyed off `ldac_quality != 0` -- a device that was
 /// manually put in Adaptive or pinned to a rate at some point is "LDAC in
 /// play" even while off; a device nobody ever touched has no such
-/// evidence and stays hidden (§7: no first-run prompt).
+/// evidence and stays hidden (no first-run prompt).
 fn device_page_quality_present(model: &BtModel, addr: DeviceAddr) -> bool {
     if model.connected_addr == Some(addr) {
         model.connected_codec.as_ref().is_some_and(|c| c.word == "LDAC")
@@ -66,11 +64,10 @@ fn device_page_quality_present(model: &BtModel, addr: DeviceAddr) -> bool {
 }
 
 /// The device-page value-column budget (px) the `QUALITY` row's Adaptive
-/// form must fit inside -- design §4.2's own measure, shared with a
-/// `QUALITY` label of ~35px against the row's 182px total. Ruby must
-/// measure, not assume (§4.2): [`format_adaptive_row_value`] checks this
-/// at build time and falls back to the no-separator form if it disagrees,
-/// rather than trusting the design doc's estimate blindly.
+/// form must fit inside, against a `QUALITY` label of ~35px against the
+/// row's 182px total. Measured, not assumed:
+/// [`format_adaptive_row_value`] checks this at build time and falls back
+/// to the no-separator form if it disagrees.
 const DEVICE_PAGE_ADAPTIVE_VALUE_BUDGET_PX: u32 = 182;
 
 /// The horizontal pixel footprint `text` would render at in `font` --
@@ -84,9 +81,9 @@ fn text_width(font: &FontRenderer, text: &str) -> u32 {
 }
 
 /// The `QUALITY` row's value under Adaptive while a live figure exists --
-/// design §4.2: `Adaptive · <n>`, no `kbps` unit (it's stated everywhere
-/// else already), falling back to the no-separator `Adaptive <n>` form if
-/// the middle dot's measured width overruns the row's value budget.
+/// `Adaptive · <n>`, no `kbps` unit (it's stated everywhere else already),
+/// falling back to the no-separator `Adaptive <n>` form if the middle
+/// dot's measured width overruns the row's value budget.
 fn format_adaptive_row_value(kbps: u32) -> String {
     let preferred = format!("Adaptive \u{b7} {kbps}");
     if text_width(&theme::font::value(), &preferred) <= DEVICE_PAGE_ADAPTIVE_VALUE_BUDGET_PX {
@@ -96,16 +93,15 @@ fn format_adaptive_row_value(kbps: u32) -> String {
     }
 }
 
-/// The `QUALITY` row's trailing value, per design §4.2's table.
+/// The `QUALITY` row's trailing value.
 fn device_page_quality_row_value(model: &BtModel, device: &PairedDevice, connected: bool) -> String {
     if device.ldac_quality == LDAC_QUALITY_ADAPTIVE {
         let streaming = connected && model.connected_codec.as_ref().is_some_and(|c| c.word == "LDAC");
         match (streaming, model.ldac_live_kbps) {
             (true, Some(kbps)) => format_adaptive_row_value(kbps),
             // Disconnected, or connected-but-no-live-reading-yet: never
-            // claim a number we don't have (design §8: "Adaptive's
-            // trailing note reads `varies`" is the picker's own wording;
-            // the row's plain `Adaptive` is the same honesty rule).
+            // claim a number we don't have -- the picker's own "Adaptive's
+            // trailing note reads `varies`" is the same honesty rule.
             _ => String::from("Adaptive"),
         }
     } else {
@@ -120,26 +116,22 @@ fn device_page_forget_row_index(rows_len: usize) -> usize {
     rows_len - 1
 }
 
-/// The device page's rows, in order (design
-/// `.planning/design/2026-09-02-device-page.md` §3, as scoped by
-/// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
-/// §3.4): `CODEC`, `QUALITY` (present only when LDAC is effective-or-pinned
-/// -- `.planning/design/2026-09-07-ldac-quality-selector.md` §2/§8),
-/// `SAMPLE RATE`, `USB IN`, `A2DP`, `ADDRESS`, `Forget this device`.
+/// The device page's rows, in order: `CODEC`, `QUALITY` (present only
+/// when LDAC is effective-or-pinned), `SAMPLE RATE`, `USB IN`, `A2DP`,
+/// `ADDRESS`, `Forget this device`.
 ///
 /// **PURE.** Model in, rows out -- no `Screen`, no `Navigator`, no
 /// framebuffer, testable directly. `CODEC` is [`FieldKind::Readonly`], not
-/// `Action`, in THIS bead: there is no codec picker to open yet (Ada's
+/// `Action`: there is no codec picker to open yet (Ada's
 /// `CodecAvailability` seam doesn't exist), and a bright, caret-growing row
 /// that does nothing on `A` would be exactly the "an unlabelled/live A
-/// lies" defect design rule 4 exists to prevent. Wiring `CODEC` back to
-/// `Action` is the device-page follow-up that lands alongside the codec
-/// picker (§9 of the design of record above). `QUALITY`, by contrast, IS
-/// `Action` -- pico-link-7jol.5 builds the picker it opens.
+/// lies" defect. Wiring `CODEC` back to `Action` is the device-page
+/// follow-up that lands alongside the codec picker. `QUALITY`, by
+/// contrast, IS `Action` -- it builds the picker it opens.
 fn device_page_rows(model: &BtModel, addr: DeviceAddr) -> Vec<FieldRow> {
     let connected = model.connected_addr == Some(addr);
-    // A *stored* setting (§3.0): never dashes, even disconnected. Today
-    // that's only ever "the live codec, or Automatic" -- there is no real
+    // A *stored* setting: never dashes, even disconnected. Today that's
+    // only ever "the live codec, or Automatic" -- there is no real
     // pin to read yet (`PairedDevice` carries no `codec_id` field), so a
     // disconnected device always reads `Automatic`, honestly.
     let codec_value =
@@ -176,7 +168,7 @@ fn device_page_rows(model: &BtModel, addr: DeviceAddr) -> Vec<FieldRow> {
 }
 
 /// Formats a device address exactly like the address a phone or laptop
-/// shows for the same device -- colons kept (device-page design §3.6).
+/// shows for the same device -- colons kept.
 fn format_device_address(addr: DeviceAddr) -> String {
     format!(
         "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
@@ -184,10 +176,8 @@ fn format_device_address(addr: DeviceAddr) -> String {
     )
 }
 
-/// The connected-or-paired device's detail page (design
-/// `.planning/design/2026-09-02-device-page.md`, scoped for this bead by
-/// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
-/// §3). Returns [`Refresh::Gone`] when `addr` is no longer in
+/// The connected-or-paired device's detail page. Returns
+/// [`Refresh::Gone`] when `addr` is no longer in
 /// [`BtModel::paired`] -- e.g. the device was forgotten from its own
 /// confirm screen, or from Devices while this page happened to be open one
 /// level up -- so [`App::refresh_stack`] can unwind the stack rather than
@@ -216,9 +206,7 @@ pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry:
         if quality_present && index == DEVICE_PAGE_QUALITY_ROW_INDEX {
             // Depth-2 push, fresh `ScreenCarry` -- `refresh_stack` owns
             // carrying focus/scroll forward on every subsequent rebuild,
-            // same as the connected-row-to-device-page push above it does
-            // (design `.planning/design/2026-09-07-device-page-and-single-
-            // select-picker.md` §1).
+            // same as the connected-row-to-device-page push above it does.
             let model = model_for_quality_picker.clone();
             let commands = Rc::clone(&commands_for_quality_picker);
             return Action::PushView(Box::new(move || {
@@ -229,8 +217,8 @@ pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry:
                     // vanished between the press and this closure running
                     // -- structurally unreachable, same reasoning as
                     // `build_devices_screen`'s own connected-row push.
-                    // `Refresh::Keep` is likewise unreachable here (bead
-                    // pico-link-bgnd M0 -- no builder returns it yet).
+                    // `Refresh::Keep` is likewise unreachable here -- no
+                    // builder returns it yet.
                     Refresh::Gone | Refresh::Keep => Screen::new("Quality", vec![]),
                 }
             }));
@@ -247,15 +235,15 @@ pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry:
     Refresh::Rebuild(Screen::new(title, vec![Box::new(Spacer::new(12)), Box::new(view)]).with_id(ScreenId::DevicePage(addr)))
 }
 
-/// Wraps [`FieldList`] to add the device page's `X` action (design §2.1's
-/// amendment: `drop` when connected, `link` when not -- both labelled,
-/// both real, no confirm needed since neither is destructive/irreversible)
-/// -- the same "small wrapper widget intercepts one `NavIntent` variant,
-/// delegates the rest" shape [`DevicesListView`] already uses for its own
-/// `ShortcutX` handling, and every method below that isn't
+/// Wraps [`FieldList`] to add the device page's `X` action (`drop` when
+/// connected, `link` when not -- both labelled, both real, no confirm
+/// needed since neither is destructive/irreversible) -- the same "small
+/// wrapper widget intercepts one `NavIntent` variant, delegates the rest"
+/// shape [`DevicesListView`] already uses for its own `ShortcutX`
+/// handling, and every method below that isn't
 /// `on_intent`/`chrome_contribution` is a forward, not an override -- see
-/// [`Widget::activation`]'s doc comment (pico-link-vxc D2) for why a
-/// wrapper must forward rather than let the default silently swallow one.
+/// [`Widget::activation`]'s doc comment for why a wrapper must forward
+/// rather than let the default silently swallow one.
 struct DevicePageView {
     list: FieldList,
     addr: DeviceAddr,
@@ -330,10 +318,8 @@ impl Widget for DevicePageView {
     }
 
     /// Folds `list`'s own key and nothing else -- deliberately does NOT
-    /// fold `connected`/`LinkState`/the X label
-    /// (`.planning/design/2026-09-07-device-page-and-single-select-
-    /// picker.md` §5, damage-key rule 2): the rail has its own key fed by
-    /// the already-resolved `ButtonLabel`s (`chrome_contribution` above),
+    /// fold `connected`/`LinkState`/the X label: the rail has its own key
+    /// fed by the already-resolved `ButtonLabel`s (`chrome_contribution` above),
     /// so folding link state into the *body* key would repaint the body on
     /// every link-state change for zero changed body pixels -- exactly the
     /// "fold something you don't draw" defect this project has already
@@ -356,7 +342,7 @@ mod tests {
 
     use super::*;
 
-    // --- pico-link-7jol.4: device_page_rows (pure) ---
+    // --- device_page_rows (pure) ---
 
     #[test]
     fn device_page_rows_shows_the_live_codec_when_connected() {
@@ -415,8 +401,7 @@ mod tests {
         // exposed on `FieldRow` directly): CODEC/SAMPLE RATE/USB IN/A2DP/
         // ADDRESS must be `Readonly` (A does nothing), and only the last
         // row (Forget) must be `Action` (A is live) -- no codec picker to
-        // open yet in this bead (this file's `device_page_rows` doc
-        // comment).
+        // open yet (see `device_page_rows`'s doc comment).
         let mut list = FieldList::new(rows);
         for _ in 0..row_count - 1 {
             assert_eq!(list.activation(), None, "only Forget should be pressable on this bead's device page");
@@ -425,7 +410,7 @@ mod tests {
         assert_eq!(list.activation(), Some(Verb::Open), "the focused last row (Forget) must be pressable");
     }
 
-    // --- pico-link-7jol.4: the device page's own screen/wrapper ---
+    // --- The device page's own screen/wrapper ---
 
     #[test]
     fn the_connected_devices_page_x_binding_is_drop() {
@@ -442,11 +427,11 @@ mod tests {
 
     #[test]
     fn a_disconnected_devices_page_x_binding_is_link_and_reconnects() {
-        // Reach a disconnected device's page the only way it's wired in
-        // this bead: connect once (so the page is reachable via the
-        // connected row), then let the link drop while the page stays
-        // open -- `refresh_stack` must flip `connected` (and therefore the
-        // X binding) live, matching device-page design §2.1's amendment.
+        // Reach a disconnected device's page the only way it's wired:
+        // connect once (so the page is reachable via the connected row),
+        // then let the link drop while the page stays open --
+        // `refresh_stack` must flip `connected` (and therefore the X
+        // binding) live.
         let mut app = App::new(240, 240);
         let addr = [9; 6];
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
@@ -487,8 +472,8 @@ mod tests {
         let mut model = BtModel::default();
         let addr = [20; 6];
         model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
-        // Not connected, ldac_quality == 0 -- design §2/§8: no first-run
-        // prompt, the row simply doesn't exist yet.
+        // Not connected, ldac_quality == 0 -- no first-run prompt, the
+        // row simply doesn't exist yet.
         let rows = device_page_rows(&model, addr);
         assert!(!rows.iter().any(|r| r.label == "QUALITY"), "a never-touched, disconnected device must not show QUALITY");
     }
@@ -521,8 +506,8 @@ mod tests {
         let mut model = BtModel::default();
         let addr = [23; 6];
         model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 2 });
-        // Not connected -- design §8: "picking a quality while disconnected
-        // is allowed", and a previously pinned device stays visible.
+        // Not connected -- "picking a quality while disconnected is
+        // allowed", and a previously pinned device stays visible.
         let rows = device_page_rows(&model, addr);
         let row = rows.iter().find(|r| r.label == "QUALITY").expect("a previously-pinned device must show QUALITY even while disconnected");
         assert_eq!(row.value(), Some("660 kbps"), "a stored pin never dashes, any link state (design §4.2)");
@@ -598,7 +583,7 @@ mod tests {
 
         // Before the echo: the device page underneath still reads the OLD
         // value (990 kbps, the effective default) -- there is no
-        // optimistic local state anywhere in this path (design §5.1).
+        // optimistic local state anywhere in this path.
         app.handle_input(vec![NavIntent::Back]); // -> device page
         let rows_before_echo = device_page_rows(&app.model(), addr);
         assert_eq!(rows_before_echo.iter().find(|r| r.label == "QUALITY").unwrap().value(), Some("990 kbps"), "no optimistic update before the echo");

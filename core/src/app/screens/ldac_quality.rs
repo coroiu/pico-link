@@ -16,23 +16,18 @@ use super::super::{BtModel, Command, DeviceAddr, PickerKind, Refresh, ScreenCarr
 /// Adaptive).
 pub(crate) const LDAC_QUALITY_ADAPTIVE: u8 = 4;
 
-/// `ListItemKey`s for the `QUALITY` picker's four rows, in the order Uma's
-/// design lists them (highest rate first, Adaptive last) --
-/// `.planning/design/2026-09-07-ldac-quality-selector.md` §4.1. Reused for
-/// both the picker's `checked`/`on_pick` plumbing and
-/// [`ldac_quality_fixed_kbps`]'s parallel ordering.
+/// `ListItemKey`s for the `QUALITY` picker's four rows (highest rate
+/// first, Adaptive last). Reused for both the picker's `checked`/`on_pick`
+/// plumbing and [`ldac_quality_fixed_kbps`]'s parallel ordering.
 const LDAC_QUALITY_PICKER_KEYS: [ListItemKey; 4] =
     [ListItemKey::from_u64(101), ListItemKey::from_u64(102), ListItemKey::from_u64(103), ListItemKey::from_u64(104)];
 
 /// LDAC's three named fixed rates, in kbps, highest first --
-/// `.planning/design/2026-09-07-ldac-quality-selector.md` §8 rule 4:
 /// sample-rate dependent (909/606/303 at 44.1kHz), computed here in **one**
 /// place rather than restated at each of the row/picker/Home call sites.
 /// `None` (rate unknown, or disconnected) falls back to the 48kHz set --
 /// this project's USB chain is 48k-only today and there is no
-/// `sample_rate_hz` seam yet
-/// (`.planning/design/2026-09-07-device-page-and-single-select-picker.md`'s
-/// scope table), so every call site below passes `None`.
+/// `sample_rate_hz` seam yet, so every call site below passes `None`.
 fn ldac_quality_rates_kbps(sample_rate_hz: Option<u32>) -> [u32; 3] {
     if sample_rate_hz == Some(44_100) {
         [909, 606, 303]
@@ -43,12 +38,11 @@ fn ldac_quality_rates_kbps(sample_rate_hz: Option<u32>) -> [u32; 3] {
 
 /// `ldac_quality` (1-based, [`PairedDevice::ldac_quality`]'s convention) to
 /// its fixed kbps, or `None` for Adaptive (`4`) or any out-of-range value.
-/// `0` ("never chosen") maps to the firmware's built-in default -- design
-/// §7's ruling that `0` is a storage state, never a display state: the
-/// fresh-device row/picker render the effective default as if it had been
-/// chosen, check included. `codec_ldac.c`'s
-/// `pl_ldac_quality_to_initial_state` is the source of truth this mirrors
-/// (today: HQ/990 kbps for both `0` and `1`).
+/// `0` ("never chosen") maps to the firmware's built-in default -- `0` is
+/// a storage state, never a display state: the fresh-device row/picker
+/// render the effective default as if it had been chosen, check included.
+/// `codec_ldac.c`'s `pl_ldac_quality_to_initial_state` is the source of
+/// truth this mirrors (today: HQ/990 kbps for both `0` and `1`).
 pub(in crate::app) fn ldac_quality_fixed_kbps(ldac_quality: u8, sample_rate_hz: Option<u32>) -> Option<u32> {
     let rates = ldac_quality_rates_kbps(sample_rate_hz);
     match ldac_quality {
@@ -61,7 +55,7 @@ pub(in crate::app) fn ldac_quality_fixed_kbps(ldac_quality: u8, sample_rate_hz: 
 
 /// The device page's `QUALITY` row's checked-row key, mirroring
 /// [`ldac_quality_fixed_kbps`]'s `0`-is-the-default convention so the
-/// check never sits on nothing (design §7).
+/// check never sits on nothing.
 fn ldac_quality_checked_key(ldac_quality: u8) -> ListItemKey {
     match ldac_quality {
         2 => LDAC_QUALITY_PICKER_KEYS[1],
@@ -71,10 +65,9 @@ fn ldac_quality_checked_key(ldac_quality: u8) -> ListItemKey {
     }
 }
 
-/// The `QUALITY` picker's four entries, per design §4.1: numbers leading,
-/// highest first, `HQ`/`SQ`/`MQ` never shown
-/// (`.planning/design/2026-09-07-ldac-quality-selector.md`). Returns
-/// [`Refresh::Gone`] when `addr` is no longer in [`BtModel::paired`] --
+/// The `QUALITY` picker's four entries: numbers leading, highest first,
+/// `HQ`/`SQ`/`MQ` never shown. Returns [`Refresh::Gone`] when `addr` is
+/// no longer in [`BtModel::paired`] --
 /// same reasoning as [`build_device_page_screen`]'s own doc comment (the
 /// picker sits one level above the page that already unwinds on this).
 pub(in crate::app) fn build_ldac_quality_picker_screen(model: &BtModel, addr: DeviceAddr, carry: &ScreenCarry, commands: &Rc<RefCell<VecDeque<Command>>>) -> Refresh {
@@ -94,10 +87,10 @@ pub(in crate::app) fn build_ldac_quality_picker_screen(model: &BtModel, addr: De
             selectable: true,
         })
         .collect();
-    // Adaptive's trailing note is live while streaming (design §4.1:
-    // "660 now", mirroring the codec picker's existing "SBC now"), and
-    // `varies` otherwise -- disconnected, or connected but not yet
-    // streaming LDAC (never claim a number we don't have, same rule
+    // Adaptive's trailing note is live while streaming ("660 now",
+    // mirroring the codec picker's existing "SBC now"), and `varies`
+    // otherwise -- disconnected, or connected but not yet streaming LDAC
+    // (never claim a number we don't have, same rule
     // `device_page_quality_row_value` follows).
     let adaptive_note = if streaming { model.ldac_live_kbps.map_or_else(|| String::from("varies"), |kbps| format!("{kbps} now")) } else { String::from("varies") };
     options.push(PickerOption {
@@ -115,9 +108,9 @@ pub(in crate::app) fn build_ldac_quality_picker_screen(model: &BtModel, addr: De
             .position(|k| *k == key)
             .map_or(LDAC_QUALITY_ADAPTIVE, |i| u8::try_from(i + 1).unwrap_or(LDAC_QUALITY_ADAPTIVE));
         commands_for_pick.borrow_mut().push_back(Command::SetDeviceLdacQuality { addr, ldac_quality });
-        // Design §5: applies live, no confirm, the picker stays open --
-        // `Action::None` (not `PopView`), per `build_single_select_screen`'s
-        // rule 2. The check itself moves only once the model's own echo
+        // Applies live, no confirm, the picker stays open -- `Action::None`
+        // (not `PopView`), per `build_single_select_screen`'s rule 2. The
+        // check itself moves only once the model's own echo
         // (`Event::PairedDeviceUpserted`) lands and `refresh_stack` rebuilds
         // this screen from `checked` above -- never optimistically here.
         Action::None
@@ -146,9 +139,7 @@ mod tests {
 
     use super::*;
 
-    // --- pico-link-7jol.5: the QUALITY row, its picker, and Home's live
-    // bitrate/ADAPTIVE tag. Design
-    // `.planning/design/2026-09-07-ldac-quality-selector.md`. ---
+    // --- The QUALITY row, its picker, and Home's live bitrate/ADAPTIVE tag ---
 
     #[test]
     fn ldac_quality_rates_default_to_the_48khz_ladder_and_switch_at_44_1khz() {

@@ -3,13 +3,11 @@
 //! in whatever area it's given.
 //!
 //! A general framework-level primitive, not tied to any one caller's
-//! content states: a waiting/empty/error state for a list view, a "this
-//! item was removed" gone state for a detail view, or a stubbed
-//! not-yet-implemented placeholder screen (`crate::app::placeholder_screen`)
-//! can all reuse this same widget rather than each hand-rolling their own
-//! centered icon/headline/subline layout — three or more call sites is
-//! exactly the point past which "just leave it wherever it happened to be
-//! written" stops
+//! content states: a waiting/empty/error state for a list view, or a "this
+//! item was removed" gone state for a detail view, can all reuse this same
+//! widget rather than each hand-rolling their own centered icon/headline/
+//! subline layout — three or more call sites is exactly the point past
+//! which "just leave it wherever it happened to be written" stops
 //! being good enough, per the ADR's "shared `MessageView` widget" seam.
 //!
 //! A real [`Widget`] (not just a free function) so it can be dropped

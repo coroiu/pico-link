@@ -1,14 +1,11 @@
 //! `App`: the platform-free application state the unified main loop
 //! ([`crate::run::run`]) drives every frame.
 //!
-//! This is the minimal shell left after stripping the previous product
-//! layer down to a generic UI-framework template: a [`Navigator`] built
-//! once over a placeholder root screen, plus the single [`FrameBuffer565`]
-//! it renders into. There is no domain model, no sync, and no output seam
-//! wired up here — those are exactly the pieces a concrete product adds on
-//! top of this shell: build real content [`Screen`]s, wire `Action`s to
-//! push/pop them, and hand `App` whatever live state those screens need to
-//! read.
+//! Owns the [`Navigator`] (built over the Home root screen), the live
+//! [`BtModel`], and the single [`FrameBuffer565`] it renders into. Bluetooth
+//! events fold into the model via [`App::handle_event`]; user input reaches
+//! the navigator via [`App::handle_input`]; screens read the model to render
+//! and queue [`Command`]s back out through [`App::poll_command`].
 
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
@@ -24,10 +21,7 @@ use crate::input::NavIntent;
 use crate::power::DisplaySettings;
 use crate::render::home::build_home_screen;
 use crate::render::{FrameBuffer565, Instant, Navigator, RenderCtx};
-// Only the `#[cfg(test)]` methods below (`push_screen_for_test`,
-// `replace_root_for_test`) name `Screen` directly -- a plain `cargo build`
-// never uses it, hence the otherwise-unwarranted `allow`.
-#[allow(unused_imports)]
+#[cfg(test)]
 use crate::render::Screen;
 
 mod events;
@@ -48,10 +42,7 @@ pub(crate) use refresh::{Refresh, ScreenCarry};
 pub use screen_id::{PickerKind, ScreenId, SettingsPickerKind};
 pub(crate) use screens::device_page::build_device_page_screen;
 pub(crate) use screens::devices::build_devices_screen;
-// Only test code (this module's own `mod tests` and `render::wizard`'s)
-// reaches this via `crate::app::DEVICES_TITLE` -- a plain `cargo build`
-// never uses it, hence the otherwise-unwarranted `allow`.
-#[allow(unused_imports)]
+#[cfg(test)]
 pub(crate) use screens::devices::DEVICES_TITLE;
 use screens::ldac_quality::build_ldac_quality_picker_screen;
 pub(crate) use screens::ldac_quality::LDAC_QUALITY_ADAPTIVE;
@@ -65,55 +56,32 @@ pub use ui_state::{DisplaySettingsState, HomeFace, WizardPhase};
 /// sub-frame duration): unclamped, that would make `next_redraw_at`
 /// exactly equal to (or barely past) the instant just rendered, and
 /// [`App::tick`]'s due-check uses `>=`, so it would come due on the very
-/// next tick with effectively no time elapsed -- forever. That silently
-/// reinstates the always-dirty behaviour
-/// `.planning/decisions/2026-08-31-render-ctx-frame-scoped-clock.md`
-/// forbids: it costs the flush-skip on every screen and puts full-frame
-/// blits into SPI contention with audio (see pico-link-6wz). Not a live
-/// bug -- no production widget returns a sub-frame duration today -- this
-/// is a guard against a future one.
+/// next tick with effectively no time elapsed -- forever, reinstating an
+/// always-dirty screen that costs the flush-skip and contends with audio
+/// over SPI. Not a live bug (no production widget returns a sub-frame
+/// duration today) -- a guard against a future one.
 ///
-/// This is a conservative floor, not a measured frame cadence: no
-/// existing `core`-visible constant was available to reuse.
-/// `run::run`'s `frame_budget` is a runtime parameter chosen per platform
-/// (the emulator passes 33ms; firmware's superloop has no fixed period at
-/// all, see `firmware/src/main.c`'s per-frame `pl_ui_tick` call), not a
+/// A conservative floor, not a measured frame cadence: `run::run`'s
+/// `frame_budget` is a runtime parameter chosen per platform, not a
 /// compile-time constant `App` can see. `Duration::from_millis(16)`
-/// (~60Hz) is comfortably below any real frame period on this hardware,
-/// so it never meaningfully delays a widget with a genuinely short but
-/// non-pathological redraw interval -- it only rules out the
-/// exactly-or-near-zero case that re-dirties every tick.
+/// (~60Hz) is comfortably below any real frame period on this hardware.
 ///
-/// Deliberately *not* gated behind `debug_assert!`/`cfg(debug_assertions)`:
-/// this project's firmware builds `NDEBUG`-on by default (pico-sdk forces
-/// `CMAKE_BUILD_TYPE=Release` when the caller sets none), which also
-/// compiles out Rust's `debug_assert!` -- so a debug_assert-only guard
-/// would protect the host test suite and emulator but not the shipped
-/// firmware, exactly the environment where this regression is costly. The
-/// clamp below is unconditional in every build and is the actual guard;
-/// there is no accompanying `debug_assert!`, deliberately -- returning a
-/// sub-floor duration is a normal, silently-handled case (see
-/// [`Widget::redraw_after`](crate::render::Widget::redraw_after)'s doc
-/// comment), not a bug to flag loudly, and this crate's own test suite
-/// exercises exactly that case.
+/// Deliberately *not* gated behind `debug_assert!`: this project's firmware
+/// builds `NDEBUG`-on by default, which compiles out `debug_assert!` too --
+/// a debug-only guard would protect the host test suite but not the
+/// shipped firmware, exactly where this regression is costly. The clamp
+/// below is unconditional in every build.
 const MIN_REDRAW_DELAY: Duration = Duration::from_millis(16);
-
-
-
-/// Shared, interior-mutable handle to the live [`BtModel`] -- the M0 step
-/// of the live-widgets refactor (bead `pico-link-bgnd`,
-/// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md`
-/// section 2). `App` owns the one `Rc`; future app-view widgets (Home,
-/// Devices, ...) will hold their own clone of this same handle so they can
-/// read live state at render/sync time instead of being rebuilt from a
-/// snapshot on every model change. `RefCell`, not a plain `Rc<BtModel>`:
-/// `App`'s own event-folding methods need to mutate through it. **Borrow
-/// rule**: never hold a live `Ref`/`RefMut` across a call back into `App`
-/// (e.g. `refresh_stack`) -- borrow, read/write, drop, *then* call back in,
-/// or the `RefCell` panics at runtime. Model writes happen only inside
-/// `App::handle_event`'s fold methods, never during `sync`/`render`/
-/// `dispatch`, so such a panic would indicate a real bug, not a false
-/// positive.
+/// Shared, interior-mutable handle to the live [`BtModel`]. `App` owns the
+/// one `Rc`; screens hold their own clone so they can read live state at
+/// render/sync time instead of being rebuilt from a snapshot. `RefCell`,
+/// not a plain `Rc<BtModel>`: `App`'s own event-folding methods need to
+/// mutate through it. **Borrow rule**: never hold a live `Ref`/`RefMut`
+/// across a call back into `App` (e.g. `refresh_stack`) -- borrow,
+/// read/write, drop, *then* call back in, or the `RefCell` panics at
+/// runtime. Model writes happen only inside `App::handle_event`'s fold
+/// methods, never during `sync`/`render`/`dispatch`, so such a panic would
+/// indicate a real bug, not a false positive.
 pub(crate) type ModelHandle = Rc<RefCell<BtModel>>;
 
 /// The application core: a [`Navigator`] built once over the devices root
@@ -129,17 +97,12 @@ pub struct App {
     /// The live Bluetooth device/link state, folded in from [`Event`]s via
     /// [`App::handle_event`]. Screens are built by *reading* this, not by
     /// owning fragments of it themselves -- see [`BtModel`]'s doc comment.
-    /// A [`ModelHandle`] (`Rc<RefCell<BtModel>>`) as of bead
-    /// `pico-link-bgnd` M0, not a bare `BtModel` -- see that type alias's
-    /// doc comment for the borrow rule and why.
+    /// See [`ModelHandle`]'s doc comment for the borrow rule.
     model: ModelHandle,
-    /// C's own clock, threaded through from [`App::tick`]
-    /// (`pl_ui_tick`'s `now_us` in the FFI surface -- previously received
-    /// and silently discarded, see pico-link-a67). `core` never reads a
-    /// hardware timer itself (the platform seam owns that); this is purely
-    /// the latest value C has told it. Not yet consumed by any screen in
-    /// this bead's scope -- storing it is the fix pico-link-a67 asks for;
-    /// wiring a liveness/timeout indicator to it is future UI work.
+    /// C's own clock, threaded through from [`App::tick`] (`pl_ui_tick`'s
+    /// `now_us` in the FFI surface). `core` never reads a hardware timer
+    /// itself (the platform seam owns that); this is purely the latest
+    /// value C has told it.
     now_us: u64,
     /// The next instant, if any, at which some widget on the current
     /// screen says its own appearance would differ purely from elapsed
@@ -157,63 +120,49 @@ pub struct App {
     /// stack, with no path back to `App` itself -- this is the shared
     /// mailbox between them.
     commands: Rc<RefCell<VecDeque<Command>>>,
-    /// The pairing wizard's phase (pico-link-znb.7 / E5) -- shared with
-    /// whatever `PairingWizardView` widget instance is currently on the
-    /// navigator's stack, the same `Rc<RefCell<_>>`-mailbox shape
-    /// `commands` uses above. Two-way: the widget itself mutates this
-    /// directly for user-input-driven transitions (pressing A/X), and
-    /// `App` mutates it directly from C events (`on_connect_step_changed`
-    /// and friends) -- either side's write is picked up by the widget's
-    /// next `render` because it reads through the same `Rc` rather than a
-    /// snapshot, so **no screen replacement is needed** for a phase
-    /// transition alone (contrast [`App::rebuild_root`], which fully
-    /// rebuilds the *devices* screen on every model change -- the wizard
-    /// screen, once pushed, is never rebuilt or replaced; only its shared
-    /// state changes underneath it). This is what design section 14/F8
-    /// means by "phase/wizard screen replaced by C events without
-    /// pushing" at the state level: no `Navigator` stack operation is
-    /// involved in a phase advance at all, pushing or otherwise.
+    /// The pairing wizard's phase -- shared with whatever
+    /// `PairingWizardView` widget instance is currently on the navigator's
+    /// stack, the same `Rc<RefCell<_>>`-mailbox shape `commands` uses
+    /// above. Two-way: the widget itself mutates this directly for
+    /// user-input-driven transitions (pressing A/X), and `App` mutates it
+    /// directly from C events (`on_connect_step_changed` and friends) --
+    /// either side's write is picked up by the widget's next `render`
+    /// because it reads through the same `Rc` rather than a snapshot, so
+    /// **no screen replacement is needed** for a phase transition alone
+    /// (contrast [`App::refresh_stack`], which fully rebuilds the *devices*
+    /// screen on every model change -- the wizard screen, once pushed, is
+    /// never rebuilt or replaced; only its shared state changes underneath
+    /// it).
     wizard_phase: Rc<RefCell<WizardPhase>>,
     /// A live mirror of `model.discovered`, shared with the wizard widget the
     /// same way `wizard_phase` is -- kept in lockstep by [`App::add_device`]/
     /// [`App::clear_devices`] purely so the wizard's scan-list rendering
     /// doesn't need a borrowed reference into `App` itself (which nothing
-    /// living inside `Navigator`'s stack can hold). A small, bounded clone
-    /// on every device event (the design's own Class-of-Device filter, E9,
-    /// keeps this list under ~12 entries) -- simplicity over cleverness,
-    /// matching this crate's existing "rebuilt from scratch" philosophy
-    /// for small lists (see [`build_devices_screen`]'s doc comment).
+    /// living inside `Navigator`'s stack can hold).
     wizard_devices: Rc<RefCell<Vec<DeviceEntry>>>,
-    /// Which of Home's two faces (design section 4/7) is currently
-    /// showing -- shared with whatever `HomeView` widget instance is
-    /// currently the root screen's content, the same `Rc<RefCell<_>>`-
-    /// mailbox shape [`App::wizard_phase`] uses. This indirection is
-    /// required, not just consistent-for-its-own-sake: unlike the wizard
-    /// (pushed once, never rebuilt -- see `wizard.rs`'s module doc),
+    /// Which of Home's two faces is currently showing -- shared with
+    /// whatever `HomeView` widget instance is currently the root screen's
+    /// content, the same `Rc<RefCell<_>>`-mailbox shape [`App::wizard_phase`]
+    /// uses. Required, not just consistent-for-its-own-sake: unlike the
+    /// wizard (pushed once, never rebuilt -- see `wizard.rs`'s module doc),
     /// Home *is* rebuilt on every model change (it's the root screen, see
-    /// [`App::rebuild_root`]), so a face toggle recorded only on a
+    /// [`App::refresh_stack`]), so a face toggle recorded only on a
     /// `HomeView` field would be silently discarded the next time a
-    /// Bluetooth event fires while the menu face is showing -- exactly
-    /// the defect class `pico-link-a67`'s `Navigator::replace_root` fix
-    /// already closed for screen-stack depth; this closes the same class
-    /// for this one piece of intra-screen state. Read (not written) fresh
-    /// by every freshly built `HomeView`, so the toggle survives a
-    /// rebuild with no navigator involvement.
+    /// Bluetooth event fires while the menu face is showing. Read (not
+    /// written) fresh by every freshly built `HomeView`, so the toggle
+    /// survives a rebuild with no navigator involvement.
     home_face: Rc<RefCell<HomeFace>>,
-    /// The `why?` page's frozen block order (design
-    /// `.planning/design/2026-09-07-home-fault-strip.md` §8.1, orchestrator
-    /// ruling on `pico-link-9eq2.3.3`) -- shared with `HomeView`/
+    /// The `why?` page's frozen block order -- shared with `HomeView`/
     /// `build_why_page_screen` the same `Rc<RefCell<_>>`-mailbox shape
     /// `home_face` uses, for the same reason: the page's ordering must
     /// survive [`App::refresh_stack`] rebuilding it on every subsequent
     /// fault event while it's open, only ever appending, never re-sorting
     /// (see [`build_why_page_screen`]'s doc comment).
     why_page_order: Rc<RefCell<Vec<FaultKey>>>,
-    /// The screensaver dim/off + timeout setting's shared mailbox (bead
-    /// pico-link-qivj.2) -- same `Rc<RefCell<_>>` shape as `home_face`/
-    /// `wizard_phase`, for the same reason (the Settings screen and its
-    /// pickers are pushed `Action::PushView` closures with no path back to
-    /// `App`).
+    /// The screensaver dim/off + timeout setting's shared mailbox -- same
+    /// `Rc<RefCell<_>>` shape as `home_face`/`wizard_phase`, for the same
+    /// reason (the Settings screen and its pickers are pushed
+    /// `Action::PushView` closures with no path back to `App`).
     display_settings: Rc<RefCell<DisplaySettingsState>>,
 }
 
@@ -311,34 +260,16 @@ impl App {
 
     /// Refreshes every screen on the [`Navigator`]'s stack that carries a
     /// [`ScreenId`] to reflect the current [`BtModel`], via
-    /// [`Navigator::replace_at`] one index at a time -- the generalization
-    /// of the old `rebuild_root` (renamed by
-    /// `pico-link-7jol.4`/`.planning/design/2026-09-07-device-page-and-
-    /// single-select-picker.md` §1.1) from "refresh index 0, and index 1
-    /// if it happens to be Devices, identified by title string" to "refresh
-    /// every identified screen, at any depth, identified by
-    /// [`ScreenId`]".
-    ///
-    /// **Behaviour-preserving for every screen that never calls
-    /// [`Screen::with_id`]** (the wizard, `ConfirmView`s, Settings):
-    /// [`Navigator::id_at`] returns `None` for those, and this loop skips
-    /// them exactly as before -- they were never in `rebuild_root`'s old
-    /// two-branch check either, so nothing about their behaviour changes.
-    /// [`ScreenId::Home`] and [`ScreenId::Devices`] replace the old
-    /// `stack[0]`-is-always-Home assumption and the
-    /// `title_at(1) == Some(DEVICES_TITLE)` check respectively, with
-    /// identical net effect; [`ScreenId::DevicePage`] is new with this
-    /// bead.
+    /// [`Navigator::replace_at`] one index at a time. Screens that never
+    /// call [`Screen::with_id`] (the wizard, `ConfirmView`s, Settings) are
+    /// skipped: [`Navigator::id_at`] returns `None` for those.
     ///
     /// If a screen's subject has vanished from the model (e.g. a
     /// [`ScreenId::DevicePage`] for a device that was just forgotten from
     /// one level up), [`Self::build_identified_screen`] returns
     /// [`Refresh::Gone`] and the stack unwinds to just below it via
-    /// [`Navigator::truncate_to`] -- "Forget pops two levels" (device-page
-    /// design §3.7) becomes structural this way rather than a hand-written
-    /// double pop in a confirm's callback, and it fires from *either*
-    /// route a device can disappear by, not only the one the user is
-    /// looking at.
+    /// [`Navigator::truncate_to`] -- this fires from *either* route a
+    /// device can disappear by, not only the one the user is looking at.
     fn refresh_stack(&mut self) {
         let mut truncate_at: Option<usize> = None;
         for index in 0..self.navigator.depth() {
@@ -355,9 +286,9 @@ impl App {
                     break;
                 }
                 // Leave the screen already on the stack in place -- no
-                // `replace_at`, no forced full-frame damage (bead
-                // pico-link-bgnd M0). Dead in practice today: no
-                // `build_identified_screen` arm returns `Keep` yet.
+                // `replace_at`, no forced full-frame damage. Dead in
+                // practice today: no `build_identified_screen` arm
+                // returns `Keep` yet.
                 Refresh::Keep => {}
             }
         }
@@ -410,18 +341,13 @@ impl App {
     }
 
     /// Records C's latest clock reading (`pl_ui_tick`'s core-side
-    /// implementation -- previously a no-op that discarded `now_us`
-    /// entirely, see pico-link-a67). Marks the app dirty exactly when
-    /// `now_us` reaches or passes [`App::next_redraw_at`] -- the
-    /// `redraw_after` seam's whole point (see the frame-scoped clock ADR):
-    /// a widget declares when it would next look different, rather than
-    /// this unconditionally marking dirty on every tick (which would
-    /// permanently cost the flush-skip and full-frame-blit a static screen
-    /// every tick, contending with audio over SPI on real hardware -- see
-    /// the ADR's "hacks to retire" section). Deliberately does **not**
-    /// clear `next_redraw_at` here: the next [`App::render`] recomputes it
-    /// from scratch, and until then it stays accurate for any repeated
-    /// `tick` call in the same frame.
+    /// implementation). Marks the app dirty exactly when `now_us` reaches
+    /// or passes [`App::next_redraw_at`] -- a widget declares when it would
+    /// next look different, rather than this unconditionally marking dirty
+    /// on every tick. Deliberately does **not** clear `next_redraw_at`
+    /// here: the next [`App::render`] recomputes it from scratch, and
+    /// until then it stays accurate for any repeated `tick` call in the
+    /// same frame.
     pub fn tick(&mut self, now_us: u64) {
         self.now_us = now_us;
         if let Some(due) = self.next_redraw_at {
@@ -442,7 +368,7 @@ impl App {
             // Sync before EACH dispatch, not once before the loop: a single
             // intent can pop the stack, exposing a screen underneath that
             // was not synced yet this frame -- see `Navigator::sync_top`'s
-            // doc comment (bead `pico-link-bgnd` M0).
+            // doc comment.
             self.navigator.sync_top(&ctx);
             self.navigator.dispatch(intent);
         }
@@ -476,12 +402,10 @@ impl App {
     /// on).
     ///
     /// Also forces the *whole framebuffer* damaged on that next render
-    /// (`Navigator::force_full_damage`) -- one of the damage pass's
-    /// enumerated full-damage triggers (design section 3.4, "wake from
-    /// display blank"): the panel was off, so nothing on it can be trusted
-    /// to already show the current screen's pixels, and a plain damage
-    /// diff (which only compares *this app's* last painted state, not
-    /// what's physically on the blanked panel) would otherwise see
+    /// (`Navigator::force_full_damage`): the panel was off, so nothing on
+    /// it can be trusted to already show the current screen's pixels, and a
+    /// plain damage diff (which only compares *this app's* last painted
+    /// state, not what's physically on the blanked panel) would otherwise see
     /// nothing dirty and skip repainting entirely.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
@@ -520,17 +444,14 @@ impl App {
 }
 
 /// The result of one [`App::render`] call: the framebuffer that was drawn
-/// into, plus the frame damage rect the damage pass
-/// (`.planning/design/2026-09-06-damage-rect-render-and-partial-blit.md`
-/// section 3.3) actually painted this frame -- `Rectangle::zero()` on a
-/// frame that changed nothing on screen.
+/// into, plus the frame damage rect the damage pass actually painted this
+/// frame -- `Rectangle::zero()` on a frame that changed nothing on screen.
 ///
 /// `Deref`s to [`FrameBuffer565`] so every existing call site that only
 /// ever wanted the framebuffer itself (`.pixel(..)`, `.pixels()`,
 /// `.size()`, a `DisplaySurface::flush(&output)`) keeps compiling
-/// unchanged -- only a caller that actually needs the rect (the FFI seam,
-/// bead `pico-link-7h5.6`; this bead's own A4 property test below) reads
-/// [`Self::damage`] directly.
+/// unchanged -- only a caller that actually needs the rect (the FFI seam)
+/// reads [`Self::damage`] directly.
 pub struct RenderOutput<'a> {
     framebuffer: &'a FrameBuffer565,
     pub damage: Rectangle,

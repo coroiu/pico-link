@@ -19,7 +19,7 @@
 //! Unlike the wizard (pushed once when the user opens it, then never
 //! rebuilt -- see `wizard.rs`'s module doc), Home *is* the root screen,
 //! rebuilt on every Bluetooth model change via
-//! [`crate::app::App::rebuild_root`]. A face stored only on a `HomeView`
+//! `crate::app::App::refresh_stack`. A face stored only on a `HomeView`
 //! field would be silently discarded by the very next rebuild -- exactly
 //! the defect class `pico-link-a67`'s `Navigator::replace_root` fix
 //! already closed for screen-stack depth. [`crate::app::App::home_face`]
@@ -123,7 +123,7 @@ const MENU_ROW_SETTINGS: usize = 1;
 
 /// Builds the Home screen at whatever face `home_face` currently holds --
 /// see the module doc for why no further rebuild is needed as the face
-/// toggles (unlike [`crate::app::App::rebuild_root`], which *does* rebuild
+/// toggles (unlike `crate::app::App::refresh_stack`, which *does* rebuild
 /// this screen on every Bluetooth model change, for the same reason it
 /// always has: the status face's hero widget needs to reflect live data).
 #[must_use]
@@ -334,7 +334,7 @@ impl HomeView {
         // `Action::PushView`'s builder is `FnOnce` with no path back to a
         // live `&BtModel`, and this is a `HomeView` field rather than a
         // per-press clone because the same snapshot serves every
-        // `ShortcutY` press until the next `rebuild_root` replaces it.
+        // `ShortcutY` press until the next `refresh_stack` replaces it.
         let model_for_shortcut_y = model.clone();
         let commands_for_shortcut_y = Rc::clone(commands);
         let commands_for_bluetooth = Rc::clone(commands);

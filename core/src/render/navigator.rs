@@ -187,7 +187,7 @@ impl Navigator {
     }
 
     /// The screen title at `index`, if any -- used by a caller (e.g.
-    /// [`crate::app::App::rebuild_root`]) to check whether a specific
+    /// `crate::app::App::refresh_stack`) to check whether a specific
     /// live-data-backed screen (e.g. Devices) is currently sitting at a
     /// known stack position before refreshing it via
     /// [`Navigator::replace_at`].
@@ -232,7 +232,7 @@ impl Navigator {
     /// This is deliberately *not* [`Navigator::new`] followed by re-pushing
     /// the rest of the stack: it exists specifically so a live-data-backed
     /// root screen (the devices list, driven by Bluetooth events — see
-    /// `pico_link_core::app::App::rebuild_root`) can be refreshed on every
+    /// `pico_link_core::app::App::refresh_stack`) can be refreshed on every
     /// model change without evicting the user from whatever screen they've
     /// navigated to. Rebuilding the whole `Navigator` here was a real
     /// defect: any Bluetooth event while browsing a pushed screen would
@@ -247,7 +247,7 @@ impl Navigator {
     /// refreshes the screen at `index` in place, leaving every other
     /// stack entry (above or below it) untouched, same non-negotiable
     /// property `replace_root` has for `index == 0`. A no-op if `index`
-    /// is out of range (the caller -- [`crate::app::App::rebuild_root`] --
+    /// is out of range (the caller -- `crate::app::App::refresh_stack` --
     /// is expected to have checked [`Navigator::title_at`] first, but this
     /// stays defensive rather than panicking on a stale index).
     ///

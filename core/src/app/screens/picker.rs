@@ -10,15 +10,8 @@ use crate::render::{Action, FieldList, FieldRow, ListItemKey, Screen, Verb};
 
 use super::super::{ScreenCarry, ScreenId};
 
-/// A single row in a [`build_single_select_screen`] picker.
-///
-/// `#[allow(dead_code)]` on this and on [`build_single_select_screen`]
-/// itself: this bead (`pico-link-7jol.4`) builds and tests the general
-/// picker mechanism ahead of its first real caller, the `QUALITY` row
-/// (`pico-link-7jol.5`) -- see
-/// `.planning/design/2026-09-07-device-page-and-single-select-picker.md`
-/// §7 step 4. Its first real caller is
-/// [`build_ldac_quality_picker_screen`] (pico-link-7jol.5).
+/// A single row in a [`build_single_select_screen`] picker. Its first
+/// real caller is [`build_ldac_quality_picker_screen`].
 pub(crate) struct PickerOption {
     /// Stable identity -- carries focus and the check across rebuilds, and
     /// is what [`build_single_select_screen`]'s `on_pick` callback is
@@ -34,14 +27,11 @@ pub(crate) struct PickerOption {
 }
 
 /// A generic single-select picker screen -- the codec picker and the LDAC
-/// quality picker (`pico-link-7jol.5`) are both this function with
-/// different `options`/`on_pick`, not two widgets
-/// (`.planning/design/2026-09-07-device-page-and-single-select-picker.md`
-/// §2). **Not a widget, not a `render/` module** -- composition of
-/// [`FieldList`] alone, per that design's §0.1 verdict.
+/// quality picker are both this function with different `options`/
+/// `on_pick`, not two widgets. **Not a widget, not a `render/` module**
+/// -- composition of [`FieldList`] alone.
 ///
-/// Five rules this shape makes structural rather than remembered (design
-/// §2.1):
+/// Five rules this shape makes structural rather than remembered:
 /// 1. **The check follows the stored value.** `checked` is read from the
 ///    model by the caller, not from a local "pressed" bit -- there is no
 ///    place in this function to put an optimistic check by accident.
@@ -56,10 +46,9 @@ pub(crate) struct PickerOption {
 /// 5. **`A` never lies** -- [`Verb::Select`] on selectable rows, no verb
 ///    (dim `A`) on unavailable ones, both from `FieldList::activation`.
 ///
-/// `A`'s rail word is [`Verb::Select`] (orchestrator ruling on
-/// `pico-link-7jol.4`: Uma's sketches say "pick", which would need a
-/// second `Verb::Exception` and her sign-off for one word that means the
-/// same thing to the user).
+/// `A`'s rail word is [`Verb::Select`]: the sketches say "pick", which
+/// would need a second `Verb::Exception` and sign-off for one word that
+/// means the same thing to the user.
 pub(crate) fn build_single_select_screen(
     id: ScreenId,
     title: impl Into<String>,
@@ -110,11 +99,9 @@ mod tests {
 
     use super::*;
 
-    // --- pico-link-7jol.4: build_single_select_screen (the general picker) ---
+    // --- build_single_select_screen (the general picker) ---
 
     fn quality_like_test_id() -> ScreenId {
-        // No ScreenId::Picker variant exists yet in this bead (it lands
-        // with pico-link-7jol.5, alongside its first real caller) --
         // `build_single_select_screen` is generic over `id`, so any
         // ScreenId value exercises its contract identically. Standing in
         // with an address distinct from any real device used elsewhere in
@@ -195,13 +182,9 @@ mod tests {
         assert!(picked.borrow().is_empty(), "an unavailable option must not be pickable -- the activation gate lives in FieldList, not on_pick");
     }
 
-    /// Headless PNG dump of the picker, at zoom -- the picker has no
-    /// wired-in caller yet in this bead (`ScreenId::Picker` and its first
-    /// real content land with `pico-link-7jol.5`), so it can't be reached
-    /// through the public `App`/emulator surface the way the device page
-    /// can (see `core/examples/device_page_screenshots.rs`). Dumped from
-    /// here instead, since this module's tests are the only place with
-    /// `pub(crate)` access to `build_single_select_screen` itself.
+    /// Headless PNG dump of the picker, at zoom -- dumped from here since
+    /// this module's tests are the only place with `pub(crate)` access to
+    /// `build_single_select_screen` itself.
     #[test]
     fn picker_screenshot_at_zoom() {
         const ZOOM: u32 = 3;

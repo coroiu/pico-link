@@ -12,10 +12,8 @@ use super::{App, ConnectedCodec, DeviceAddr, LinkState, PairedDevice};
 impl App {
     /// Folds one inbound Bluetooth-domain [`Event`] into [`BtModel`] and
     /// refreshes the root screen (`pl_ui_push_event`'s core-side
-    /// implementation -- the single entry point replacing the old
-    /// `set_link_state`/`add_device`/`clear_devices` setter trio). `core`
-    /// never acts on these itself -- it has no Bluetooth stack -- it only
-    /// updates what screens read.
+    /// implementation). `core` never acts on these itself -- it has no
+    /// Bluetooth stack -- it only updates what screens read.
     pub fn handle_event(&mut self, event: Event) {
         match event {
             Event::LinkStateChanged(state) => self.set_link_state(state),
@@ -67,21 +65,16 @@ impl App {
         }
     }
 
-    /// Phase 2 -> phase 3 transition (design section 9): when a GAP
-    /// inquiry ends (bead `pico-link-88xs`: called only from
-    /// [`App::set_discovering`] on the `scanning == false` edge, i.e. a
-    /// genuine [`Event::DiscoveryStateChanged`] -- no longer a
+    /// Phase 2 -> phase 3 transition: when a GAP inquiry ends (called only
+    /// from [`App::set_discovering`] on the `scanning == false` edge, i.e.
+    /// a genuine [`Event::DiscoveryStateChanged`] -- not a
     /// `LinkStateChanged(Idle)`, which could also fire on a connect
     /// failure or a disconnect and spuriously flip the wizard to
     /// `NothingFound`) while the wizard is still on
     /// [`WizardPhase::Scanning`] and nothing was found, moves it to
     /// [`WizardPhase::NothingFound`]. A no-op in every other case --
-    /// devices *were* found (the phase just stays `Scanning`, now showing
-    /// a selectable list instead of an actively-filling one -- design
-    /// section 9 draws no rendering distinction between those), the
-    /// wizard isn't open, or it's already past phase 2 (e.g. the user
-    /// already selected a device and moved on to phase 4 before this
-    /// event arrived).
+    /// devices *were* found, the wizard isn't open, or it's already past
+    /// phase 2.
     fn on_scan_ended_if_applicable(&mut self) {
         let mut phase = self.wizard_phase.borrow_mut();
         if matches!(*phase, WizardPhase::Scanning { .. }) && self.wizard_devices.borrow().is_empty() {
@@ -138,14 +131,13 @@ impl App {
     /// phase 6 success outcome, from either `Connecting` or
     /// `NotResponding`.
     ///
-    /// Also queues [`Command::PersistDevice { addr }`] (bead pico-link-cz0.6,
-    /// M5 persistence design point 7 -- `core`'s auto-reconnect/remember-
-    /// this-device POLICY: a connect that actually succeeded is worth
-    /// remembering), unconditionally -- `addr` comes straight off the event
-    /// itself (see [`Event::ConnectSucceeded`]'s doc comment for why that,
-    /// not `WizardPhase`, is the source of truth: it works identically for
-    /// a wizard-driven connect and the `PL_DEBUG_REMOTE` bypass, which
-    /// never touches `WizardPhase` at all).
+    /// Also queues [`Command::PersistDevice { addr }`] unconditionally --
+    /// `core`'s auto-reconnect/remember-this-device policy: a connect that
+    /// actually succeeded is worth remembering. `addr` comes straight off
+    /// the event itself (see [`Event::ConnectSucceeded`]'s doc comment for
+    /// why that, not `WizardPhase`, is the source of truth: it works
+    /// identically for a wizard-driven connect and the `PL_DEBUG_REMOTE`
+    /// bypass, which never touches `WizardPhase` at all).
     fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
         self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
         self.model.borrow_mut().connected_addr = Some(addr);
@@ -155,11 +147,10 @@ impl App {
 
     /// Folds one [`Event::StoreLoaded`] -- records `status` in [`BtModel`]
     /// and runs the auto-reconnect policy: `core` decides *whether* and
-    /// *which* device to reconnect to, C only loads/stages/flushes (design
-    /// point 7). Reshaped by bead pico-link-4vb.4 (T4), design section 5.2:
-    /// this event no longer carries an address -- by the time it arrives,
-    /// every `Event::PairedDeviceUpserted` C pushed ahead of it (its own
-    /// boot sequence's `count` records) has already folded into
+    /// *which* device to reconnect to, C only loads/stages/flushes. This
+    /// event carries no address -- by the time it arrives, every
+    /// `Event::PairedDeviceUpserted` C pushed ahead of it (its own boot
+    /// sequence's `count` records) has already folded into
     /// [`BtModel::paired`] (see [`App::on_paired_device_upserted`]), so the
     /// target is simply the highest `mru_seq` in that list. Queues the
     /// exact same [`Command::Connect`] a manual paired-row activation uses.
@@ -183,8 +174,7 @@ impl App {
     /// Folds one [`Event::PairedDeviceUpserted`] into [`BtModel::paired`] --
     /// update-in-place if `addr` is already known (a rename, an `mru_seq`
     /// bump), append otherwise. One of exactly two writers of `paired`
-    /// (design section 3's single-writer rule -- see that event's doc
-    /// comment). Bead pico-link-4vb.4 (T4).
+    /// (the single-writer rule -- see that event's doc comment).
     fn on_paired_device_upserted(&mut self, device: PairedDevice) {
         {
             let mut model = self.model.borrow_mut();
@@ -198,8 +188,8 @@ impl App {
     }
 
     /// Folds one [`Event::PairedDeviceForgotten`] into [`BtModel::paired`] --
-    /// the other of the two writers (design section 3). A no-op if `addr`
-    /// isn't currently known (e.g. a stray/duplicate echo).
+    /// the other of the two writers. A no-op if `addr` isn't currently
+    /// known (e.g. a stray/duplicate echo).
     fn on_paired_device_forgotten(&mut self, addr: DeviceAddr) {
         self.model.borrow_mut().paired.retain(|d| d.addr != addr);
         self.refresh_stack();
@@ -216,28 +206,24 @@ impl App {
     /// Folds one [`Event::WizardAutoDismiss`] -- pops all the way back to
     /// Home, but **only** if it's currently showing a plain (non-degraded)
     /// success; see that event's doc comment for why this guard exists.
-    /// pico-link-4vb.2 (Andreas's ruling): landing on Devices left him
-    /// pressing Back repeatedly to get back to Home, so this now calls
-    /// [`crate::render::Navigator::pop_to_root`] instead of
-    /// [`crate::render::Navigator::pop`] -- a no-op if the wizard isn't
-    /// actually the top of the stack any more (e.g. this event arrived
-    /// after the user already backed out via B), same as `pop` was.
+    /// Calls [`crate::render::Navigator::pop_to_root`] rather than
+    /// [`crate::render::Navigator::pop`] so it lands on Home, not
+    /// Devices -- a no-op if the wizard isn't actually the top of the
+    /// stack any more (e.g. this event arrived after the user already
+    /// backed out via B), same as `pop` was.
     fn on_wizard_auto_dismiss(&mut self) {
         let should_pop = matches!(*self.wizard_phase.borrow(), WizardPhase::Succeeded { degraded: false });
         if should_pop {
             self.navigator.pop_to_root();
             *self.wizard_phase.borrow_mut() = WizardPhase::default();
             self.wizard_devices.borrow_mut().clear();
-            // pico-link-l4d: `pop_to_root` only restores navigation depth --
-            // it doesn't touch which of Home's two faces (`HomeFace::Status`
-            // vs `HomeFace::Menu`) is showing. The user reached the wizard
-            // via Home's Menu face (Home -> A -> Devices -> pair), so without
+            // `pop_to_root` only restores navigation depth -- it doesn't
+            // touch which of Home's two faces (`HomeFace::Status` vs
+            // `HomeFace::Menu`) is showing. The user reached the wizard via
+            // Home's Menu face (Home -> A -> Devices -> pair), so without
             // this the auto-dismiss silently landed back on the
             // Bluetooth/Settings list instead of the hero -- which is the
             // entire point of auto-dismissing: showing the codec just paired.
-            // This is a deliberate, automatic choice of destination (see the
-            // policy note on `on_devices_back`/wizard-success-B for why the
-            // *manual* B routes are treated differently).
             *self.home_face.borrow_mut() = HomeFace::Status;
             self.dirty = true;
         }
@@ -250,37 +236,34 @@ impl App {
     ///
     /// Also clears [`BtModel::connected_codec`] whenever `state` isn't
     /// [`LinkState::Connected`] -- a stale codec word surviving a
-    /// disconnect is worse than `NO LINK` (design section 15).
-    /// Deliberately keyed off the link state itself rather than a
-    /// dedicated disconnect event: every path off `Connected` already
-    /// flows through this one method (bead pico-link-1v5), so this can't
-    /// race with a disconnect notification C forgot to send, and it needs
-    /// zero new firmware plumbing in `bt.c`.
+    /// disconnect is worse than `NO LINK`. Deliberately keyed off the
+    /// link state itself rather than a dedicated disconnect event: every
+    /// path off `Connected` already flows through this one method, so
+    /// this can't race with a disconnect notification C forgot to send,
+    /// and it needs zero new firmware plumbing in `bt.c`.
     ///
-    /// `LinkState` no longer carries a scan (bead `pico-link-88xs`, design
-    /// `.planning/design/2026-09-08-link-state-vs-discovery-axis.md`):
-    /// this method's own clear-on-not-`Connected` rule is unchanged --
-    /// see [`LinkState`]'s doc comment for why narrowing the type, not
-    /// relaxing this rule, is what fixed the "a scan wipes the connected
-    /// model" bug. [`BtModel::link_state`] has exactly one writer: this
-    /// method (INVARIANT L2) -- see [`App::record_connect_failure`].
+    /// [`BtModel::link_state`] has exactly one writer: this method -- see
+    /// [`App::record_connect_failure`]. See [`LinkState`]'s doc comment
+    /// for why narrowing the type, not relaxing this method's
+    /// clear-on-not-`Connected` rule, is what fixed the "a scan wipes the
+    /// connected model" bug.
     pub fn set_link_state(&mut self, state: LinkState) {
         {
             let mut model = self.model.borrow_mut();
             model.link_state = state;
             if state != LinkState::Connected {
                 model.connected_codec = None;
-                // `connected_addr` (bead pico-link-4vb.4, T5) follows the exact
-                // same lifecycle as `connected_codec`, for the same reason --
-                // see `BtModel::connected_addr`'s doc comment.
+                // `connected_addr` follows the exact same lifecycle as
+                // `connected_codec`, for the same reason -- see
+                // `BtModel::connected_addr`'s doc comment.
                 model.connected_addr = None;
-                // `out_level` (bead pico-link-du0) follows the exact same
-                // lifecycle for the exact same reason -- see
-                // `BtModel::out_level`'s doc comment.
+                // `out_level` follows the exact same lifecycle for the
+                // exact same reason -- see `BtModel::out_level`'s doc
+                // comment.
                 model.out_level = None;
-                // `ldac_live_kbps` (bead pico-link-7jol.5) follows the exact
-                // same lifecycle for the exact same reason -- see
-                // `BtModel::ldac_live_kbps`'s doc comment.
+                // `ldac_live_kbps` follows the exact same lifecycle for
+                // the exact same reason -- see `BtModel::ldac_live_kbps`'s
+                // doc comment.
                 model.ldac_live_kbps = None;
             }
         }
@@ -288,10 +271,10 @@ impl App {
     }
 
     /// Records whether the radio is running an inquiry. The SECOND,
-    /// independent axis (bead `pico-link-88xs`) -- deliberately does NOT
-    /// touch [`BtModel::link_state`] and does NOT clear any connected-model
-    /// field: an inquiry does not disconnect A2DP. [`BtModel::discovering`]
-    /// has exactly one writer: this method (INVARIANT L2).
+    /// independent axis -- deliberately does NOT touch
+    /// [`BtModel::link_state`] and does NOT clear any connected-model
+    /// field: an inquiry does not disconnect A2DP.
+    /// [`BtModel::discovering`] has exactly one writer: this method.
     pub fn set_discovering(&mut self, scanning: bool) {
         self.model.borrow_mut().discovering = scanning;
         if !scanning {
@@ -310,9 +293,9 @@ impl App {
             let mut model = self.model.borrow_mut();
             // A renegotiation away from LDAC (or a fresh connect that isn't
             // LDAC at all) must drop the previous stream's live figure --
-            // `ldac_live_kbps` (bead pico-link-7jol.5) is only ever meaningful
-            // for the codec it was measured on, and a stale reading surviving
-            // a codec change would show under the wrong hero word.
+            // `ldac_live_kbps` is only ever meaningful for the codec it was
+            // measured on, and a stale reading surviving a codec change
+            // would show under the wrong hero word.
             if codec.word != "LDAC" {
                 model.ldac_live_kbps = None;
             }
@@ -321,38 +304,34 @@ impl App {
         self.refresh_stack();
     }
 
-    /// Folds one [`Event::VolumeChanged`] reading into [`BtModel::volume`]
-    /// (bead pico-link-4v2.5, VT5, design section 7). No screen reads this
-    /// yet -- `rebuild_root` is called anyway, matching every other
-    /// `BtModel`-mutating fold in this file, so a future screen can rely
-    /// on that convention rather than each one deciding for itself whether
-    /// a redraw is warranted.
+    /// Folds one [`Event::VolumeChanged`] reading into [`BtModel::volume`].
+    /// Calls [`App::refresh_stack`] like every other `BtModel`-mutating
+    /// fold, so a future screen can rely on that convention rather than
+    /// each one deciding for itself whether a redraw is warranted.
     pub fn on_volume_changed(&mut self, level: u8, muted: bool, source: VolumeSource) {
         self.model.borrow_mut().volume = Some(VolumeState { level, muted, source });
         self.refresh_stack();
     }
 
     /// Folds one [`Event::LdacBitrateChanged`] reading into
-    /// [`BtModel::ldac_live_kbps`] (bead pico-link-7jol.5) -- see that
-    /// field's doc comment for the "never snapped to the ladder" rule.
-    /// Refreshes the stack so Home's bitrate line and the device page's
-    /// `QUALITY` row (its Adaptive trailing note) both pick up the new
-    /// figure the same frame it arrives.
+    /// [`BtModel::ldac_live_kbps`] -- see that field's doc comment for the
+    /// "never snapped to the ladder" rule. Refreshes the stack so Home's
+    /// bitrate line and the device page's `QUALITY` row (its Adaptive
+    /// trailing note) both pick up the new figure the same frame it
+    /// arrives.
     pub fn on_ldac_bitrate_changed(&mut self, kbps: u32) {
         self.model.borrow_mut().ldac_live_kbps = Some(kbps);
         self.refresh_stack();
     }
 
     /// Folds one [`Event::FaultRaised`] reading into
-    /// [`BtModel::fault_log`] (design `.planning/design/2026-09-07-audio-
-    /// fault-model.md` §7.4). Uses `self.now_us` (the FFI seam's own
+    /// [`BtModel::fault_log`]. Uses `self.now_us` (the FFI seam's own
     /// stored clock, see [`App::tick`]'s doc comment) rather than taking a
     /// clock parameter -- the same convention [`App::on_levels_changed`]'s
     /// peak-hold already uses. Calls [`App::refresh_stack`] like every
-    /// other `BtModel`-mutating fold, so a future screen (S3,
-    /// `pico-link-9eq2.3.3`) can rely on that convention rather than each
-    /// one deciding for itself whether a redraw is warranted -- this bead
-    /// builds no screen that actually reads `fault_log` yet.
+    /// other `BtModel`-mutating fold, so a future screen can rely on that
+    /// convention rather than each one deciding for itself whether a
+    /// redraw is warranted.
     pub fn on_fault_raised(&mut self, key: FaultKey, value: Option<FaultValue>, count: u16) {
         let now = Instant::from_micros(self.now_us);
         self.model.borrow_mut().fault_log.record(key, now, value, count);
@@ -360,8 +339,8 @@ impl App {
     }
 
     /// Folds one [`Event::LevelsChanged`] reading into
-    /// [`BtModel::out_level`] and refreshes the Home hero widget's meter
-    /// (bead pico-link-du0). Also updates the per-channel peak-hold cap:
+    /// [`BtModel::out_level`] and refreshes the Home hero widget's meter.
+    /// Also updates the per-channel peak-hold cap:
     /// a channel's hold value tracks the highest peak seen, and only
     /// drops back down once [`OUT_LEVEL_HOLD_DURATION`] has passed since
     /// it was last set to a new maximum -- the conventional VU-meter
@@ -390,11 +369,10 @@ impl App {
         } else {
             (prev_hold_r, prev_hold_r_at)
         };
-        // Release-ballistic attack anchor (bead pico-link-ajj, design
-        // requirement C; anchors on peak, not rms, as of bead pico-link-53c
-        // -- the bar itself now draws peak, so the ballistic must decay the
+        // Release-ballistic attack anchor -- anchors on peak, not rms,
+        // since the bar itself draws peak, so the ballistic must decay the
         // same quantity it draws or the displayed bar and its decay drift
-        // apart): decay the previous anchor to "now" and compare against
+        // apart: decay the previous anchor to "now" and compare against
         // the fresh peak sample. If the fresh sample is at or above that
         // decayed value, this is a rise -- attack is instantaneous, so the
         // anchor jumps straight to the new sample. Otherwise the anchor is
@@ -467,15 +445,12 @@ impl App {
     /// `BtModel::last_connect_failure`, not the link state.
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
         self.model.borrow_mut().last_connect_failure = Some((addr, reason));
-        // Bead pico-link-88xs, INVARIANT L2: `link_state` has exactly one
-        // writer. Routed through `set_link_state` rather than assigning
-        // the field directly (as this used to) -- correct today only by
-        // accident, since the preceding `Connecting` push had already
-        // cleared the four connected-model fields; going through the real
-        // setter makes that true by construction instead. The
-        // `refresh_stack()` call below is therefore redundant with the one
-        // inside `set_link_state`, but harmless -- `refresh_stack` is
-        // idempotent.
+        // `link_state` has exactly one writer: routed through
+        // `set_link_state` rather than assigning the field directly, so
+        // the "codec/addr/out_level cleared off `Connected`" invariant
+        // holds by construction. The `refresh_stack()` call below is
+        // therefore redundant with the one inside `set_link_state`, but
+        // harmless -- `refresh_stack` is idempotent.
         self.set_link_state(LinkState::Idle);
         // Phase 4/5 -> phase 6 (failure outcome). Unconditional (not
         // gated on the wizard currently being open/mid-connect): a stray

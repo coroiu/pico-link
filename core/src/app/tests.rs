@@ -9,7 +9,7 @@ use super::model::MAX_PAIRED_DEVICES;
 use super::*;
 use super::test_support::*;
 
-// --- VT6 design section 5.4/6.1: `App::volume_requires_dim_floor` ---
+// --- `App::volume_requires_dim_floor` ---
 
 #[test]
 fn volume_requires_dim_floor_is_false_with_no_volume_reading() {
@@ -71,9 +71,9 @@ fn handle_input_marks_dirty_and_moving_selection_changes_the_rendered_framebuffe
     // Home's status face has no focusable list of its own (Up/Down
     // is unbound there in Tier 1 -- see `render::home`'s module doc),
     // so this proof needs the Devices screen's list underneath it.
-    // Bead pico-link-4vb.4 (T5): with nothing remembered, Devices has
-    // only one row ("Pair new headphones") and Down has nowhere to go
-    // -- one paired device gives it a second row to move onto.
+    // With nothing remembered, Devices has only one row ("Pair new
+    // headphones") and Down has nowhere to go -- one paired device
+    // gives it a second row to move onto.
     app.handle_event(upsert([1, 2, 3, 4, 5, 6], "Test Headphones", 1));
     open_devices(&mut app);
 
@@ -96,17 +96,16 @@ fn navigator_starts_at_depth_one_with_the_placeholder_root_screen() {
     assert_eq!(app.navigator_depth(), 1);
 }
 
-// --- pico-link-a67: the navigator-preservation fix ---
+// --- The navigator-preservation fix ---
 //
-// These are the single most valuable tests in this bead: the old
-// `rebuild_root` called `Navigator::new`, which resets the stack to
-// depth 1 over a brand-new root screen. That's invisible with only one
-// screen ever on the stack (this crate's current shipped behavior) but
-// fatal for the approved multi-screen design, where a Bluetooth event
-// arriving while the user is browsing a pushed screen would silently
-// eject them back to root. `push_screen_for_test` simulates "the user
-// navigated away from root" without this bead building any real second
-// screen.
+// These are among the most valuable tests in this module: an earlier
+// implementation called `Navigator::new` on every model change, which
+// resets the stack to depth 1 over a brand-new root screen. That's
+// invisible with only one screen ever on the stack, but fatal for a
+// multi-screen design, where a Bluetooth event arriving while the user
+// is browsing a pushed screen would silently eject them back to root.
+// `push_screen_for_test` simulates "the user navigated away from root"
+// without building any real second screen.
 
 #[test]
 fn a_bluetooth_event_mid_navigation_does_not_reset_the_screen_stack() {
@@ -115,8 +114,8 @@ fn a_bluetooth_event_mid_navigation_does_not_reset_the_screen_stack() {
     assert_eq!(app.navigator_depth(), 2);
     assert_eq!(app.current_screen_title(), "detail");
 
-    // Three different Event variants, all of which used to rebuild the
-    // whole Navigator via App::rebuild_root.
+    // Three different Event variants, all of which fold through
+    // App::refresh_stack.
     app.handle_event(Event::DiscoveryStateChanged { scanning: true });
     assert_eq!(app.navigator_depth(), 2, "DiscoveryStateChanged must not pop the pushed screen");
     assert_eq!(app.current_screen_title(), "detail");
@@ -137,7 +136,7 @@ fn a_bluetooth_event_mid_navigation_does_not_reset_the_screen_stack() {
 #[test]
 fn a_paired_device_upserted_mid_navigation_does_not_reset_the_devices_screens_selection() {
     let mut app = App::new(240, 240);
-    // MRU-descending (design section 4): B (seq 2) sorts above A (seq 1).
+    // MRU-descending: B (seq 2) sorts above A (seq 1).
     // Upserted BEFORE opening Devices so the screen's very first build
     // already reflects them -- Home's Bluetooth row always opens
     // Devices with `(prev_key: None, prev_index: 0)`, so starting
@@ -151,7 +150,7 @@ fn a_paired_device_upserted_mid_navigation_does_not_reset_the_devices_screens_se
     assert_eq!(app.devices_selected_index_for_test(), Some(1), "selection should be on Device A's row");
 
     // A third device, sorting below both, must not snap the selection
-    // back to row 0 -- proving `App::rebuild_root`'s
+    // back to row 0 -- proving `App::refresh_stack`'s
     // `Navigator::replace_at(1, ...)` path carries the selection
     // forward the way `replace_root` always has.
     app.handle_event(upsert([3, 3, 3, 3, 3, 3], "Device C", 0));
@@ -162,14 +161,14 @@ fn a_paired_device_upserted_mid_navigation_does_not_reset_the_devices_screens_se
     assert_eq!(app.devices_selected_index_for_test(), Some(1), "a link-state change must not reset the user's selection");
 }
 
-/// Field-list widget ruling §4.7's defect fix: `App::rebuild_root`
-/// carried the *selection* forward across a live-model rebuild but not
-/// `top_index`, so a scrolled Devices list snapped back to the top on
-/// any unrelated event and `reconcile_top_index` then re-landed the
-/// selected row at the viewport's BOTTOM edge -- latent while only 4
-/// rows fit, not latent once a page scrolls. `MAX_PAIRED_DEVICES` (8)
-/// paired rows + the fixed "Pair new headphones" row is 9, comfortably
-/// past this screen's ~5-row viewport (206px content / 40px rows).
+/// A defect fix: `App::refresh_stack` carried the *selection* forward
+/// across a live-model rebuild but not `top_index`, so a scrolled
+/// Devices list snapped back to the top on any unrelated event and
+/// `reconcile_top_index` then re-landed the selected row at the
+/// viewport's BOTTOM edge -- latent while only 4 rows fit, not latent
+/// once a page scrolls. `MAX_PAIRED_DEVICES` (8) paired rows + the fixed
+/// "Pair new headphones" row is 9, comfortably past this screen's
+/// ~5-row viewport (206px content / 40px rows).
 #[test]
 fn an_unrelated_event_does_not_snap_a_scrolled_devices_list_back_to_the_top() {
     let mut app = App::new(240, 240);
@@ -260,9 +259,9 @@ fn a_widget_requesting_a_redraw_leaves_the_app_clean_before_it_is_due_and_dirty_
     assert!(app.dirty(), "must go dirty once now_us reaches/passes the widget's requested redraw instant");
 }
 
-/// pico-link-6wz: a widget returning `Some(Duration::ZERO)` must not
-/// re-dirty the app on the immediately-following tick with no time
-/// elapsed. Unclamped, `next_redraw_at` would equal exactly
+/// A widget returning `Some(Duration::ZERO)` must not re-dirty the app
+/// on the immediately-following tick with no time elapsed. Unclamped,
+/// `next_redraw_at` would equal exactly
 /// `ctx.now()`, and `tick`'s `>=` due-check would fire on the very
 /// next call regardless of elapsed time -- reinstating always-dirty
 /// behaviour forever. `MIN_REDRAW_DELAY` clamps this up so the app
@@ -312,10 +311,9 @@ fn a_widget_with_no_time_driven_opinion_never_goes_dirty_from_tick_alone() {
 
 #[test]
 fn cancel_scan_command_round_trips_through_poll_command() {
-    // pico-link-znb.2 (E1): the wizard screen (pico-link-znb.7) that
-    // binds B to this doesn't exist yet, so this exercises the
-    // enqueue/drain path directly via the test-only helper rather than
-    // through UI input -- the same shape `pl_ui_poll_command` will see.
+    // Exercises the enqueue/drain path directly via the test-only helper
+    // rather than through UI input -- the same shape `pl_ui_poll_command`
+    // will see.
     let mut app = App::new(240, 240);
     assert_eq!(app.poll_command(), None, "no command queued yet");
 
@@ -326,11 +324,8 @@ fn cancel_scan_command_round_trips_through_poll_command() {
 
 #[test]
 fn disconnect_command_round_trips_through_poll_command() {
-    // Bead pico-link-44w: FFI surface only -- no screen queues this
-    // yet (design-of-record rule 2 forbids a labelled-but-dead
-    // affordance), so this exercises the enqueue/drain path directly
-    // via the test-only helper, same shape as `CancelScan` above
-    // before its wizard binding existed.
+    // FFI surface only -- no screen queues this yet, so this exercises
+    // the enqueue/drain path directly via the test-only helper.
     let mut app = App::new(240, 240);
     assert_eq!(app.poll_command(), None, "no command queued yet");
 
@@ -339,7 +334,7 @@ fn disconnect_command_round_trips_through_poll_command() {
     assert_eq!(app.poll_command(), None, "the queue drains -- one poll per queued command");
 }
 
-// --- pico-link-znb.8 (E7): Home's two-face toggle ---
+// --- Home's two-face toggle ---
 //
 // Home has no test-only accessor for "which face is showing" (that's
 // an internal `HomeView`/`HomeFace` implementation detail -- see
@@ -440,11 +435,10 @@ fn a_live_bluetooth_event_does_not_flip_the_face_or_reset_the_navigator() {
     app.handle_input(vec![NavIntent::Select]); // status -> menu
     assert_eq!(menu_face_row0_pixel(&mut app), palette::SURFACE_ELEVATED, "menu face showing before the event");
 
-    // `App::rebuild_root` runs on every one of these -- proving the
+    // `App::refresh_stack` runs on every one of these -- proving the
     // menu face (held in `App::home_face`, shared with the freshly
     // rebuilt `HomeView` -- see `render::home`'s module doc) survives
-    // a root rebuild the same way pico-link-a67 already proved pushed
-    // screens survive one.
+    // a root rebuild the same way a pushed screen survives one.
     app.handle_event(Event::DiscoveryStateChanged { scanning: true });
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
     app.handle_event(Event::DevicesCleared);
@@ -457,19 +451,18 @@ fn a_live_bluetooth_event_does_not_flip_the_face_or_reset_the_navigator() {
     );
 }
 
-// --- pico-link-dgx: does navigating back to Home disconnect the link? ---
+// --- Does navigating back to Home disconnect the link? ---
 //
-// Orchestrator investigation (bead comment, 2026-08-30) already refuted
-// both hypotheses in the bead's description by reading the code: there
-// is no Disconnect command in the FFI at all, none of the five command
-// push sites in `core/` is reachable from navigating to Home, and the
-// one command a Back press CAN emit (`CancelConnect`, wizard.rs:309) is
-// a no-op on the C side and only fires from `Connecting`/`NotResponding`,
-// never from a connected state. These tests turn that reading into a
-// regression: they drive a connected `BtModel` through every realistic
-// Back route to Home and assert (a) the command queue stays *entirely*
-// empty -- not just free of a Disconnect variant that cannot exist --
-// and (b) the model and Home's own render both still say connected.
+// There is no Disconnect command reachable from navigating to Home at
+// all: none of the command push sites in `core/` fire on a Back press,
+// and the one command a Back press CAN emit (`CancelConnect`,
+// wizard.rs:309) is a no-op on the C side and only fires from
+// `Connecting`/`NotResponding`, never from a connected state. These
+// tests turn that reading into a regression: they drive a connected
+// `BtModel` through every realistic Back route to Home and assert (a)
+// the command queue stays *entirely* empty -- not just free of a
+// Disconnect variant that cannot exist -- and (b) the model and Home's
+// own render both still say connected.
 
 /// Route 1: Back from the wizard's success phase (Succeeded, degraded
 /// or not -- both are reachable by a real Back press, only plain
@@ -489,10 +482,8 @@ fn back_from_wizard_success_to_home(degraded: bool) {
 
     app.handle_event(Event::ConnectSucceeded { addr: DGX_ADDR, degraded });
     assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded });
-    // Bead pico-link-cz0.6 (M5 persistence): a real success now always
-    // queues PersistDevice -- drain exactly that one command rather
-    // than asserting the queue is empty (which this test did before
-    // that bead landed).
+    // A real success always queues PersistDevice -- drain exactly that
+    // one command rather than asserting the queue is empty.
     assert_eq!(app.poll_command(), Some(Command::PersistDevice { addr: DGX_ADDR }));
     assert_no_commands_queued(&mut app);
     assert_link_still_connected(&app);
@@ -533,11 +524,9 @@ fn back_from_wizard_degraded_success_to_home_does_not_disconnect() {
     back_from_wizard_success_to_home(true);
 }
 
-/// Route 2: Back from an arbitrary pushed screen (standing in for a
-/// future device-detail screen, per this bead's brief -- no such screen
-/// exists in `core/` yet, so `push_screen_for_test` is the only way to
-/// simulate "the user navigated one level deep and pressed Back") while
-/// connected.
+/// Route 2: Back from an arbitrary pushed screen while connected --
+/// `push_screen_for_test` simulates "the user navigated one level deep
+/// and pressed Back" without needing a real second screen.
 #[test]
 fn back_from_a_pushed_screen_to_home_does_not_disconnect() {
     let mut app = App::new(240, 240);
@@ -557,9 +546,9 @@ fn back_from_a_pushed_screen_to_home_does_not_disconnect() {
     assert_home_hero_renders_connected(&mut app);
 }
 
-/// Route 3: the `Navigator::replace_root` path `App::rebuild_root`
-/// drives (app.rs:630) -- not a Back press at all, but the other way
-/// Home's content changes while sitting at the root. Confirms a live
+/// Route 3: the `Navigator::replace_at` path `App::refresh_stack`
+/// drives -- not a Back press at all, but the other way Home's content
+/// changes while sitting at the root. Confirms a live
 /// Bluetooth event folding into an already-connected model, with Home
 /// as the current (root) screen the whole time, queues nothing and
 /// keeps rendering connected.
@@ -572,7 +561,7 @@ fn a_bluetooth_event_while_home_is_root_does_not_disconnect_or_queue_commands() 
     assert_link_still_connected(&app);
     assert_home_hero_renders_connected(&mut app);
 
-    // A second, unrelated event folds through `rebuild_root` again --
+    // A second, unrelated event folds through `refresh_stack` again --
     // must not disturb the connected model or queue anything either.
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 1, 1, 1, 1, 1], name: String::from("Other"), rssi: -55, class_of_device: 0 }));
     assert_no_commands_queued(&mut app);
@@ -580,14 +569,13 @@ fn a_bluetooth_event_while_home_is_root_does_not_disconnect_or_queue_commands() 
     assert_home_hero_renders_connected(&mut app);
 }
 
-// --- beads pico-link-cz0.6 / pico-link-4vb.4 (T4): StoreLoaded / PersistDevice ---
+// --- StoreLoaded / PersistDevice ---
 
 #[test]
 fn store_loaded_after_paired_devices_folded_auto_reconnects_to_the_mru_max() {
-    // Reshaped by bead pico-link-4vb.4 (T4), design section 5.2:
-    // `StoreLoaded` no longer carries an address -- C's real boot
-    // sequence is `count` x `PairedDeviceUpserted` THEN `StoreLoaded` as
-    // the terminator, so this drives that same order.
+    // `StoreLoaded` carries no address -- C's real boot sequence is
+    // `count` x `PairedDeviceUpserted` THEN `StoreLoaded` as the
+    // terminator, so this drives that same order.
     let mut app = App::new(240, 240);
     let addr_old = [1, 2, 3, 4, 5, 6];
     let addr_new = [9, 9, 9, 9, 9, 9];
@@ -664,10 +652,10 @@ fn connect_succeeded_queues_persist_device_for_the_events_own_address() {
 fn connect_succeeded_persists_even_with_the_wizard_closed() {
     // The debug-remote bypass path (firmware/src/bt.c's
     // pl_bt_debug_connect) never drives the wizard -- this is exactly
-    // why Event::ConnectSucceeded carries its own `addr` (bead
-    // pico-link-cz0.6) rather than requiring core to read it back off
-    // WizardPhase, which stays WizardPhase::default() (NothingFound)
-    // for the whole debug-bypass path. Persistence must still work.
+    // why Event::ConnectSucceeded carries its own `addr` rather than
+    // requiring core to read it back off WizardPhase, which stays
+    // WizardPhase::default() (NothingFound) for the whole debug-bypass
+    // path. Persistence must still work.
     let mut app = App::new(240, 240);
     let addr = [42, 42, 42, 42, 42, 42];
     app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
@@ -675,13 +663,12 @@ fn connect_succeeded_persists_even_with_the_wizard_closed() {
     assert_eq!(app.poll_command(), None);
 }
 
-// --- pico-link-7jol.4: refresh_stack (the ScreenId refactor) ---
+// --- refresh_stack (the ScreenId refactor) ---
 
-/// Fern's design §7 step 1's explicit ask: an unidentified screen (the
-/// wizard, `ConfirmView`s, Settings, or in this test's case an
-/// arbitrary probe screen standing in for any of them) must never be
-/// replaced OR truncated by `refresh_stack`, no matter how many
-/// unrelated model events fire while it's on the stack.
+/// An unidentified screen (the wizard, `ConfirmView`s, Settings, or in
+/// this test's case an arbitrary probe screen standing in for any of
+/// them) must never be replaced OR truncated by `refresh_stack`, no
+/// matter how many unrelated model events fire while it's on the stack.
 #[test]
 fn refresh_stack_never_touches_a_screen_with_no_screen_id() {
     let mut app = App::new(240, 240);
@@ -716,11 +703,11 @@ fn refresh_stack_keeps_home_and_devices_tagged_with_their_screen_ids() {
     assert_eq!(app.navigator.id_at(1), Some(ScreenId::Devices));
 }
 
-/// "Forget pops two levels" (device-page design §3.7), now structural
-/// via `Refresh::Gone` rather than a hand-written double pop -- this
-/// fires even when the device disappears from a route *other than*
-/// the device page's own Forget row (here: forgetting it from the
-/// Devices screen underneath, one level below the open device page).
+/// "Forget pops two levels", structural via `Refresh::Gone` rather than
+/// a hand-written double pop -- this fires even when the device
+/// disappears from a route *other than* the device page's own Forget
+/// row (here: forgetting it from the Devices screen underneath, one
+/// level below the open device page).
 #[test]
 fn forgetting_the_device_shown_by_an_open_device_page_unwinds_the_stack_to_devices() {
     let mut app = App::new(240, 240);
@@ -742,12 +729,12 @@ fn forgetting_the_device_shown_by_an_open_device_page_unwinds_the_stack_to_devic
 
 #[test]
 fn home_menu_selection_survives_a_live_refresh_while_streaming() {
-    // Bead pico-link-hu97: while music plays, volume/codec/meter
-    // events fire `refresh_stack` constantly (audio events, not user
-    // input). Before the fix, `ScreenId::Home`'s arm rebuilt
-    // `HomeView` without the `ScreenCarry` it had just read, so every
-    // one of those refreshes snapped the menu face back to row 0
-    // (Bluetooth) even while the user was looking at Settings.
+    // While music plays, volume/codec/meter events fire `refresh_stack`
+    // constantly (audio events, not user input). Before the fix,
+    // `ScreenId::Home`'s arm rebuilt `HomeView` without the
+    // `ScreenCarry` it had just read, so every one of those refreshes
+    // snapped the menu face back to row 0 (Bluetooth) even while the
+    // user was looking at Settings.
     let mut app = App::new(240, 240);
     app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected, row 0)
     app.handle_input(vec![NavIntent::Down]); // move to Settings (row 1) -- not activated
@@ -788,9 +775,9 @@ fn home_bitrate_line_shows_the_live_number_and_the_adaptive_tag_when_the_device_
 
 #[test]
 fn ldac_live_kbps_is_never_snapped_to_the_nominal_ladder() {
-    // pico-link-qx8's trap: a fast down-step can report a transient
-    // non-ladder rate (~700 kbps) for one packet. `on_ldac_bitrate_
-    // changed` must store exactly what it's given.
+    // A fast down-step can report a transient non-ladder rate
+    // (~700 kbps) for one packet. `on_ldac_bitrate_changed` must store
+    // exactly what it's given.
     let mut app = App::new(240, 240);
     app.handle_event(Event::LdacBitrateChanged { kbps: 703 });
     assert_eq!(app.model().ldac_live_kbps, Some(703), "must not snap to the nearest rung");
@@ -809,15 +796,14 @@ fn ldac_live_kbps_is_cleared_on_disconnect() {
     assert_eq!(app.model().ldac_live_kbps, None);
 }
 
-// --- pico-link-88xs: the link-state vs discovery axis split ---
+// --- The link-state vs discovery axis split ---
 //
-// Design `.planning/design/2026-09-08-link-state-vs-discovery-axis.md`
-// section 8.5's six owed tests. Test 5 (paint-key fold) lives in
-// `render::screen`'s own test module, and test 6 (the malformed-wire
-// rejection) lives in `ui-ffi`'s -- both own the code under test.
+// Test 5 (paint-key fold) lives in `render::screen`'s own test module,
+// and test 6 (the malformed-wire rejection) lives in `ui-ffi`'s -- both
+// own the code under test.
 
-/// Test 1 (design 8.5.1): THE REGRESSION ITSELF -- the test whose
-/// absence let the bug ship. A scan started while connected must not
+/// Test 1: THE REGRESSION ITSELF -- the test whose absence let the bug
+/// ship. A scan started while connected must not
 /// wipe any of the four connected-model fields, and `link_state` must
 /// still read `Connected` throughout and after the scan.
 #[test]
@@ -853,8 +839,8 @@ fn a_scan_while_connected_does_not_wipe_the_connected_model() {
     assert_eq!(app.model().ldac_live_kbps, Some(660), "inquiry-complete must not clear ldac_live_kbps");
 }
 
-/// Test 2 (design 8.5.2): guard against over-correcting -- a real
-/// disconnect must still clear all four fields, exactly as before.
+/// Test 2: guard against over-correcting -- a real disconnect must
+/// still clear all four fields, exactly as before.
 #[test]
 fn a_real_disconnect_still_clears_the_connected_model() {
     let mut app = App::new(240, 240);
@@ -875,7 +861,7 @@ fn a_real_disconnect_still_clears_the_connected_model() {
     assert_eq!(app.model().ldac_live_kbps, None);
 }
 
-/// Test 3 (design 8.5.3): the wizard's scan-end detection moves onto
+/// Test 3: the wizard's scan-end detection moves onto
 /// `DiscoveryStateChanged` -- a `LinkStateChanged(Idle)` alone (e.g. a
 /// connect failure or a disconnect landing while the wizard happens to
 /// be on `WizardPhase::Scanning`) must no longer spuriously flip it to
@@ -897,7 +883,7 @@ fn only_a_genuine_discovery_state_changed_ends_the_wizard_scan() {
     assert_eq!(app.wizard_phase_for_test(), WizardPhase::NothingFound, "a genuine end-of-inquiry with zero devices found must still advance to NothingFound");
 }
 
-/// Test 4 (design 8.5.4): the pending-timestamp backfill
+/// Test 4: the pending-timestamp backfill
 /// (`stamp_pending_wizard_timestamp`, called unconditionally at the
 /// end of `handle_event`) must still fire when the event that lands is
 /// a `DiscoveryStateChanged` -- the new arm must not early-return
