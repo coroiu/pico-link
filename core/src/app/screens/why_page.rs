@@ -11,19 +11,14 @@ use crate::render::{FieldList, FieldRow, Instant, ListItemKey, Screen};
 
 use super::super::{BtModel, FaultGlyphClass, FaultKey, FaultSeverity, FaultValue, Refresh, ScreenCarry, ScreenId};
 
-/// The `why?` page's fixed title (design
-/// `.planning/design/2026-09-07-home-fault-strip.md` §8.2: "Header: `WHY?`").
+/// The `why?` page's fixed title.
 const WHY_PAGE_TITLE: &str = "WHY?";
 
 /// Formats `elapsed_since(at)` as a short relative age -- `"8s ago"`,
-/// `"4m ago"`, `"2h ago"` -- **never an absolute timestamp**, per design
-/// §8.2's "Relative times only. Never absolute timestamps -- no RTC." This
-/// board has no RTC (`.planning/design/2026-09-01-idle-policy-across-the-
-/// ffi-seam.md`'s own note, restated here because it is easy to
-/// rediscover as a missing feature rather than a hard constraint) --
-/// `now`/`at` are both [`crate::run::FAULT_LIVE_WINDOW`]-scale
-/// [`Instant`]s derived from the FFI seam's monotonic microsecond clock,
-/// never wall-clock time.
+/// `"4m ago"`, `"2h ago"` -- **never an absolute timestamp**: this board
+/// has no RTC, so `now`/`at` are both
+/// [`crate::run::FAULT_LIVE_WINDOW`]-scale [`Instant`]s derived from the
+/// FFI seam's monotonic microsecond clock, never wall-clock time.
 fn relative_time(now: Instant, at: Instant) -> String {
     let elapsed = now.saturating_duration_since(at);
     let secs = elapsed.as_secs();
@@ -36,51 +31,43 @@ fn relative_time(now: Instant, at: Instant) -> String {
     }
 }
 
-/// The Home fault strip's `why?` detail page (design
-/// `.planning/design/2026-09-07-home-fault-strip.md` §8, bead
-/// `pico-link-9eq2.3.3`) -- a scrollable list of **kinds, not events**
-/// (orchestrator ruling on this bead): one aggregated two-line block per
-/// [`FaultKey`] that has ever fired, in `order`'s sequence, including
-/// retired keys (design §8.2: "including retired keys -- this is the
-/// session history").
+/// The Home fault strip's `why?` detail page -- a scrollable list of
+/// **kinds, not events**: one aggregated two-line block per [`FaultKey`]
+/// that has ever fired, in `order`'s sequence, including retired keys --
+/// this is the session history.
 ///
-/// **Ordering discipline is the load-bearing part of this function**
-/// (orchestrator ruling, restated because it is easy to miss): `order` is
-/// the caller's frozen block order, established once by `render::home`'s
-/// `ShortcutX` handler (a fresh most-recently-active-first sort, written
-/// directly into the shared `Rc<RefCell<_>>` at push time) and never
-/// re-sorted by this function on any subsequent call. What this function
-/// DOES do, every call (including the very first, harmlessly, since
-/// `order` starts empty then): **append** any key that has an entry in
-/// [`BtModel::fault_log`] but is not yet present in `order`, at the END --
-/// "a key that fires for the first time while the page is open appends at
-/// the bottom rather than jumping to the top." A live re-sort under a
-/// scrolling thumb is exactly the moving-target problem design §6.2
-/// rejects for Home's own rows, worse here because the user is reading,
-/// not glancing.
+/// **Ordering discipline is the load-bearing part of this function.**
+/// `order` is the caller's frozen block order, established once by
+/// `render::home`'s `ShortcutX` handler (a fresh
+/// most-recently-active-first sort, written directly into the shared
+/// `Rc<RefCell<_>>` at push time) and never re-sorted by this function on
+/// any subsequent call. What this function DOES do, every call (including
+/// the very first, harmlessly, since `order` starts empty then):
+/// **append** any key that has an entry in [`BtModel::fault_log`] but is
+/// not yet present in `order`, at the END -- a key that fires for the
+/// first time while the page is open appends at the bottom rather than
+/// jumping to the top. A live re-sort under a scrolling thumb is exactly
+/// the moving-target problem Home's own rows reject, worse here because
+/// the user is reading, not glancing.
 ///
 /// Never returns [`Refresh::Gone`] -- this page has no subject that can
 /// vanish out from under it (unlike [`ScreenId::DevicePage`]'s device).
-/// The `why?` page's line 3 (design §8.2): "one plain-language consequence
-/// sentence plus the raw number." Neither design doc dictates exact
-/// wording -- the audio-fault-model design (`.planning/design/2026-09-07-
-/// audio-fault-model.md` §3.1's "Reads" column) only specifies each key's
-/// value KIND and what it measures; Uma's sketch (§10.7) gives two worked
-/// examples in her own prose. This function is that prose, one sentence
-/// per key, filled in with the actual raw value -- never the saturated/
-/// rounded figure Home's own count slot uses (§8.2: "no saturation here").
-/// `None` (a key whose value has never been wired -- e.g. the USB supply
-/// ratio before `pl_usb_supply_q8()` lands) means no line 3 at all, never a
-/// guessed number.
+/// The `why?` page's line 3: "one plain-language consequence sentence plus
+/// the raw number." This function fills that in, one sentence per key,
+/// with the actual raw value -- never the saturated/rounded figure Home's
+/// own count slot uses ("no saturation here"). `None` (a key whose value
+/// has never been wired -- e.g. the USB supply ratio before
+/// `pl_usb_supply_q8()` lands) means no line 3 at all, never a guessed
+/// number.
 fn fault_consequence_text(key: FaultKey, value: Option<FaultValue>) -> Option<String> {
     let value = value?;
     // Every arm below is measured against the why? page's real row budget
     // (`font::value()`, ~194px -- `core/examples/fault_strip_probe.rs`'s
     // `measure_why_page_consequence_texts`) and kept under it: `FieldList`
-    // CLIPS an overlong label rather than ellipsising it (field-list ruling
-    // §4.6), which for a full sentence reads as a confusing mid-word cut
-    // rather than the name truncation this render core uses everywhere
-    // else -- so these stay short by construction, not by luck.
+    // CLIPS an overlong label rather than ellipsising it, which for a full
+    // sentence reads as a confusing mid-word cut rather than the name
+    // truncation this render core uses everywhere else -- so these stay
+    // short by construction, not by luck.
     Some(match (key, value) {
         (FaultKey::BufStarved, FaultValue::Millis(ms)) => format!("ring dry, min fill {ms}ms"),
         (FaultKey::BufOverflow, FaultValue::Count(frames)) => format!("ring full, {frames} dropped"),
@@ -96,10 +83,9 @@ fn fault_consequence_text(key: FaultKey, value: Option<FaultValue>) -> Option<St
         (FaultKey::AirCongested, FaultValue::Count(deferred)) => format!("air busy, x{deferred} deferred"),
         (FaultKey::AirLinkLost, FaultValue::Count(occurrences)) => format!("link dropped x{occurrences}"),
         (FaultKey::EncResync, FaultValue::Count(frames)) => format!("trim dropped x{frames}"),
-        // A key paired with a `FaultValue` variant the audio-fault-model
-        // design's own table (§3.1) never assigns it -- e.g. a firmware
-        // bug sending the wrong `value_kind` tag. Never fabricate a
-        // sentence for a combination the design doesn't define; the
+        // A key paired with a `FaultValue` variant it's never assigned --
+        // e.g. a firmware bug sending the wrong `value_kind` tag. Never
+        // fabricate a sentence for an undefined combination; the
         // count/name/times on lines 1-2 still show, just no line 3.
         _ => return None,
     })
@@ -138,8 +124,8 @@ pub(crate) fn build_why_page_screen(model: &BtModel, now: Instant, order: &Rc<Re
             FaultSeverity::Audible => palette::STATUS_ERROR,
             FaultSeverity::Concealed => palette::STATUS_WARNING,
         };
-        // Line 1: glyph, name, TOTAL count -- "no saturation here, show the
-        // real number" (design §8.2), unlike Home's own `x99+` cap.
+        // Line 1: glyph, name, TOTAL count -- "no saturation here, show
+        // the real number", unlike Home's own `x99+` cap.
         rows.push(
             FieldRow::readonly(format!("{glyph_char} {}", key.name()))
                 .with_label_color(color)
@@ -154,13 +140,11 @@ pub(crate) fn build_why_page_screen(model: &BtModel, now: Instant, order: &Rc<Re
                 .with_key(ListItemKey::from_u64(next_key)),
         );
         next_key += 1;
-        // Line 3 (design §8.2): "one plain-language consequence sentence
-        // plus the raw number, which is where pico-link-8jp's supply
-        // ratio and every other counter value now lives." Absent when
-        // `entry.value` is `None` -- some keys have never had a value
-        // wired (e.g. the USB supply ratio, per the audio-fault-model
-        // design §6.3, "absent (`None`) until `pl_usb_supply_q8()`
-        // exists") -- absent, never faked (parent design §15).
+        // Line 3: "one plain-language consequence sentence plus the raw
+        // number." Absent when `entry.value` is `None` -- some keys have
+        // never had a value wired (e.g. the USB supply ratio, "absent
+        // (`None`) until `pl_usb_supply_q8()` exists") -- absent, never
+        // faked.
         if let Some(text) = fault_consequence_text(key, entry.value) {
             rows.push(FieldRow::readonly(text).with_key(ListItemKey::from_u64(next_key)));
             next_key += 1;
@@ -178,8 +162,7 @@ mod tests {
 
     use super::*;
 
-    // --- `why?` page (design `.planning/design/2026-09-07-home-fault-
-    // strip.md` §8, bead `pico-link-9eq2.3.3`) ---
+    // --- `why?` page ---
 
     #[test]
     fn relative_time_formats_seconds_minutes_and_hours() {
@@ -195,10 +178,9 @@ mod tests {
 
     #[test]
     fn why_page_appends_a_newly_fired_key_at_the_bottom_rather_than_resorting() {
-        // Orchestrator ruling on this bead: "the page FREEZES its block
-        // ordering on entry ... A key that fires for the first time while
-        // the page is open appends at the BOTTOM rather than jumping to
-        // the top."
+        // The page FREEZES its block ordering on entry -- a key that
+        // fires for the first time while the page is open appends at the
+        // BOTTOM rather than jumping to the top.
         let mut model = BtModel::default();
         model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), None, 1);
         let order = Rc::new(RefCell::new(vec![FaultKey::BufOverflow])); // simulates the page already open, frozen on entry
@@ -244,13 +226,13 @@ mod tests {
         match refresh {
             Refresh::Rebuild(screen) => assert_eq!(screen.id(), Some(ScreenId::WhyPage)),
             Refresh::Gone => panic!("the why? page has no subject that can vanish -- must never be Gone"),
-            Refresh::Keep => panic!("build_why_page_screen never returns Keep as of pico-link-bgnd M0"),
+            Refresh::Keep => panic!("build_why_page_screen never returns Keep"),
         }
     }
 
     #[test]
     fn fault_consequence_text_is_absent_when_no_value_was_ever_wired() {
-        assert_eq!(fault_consequence_text(FaultKey::UsbSupplyLow, None), None, "absent, never faked (parent design §15)");
+        assert_eq!(fault_consequence_text(FaultKey::UsbSupplyLow, None), None, "absent, never faked");
     }
 
     #[test]
