@@ -37,7 +37,7 @@
 #define PL_LDAC_ABR_Q_HI (4 * 256)
 #define PL_LDAC_ABR_Q_LO (1 * 256)
 #define PL_LDAC_ABR_SETTLE_US 1000000ULL
-#define PL_LDAC_ABR_UP_DWELL_US 60000000ULL
+#define PL_LDAC_ABR_UP_DWELL_US 10000000ULL // pico-link-qiow: shortened from 60s 2026-09-24
 
 // The DECIDE-phase state, copied from a2dp.c's pl_a2dp_ctx_t fields plus
 // codec_ldac.c's applied/target rung (modeled together here for a single
@@ -192,7 +192,8 @@ int main(void) {
     }
 
     // --- (c) a single stop_queue_full delta during the up-dwell window
-    // vetoes the step up, even after 60s+ has elapsed and q_ema is low. ---
+    // vetoes the step up, even after UP_DWELL_US+ has elapsed and q_ema is
+    // low. ---
     {
         model_abr_t c;
         model_abr_reset(&c, 0);
@@ -200,9 +201,9 @@ int main(void) {
         c.target_rung = 2;  // keep target in sync -- applied/target only diverge via a real decide() step
         uint64_t now = 0;
         uint32_t stop_queue_full = 0;
-        for (int i = 0; i < 6001; i++) { // 60.01s
+        for (int i = 0; i < 1001; i++) { // 10.01s
             now += 10000;
-            if (i == 3000) {
+            if (i == 500) {
                 stop_queue_full++; // one rail hit mid-window
             }
             model_decide(&c, 0, now, stop_queue_full); // empty queue -- well under Q_LO
@@ -222,14 +223,14 @@ int main(void) {
         c.target_rung = 2; // keep target in sync -- see (c)'s comment
         c.qfull_snapshot = 5;
         uint64_t now = 0;
-        for (int i = 0; i < 6001; i++) {
+        for (int i = 0; i < 1001; i++) {
             now += 10000;
             model_decide(&c, 0, now, 5); // stable, no delta
             model_apply(&c);
         }
         assert(c.steps_up == 1);
         assert(c.applied_rung == 1);
-        printf("ok:   a clean 60s dwell with zero stop_queue_full delta steps up exactly once\n");
+        printf("ok:   a clean 10s dwell with zero stop_queue_full delta steps up exactly once\n");
     }
 
     // --- (d) cannot oscillate faster than the asymmetric dwell bounds.
@@ -269,7 +270,7 @@ int main(void) {
             // The period between consecutive DOWN steps must be at least
             // the up-dwell (the time spent waiting to earn a step back up)
             // -- this is the falsifiable form of "cannot oscillate faster
-            // than once per minute" (design sec 3.4).
+            // than once per UP_DWELL_US window" (design sec 3.4).
             assert(period >= PL_LDAC_ABR_UP_DWELL_US);
         }
         printf(

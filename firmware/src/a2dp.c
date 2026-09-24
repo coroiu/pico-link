@@ -164,13 +164,16 @@ _Static_assert(
 // Q8 fixed point (1 slot == 256). The dead band (1.0..4.0 slots) is
 // deliberately enormous -- see the design doc's rationale: we are choosing
 // between five discrete operating points, not tracking a continuous
-// setpoint. Asymmetric dwell (1s down, 60s up) is the anti-oscillation
+// setpoint. Asymmetric dwell (1s down, 10s up) is the anti-oscillation
 // mechanism (sec 3.4) -- do not narrow SETTLE_US without re-reading that
-// section's limit-cycle argument.
+// section's limit-cycle argument. Up-dwell shortened from 60s to 10s
+// 2026-09-24 (bead pico-link-qiow, Andreas approved): 60s of q_ema<=Q_LO
+// plus zero stop_queue_full meant a real link practically never returned
+// to HQ (detective finding on pico-link-dge6).
 #define PL_LDAC_ABR_Q_HI (4 * 256)
 #define PL_LDAC_ABR_Q_LO (1 * 256)
 #define PL_LDAC_ABR_SETTLE_US 1000000ULL
-#define PL_LDAC_ABR_UP_DWELL_US 60000000ULL
+#define PL_LDAC_ABR_UP_DWELL_US 10000000ULL
 
 // design sec 1: our own crystal, via btstack_run_loop timers, paces the
 // A2DP media stream -- matches a2dp_source_demo.c's own AUDIO_TIMEOUT_MS.
