@@ -21,9 +21,15 @@
 //! on every call rather than a cached snapshot, either side's write is
 //! picked up on the very next frame with no `Navigator` operation
 //! involved at all. The one exception is the phase-2 scan list, which
-//! *does* need its `VerticalList` rebuilt when `BtModel::devices` changes
-//! shape -- handled internally by [`PairingWizardView::sync_list`], not by
-//! replacing the `Screen`.
+//! *does* need its `VerticalList` rebuilt when `BtModel::discovered`
+//! changes shape -- handled internally by
+//! [`PairingWizardView::sync_list`], not by replacing the `Screen`.
+//!
+//! As of bead `pico-link-bgnd` M4, phase 2's scan list reads
+//! `BtModel::discovered` straight off the live [`crate::app::ModelHandle`]
+//! this widget holds -- there is no more `App::wizard_devices` mirror to
+//! keep in lockstep (design §6/§7 M4: "wizard reads discovered through the
+//! handle; delete `wizard_devices`").
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -40,7 +46,7 @@ use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use crate::app::{
-    is_audio_sink, truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, WizardPhase, MAX_SCAN_LIST_ITEMS,
+    is_audio_sink, truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, ModelHandle, WizardPhase, MAX_SCAN_LIST_ITEMS,
 };
 use crate::input::NavIntent;
 
@@ -67,12 +73,8 @@ pub const WIZARD_TITLE: &str = "Pair headphones";
 /// -- see the module doc for why no further rebuild is needed as the
 /// phase advances.
 #[must_use]
-pub fn build_wizard_screen(
-    phase: Rc<RefCell<WizardPhase>>,
-    devices: Rc<RefCell<Vec<DeviceEntry>>>,
-    commands: Rc<RefCell<VecDeque<Command>>>,
-) -> Screen {
-    let view = PairingWizardView::new(phase, devices, commands);
+pub fn build_wizard_screen(phase: Rc<RefCell<WizardPhase>>, model: ModelHandle, commands: Rc<RefCell<VecDeque<Command>>>) -> Screen {
+    let view = PairingWizardView::new(phase, model, commands);
     Screen::new(WIZARD_TITLE, vec![Box::new(view)])
 }
 
@@ -197,35 +199,41 @@ fn render_connecting_steps(area: Rectangle, current: ConnectStep, elapsed: core:
 /// behavior.
 struct PairingWizardView {
     phase: Rc<RefCell<WizardPhase>>,
-    devices: Rc<RefCell<Vec<DeviceEntry>>>,
+    /// The live model handle -- as of bead `pico-link-bgnd` M4, phase 2's
+    /// scan list reads `model.discovered` straight off this fresh every
+    /// [`Self::sync_list`] call, rather than a separate `App`-maintained
+    /// mirror (`App::wizard_devices`, since deleted). See
+    /// [`crate::app::ModelHandle`]'s doc comment for the borrow rule.
+    model: ModelHandle,
     commands: Rc<RefCell<VecDeque<Command>>>,
     /// Phase 2's scan-result list, lazily (re)built by [`Self::sync_list`]
-    /// whenever `devices` no longer matches `list_devices` -- `RefCell`
-    /// because [`Widget::render`] takes `&self`. `with_selected_identity`
-    /// is used exactly the way `build_devices_screen` uses it, per design
-    /// section 9 rule 1/2 (stable sort, first-seen/append-only order --
-    /// `devices`' own order is never touched here, so this is automatic --
-    /// and identity-keyed selection so a late name or a new arrival never
+    /// whenever `model.discovered` no longer matches `list_devices` --
+    /// `RefCell` because [`Widget::render`] takes `&self`.
+    /// `with_selected_identity` is used exactly the way
+    /// `build_devices_screen` uses it, per design section 9 rule 1/2
+    /// (stable sort, first-seen/append-only order -- `model.discovered`'s
+    /// own order is never touched here, so this is automatic -- and
+    /// identity-keyed selection so a late name or a new arrival never
     /// moves the cursor out from under the user).
     list: RefCell<VerticalList>,
-    /// The device snapshot `list` was last built from -- compared against
-    /// `devices` on every [`Self::sync_list`] call to decide whether a
-    /// rebuild is needed at all.
+    /// The `model.discovered` snapshot `list` was last built from --
+    /// compared against the live value on every [`Self::sync_list`] call
+    /// to decide whether a rebuild is needed at all.
     list_devices: RefCell<Vec<DeviceEntry>>,
 }
 
 impl PairingWizardView {
-    fn new(phase: Rc<RefCell<WizardPhase>>, devices: Rc<RefCell<Vec<DeviceEntry>>>, commands: Rc<RefCell<VecDeque<Command>>>) -> Self {
-        let list = build_scan_list(&devices.borrow(), &phase, &commands, None, 0);
-        let list_devices = devices.borrow().clone();
-        Self { phase, devices, commands, list: RefCell::new(list), list_devices: RefCell::new(list_devices) }
+    fn new(phase: Rc<RefCell<WizardPhase>>, model: ModelHandle, commands: Rc<RefCell<VecDeque<Command>>>) -> Self {
+        let list_devices = model.borrow().discovered.clone();
+        let list = build_scan_list(&list_devices, &phase, &commands, None, 0);
+        Self { phase, model, commands, list: RefCell::new(list), list_devices: RefCell::new(list_devices) }
     }
 
-    /// Rebuilds `list` from `devices` iff the device set actually changed
-    /// since the last build -- cheap no-op on every render/input call that
-    /// isn't reacting to a new/updated/cleared device.
+    /// Rebuilds `list` from `model.discovered` iff the device set actually
+    /// changed since the last build -- cheap no-op on every render/input
+    /// call that isn't reacting to a new/updated/cleared device.
     fn sync_list(&self) {
-        let current = self.devices.borrow().clone();
+        let current = self.model.borrow().discovered.clone();
         if *self.list_devices.borrow() == current {
             return;
         }
@@ -343,12 +351,12 @@ impl Widget for PairingWizardView {
         let phase = self.phase.borrow().clone();
         match phase {
             WizardPhase::NothingFound => {
-                // Phase 3 -> phase 2 (re-scan). Clearing `devices`
+                // Phase 3 -> phase 2 (re-scan). Clearing `model.discovered`
                 // proactively (rather than waiting for C's own
                 // `DevicesCleared` event) avoids a stale-row flash from a
                 // previous scan between this press and that event
                 // arriving.
-                self.devices.borrow_mut().clear();
+                self.model.borrow_mut().discovered.clear();
                 self.commands.borrow_mut().push_back(Command::StartScan);
                 *self.phase.borrow_mut() = WizardPhase::scanning_pending();
                 Action::None
@@ -1141,5 +1149,63 @@ mod tests {
         assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::WizardAutoDismiss);
         assert_eq!(app.navigator_depth(), 1, "auto-dismiss returns all the way to Home (pico-link-4vb.2: no more Back-Back-Back)");
+    }
+
+    // --- bead pico-link-bgnd M4: the scan list reads `model.discovered`
+    // live, and a device arriving mid-scan must not disturb the cursor ---
+
+    #[test]
+    fn a_device_arriving_mid_scan_does_not_move_the_selection_off_the_row_the_user_is_on() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        for i in 1..=3u8 {
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [i; 6], name: format!("Device {i}"), rssi: -40, class_of_device: 0 }));
+        }
+        app.render(); // establish the list
+        app.handle_input(vec![NavIntent::Down]); // focus row 1 ("Device 2")
+        assert_eq!(app.wizard_selected_index_for_test(), Some(1));
+
+        // A fourth device arrives -- purely additive, must not reset the
+        // cursor back to row 0 or move it off "Device 2".
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [4; 6], name: String::from("Device 4"), rssi: -40, class_of_device: 0 }));
+        app.render();
+        assert_eq!(
+            app.wizard_selected_index_for_test(),
+            Some(1),
+            "a device arriving mid-scan must not move the selection off the row the user is on"
+        );
+    }
+
+    #[test]
+    fn a_device_arriving_mid_scan_keeps_the_selection_on_the_last_row_past_the_default_viewport() {
+        // `PairingWizardView` doesn't forward `Widget::scroll_top` (a
+        // pre-existing gap, not this bead's to fix), so this proves the
+        // same "no cursor jump" guarantee at a selection index deep enough
+        // that a naive rebuild-from-scratch would have reset it to row 0.
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        for i in 1..=13u8 {
+            app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+                addr: [i; 6],
+                name: format!("Device {i}"),
+                rssi: -40,
+                class_of_device: 0x24_04_04,
+            }));
+        }
+        app.handle_input(vec![NavIntent::Down; 11]); // the 12th (cap-boundary) device row
+        app.render();
+        assert_eq!(app.wizard_selected_index_for_test(), Some(11));
+
+        // A late-arriving name update for an already-shown device (the
+        // same in-place-update path `add_device` uses for a repeat report)
+        // must not move the cursor.
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry {
+            addr: [5; 6],
+            name: String::from("Device 5 (resolved)"),
+            rssi: -40,
+            class_of_device: 0x24_04_04,
+        }));
+        app.render();
+        assert_eq!(app.wizard_selected_index_for_test(), Some(11), "an in-place device update must not move the selection");
     }
 }

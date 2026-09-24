@@ -77,7 +77,7 @@ impl App {
     /// phase 2.
     fn on_scan_ended_if_applicable(&mut self) {
         let mut phase = self.wizard_phase.borrow_mut();
-        if matches!(*phase, WizardPhase::Scanning { .. }) && self.wizard_devices.borrow().is_empty() {
+        if matches!(*phase, WizardPhase::Scanning { .. }) && self.model.borrow().discovered.is_empty() {
             *phase = WizardPhase::NothingFound;
             drop(phase);
             self.dirty = true;
@@ -216,7 +216,7 @@ impl App {
         if should_pop {
             self.navigator.pop_to_root();
             *self.wizard_phase.borrow_mut() = WizardPhase::default();
-            self.wizard_devices.borrow_mut().clear();
+            self.model.borrow_mut().discovered.clear();
             // `pop_to_root` only restores navigation depth -- it doesn't
             // touch which of Home's two faces (`HomeFace::Status` vs
             // `HomeFace::Menu`) is showing. The user reached the wizard via
@@ -423,10 +423,6 @@ impl App {
                 model.discovered.push(DeviceEntry { addr, name, rssi, class_of_device });
             }
         }
-        // Kept in lockstep with `model.discovered` -- see `wizard_devices`'s
-        // doc comment on why the wizard widget needs its own mirror
-        // rather than a borrow into `self.model`.
-        self.wizard_devices.borrow_mut().clone_from(&self.model.borrow().discovered);
         self.refresh_stack();
     }
 
@@ -434,7 +430,6 @@ impl App {
     /// scan.
     pub fn clear_devices(&mut self) {
         self.model.borrow_mut().discovered.clear();
-        self.wizard_devices.borrow_mut().clear();
         self.refresh_stack();
     }
 

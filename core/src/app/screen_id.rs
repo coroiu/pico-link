@@ -20,11 +20,12 @@ pub enum ScreenId {
     /// the codec picker itself waits on Ada's `CodecAvailability` seam.
     Picker(PickerKind, DeviceAddr),
     /// The Home fault strip's `why?` detail page -- a singleton, no
-    /// payload: there is exactly one, reached only from `X` on Home.
-    /// Refreshed like every other identified screen so a fault that fires
-    /// while it's open updates counts/times/tier in place (see
-    /// [`build_why_page_screen`]'s doc comment for the append-only
-    /// ordering rule this refresh enforces).
+    /// payload: there is exactly one, reached only from `X` on Home. Built
+    /// once per push and never rebuilt again (bead `pico-link-bgnd` M4) --
+    /// its widget reads the live model itself via `Widget::sync` so a
+    /// fault that fires while it's open updates counts/times in place (see
+    /// `crate::app::screens::why_page::WhyPageView`'s doc comment for the
+    /// append-only ordering rule this enforces).
     WhyPage,
     /// The Settings screen -- a singleton, no payload, reached only from
     /// Home's menu-face "Settings" row.
