@@ -384,6 +384,17 @@ impl Screen {
         self.widgets.iter().filter_map(|widget| widget.redraw_after(ctx)).min()
     }
 
+    /// Forwards [`Widget::sync`] to every widget on this screen, focused or
+    /// not -- see that method's doc comment and
+    /// [`super::navigator::Navigator::sync_top`]'s for why this runs once
+    /// per frame, before render/input, rather than being folded into
+    /// render itself.
+    pub(super) fn sync(&mut self, ctx: &RenderCtx) {
+        for widget in &mut self.widgets {
+            widget.sync(ctx);
+        }
+    }
+
     /// Focuses the first focusable widget, if none is focused yet. Called
     /// when a screen is first pushed onto the stack. A no-op if focus was
     /// already established (which is how per-screen focus memory works:

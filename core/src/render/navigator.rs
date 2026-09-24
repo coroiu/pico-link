@@ -406,6 +406,23 @@ impl Navigator {
     pub fn redraw_after(&self, ctx: &RenderCtx) -> Option<core::time::Duration> {
         self.current().redraw_after(ctx)
     }
+
+    /// Syncs the top-of-stack screen's widgets ([`Screen::sync`], which
+    /// forwards to [`Widget::sync`](super::widget::Widget::sync)) against
+    /// `ctx` -- only the top screen, deliberately: it is the only one
+    /// currently visible or reachable by input, matching
+    /// [`Self::redraw_after`]'s own "top screen only" reasoning above.
+    ///
+    /// Called by `App` at exactly two points (see
+    /// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md`
+    /// section 2, bead `pico-link-bgnd` M0): once before `Self::render`,
+    /// and once before *each* dispatch inside `App::handle_input`'s loop --
+    /// a single intent can pop the stack, exposing a screen underneath that
+    /// was not synced this frame, so a naive "sync once before the whole
+    /// loop" would leave it stale for that same frame's remaining intents.
+    pub fn sync_top(&mut self, ctx: &RenderCtx) {
+        self.current_mut().sync(ctx);
+    }
 }
 
 #[cfg(test)]

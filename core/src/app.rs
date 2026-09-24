@@ -17,7 +17,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Ref, RefCell};
 use core::convert::Infallible;
 use core::time::Duration;
 
@@ -1392,6 +1392,18 @@ pub(crate) enum Refresh {
     /// [`ScreenId::DevicePage`] for a forgotten device) -- drop it and
     /// everything above it.
     Gone,
+    /// Leave the screen already on the stack in place -- no
+    /// [`Navigator::replace_at`], no forced full-frame damage. This is the
+    /// migration seam for the live-widgets refactor (bead `pico-link-bgnd`
+    /// M0, `.planning/design/2026-09-24-live-widgets-retire-refresh-
+    /// stack.md` section 7): a screen kind migrates to reading live model
+    /// state via `Widget::sync` (`crate::render::widget::Widget::sync`)
+    /// simply by having its `App::build_identified_screen` arm return this
+    /// instead of [`Self::Rebuild`]. **No builder returns this yet** -- as
+    /// of M0 this variant exists and is handled, but is otherwise dead
+    /// code; the first arm to actually return it lands with M1 (Home).
+    #[allow(dead_code)] // Not constructed until M1 -- see the variant's own doc comment.
+    Keep,
 }
 
 /// A paired device's display label -- its name, or, if C never reported one
@@ -1509,7 +1521,10 @@ pub(crate) fn build_devices_screen(
                             // structurally unreachable here, but a
                             // same-titled empty screen is a harmless
                             // fallback rather than a panic if it ever is.
-                            Refresh::Gone => Screen::new(fallback_title, vec![]),
+                            // `Refresh::Keep` is likewise unreachable:
+                            // `build_device_page_screen` never returns it
+                            // (bead pico-link-bgnd M0 -- no builder does yet).
+                            Refresh::Gone | Refresh::Keep => Screen::new(fallback_title, vec![]),
                         }
                     }));
                 }
@@ -1950,7 +1965,9 @@ pub(crate) fn build_device_page_screen(model: &BtModel, addr: DeviceAddr, carry:
                     // vanished between the press and this closure running
                     // -- structurally unreachable, same reasoning as
                     // `build_devices_screen`'s own connected-row push.
-                    Refresh::Gone => Screen::new("Quality", vec![]),
+                    // `Refresh::Keep` is likewise unreachable here (bead
+                    // pico-link-bgnd M0 -- no builder returns it yet).
+                    Refresh::Gone | Refresh::Keep => Screen::new("Quality", vec![]),
                 }
             }));
         }
@@ -2384,6 +2401,22 @@ pub(crate) fn build_settings_screen() -> Screen {
     Screen::new(SETTINGS_TITLE, vec![])
 }
 
+/// Shared, interior-mutable handle to the live [`BtModel`] -- the M0 step
+/// of the live-widgets refactor (bead `pico-link-bgnd`,
+/// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md`
+/// section 2). `App` owns the one `Rc`; future app-view widgets (Home,
+/// Devices, ...) will hold their own clone of this same handle so they can
+/// read live state at render/sync time instead of being rebuilt from a
+/// snapshot on every model change. `RefCell`, not a plain `Rc<BtModel>`:
+/// `App`'s own event-folding methods need to mutate through it. **Borrow
+/// rule**: never hold a live `Ref`/`RefMut` across a call back into `App`
+/// (e.g. `refresh_stack`) -- borrow, read/write, drop, *then* call back in,
+/// or the `RefCell` panics at runtime. Model writes happen only inside
+/// `App::handle_event`'s fold methods, never during `sync`/`render`/
+/// `dispatch`, so such a panic would indicate a real bug, not a false
+/// positive.
+pub(crate) type ModelHandle = Rc<RefCell<BtModel>>;
+
 /// The application core: a [`Navigator`] built once over the devices root
 /// screen, the [`BtModel`] that screen (and any future ones) reads to
 /// render itself, and the single [`FrameBuffer565`] rendered into.
@@ -2397,7 +2430,10 @@ pub struct App {
     /// The live Bluetooth device/link state, folded in from [`Event`]s via
     /// [`App::handle_event`]. Screens are built by *reading* this, not by
     /// owning fragments of it themselves -- see [`BtModel`]'s doc comment.
-    model: BtModel,
+    /// A [`ModelHandle`] (`Rc<RefCell<BtModel>>`) as of bead
+    /// `pico-link-bgnd` M0, not a bare `BtModel` -- see that type alias's
+    /// doc comment for the borrow rule and why.
+    model: ModelHandle,
     /// C's own clock, threaded through from [`App::tick`]
     /// (`pl_ui_tick`'s `now_us` in the FFI surface -- previously received
     /// and silently discarded, see pico-link-a67). `core` never reads a
@@ -2489,9 +2525,9 @@ impl App {
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
-        let model = BtModel::default();
+        let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
         let navigator = Navigator::new(build_home_screen(
-            &model,
+            &model.borrow(),
             &home_face,
             &commands,
             &wizard_phase,
@@ -2560,6 +2596,11 @@ impl App {
                     truncate_at = Some(index);
                     break;
                 }
+                // Leave the screen already on the stack in place -- no
+                // `replace_at`, no forced full-frame damage (bead
+                // pico-link-bgnd M0). Dead in practice today: no
+                // `build_identified_screen` arm returns `Keep` yet.
+                Refresh::Keep => {}
             }
         }
         if let Some(index) = truncate_at {
@@ -2576,7 +2617,7 @@ impl App {
     fn build_identified_screen(&self, id: ScreenId, carry: &ScreenCarry) -> Refresh {
         match id {
             ScreenId::Home => Refresh::Rebuild(build_home_screen(
-                &self.model,
+                &self.model.borrow(),
                 &self.home_face,
                 &self.commands,
                 &self.wizard_phase,
@@ -2586,7 +2627,7 @@ impl App {
                 carry,
             )),
             ScreenId::Devices => Refresh::Rebuild(build_devices_screen(
-                &self.model,
+                &self.model.borrow(),
                 carry.selected_key,
                 carry.selected_index,
                 carry.scroll_top,
@@ -2594,9 +2635,9 @@ impl App {
                 &self.wizard_phase,
                 &self.wizard_devices,
             )),
-            ScreenId::DevicePage(addr) => build_device_page_screen(&self.model, addr, carry, &self.commands),
-            ScreenId::Picker(PickerKind::LdacQuality, addr) => build_ldac_quality_picker_screen(&self.model, addr, carry, &self.commands),
-            ScreenId::WhyPage => build_why_page_screen(&self.model, Instant::from_micros(self.now_us), &self.why_page_order, carry),
+            ScreenId::DevicePage(addr) => build_device_page_screen(&self.model.borrow(), addr, carry, &self.commands),
+            ScreenId::Picker(PickerKind::LdacQuality, addr) => build_ldac_quality_picker_screen(&self.model.borrow(), addr, carry, &self.commands),
+            ScreenId::WhyPage => build_why_page_screen(&self.model.borrow(), Instant::from_micros(self.now_us), &self.why_page_order, carry),
         }
     }
 
@@ -2734,7 +2775,7 @@ impl App {
     /// never touches `WizardPhase` at all).
     fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
         self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
-        self.model.connected_addr = Some(addr);
+        self.model.borrow_mut().connected_addr = Some(addr);
         *self.wizard_phase.borrow_mut() = WizardPhase::Succeeded { degraded };
         self.dirty = true;
     }
@@ -2755,10 +2796,12 @@ impl App {
     /// `ConnectSucceeded` event flow a manual connect would, which is what
     /// actually updates the UI as the auto-reconnect proceeds.
     fn on_store_loaded(&mut self, status: StoreStatus) {
-        self.model.store_status = Some(status);
-        if let Some(device) = self.model.paired.iter().max_by_key(|d| d.mru_seq) {
-            let addr = device.addr;
-            let name = truncate_device_name(&device.name);
+        let auto_reconnect = {
+            let mut model = self.model.borrow_mut();
+            model.store_status = Some(status);
+            model.paired.iter().max_by_key(|d| d.mru_seq).map(|device| (device.addr, truncate_device_name(&device.name)))
+        };
+        if let Some((addr, name)) = auto_reconnect {
             self.commands.borrow_mut().push_back(Command::Connect { addr, name });
         }
         self.refresh_stack();
@@ -2770,10 +2813,13 @@ impl App {
     /// (design section 3's single-writer rule -- see that event's doc
     /// comment). Bead pico-link-4vb.4 (T4).
     fn on_paired_device_upserted(&mut self, device: PairedDevice) {
-        if let Some(existing) = self.model.paired.iter_mut().find(|d| d.addr == device.addr) {
-            *existing = device;
-        } else {
-            self.model.paired.push(device);
+        {
+            let mut model = self.model.borrow_mut();
+            if let Some(existing) = model.paired.iter_mut().find(|d| d.addr == device.addr) {
+                *existing = device;
+            } else {
+                model.paired.push(device);
+            }
         }
         self.refresh_stack();
     }
@@ -2782,7 +2828,7 @@ impl App {
     /// the other of the two writers (design section 3). A no-op if `addr`
     /// isn't currently known (e.g. a stray/duplicate echo).
     fn on_paired_device_forgotten(&mut self, addr: DeviceAddr) {
-        self.model.paired.retain(|d| d.addr != addr);
+        self.model.borrow_mut().paired.retain(|d| d.addr != addr);
         self.refresh_stack();
     }
 
@@ -2790,7 +2836,7 @@ impl App {
     /// [`BtModel::store_full`]'s doc comments for why this is populated
     /// ahead of any screen actually reading it.
     fn on_paired_store_full(&mut self) {
-        self.model.store_full = true;
+        self.model.borrow_mut().store_full = true;
         self.dirty = true;
     }
 
@@ -2846,21 +2892,24 @@ impl App {
     /// model" bug. [`BtModel::link_state`] has exactly one writer: this
     /// method (INVARIANT L2) -- see [`App::record_connect_failure`].
     pub fn set_link_state(&mut self, state: LinkState) {
-        self.model.link_state = state;
-        if state != LinkState::Connected {
-            self.model.connected_codec = None;
-            // `connected_addr` (bead pico-link-4vb.4, T5) follows the exact
-            // same lifecycle as `connected_codec`, for the same reason --
-            // see `BtModel::connected_addr`'s doc comment.
-            self.model.connected_addr = None;
-            // `out_level` (bead pico-link-du0) follows the exact same
-            // lifecycle for the exact same reason -- see
-            // `BtModel::out_level`'s doc comment.
-            self.model.out_level = None;
-            // `ldac_live_kbps` (bead pico-link-7jol.5) follows the exact
-            // same lifecycle for the exact same reason -- see
-            // `BtModel::ldac_live_kbps`'s doc comment.
-            self.model.ldac_live_kbps = None;
+        {
+            let mut model = self.model.borrow_mut();
+            model.link_state = state;
+            if state != LinkState::Connected {
+                model.connected_codec = None;
+                // `connected_addr` (bead pico-link-4vb.4, T5) follows the exact
+                // same lifecycle as `connected_codec`, for the same reason --
+                // see `BtModel::connected_addr`'s doc comment.
+                model.connected_addr = None;
+                // `out_level` (bead pico-link-du0) follows the exact same
+                // lifecycle for the exact same reason -- see
+                // `BtModel::out_level`'s doc comment.
+                model.out_level = None;
+                // `ldac_live_kbps` (bead pico-link-7jol.5) follows the exact
+                // same lifecycle for the exact same reason -- see
+                // `BtModel::ldac_live_kbps`'s doc comment.
+                model.ldac_live_kbps = None;
+            }
         }
         self.refresh_stack();
     }
@@ -2871,7 +2920,7 @@ impl App {
     /// field: an inquiry does not disconnect A2DP. [`BtModel::discovering`]
     /// has exactly one writer: this method (INVARIANT L2).
     pub fn set_discovering(&mut self, scanning: bool) {
-        self.model.discovering = scanning;
+        self.model.borrow_mut().discovering = scanning;
         if !scanning {
             self.on_scan_ended_if_applicable();
         }
@@ -2884,15 +2933,18 @@ impl App {
     /// `word`/`nominal_bitrate_bps` as opaque, already-decided display
     /// data rather than deriving them from codec identity itself.
     pub fn set_connected_codec(&mut self, codec: ConnectedCodec) {
-        // A renegotiation away from LDAC (or a fresh connect that isn't
-        // LDAC at all) must drop the previous stream's live figure --
-        // `ldac_live_kbps` (bead pico-link-7jol.5) is only ever meaningful
-        // for the codec it was measured on, and a stale reading surviving
-        // a codec change would show under the wrong hero word.
-        if codec.word != "LDAC" {
-            self.model.ldac_live_kbps = None;
+        {
+            let mut model = self.model.borrow_mut();
+            // A renegotiation away from LDAC (or a fresh connect that isn't
+            // LDAC at all) must drop the previous stream's live figure --
+            // `ldac_live_kbps` (bead pico-link-7jol.5) is only ever meaningful
+            // for the codec it was measured on, and a stale reading surviving
+            // a codec change would show under the wrong hero word.
+            if codec.word != "LDAC" {
+                model.ldac_live_kbps = None;
+            }
+            model.connected_codec = Some(codec);
         }
-        self.model.connected_codec = Some(codec);
         self.refresh_stack();
     }
 
@@ -2903,7 +2955,7 @@ impl App {
     /// on that convention rather than each one deciding for itself whether
     /// a redraw is warranted.
     pub fn on_volume_changed(&mut self, level: u8, muted: bool, source: VolumeSource) {
-        self.model.volume = Some(VolumeState { level, muted, source });
+        self.model.borrow_mut().volume = Some(VolumeState { level, muted, source });
         self.refresh_stack();
     }
 
@@ -2914,7 +2966,7 @@ impl App {
     /// `QUALITY` row (its Adaptive trailing note) both pick up the new
     /// figure the same frame it arrives.
     pub fn on_ldac_bitrate_changed(&mut self, kbps: u32) {
-        self.model.ldac_live_kbps = Some(kbps);
+        self.model.borrow_mut().ldac_live_kbps = Some(kbps);
         self.refresh_stack();
     }
 
@@ -2930,7 +2982,7 @@ impl App {
     /// builds no screen that actually reads `fault_log` yet.
     pub fn on_fault_raised(&mut self, key: FaultKey, value: Option<FaultValue>, count: u16) {
         let now = Instant::from_micros(self.now_us);
-        self.model.fault_log.record(key, now, value, count);
+        self.model.borrow_mut().fault_log.record(key, now, value, count);
         self.refresh_stack();
     }
 
@@ -2950,7 +3002,8 @@ impl App {
     #[allow(clippy::similar_names)]
     pub fn on_levels_changed(&mut self, peak_l: u8, peak_r: u8, rms_l: u8, rms_r: u8) {
         let now = Instant::from_micros(self.now_us);
-        let (prev_hold_l, prev_hold_l_at, prev_hold_r, prev_hold_r_at) = match &self.model.out_level {
+        let prev_out_level = self.model.borrow().out_level;
+        let (prev_hold_l, prev_hold_l_at, prev_hold_r, prev_hold_r_at) = match prev_out_level {
             Some(sample) => (sample.hold_l, sample.hold_l_at, sample.hold_r, sample.hold_r_at),
             None => (0, now, 0, now),
         };
@@ -2976,7 +3029,7 @@ impl App {
         // `crate::render::hero` continues gliding down from the same
         // point instead of re-anchoring (and thus flattening the release
         // curve) on every quieter sample.
-        let (prev_anchor_l, prev_anchor_l_at, prev_anchor_r, prev_anchor_r_at) = match &self.model.out_level {
+        let (prev_anchor_l, prev_anchor_l_at, prev_anchor_r, prev_anchor_r_at) = match prev_out_level {
             Some(sample) => (sample.attack_peak_l, sample.attack_peak_l_at, sample.attack_peak_r, sample.attack_peak_r_at),
             None => (0, now, 0, now),
         };
@@ -2986,7 +3039,7 @@ impl App {
         let decayed_r = decay_peak(prev_anchor_r, now.saturating_duration_since(prev_anchor_r_at));
         let (attack_peak_r, attack_peak_r_at) =
             if peak_r >= decayed_r { (peak_r, now) } else { (prev_anchor_r, prev_anchor_r_at) };
-        self.model.out_level = Some(OutLevelSample {
+        self.model.borrow_mut().out_level = Some(OutLevelSample {
             peak_l,
             peak_r,
             rms_l,
@@ -3009,24 +3062,27 @@ impl App {
     /// rather than appending a duplicate row: BTstack's inquiry reports the
     /// same device repeatedly as its RSSI/name resolve.
     pub fn add_device(&mut self, addr: [u8; 6], name: String, rssi: i8, class_of_device: u32) {
-        if let Some(existing) = self.model.discovered.iter_mut().find(|d| d.addr == addr) {
-            existing.name = name;
-            existing.rssi = rssi;
-            existing.class_of_device = class_of_device;
-        } else {
-            self.model.discovered.push(DeviceEntry { addr, name, rssi, class_of_device });
+        {
+            let mut model = self.model.borrow_mut();
+            if let Some(existing) = model.discovered.iter_mut().find(|d| d.addr == addr) {
+                existing.name = name;
+                existing.rssi = rssi;
+                existing.class_of_device = class_of_device;
+            } else {
+                model.discovered.push(DeviceEntry { addr, name, rssi, class_of_device });
+            }
         }
         // Kept in lockstep with `model.discovered` -- see `wizard_devices`'s
         // doc comment on why the wizard widget needs its own mirror
         // rather than a borrow into `self.model`.
-        self.wizard_devices.borrow_mut().clone_from(&self.model.discovered);
+        self.wizard_devices.borrow_mut().clone_from(&self.model.borrow().discovered);
         self.refresh_stack();
     }
 
     /// Clears the discovered-device list, e.g. at the start of a fresh
     /// scan.
     pub fn clear_devices(&mut self) {
-        self.model.discovered.clear();
+        self.model.borrow_mut().discovered.clear();
         self.wizard_devices.borrow_mut().clear();
         self.refresh_stack();
     }
@@ -3037,7 +3093,7 @@ impl App {
     /// offer a retry reads `reason.retryable()` off
     /// `BtModel::last_connect_failure`, not the link state.
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
-        self.model.last_connect_failure = Some((addr, reason));
+        self.model.borrow_mut().last_connect_failure = Some((addr, reason));
         // Bead pico-link-88xs, INVARIANT L2: `link_state` has exactly one
         // writer. Routed through `set_link_state` rather than assigning
         // the field directly (as this used to) -- correct today only by
@@ -3060,10 +3116,33 @@ impl App {
     }
 
     /// Read-only access to the live Bluetooth model, for tests/diagnostics
-    /// and for any future FFI accessor that needs to read it back.
+    /// and for any future FFI accessor that needs to read it back. Returns
+    /// a [`Ref`] rather than `&BtModel` as of bead `pico-link-bgnd` M0
+    /// (`self.model` is now a [`ModelHandle`]) -- `Ref` derefs to
+    /// `BtModel`, so every existing `app.model().some_field` call site
+    /// keeps compiling unchanged; only a call site that needs an actual
+    /// `&BtModel` (a function argument) must add an explicit `&`.
+    ///
+    /// # Panics
+    ///
+    /// If a `RefMut` borrow of the model is already held -- see
+    /// [`ModelHandle`]'s doc comment for the borrow rule that's meant to
+    /// make this never happen in practice.
+    ///
+    /// # Rule for unsafe FFI call sites (`ui-ffi`)
+    ///
+    /// In safe Rust the returned `Ref` is borrow-checked against `&App` and
+    /// cannot outlive it. But `ui-ffi` derefs a raw `*mut PlUi` to get at
+    /// `App`, which yields an *unbounded* lifetime -- so in `ui-ffi`, never
+    /// bind `app.model()` to a `let` and hold it across any `pl_ui_*` call
+    /// (especially `pl_ui_destroy`, which frees the `Rc<RefCell<BtModel>>`
+    /// this `Ref` borrows from). Scope it in an inner block instead, so
+    /// `Ref`'s `Drop` runs before the next `pl_ui_*` call. See the DECISION
+    /// comment on bead `pico-link-bgnd.7` (a real heap-use-after-free was
+    /// found and fixed this way in `ui-ffi/src/lib.rs`).
     #[must_use]
-    pub fn model(&self) -> &BtModel {
-        &self.model
+    pub fn model(&self) -> Ref<'_, BtModel> {
+        self.model.borrow()
     }
 
     /// Whether the current volume reading means the display must never go
@@ -3076,7 +3155,7 @@ impl App {
     /// `IdlePolicy::tick`'s doc comment for the mechanism.
     #[must_use]
     pub fn volume_requires_dim_floor(&self) -> bool {
-        self.model.volume.is_some_and(|volume| volume.muted || volume.level == 0)
+        self.model.borrow().volume.is_some_and(|volume| volume.muted || volume.level == 0)
     }
 
     /// Pops the oldest queued user command, if any
@@ -3241,7 +3320,13 @@ impl App {
         if intents.is_empty() {
             return;
         }
+        let ctx = RenderCtx::at(Instant::from_micros(self.now_us));
         for intent in intents {
+            // Sync before EACH dispatch, not once before the loop: a single
+            // intent can pop the stack, exposing a screen underneath that
+            // was not synced yet this frame -- see `Navigator::sync_top`'s
+            // doc comment (bead `pico-link-bgnd` M0).
+            self.navigator.sync_top(&ctx);
             self.navigator.dispatch(intent);
         }
         self.stamp_pending_wizard_timestamp();
@@ -3295,6 +3380,7 @@ impl App {
     /// `Result::expect` is how that's asserted at the call site.
     pub fn render(&mut self) -> RenderOutput<'_> {
         let ctx = RenderCtx::at(Instant::from_micros(self.now_us));
+        self.navigator.sync_top(&ctx);
         let damage = self
             .navigator
             .render(&ctx, &mut self.framebuffer)
@@ -5493,13 +5579,13 @@ mod tests {
         // value (990 kbps, the effective default) -- there is no
         // optimistic local state anywhere in this path (design §5.1).
         app.handle_input(vec![NavIntent::Back]); // -> device page
-        let rows_before_echo = device_page_rows(app.model(), addr);
+        let rows_before_echo = device_page_rows(&app.model(), addr);
         assert_eq!(rows_before_echo.iter().find(|r| r.label == "QUALITY").unwrap().value(), Some("990 kbps"), "no optimistic update before the echo");
 
         // The echo lands (C's PairedDeviceUpserted, same write that
         // produced the command above) -- refresh_stack must now show 660.
         app.handle_event(upsert_with_quality(addr, "Cans", 2, 2));
-        let rows_after_echo = device_page_rows(app.model(), addr);
+        let rows_after_echo = device_page_rows(&app.model(), addr);
         assert_eq!(rows_after_echo.iter().find(|r| r.label == "QUALITY").unwrap().value(), Some("660 kbps"), "the check follows the stored echo");
     }
 
@@ -5748,6 +5834,7 @@ mod tests {
         match refresh {
             Refresh::Rebuild(screen) => assert_eq!(screen.id(), Some(ScreenId::WhyPage)),
             Refresh::Gone => panic!("the why? page has no subject that can vanish -- must never be Gone"),
+            Refresh::Keep => panic!("build_why_page_screen never returns Keep as of pico-link-bgnd M0"),
         }
     }
 
