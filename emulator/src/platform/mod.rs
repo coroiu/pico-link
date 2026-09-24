@@ -40,3 +40,18 @@ pub use input::{HttpInput, NoopInput, WindowedInput};
 pub use minifb_surface::MinifbSurface;
 pub use power::RecordingPowerControl;
 pub use storage::{FileStorage, FileStorageError};
+
+/// The perceptual dim factor both [`headless_surface`]'s PNG preview and
+/// [`minifb_surface`]'s live window rasterization multiply each 8-bit RGB
+/// channel by while [`pico_link_core::platform::DisplayPower::Dim`] is
+/// active -- one shared formula so the two surfaces stay provably
+/// pixel-identical (the same guarantee `emulator/tests/surface_parity.rs`
+/// already holds for `On`/`Off`). `(DIM_BACKLIGHT_PERMILLE / 1000) ^
+/// (1/2.2)`: a gamma-corrected approximation of what a physical backlight
+/// dimmed to that duty cycle actually looks like to the eye, not a flat
+/// linear scale-down (which would look far darker than the real panel at
+/// the same PWM level).
+#[must_use]
+pub fn dim_factor() -> f32 {
+    (f32::from(pico_link_core::DIM_BACKLIGHT_PERMILLE) / 1000.0).powf(1.0 / 2.2)
+}

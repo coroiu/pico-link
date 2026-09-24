@@ -33,7 +33,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pico_link_core::{run, App, IdlePowerSetting};
+use pico_link_core::{run, App, DisplaySettings};
 use emulator::desktop::HttpServer;
 use emulator::platform::{FileStorage, HeadlessSurface, HostPlatform, HttpInput, MinifbSurface, RecordingPowerControl, SharedHeadlessSurface, WindowedInput};
 use minifb::{Window, WindowOptions};
@@ -95,21 +95,22 @@ fn main() {
 
     let kv_storage = FileStorage::new_default().expect("Failed to open kv store");
 
-    // The single persisted idle-power toggle covering both the
-    // screensaver and (once armed -- see `pico_link_core::power::
-    // DEEP_SLEEP_ARMED`) deep-sleep tiers, loaded once here before
-    // `kv_storage` is moved into whichever `HostPlatform` gets built below.
-    // Defaults to enabled (screensaver on) if never explicitly saved.
+    // The persisted screensaver dim/off + timeout setting, loaded once here
+    // before `kv_storage` is moved into whichever `HostPlatform` gets built
+    // below. Defaults to `Off`/1 min if never explicitly saved (or only the
+    // legacy `IdlePowerSetting` key was -- see `DisplaySettings::load`).
     //
-    // Unlike the previous product layer (which let a live Settings screen
-    // toggle this without a restart), this minimal shell has no settings
-    // UI yet, so the setting is only read once, at boot, and baked into
-    // `run`'s two `Option<Duration>` parameters for the whole process
-    // lifetime -- a future settings screen can reintroduce live gating the
-    // same way the old `App::idle_power`/`take_settings_dirty` seam did.
-    let idle_power = IdlePowerSetting::load(&kv_storage);
-    let idle_timeout = idle_power.idle_timeout();
-    let deep_sleep_timeout = idle_power.deep_sleep_timeout();
+    // Unlike a future on-device build (where the live Settings screen's
+    // picks apply immediately via `Runner::step`'s
+    // `take_display_settings_to_apply`), this baked `idle_timeout`/
+    // `deep_sleep_timeout` pair only matters for `run`'s *very first*
+    // `IdlePolicy` construction -- `app.set_display_settings` below seeds
+    // the same value into the live `App`, so a pick made in the emulator's
+    // own Settings screen still takes effect immediately, exactly like the
+    // real device.
+    let display_settings = DisplaySettings::load(&kv_storage);
+    let idle_timeout = display_settings.idle_timeout();
+    let deep_sleep_timeout = display_settings.deep_sleep_timeout();
 
     std::thread::spawn(move || {
         println!("HTTP server running on http://127.0.0.1:8080");
@@ -125,6 +126,7 @@ fn main() {
     });
 
     let mut app = App::new(WIDTH, HEIGHT);
+    app.set_display_settings(display_settings);
 
     // The `PowerControl` capability, shared by both run modes the same way
     // any other capability field would be (only one branch below actually

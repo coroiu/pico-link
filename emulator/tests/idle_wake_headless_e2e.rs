@@ -48,7 +48,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pico_link_core::input::NavIntent;
-use pico_link_core::{run, App};
+use pico_link_core::platform::DisplayPower;
+use pico_link_core::{run, App, Event, VolumeSource};
 use emulator::platform::{FileStorage, HeadlessSurface, HostPlatform, HttpInput, RecordingPowerControl, SharedHeadlessSurface};
 
 const WIDTH: u32 = 240;
@@ -101,6 +102,19 @@ const TOTAL_ITERATIONS: u32 = CHECKPOINT_IDLE_AND_INJECT;
 
 fn is_all_black(image: &image::RgbImage) -> bool {
     image.pixels().all(|p| *p == image::Rgb([0, 0, 0]))
+}
+
+/// Mean of all three channels across every pixel -- used to prove a
+/// dimmed frame is genuinely between "off" (0) and "on" (its own,
+/// content-dependent mean), not just "not all black".
+fn mean_luminance(image: &image::RgbImage) -> f64 {
+    let mut total = 0u64;
+    let mut count = 0u64;
+    for p in image.pixels() {
+        total += u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]);
+        count += 3;
+    }
+    total as f64 / count as f64
 }
 
 /// [`new_platform`]'s return type, factored out (clippy's `type_complexity`
@@ -224,4 +238,72 @@ fn idle_past_the_timeout_never_blanks_the_display_while_inside_the_pairing_wizar
         "the screensaver must never blank the display while inside the pairing wizard, no matter how much idle time passes"
     );
     assert_eq!(idle_screenshot, initial_screenshot, "the wizard screen must be untouched -- no blank, no navigation, nothing queued to wake");
+}
+
+#[test]
+fn driving_to_idle_while_muted_dims_the_headless_screenshot_and_a_press_restores_full_brightness_without_navigating() {
+    // pico-link-qivj.2, Andreas's Q1 ruling: muted/zero volume + idle
+    // lands on Dim, never Off -- proven here end to end, through a real
+    // `App`/`Navigator`/`HeadlessSurface`, not just `IdlePolicy` in
+    // isolation (already covered by `core::run::idle_policy_tests`).
+    let (mut platform, input_queue, surface) = new_platform();
+    let surface_handle_for_closure = Arc::clone(&surface);
+
+    let mut app = App::new(WIDTH, HEIGHT);
+    assert!(app.is_at_home_root(), "sanity: a fresh App starts at Home root");
+    // Default mode is Off (Andreas's Q3 ruling) -- the mute/zero floor
+    // must still force Dim, never Off, regardless of mode.
+    app.handle_event(Event::VolumeChanged { level: 0, muted: true, source: VolumeSource::Host });
+
+    let mut initial_screenshot: Option<image::RgbImage> = None;
+    let mut idle_screenshot: Option<image::RgbImage> = None;
+    let mut idle_power: Option<DisplayPower> = None;
+
+    let mut iterations = 0u32;
+    run(&mut platform, &mut app, FRAME_BUDGET, Some(TEST_IDLE_TIMEOUT), None, || {
+        iterations += 1;
+
+        if iterations == CHECKPOINT_INITIAL {
+            let png = surface_handle_for_closure.lock().unwrap().encode_png().expect("iteration 1 flushed");
+            initial_screenshot = Some(image::load_from_memory(&png).expect("valid PNG").to_rgb8());
+        }
+
+        if iterations == CHECKPOINT_IDLE_AND_INJECT {
+            idle_power = Some(surface_handle_for_closure.lock().unwrap().power());
+            let png = surface_handle_for_closure.lock().unwrap().encode_png().expect("a frame was flushed before going idle");
+            idle_screenshot = Some(image::load_from_memory(&png).expect("valid PNG").to_rgb8());
+
+            // Down is unbound on Home's status face -- wakes without
+            // navigating, same reasoning as the plain idle/wake test above.
+            input_queue.lock().unwrap().push_back(NavIntent::Down);
+        }
+
+        iterations <= TOTAL_ITERATIONS
+    });
+
+    assert_eq!(app.navigator_depth(), 1, "sanity: never navigated away from Home root during this scenario");
+
+    let initial_screenshot = initial_screenshot.expect("checkpoint 1 must have run");
+    let idle_screenshot = idle_screenshot.expect("the idle checkpoint must have run");
+    let idle_power = idle_power.expect("the idle checkpoint must have run");
+
+    assert!(!is_all_black(&initial_screenshot), "the initial render must show real content");
+    assert_eq!(idle_power, DisplayPower::Dim, "muted + idle must land on Dim, never Off, even in the default Off mode");
+    assert!(!is_all_black(&idle_screenshot), "Dim must still show content, unlike Off's all-black frame");
+
+    let initial_luma = mean_luminance(&initial_screenshot);
+    let idle_luma = mean_luminance(&idle_screenshot);
+    assert!(
+        idle_luma > 0.0 && idle_luma < initial_luma,
+        "dimmed mean luminance ({idle_luma}) must sit strictly between black (0) and the full-brightness frame's ({initial_luma})"
+    );
+
+    let woken_power = surface.lock().unwrap().power();
+    let woken_png = surface.lock().unwrap().encode_png().expect("the wake iteration flushed a fresh frame");
+    let woken_screenshot = image::load_from_memory(&woken_png).expect("valid PNG").to_rgb8();
+    assert_eq!(woken_power, DisplayPower::On, "a real press must restore full brightness");
+    assert_eq!(
+        woken_screenshot, initial_screenshot,
+        "the wake-triggering press must be dropped (not delivered to the app), so the restored frame is pixel-identical to the pre-idle one"
+    );
 }

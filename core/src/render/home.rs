@@ -87,7 +87,7 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
     build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, DeviceAddr, DeviceEntry,
-    FaultKey, FaultLog, HomeFace, LinkState, Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
+    DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
 };
 use crate::input::NavIntent;
 use crate::platform::Instant;
@@ -135,8 +135,9 @@ pub fn build_home_screen(
     wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
     now: Instant,
     why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
+    display_settings: &Rc<RefCell<DisplaySettingsState>>,
 ) -> Screen {
-    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order);
+    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order, display_settings);
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
@@ -221,6 +222,7 @@ impl HomeView {
         wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
         now: Instant,
         why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
+        display_settings: &Rc<RefCell<DisplaySettingsState>>,
     ) -> Self {
         // The status face's hero widget: `NO LINK` whenever there is no
         // live codec (design section 15's "absent, never frozen or
@@ -335,6 +337,7 @@ impl HomeView {
         let commands_for_bluetooth = Rc::clone(commands);
         let wizard_phase_for_bluetooth = Rc::clone(wizard_phase);
         let wizard_devices_for_bluetooth = Rc::clone(wizard_devices);
+        let display_settings_for_settings_row = Rc::clone(display_settings);
         let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Settings")]).on_activate_index(
             // `Verb::Open`: both rows push a deeper screen and draw a
             // caret (design section 4's assignment table -- Home menu's A
@@ -350,7 +353,10 @@ impl HomeView {
                     let wizard_devices = Rc::clone(&wizard_devices_for_bluetooth);
                     Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, None, &commands, &wizard_phase, &wizard_devices)))
                 }
-                MENU_ROW_SETTINGS => Action::PushView(Box::new(build_settings_screen)),
+                MENU_ROW_SETTINGS => {
+                    let display_settings = Rc::clone(&display_settings_for_settings_row);
+                    Action::PushView(Box::new(move || build_settings_screen(&display_settings, &ScreenCarry::default())))
+                }
                 _ => Action::None,
             },
         );
@@ -672,7 +678,8 @@ mod tests {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+        let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -685,7 +692,8 @@ mod tests {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+        let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting
@@ -788,7 +796,8 @@ mod tests {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let why_page_order = Rc::new(RefCell::new(Vec::new()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order)
+        let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
     }
 
     #[test]

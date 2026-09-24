@@ -334,11 +334,15 @@ pub struct PlUi {
 /// module doc).
 ///
 /// Constructs its [`IdlePolicy`] with `idle_timeout: Some(DEFAULT_IDLE_TIMEOUT)`
-/// and `deep_sleep_timeout: None` -- the screensaver tier is on, matching
-/// `crate::power::IdlePowerSetting::default()`'s always-on behavior (the
-/// persisted toggle itself is not yet read from `Storage` here -- see
-/// pico-link-i3e's follow-up beads); deep sleep stays unreachable, matching
-/// `crate::power::DEEP_SLEEP_ARMED == false`. Deliberately does **not**
+/// and `deep_sleep_timeout: None`, `mode: Off` -- reproducing
+/// `pico_link_core::power::DisplaySettings::default()`'s exact behavior
+/// (Off/1 min, Andreas's Q3 ruling on pico-link-qivj.2) until C's persisted
+/// [`PlEventTag::DisplaySettingsLoaded`] event lands (`main.c` pushes it
+/// right after `pl_bt_init`, before the superloop starts, so it always
+/// arrives ahead of the first real [`pl_ui_tick`]) and
+/// `App::take_display_settings_to_apply` configures the live policy from
+/// it. Deep sleep stays unreachable, matching `crate::power::
+/// DEEP_SLEEP_ARMED == false`. Deliberately does **not**
 /// seed `IdlePolicy`'s idle clock from any timestamp here: this function
 /// has no clock (see the FFI direction rule -- C owns the clock, only
 /// [`pl_ui_tick`]'s `now_us` ever supplies one), and `IdlePolicy` lazily
@@ -600,6 +604,12 @@ pub unsafe extern "C" fn pl_ui_tick(ui: *mut PlUi, now_us: u64) {
     }
     // SAFETY: caller contract above.
     let ui = &mut *ui;
+    // A Settings picker's pick, applied to the live `IdlePolicy` before
+    // this tick's own arm decision -- same "apply latch, drained here"
+    // shape `Runner::step` uses (pico-link-qivj.2, S4/S8).
+    if let Some(settings) = ui.app.take_display_settings_to_apply() {
+        ui.idle.configure(settings.idle_timeout(), settings.deep_sleep_timeout(), settings.mode);
+    }
     let had_input = core::mem::take(&mut ui.input_since_last_tick) || core::mem::take(&mut ui.volume_wake_since_last_tick);
     let now = pico_link_core::platform::Instant::from_micros(now_us);
     let mute_or_zero = ui.app.volume_requires_dim_floor();
@@ -619,12 +629,18 @@ pub unsafe extern "C" fn pl_ui_tick(ui: *mut PlUi, now_us: u64) {
 pub enum PlDisplayPower {
     On = 0,
     Off = 1,
+    /// Backlight reduced to `pl_ui_backlight_permille`'s value; content
+    /// still rendered and visible. Added by pico-link-qivj.2 -- additive,
+    /// no ABI version bump (same discipline as event tags 13-17 / command
+    /// tag 8).
+    Dim = 2,
 }
 
 impl From<DisplayPower> for PlDisplayPower {
     fn from(power: DisplayPower) -> Self {
         match power {
             DisplayPower::On => PlDisplayPower::On,
+            DisplayPower::Dim => PlDisplayPower::Dim,
             DisplayPower::Off => PlDisplayPower::Off,
         }
     }
@@ -652,6 +668,28 @@ pub unsafe extern "C" fn pl_ui_display_power(ui: *mut PlUi) -> PlDisplayPower {
     // SAFETY: caller contract above.
     let ui = &*ui;
     ui.idle.display_power().into()
+}
+
+/// Backlight level, out of 1000 (permille), for [`pl_ui_display_power`]'s
+/// current level -- `On` = 1000, `Dim` = the single
+/// `pico_link_core::power::DIM_BACKLIGHT_PERMILLE` constant, `Off` = 0.
+/// `core` owns this policy entirely; C never hardcodes a level, it only
+/// ever asks this function and applies the result to the backlight PWM
+/// (`st7789_set_backlight_permille`). Same self-healing "fail bright"
+/// polarity as [`pl_ui_display_power`]: returns `1000` for a null `ui`.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_backlight_permille(ui: *const PlUi) -> u16 {
+    if ui.is_null() {
+        return 1000;
+    }
+    // SAFETY: caller contract above.
+    let ui = &*ui;
+    ui.idle.display_power().backlight_permille()
 }
 
 /// Whether [`pl_ui_render_ex`] would currently draw something different from
@@ -1101,6 +1139,23 @@ pub struct PlLinkStateChangedPayload {
 #[derive(Clone, Copy)]
 pub struct PlDiscoveryStateChangedPayload {
     pub state: u32,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::DisplaySettingsLoaded`,
+/// and also [`PlCommand`]'s payload when `tag ==
+/// PlCommandTag::SetDisplaySettings` -- the same wire shape serves both
+/// directions (bead pico-link-qivj.2), matching
+/// `pico_link_core::power::DisplaySettings::to_wire`/`from_wire` exactly:
+/// `mode` (1=Off, 2=Dim; any other value falls back to Off) and
+/// `timeout_s` (0=Never; `{0,30,60,120,300}`; any other value falls back
+/// to 60). `core` decodes with `DisplaySettings::from_wire`, never a raw
+/// match here -- same "typed field would already be UB on a garbage
+/// discriminant" reasoning as every other payload struct in this union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlDisplaySettingsPayload {
+    pub mode: u8,
+    pub timeout_s: u16,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::DeviceDiscovered`. `name`
@@ -1729,6 +1784,14 @@ pub enum PlEventTag {
     /// `1` -- see [`PlLinkState`]'s doc comment for why that ordinal is
     /// reserved-and-rejected rather than renumbered.
     DiscoveryStateChanged = 17,
+    /// Bead pico-link-qivj.2: C's persisted screensaver dim/off + timeout
+    /// setting finished loading at boot (`main.c` pushes this right after
+    /// `pl_bt_init`, thread context, before the superloop starts -- same
+    /// context `a2dp.c:1064` uses). Purely additive, same discipline as
+    /// every tag from `LevelsChanged` (13) on -- [`PL_EVENT_ABI_VERSION`]
+    /// is unchanged by this tag's own addition. See
+    /// [`PlDisplaySettingsPayload`]'s doc comment.
+    DisplaySettingsLoaded = 18,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1757,6 +1820,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             15 => Ok(PlEventTag::LdacBitrateChanged),
             16 => Ok(PlEventTag::AudioFault),
             17 => Ok(PlEventTag::DiscoveryStateChanged),
+            18 => Ok(PlEventTag::DisplaySettingsLoaded),
             _ => Err(()),
         }
     }
@@ -1802,6 +1866,9 @@ pub union PlEventPayload {
     /// Bead pico-link-88xs. See [`PlDiscoveryStateChangedPayload`]'s doc
     /// comment.
     pub discovery_state_changed: PlDiscoveryStateChangedPayload,
+    /// Bead pico-link-qivj.2. See [`PlDisplaySettingsPayload`]'s doc
+    /// comment.
+    pub display_settings: PlDisplaySettingsPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -2182,6 +2249,16 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             };
             Event::DiscoveryStateChanged { scanning: state.is_scanning() }
         }
+        PlEventTag::DisplaySettingsLoaded => {
+            // SAFETY: `tag` says this union currently holds
+            // `display_settings`. Reading it is sound regardless of its
+            // field values -- `core`'s own `DisplaySettings::from_wire`
+            // (called inside `App::handle_event`) falls back per-field on
+            // any out-of-range value, same as every other malformed-but-
+            // memory-safe payload in this union.
+            let payload = unsafe { event.payload.display_settings };
+            Event::DisplaySettingsLoaded { mode: payload.mode, timeout_s: payload.timeout_s }
+        }
     };
     ui.app.handle_event(core_event);
 }
@@ -2285,6 +2362,18 @@ pub enum PlCommandTag {
     /// changed -- so this does not bump [`PL_COMMAND_ABI_VERSION`], same
     /// reasoning as [`Disconnect`](Self::Disconnect)'s own addition.
     SetDeviceLdacQuality = 8,
+    /// Bead pico-link-qivj.2: the screensaver dim/off + timeout setting
+    /// changed (a Settings-picker pick), for C to persist under `PL:S:0`.
+    /// Unlike every other command here, this one is NOT drained from
+    /// `App`'s ordinary `commands` queue -- it comes from
+    /// `App::take_display_settings_to_save`, checked FIRST by
+    /// [`pl_ui_poll_command`], ahead of the ordinary queue (design D9: one
+    /// save latch in `core`, two adapters -- this is the `ui-ffi` one, the
+    /// emulator's `Runner::step` is the other). Purely additive to the tag
+    /// enum -- no existing payload shape changed -- so this does not bump
+    /// [`PL_COMMAND_ABI_VERSION`], same reasoning as
+    /// [`SetDeviceLdacQuality`](Self::SetDeviceLdacQuality)'s own addition.
+    SetDisplaySettings = 9,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -2361,6 +2450,8 @@ pub union PlCommandPayload {
     /// See [`PlSetDeviceLdacQualityPayload`]'s doc comment. Bead
     /// pico-link-7jol.5.
     pub set_device_ldac_quality: PlSetDeviceLdacQualityPayload,
+    /// See [`PlDisplaySettingsPayload`]'s doc comment. Bead pico-link-qivj.2.
+    pub display_settings: PlDisplaySettingsPayload,
 }
 
 /// ABI version [`PlCommand`] consumers (C call sites, i.e. `bt.c`'s poll
@@ -2493,6 +2584,18 @@ pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
     }
     // SAFETY: caller contract above.
     let ui = &mut *ui;
+    // Checked FIRST, ahead of the ordinary `commands` queue -- design D9:
+    // the display-settings save latch is a separate mailbox on `App`, not
+    // routed through `Command`/`poll_command` at all (see
+    // `PlCommandTag::SetDisplaySettings`'s doc comment).
+    if let Some(settings) = ui.app.take_display_settings_to_save() {
+        let (mode, timeout_s) = settings.to_wire();
+        return PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::SetDisplaySettings,
+            payload: PlCommandPayload { display_settings: PlDisplaySettingsPayload { mode, timeout_s } },
+        };
+    }
     match ui.app.poll_command() {
         Some(command) => pl_command_from(command),
         None => pl_command_none(),

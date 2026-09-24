@@ -63,17 +63,17 @@ struct CapturedFrame {
 pub struct HeadlessSurface {
     last_frame: Option<CapturedFrame>,
     /// Idle-screensaver display power state.
-    /// Defaults to `true` (on) so existing callers that never touch
-    /// `set_power` see unchanged behavior. `flush` keeps recording the real
-    /// frame regardless of this flag -- only `encode_png`'s *output*
-    /// changes when powered off, mirroring how a real display keeps
-    /// receiving pixel data over SPI even with its backlight off.
-    powered_on: bool,
+    /// Defaults to `On` so existing callers that never touch `set_power`
+    /// see unchanged behavior. `flush` keeps recording the real frame
+    /// regardless of this field -- only `encode_png`'s *output* changes
+    /// when dimmed/off, mirroring how a real display keeps receiving pixel
+    /// data over SPI even with its backlight dimmed or off.
+    power: DisplayPower,
 }
 
 impl Default for HeadlessSurface {
     fn default() -> Self {
-        Self { last_frame: None, powered_on: true }
+        Self { last_frame: None, power: DisplayPower::On }
     }
 }
 
@@ -83,12 +83,22 @@ impl HeadlessSurface {
         Self::default()
     }
 
+    /// The most recently requested display power level.
+    #[must_use]
+    pub fn power(&self) -> DisplayPower {
+        self.power
+    }
+
     /// Encodes the most recently flushed framebuffer as a PNG, returning
-    /// `None` if `flush` has never been called. If the surface is
-    /// currently powered off (see [`DisplaySurface::set_power`]), returns
-    /// an all-black image of the correct dimensions instead of the real
-    /// frame -- headless must observe the same blanking a real display
-    /// would show, not silently keep exposing the last real pixels.
+    /// `None` if `flush` has never been called. `On` renders the real
+    /// frame; `Off` returns an all-black image of the correct dimensions
+    /// (headless must observe the same blanking a real display would
+    /// show, not silently keep exposing the last real pixels); `Dim`
+    /// renders the real frame with each channel scaled by
+    /// [`DisplayPower::backlight_permille`]'s value, gamma-corrected
+    /// (`(permille/1000)^(1/2.2)`) so the PNG preview looks like what a
+    /// perceptually-linear backlight dim actually looks like, not a flat
+    /// linear scale-down.
     ///
     /// # Panics
     ///
@@ -100,16 +110,39 @@ impl HeadlessSurface {
         let frame = self.last_frame.as_ref()?;
         let mut image = image::RgbImage::new(frame.width, frame.height);
 
-        if self.powered_on {
-            for (index, color) in frame.pixels.iter().enumerate() {
-                let index = index as u32;
-                let x = index % frame.width;
-                let y = index / frame.width;
-                image.put_pixel(x, y, image::Rgb(rgb565_raw_to_rgb888(color.into_storage())));
+        match self.power {
+            DisplayPower::On => {
+                for (index, color) in frame.pixels.iter().enumerate() {
+                    let index = index as u32;
+                    let x = index % frame.width;
+                    let y = index / frame.width;
+                    image.put_pixel(x, y, image::Rgb(rgb565_raw_to_rgb888(color.into_storage())));
+                }
+            }
+            DisplayPower::Dim => {
+                let f = crate::platform::dim_factor();
+                for (index, color) in frame.pixels.iter().enumerate() {
+                    let index = index as u32;
+                    let x = index % frame.width;
+                    let y = index / frame.width;
+                    let [r, g, b] = rgb565_raw_to_rgb888(color.into_storage());
+                    image.put_pixel(
+                        x,
+                        y,
+                        image::Rgb([
+                            (f32::from(r) * f).round() as u8,
+                            (f32::from(g) * f).round() as u8,
+                            (f32::from(b) * f).round() as u8,
+                        ]),
+                    );
+                }
+            }
+            DisplayPower::Off => {
+                // `image::RgbImage::new` already zero-fills every pixel to
+                // black, so leaving the loop above unrun is the all-black
+                // image.
             }
         }
-        // else: `image::RgbImage::new` already zero-fills every pixel to
-        // black, so leaving the loop above unrun is the all-black image.
 
         let mut buffer = Vec::new();
         image
@@ -147,7 +180,7 @@ impl DisplaySurface for HeadlessSurface {
     }
 
     fn set_power(&mut self, power: DisplayPower) -> Result<(), Self::Error> {
-        self.powered_on = power == DisplayPower::On;
+        self.power = power;
         Ok(())
     }
 }
@@ -175,6 +208,12 @@ impl SharedHeadlessSurface {
     #[must_use]
     pub fn handle(&self) -> Arc<Mutex<HeadlessSurface>> {
         Arc::clone(&self.0)
+    }
+
+    /// The most recently requested display power level.
+    #[must_use]
+    pub fn power(&self) -> DisplayPower {
+        self.0.lock().unwrap().power()
     }
 }
 
