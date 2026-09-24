@@ -149,16 +149,13 @@ fn freshness_cases() -> Vec<FreshnessCase> {
     fn device_detail() -> App {
         let mut app = App::new(240, 240);
         let addr = [6; 6];
-        // `ConnectSucceeded` before `upsert` deliberately: the former
-        // sets `connected_addr` but does not itself `refresh_stack`
-        // (see `on_connect_succeeded`'s doc comment), so `HomeView`'s
-        // captured `model` snapshot would otherwise still read
-        // `connected_addr: None` when `open_devices` pushes the
-        // Devices screen off of it, and `on_activate_index` would take
-        // the reconnect-to-a-non-connected-row branch (pushing the
-        // wizard's Connecting phase) instead of device detail. Ordered
-        // this way, the `upsert` event's own `refresh_stack` is the one
-        // that captures the fresh, already-connected model.
+        // `ConnectSucceeded` before `upsert`: harmless either order as of
+        // bead `pico-link-bgnd` M1 -- `HomeView`'s Bluetooth-row push
+        // closure borrows the live model handle at press time, not a
+        // snapshot captured at construction, so `open_devices` below
+        // always sees the current `connected_addr` regardless of event
+        // order. Kept in this order anyway (it's also the order a real
+        // successful pairing fires in).
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         app.handle_event(upsert(addr, "Cans", 1));
         open_devices(&mut app);
