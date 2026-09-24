@@ -657,6 +657,11 @@ type OnActivate = Box<dyn Fn(&ListItem) -> Action>;
 /// alongside [`OnActivate`].
 type OnActivateIndex = Box<dyn Fn(usize) -> Action>;
 
+/// Callback invoked with the selected row's **identity key** on activation.
+/// See [`VerticalList::on_activate_key`]'s doc comment for why this exists
+/// alongside [`OnActivate`]/[`OnActivateIndex`].
+type OnActivateKey = Box<dyn Fn(ListItemKey) -> Action>;
+
 /// A focusable, scrollable vertical list of [`ListItem`]s. Moves its
 /// internal selection in response to `NavIntent::{Up,Down,JumpBy}` via
 /// `Widget::on_intent`, auto-scrolling to keep the selection visible (only
@@ -675,6 +680,15 @@ pub struct VerticalList {
     focused: bool,
     on_activate: Option<OnActivate>,
     on_activate_index: Option<OnActivateIndex>,
+    /// A live-model-backed alternative to [`Self::on_activate`]/
+    /// [`Self::on_activate_index`] -- invoked with the selected row's
+    /// [`ListItemKey`] rather than its `ListItem`/index, for a long-lived
+    /// list (bead `pico-link-bgnd` M2) whose callback resolves that key
+    /// back to a live domain entity at *press time* instead of closing over
+    /// a snapshot captured when the list was last rebuilt. See
+    /// `crate::app::screens::devices::build_devices_screen`'s
+    /// `on_activate_key` callback for the pattern.
+    on_activate_key: Option<OnActivateKey>,
     /// The A-rail verb reported for a selected row that has no per-row
     /// [`ListItem::with_verb`] override -- set alongside whichever
     /// activation callback is registered (design rule 4 §5(c): "you
@@ -694,6 +708,7 @@ impl VerticalList {
             focused: false,
             on_activate: None,
             on_activate_index: None,
+            on_activate_key: None,
             default_verb: None,
         }
     }
@@ -733,6 +748,54 @@ impl VerticalList {
         self.default_verb = Some(verb);
         self.on_activate_index = Some(Box::new(callback));
         self
+    }
+
+    /// Registers a callback invoked with the selected row's **identity
+    /// key** (not its index or `ListItem`) when the list is activated while
+    /// focused.
+    ///
+    /// The live-widgets counterpart to [`Self::on_activate_index`] (bead
+    /// `pico-link-bgnd` M2): a long-lived list that is updated in place via
+    /// [`Self::set_items`] rather than rebuilt can have its selected row's
+    /// *index* mean a different device by the time a press is actually
+    /// handled (the list's own selection index is a UI-thread concept that
+    /// can drift from a domain index the instant the model reorders without
+    /// a fresh render in between -- keys don't drift, because they are
+    /// domain identity, not position). A callback registered here should
+    /// resolve the key back to a live entity by reading the caller's own
+    /// model handle at the moment it actually runs, not from a value
+    /// captured when this list was constructed -- see
+    /// `crate::app::screens::devices::build_devices_screen`'s callback for
+    /// the pattern.
+    ///
+    /// Takes precedence over both [`Self::on_activate`] and
+    /// [`Self::on_activate_index`] if more than one happens to be set --
+    /// activation only ever fires one callback, never more than one.
+    #[must_use]
+    pub fn on_activate_key(mut self, verb: Verb, callback: impl Fn(ListItemKey) -> Action + 'static) -> Self {
+        self.default_verb = Some(verb);
+        self.on_activate_key = Some(Box::new(callback));
+        self
+    }
+
+    /// Replaces this list's rows **in place**, preserving the current
+    /// selection by [`ListItemKey`] identity with an index-based fallback --
+    /// exactly [`Self::with_selected_identity`]'s rule, moved into a setter
+    /// so a long-lived list (bead `pico-link-bgnd` M2) can be updated on a
+    /// live model change instead of being reconstructed from scratch. The
+    /// scroll-top row (`self.top_index`) is left untouched: [`Widget::
+    /// render`]'s own `reconcile_top_index` call clamps it to the new item
+    /// count/viewport on the very next render, the same way a fresh
+    /// [`Self::with_scroll_top`] value is only ever a hint that gets
+    /// reconciled there, so there is nothing for this method to fix up
+    /// itself.
+    pub fn set_items(&mut self, items: Vec<ListItem>) {
+        let prev_key = self.selected_key();
+        let prev_index = self.selected;
+        self.items = items;
+        self.selected = prev_key
+            .and_then(|key| self.items.iter().position(|item| item.key == Some(key)))
+            .unwrap_or_else(|| prev_index.min(self.items.len().saturating_sub(1)));
     }
 
     /// Sets the initially selected row, clamped to the item list's bounds.
@@ -861,7 +924,7 @@ impl Widget for VerticalList {
     /// registered or the selected row was explicitly marked
     /// [`ListItem::inert`] -- design rule 4.
     fn activation(&self) -> Option<Verb> {
-        if self.on_activate.is_none() && self.on_activate_index.is_none() {
+        if self.on_activate.is_none() && self.on_activate_index.is_none() && self.on_activate_key.is_none() {
             return None;
         }
         let item = self.items.get(self.selected)?;
@@ -927,6 +990,17 @@ impl Widget for VerticalList {
                 Action::None
             }
             FocusEvent::Activated => {
+                if let Some(callback) = &self.on_activate_key {
+                    return match self.items.get(self.selected).and_then(|item| item.key) {
+                        Some(key) => callback(key),
+                        // Every real row this widget draws is expected to
+                        // carry a key when `on_activate_key` is in use (see
+                        // its own doc comment) -- a keyless selected row is
+                        // not reachable in practice, but `Action::None` is
+                        // the harmless fallback rather than a panic.
+                        None => Action::None,
+                    };
+                }
                 if let Some(callback) = &self.on_activate_index {
                     return callback(self.selected);
                 }

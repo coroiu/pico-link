@@ -15,14 +15,15 @@ use crate::input::NavIntent;
 use crate::render::theme::palette;
 use crate::render::wizard::build_wizard_screen;
 use crate::render::{
-    Action, ButtonLabel, ChromeContribution, ConfirmView, FocusEvent, FrameBuffer565, ListItem, ListItemKey, MenuItem, RenderCtx, Screen, Verb,
-    VerticalList, Widget,
+    Action, ButtonLabel, ChromeContribution, ConfirmView, FocusEvent, FrameBuffer565, ListItem, ListItemKey, MenuItem, PaintKey, RenderCtx, Screen,
+    Verb, VerticalList, Widget,
 };
 
 use super::device_page::build_device_page_screen;
 use super::super::model::MAX_PAIRED_DEVICES;
 use super::super::{
-    truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, DeviceEntry, PairedDevice, Refresh, ScreenCarry, ScreenId, WizardPhase,
+    truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, DeviceEntry, ModelHandle, PairedDevice, Refresh, ScreenCarry, ScreenId,
+    WizardPhase,
 };
 
 /// The devices screen's "Pair new headphones" row's identity key. Not
@@ -49,28 +50,40 @@ pub(in crate::app) fn paired_device_label(device: &PairedDevice) -> String {
     }
 }
 
-/// Builds the devices screen: the connected device (if any) pinned first,
-/// sublabelled `Connected`; then every other paired device,
-/// MRU-descending, sublabelled `Paired`; then `Pair new headphones` last.
-/// **No RSSI, no address, no availability dot** -- never claim
-/// availability that hasn't been verified, and the recurring "switch
-/// device" job belongs under the cursor while the rare "pair a new one"
-/// job belongs at the end.
+/// Seed for [`DevicesListView`]'s own projection key -- see
+/// [`DevicesListView::projection_key`]'s doc comment. Unrelated to any
+/// widget's [`PaintKey`]-the-paint-key -- this is a private "did the fields
+/// I read from the model change" hash, not anything compared against a
+/// previous frame's drawn pixels.
+const DEVICES_PROJECTION_SEED: u64 = 41;
+
+/// Builds the devices screen exactly once per push -- `App::new` never
+/// calls this (Devices isn't the root), but once pushed (from Home's
+/// Bluetooth row, `render::home`'s menu closure) the resulting
+/// [`DevicesListView`] is long-lived for as long as Devices stays on the
+/// navigator's stack: `App::refresh_stack`'s `ScreenId::Devices` arm
+/// returns [`Refresh::Keep`] (bead `pico-link-bgnd` M2), so a Bluetooth
+/// event no longer rebuilds this screen -- `DevicesListView::sync` re-reads
+/// the live model itself every frame Devices is on top of the stack
+/// instead (same shape as `render::home`'s M1).
 ///
-/// Replaces the old scan-result rendering entirely -- see
-/// [`BtModel::discovered`]/[`BtModel::paired`]'s doc comments for the
-/// "wizard-only" / "Devices-screen-only" reader split this enforces.
+/// The connected device (if any) is pinned first, sublabelled `Connected`;
+/// then every other paired device, MRU-descending, sublabelled `Paired`;
+/// then `Pair new headphones` last. **No RSSI, no address, no availability
+/// dot** -- never claim availability that hasn't been verified, and the
+/// recurring "switch device" job belongs under the cursor while the rare
+/// "pair a new one" job belongs at the end.
 ///
 /// Every row carries a [`ListItemKey`] (`device.addr` via `From<[u8; 6]>`,
 /// or [`PAIR_NEW_ROW_KEY`] for the fixed last row) so `prev_key`/
-/// `prev_index` can carry the user's selection forward **by identity**
-/// through [`VerticalList::with_selected_identity`] -- a device arriving,
-/// being renamed in place, reordering by a fresh `mru_seq`, or dropping out
-/// entirely no longer moves the selection just because the *index* it used
-/// to occupy now means something else. `prev_key` of `None`/not-found
-/// falls back to clamping `prev_index` -- see that method's doc comment.
+/// `prev_index` can carry the user's selection forward **by identity** --
+/// see [`VerticalList::with_selected_identity`]'s doc comment for the full
+/// rule this still uses for the widget's *initial* construction (a fresh
+/// push, e.g. after a pop-and-repush, still wants that carry; every
+/// subsequent in-place update goes through [`VerticalList::set_items`]'s
+/// own identical rule instead).
 pub(crate) fn build_devices_screen(
-    model: &BtModel,
+    model: &ModelHandle,
     prev_key: Option<ListItemKey>,
     prev_index: usize,
     prev_scroll_top: Option<usize>,
@@ -78,49 +91,12 @@ pub(crate) fn build_devices_screen(
     wizard_phase: &Rc<RefCell<WizardPhase>>,
     wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
 ) -> Screen {
-    let connected = model.connected_addr.and_then(|addr| model.paired.iter().find(|d| d.addr == addr));
-    let mut others: Vec<&PairedDevice> =
-        model.paired.iter().filter(|d| Some(d.addr) != model.connected_addr).collect();
-    others.sort_by_key(|d| core::cmp::Reverse(d.mru_seq));
+    let (items, projection_key) = {
+        let snapshot = model.borrow();
+        (DevicesListView::build_items(&snapshot), DevicesListView::projection_key(&snapshot))
+    };
 
-    let mut ordered: Vec<PairedDevice> = Vec::with_capacity(model.paired.len());
-    if let Some(device) = connected {
-        ordered.push(device.clone());
-    }
-    ordered.extend(others.into_iter().cloned());
-
-    let mut items: Vec<ListItem> = ordered
-        .iter()
-        .map(|device| {
-            let sublabel = if Some(device.addr) == model.connected_addr { "Connected" } else { "Paired" };
-            // `Verb::Open`: every paired row pushes a deeper screen --
-            // device detail for the connected row, the wizard's
-            // `Connecting` phase for any other.
-            ListItem::new(paired_device_label(device))
-                .with_sublabel(sublabel)
-                .with_key(ListItemKey::from(device.addr))
-                .with_verb(Verb::Open)
-        })
-        .collect();
-    // `Verb::Pair`: begins pairing -- including at the 8-device cap, where
-    // the forget-picker is the app making room, not a different intent.
-    items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY).with_verb(Verb::Pair));
-
-    let paired_len = model.paired.len();
-    let connected_addr = model.connected_addr;
-    let ordered_for_activate = ordered.clone();
-    let paired_for_full = model.paired.clone();
-    // Snapshot for the connected row's push -- `Action::PushView`'s
-    // builder is `FnOnce`, with no path back to a live `&BtModel` at the
-    // moment it actually runs (it's called from inside
-    // `Navigator::apply_action`, not from `App`). `BtModel` is `Clone` for
-    // exactly this reason (see [`build_forget_picker_screen`]'s own
-    // `model.paired.clone()` precedent above). The very next model event
-    // replaces this page with a live-read one via
-    // [`App::build_identified_screen`]'s `ScreenId::DevicePage` arm -- this
-    // snapshot only has to be right for the single frame between the press
-    // and that next refresh.
-    let model_for_device_page = model.clone();
+    let model_for_activate = Rc::clone(model);
     let commands_for_activate = Rc::clone(commands);
     let wizard_phase_for_activate = Rc::clone(wizard_phase);
     let wizard_devices_for_activate = Rc::clone(wizard_devices);
@@ -128,66 +104,86 @@ pub(crate) fn build_devices_screen(
         // The `Verb::Open` here is only the list's fallback default; every
         // row above carries its own override, so this value is never
         // actually read.
-        .on_activate_index(Verb::Open, move |index| {
-            if let Some(device) = ordered_for_activate.get(index) {
-                if Some(device.addr) == connected_addr {
-                    // A on the connected row: no reconnect to do -- push
-                    // the real device page.
-                    let addr = device.addr;
-                    let fallback_title = paired_device_label(device);
-                    let model = model_for_device_page.clone();
+        .on_activate_key(Verb::Open, move |key| {
+            if key == PAIR_NEW_ROW_KEY {
+                // "Pair new headphones", the fixed last row. Gated on
+                // capacity *before* any radio work: under the cap, open
+                // the wizard exactly as before; at the cap, open the
+                // pick-one-to-forget flow instead. Read fresh from the
+                // live model at press time, not a count captured when
+                // this list was last built.
+                let (under_capacity, paired_for_full) = {
+                    let model = model_for_activate.borrow();
+                    (model.paired.len() < MAX_PAIRED_DEVICES, model.paired.clone())
+                };
+                if under_capacity {
+                    *wizard_phase_for_activate.borrow_mut() = WizardPhase::scanning_pending();
+                    wizard_devices_for_activate.borrow_mut().clear();
+                    commands_for_activate.borrow_mut().push_back(Command::StartScan);
+                    let phase = Rc::clone(&wizard_phase_for_activate);
+                    let devices = Rc::clone(&wizard_devices_for_activate);
                     let commands = Rc::clone(&commands_for_activate);
-                    return Action::PushView(Box::new(move || {
-                        let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
-                        match build_device_page_screen(&model, addr, &carry, &commands) {
-                            Refresh::Rebuild(screen) => screen,
-                            // The connected device we just pressed cannot
-                            // have vanished between the press and this
-                            // closure running -- `Refresh::Gone` is
-                            // structurally unreachable here, but a
-                            // same-titled empty screen is a harmless
-                            // fallback rather than a panic if it ever is.
-                            // `Refresh::Keep` is likewise unreachable:
-                            // `build_device_page_screen` never returns it
-                            // -- no builder does yet.
-                            Refresh::Gone | Refresh::Keep => Screen::new(fallback_title, vec![]),
-                        }
-                    }));
+                    return Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)));
                 }
-                // A on any other paired row: switch to it, reusing the
-                // wizard -- `Command::Connect` + pushing straight into
-                // `Connecting`, no new phase.
-                commands_for_activate
-                    .borrow_mut()
-                    .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
-                *wizard_phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
-                let phase = Rc::clone(&wizard_phase_for_activate);
-                let devices = Rc::clone(&wizard_devices_for_activate);
                 let commands = Rc::clone(&commands_for_activate);
-                return Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)));
+                return Action::PushView(Box::new(move || build_forget_picker_screen(paired_for_full, commands)));
             }
-            // "Pair new headphones", the fixed last row. Gated on capacity
-            // *before* any radio work: under the cap, open the wizard
-            // exactly as before; at the cap, open the pick-one-to-forget
-            // flow instead.
-            if paired_len < MAX_PAIRED_DEVICES {
-                *wizard_phase_for_activate.borrow_mut() = WizardPhase::scanning_pending();
-                wizard_devices_for_activate.borrow_mut().clear();
-                commands_for_activate.borrow_mut().push_back(Command::StartScan);
-                let phase = Rc::clone(&wizard_phase_for_activate);
-                let devices = Rc::clone(&wizard_devices_for_activate);
+            // A real device row: resolve the key back to a live
+            // `PairedDevice` against the model at press time -- this is
+            // the whole point of `on_activate_key` over the old index-
+            // based callback (see its own doc comment). A key that no
+            // longer resolves (the device was forgotten between the last
+            // render and this press) is a real but narrow race; `Action::
+            // None` is the harmless fallback rather than a panic, same
+            // shape every other "structurally rare, not unreachable" arm
+            // in this crate uses.
+            let (device, connected_addr) = {
+                let model = model_for_activate.borrow();
+                (model.paired.iter().find(|d| ListItemKey::from(d.addr) == key).cloned(), model.connected_addr)
+            };
+            let Some(device) = device else {
+                return Action::None;
+            };
+            if Some(device.addr) == connected_addr {
+                // A on the connected row: no reconnect to do -- push the
+                // real device page.
+                let addr = device.addr;
+                let fallback_title = paired_device_label(&device);
+                let model = Rc::clone(&model_for_activate);
                 let commands = Rc::clone(&commands_for_activate);
-                Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)))
-            } else {
-                let paired = paired_for_full.clone();
-                let commands = Rc::clone(&commands_for_activate);
-                Action::PushView(Box::new(move || build_forget_picker_screen(paired, commands)))
+                return Action::PushView(Box::new(move || {
+                    let carry = ScreenCarry { selected_key: None, selected_index: 0, scroll_top: None };
+                    match build_device_page_screen(&model.borrow(), addr, &carry, &commands) {
+                        Refresh::Rebuild(screen) => screen,
+                        // The connected device we just resolved cannot
+                        // have vanished between that read and this
+                        // closure running on the very same press --
+                        // `Refresh::Gone` is structurally unreachable
+                        // here, but a same-titled empty screen is a
+                        // harmless fallback rather than a panic if it
+                        // ever is. `Refresh::Keep` is likewise
+                        // unreachable: `build_device_page_screen` never
+                        // returns it -- no builder does yet.
+                        Refresh::Gone | Refresh::Keep => Screen::new(fallback_title, vec![]),
+                    }
+                }));
             }
+            // A on any other paired row: switch to it, reusing the
+            // wizard -- `Command::Connect` + pushing straight into
+            // `Connecting`, no new phase.
+            commands_for_activate
+                .borrow_mut()
+                .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
+            *wizard_phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
+            let phase = Rc::clone(&wizard_phase_for_activate);
+            let devices = Rc::clone(&wizard_devices_for_activate);
+            let commands = Rc::clone(&commands_for_activate);
+            Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)))
         })
         .with_selected_identity(prev_key, prev_index);
     let list = if let Some(top) = prev_scroll_top { list.with_scroll_top(top) } else { list };
 
-    let view = DevicesListView { list, row_devices: ordered, commands: Rc::clone(commands) };
+    let view = DevicesListView { list, model: Rc::clone(model), commands: Rc::clone(commands), projection_key };
     Screen::new(DEVICES_TITLE, vec![Box::new(view)]).with_id(ScreenId::Devices)
 }
 
@@ -198,14 +194,126 @@ pub(crate) fn build_devices_screen(
 /// intercepts one `NavIntent` variant, delegates the rest" shape
 /// `crate::render::wizard::PairingWizardView` already uses for its own
 /// phase-specific `ShortcutX` handling.
+///
+/// As of bead `pico-link-bgnd` M2, long-lived for as long as Devices stays
+/// on the navigator's stack -- [`Widget::sync`] re-projects `list`'s rows
+/// from `model` **in place** via [`VerticalList::set_items`] every frame
+/// Devices is on top of the stack, instead of [`build_devices_screen`]
+/// being re-invoked on every model change (contrast the module's own
+/// pre-M2 doc history, and see `render::home`'s M1 for the identical
+/// shape on the root screen). `ShortcutX` and `chrome_contribution` below
+/// resolve the selected row back to a live [`PairedDevice`] by
+/// [`ListItemKey`] identity against `model` at the moment they run,
+/// rather than from a `row_devices` snapshot parallel to `list` -- the
+/// same "resolve by key against the live model, not a captured index"
+/// rule `on_activate_key`'s own doc comment states.
 struct DevicesListView {
     list: VerticalList,
-    /// Parallel to `list`'s rows *up to* the fixed "Pair new headphones"
-    /// row (which carries no entry here) -- lets `on_intent` map the
-    /// currently selected index back to a real device without needing a
-    /// `ListItemKey` -> address lookup.
-    row_devices: Vec<PairedDevice>,
+    /// The live model handle, read fresh by [`Self::sync`] every frame and
+    /// by `on_intent`'s `ShortcutX` arm at press time -- see
+    /// [`crate::app::ModelHandle`]'s doc comment for the borrow rule.
+    model: ModelHandle,
     commands: Rc<RefCell<VecDeque<Command>>>,
+    /// The last [`PaintKey`]-shaped hash of every model field this view
+    /// reads (`model.connected_addr` plus each paired device's `addr`/
+    /// `name`/`mru_seq`) -- see [`Self::projection_key`]'s own doc comment.
+    /// [`Self::sync`] recomputes this every frame and only calls
+    /// [`VerticalList::set_items`] when it changed: an allocation-saving
+    /// skip, not a correctness dependency -- `set_items` is itself
+    /// selection-preserving, so calling it unconditionally would still be
+    /// correct, just wasteful on every one of the ~20 frames/s while
+    /// streaming that carry no Devices-relevant change at all.
+    projection_key: PaintKey,
+}
+
+impl DevicesListView {
+    /// Builds this screen's rows from a live `&BtModel` read: the connected
+    /// device (if any) pinned first, sublabelled `Connected`; then every
+    /// other paired device, MRU-descending, sublabelled `Paired`; then
+    /// `Pair new headphones` last. See [`build_devices_screen`]'s doc
+    /// comment for the product rule this implements. Shared between the
+    /// screen's initial construction and every subsequent [`Self::sync`]
+    /// call, so the two can never drift into building rows two different
+    /// ways.
+    fn build_items(model: &BtModel) -> Vec<ListItem> {
+        let connected = model.connected_addr.and_then(|addr| model.paired.iter().find(|d| d.addr == addr));
+        let mut others: Vec<&PairedDevice> =
+            model.paired.iter().filter(|d| Some(d.addr) != model.connected_addr).collect();
+        others.sort_by_key(|d| core::cmp::Reverse(d.mru_seq));
+
+        let mut ordered: Vec<&PairedDevice> = Vec::with_capacity(model.paired.len());
+        if let Some(device) = connected {
+            ordered.push(device);
+        }
+        ordered.extend(others);
+
+        let mut items: Vec<ListItem> = ordered
+            .iter()
+            .map(|device| {
+                let sublabel = if Some(device.addr) == model.connected_addr { "Connected" } else { "Paired" };
+                // `Verb::Open`: every paired row pushes a deeper screen --
+                // device detail for the connected row, the wizard's
+                // `Connecting` phase for any other.
+                ListItem::new(paired_device_label(device))
+                    .with_sublabel(sublabel)
+                    .with_key(ListItemKey::from(device.addr))
+                    .with_verb(Verb::Open)
+            })
+            .collect();
+        // `Verb::Pair`: begins pairing -- including at the 8-device cap,
+        // where the forget-picker is the app making room, not a different
+        // intent.
+        items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY).with_verb(Verb::Pair));
+        items
+    }
+
+    /// A cheap, total summary of every field [`Self::build_items`] reads
+    /// from `model` -- `model.connected_addr` plus each paired device's
+    /// `addr`/`name`/`mru_seq`, in `model.paired`'s own storage order
+    /// (stable between events; MRU re-sorting only happens inside
+    /// `build_items` itself, not to the underlying `Vec`). Reuses
+    /// [`PaintKey`]'s fold mechanism purely as a cheap allocation-free
+    /// hash accumulator -- this is a **projection key** (design
+    /// `.planning/design/2026-09-24-live-widgets-retire-refresh-stack.md`
+    /// §5's R2 vocabulary: "everything the view READS"), never compared
+    /// against anything a widget draws, and never itself returned from
+    /// [`Widget::paint_key`]/[`Widget::damage_region_key`] -- folding it in
+    /// there would be exactly R2's "fold a projection key into a paint
+    /// key" mistake this design explicitly forbids.
+    fn projection_key(model: &BtModel) -> PaintKey {
+        let mut key = PaintKey::of(DEVICES_PROJECTION_SEED).fold(u64::from(model.connected_addr.is_some()));
+        if let Some(addr) = model.connected_addr {
+            for byte in addr {
+                key = key.fold(u64::from(byte));
+            }
+        }
+        key = key.fold(model.paired.len() as u64);
+        for device in &model.paired {
+            for byte in device.addr {
+                key = key.fold(u64::from(byte));
+            }
+            key = key.fold_str(&device.name);
+            key = key.fold(u64::from(device.mru_seq));
+        }
+        key
+    }
+
+    /// Resolves the selected row's [`ListItemKey`] back to a live
+    /// [`PairedDevice`] against `model` -- shared by `on_intent`'s
+    /// `ShortcutX` arm and `chrome_contribution` below, both of which need
+    /// "is a real (forgettable) device row selected, and if so which one"
+    /// resolved the same way. `None` for the fixed "Pair new headphones"
+    /// row (whose key is [`PAIR_NEW_ROW_KEY`], never a real device's) or
+    /// for a key that no longer resolves (a narrow forget-race, same
+    /// "structurally rare, not unreachable" shape [`build_devices_screen`]'s
+    /// activation closure documents).
+    fn selected_device(&self) -> Option<PairedDevice> {
+        let key = self.list.selected_key()?;
+        if key == PAIR_NEW_ROW_KEY {
+            return None;
+        }
+        self.model.borrow().paired.iter().find(|d| ListItemKey::from(d.addr) == key).cloned()
+    }
 }
 
 impl Widget for DevicesListView {
@@ -224,33 +332,48 @@ impl Widget for DevicesListView {
         self.list.activation()
     }
 
+    /// Re-reads the live model and updates `list`'s rows **in place** via
+    /// [`VerticalList::set_items`] whenever [`Self::projection_key`]
+    /// changed since the last call -- see this struct's own doc comment
+    /// and [`Self::projection_key`]'s for the skip-is-an-optimization-not-
+    /// a-correctness-dependency rule. Called once per frame Devices is on
+    /// top of the navigator's stack, before `render`/`on_intent` (see
+    /// `Navigator::sync_top`'s doc comment).
+    fn sync(&mut self, _ctx: &RenderCtx) {
+        let model = self.model.borrow();
+        let key = Self::projection_key(&model);
+        if key != self.projection_key {
+            let items = Self::build_items(&model);
+            drop(model);
+            self.list.set_items(items);
+            self.projection_key = key;
+        }
+    }
+
     fn on_focus(&mut self, event: FocusEvent) -> Action {
         self.list.on_focus(event)
     }
 
     fn on_intent(&mut self, intent: NavIntent) -> Action {
         if intent == NavIntent::ShortcutX {
-            let index = self.list.selected_index();
-            return if let Some(device) = self.row_devices.get(index) {
-                let addr = device.addr;
-                let label = paired_device_label(device);
-                let commands = Rc::clone(&self.commands);
-                Action::PushView(Box::new(move || build_forget_confirm_screen(addr, &label, commands)))
-            } else {
-                // The fixed "Pair new headphones" row has nothing to forget.
-                Action::None
+            return match self.selected_device() {
+                Some(device) => {
+                    let addr = device.addr;
+                    let label = paired_device_label(&device);
+                    let commands = Rc::clone(&self.commands);
+                    Action::PushView(Box::new(move || build_forget_confirm_screen(addr, &label, commands)))
+                }
+                // Either the fixed "Pair new headphones" row (nothing to
+                // forget) or a vanished-between-frames key (see
+                // `Self::selected_device`'s doc comment).
+                None => Action::None,
             };
         }
         self.list.on_intent(intent)
     }
 
     fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
-        let index = self.list.selected_index();
-        let x = if index < self.row_devices.len() {
-            ButtonLabel::Live(String::from("forget"))
-        } else {
-            ButtonLabel::Inert
-        };
+        let x = if self.selected_device().is_some() { ButtonLabel::Live(String::from("forget")) } else { ButtonLabel::Inert };
         Some(ChromeContribution { x: Some(x), ..ChromeContribution::default() })
     }
 
@@ -357,6 +480,12 @@ mod tests {
         // Two more devices, with HIGHER mru_seq, push Device A down the list.
         app.handle_event(upsert([2, 2, 2, 2, 2, 2], "Device B", 5));
         app.handle_event(upsert([3, 3, 3, 3, 3, 3], "Device C", 6));
+        // Bead `pico-link-bgnd` M2: `DevicesListView` is long-lived and only
+        // re-projects its rows from the model at `Widget::sync` time (see
+        // `Navigator::sync_top`'s doc comment) -- a bare `handle_event` with
+        // no following `render`/`handle_input` leaves it stale by design, so
+        // a render is needed here to observe the reordering.
+        app.render();
 
         // Rows now: 0 = C (6), 1 = B (5), 2 = A (1), 3 = Pair new.
         let selected = app.devices_selected_index_for_test().expect("a device must still be selected");
@@ -374,6 +503,7 @@ mod tests {
 
         // The name resolves later, same address, higher mru_seq.
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 2));
+        app.render(); // bead pico-link-bgnd M2: sync runs at render time, not fold time.
 
         assert_eq!(app.model().paired.len(), 1, "a re-upsert for a known addr must update the existing row, not append a second one");
         assert_eq!(app.model().paired[0].name, "Sony WH-1000XM5");
@@ -394,6 +524,7 @@ mod tests {
         assert_eq!(app.devices_selected_index_for_test(), Some(1));
 
         app.handle_event(Event::PairedDeviceForgotten { addr: addr_b });
+        app.render(); // bead pico-link-bgnd M2: sync runs at render time, not fold time.
 
         // Only Device A and "Pair new headphones" remain (rows 0 and 1);
         // B's key is gone, so `with_selected_identity` falls back to
@@ -515,5 +646,111 @@ mod tests {
     fn a_nameless_paired_device_renders_the_unknown_device_fallback_label() {
         let device = PairedDevice { addr: [0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33], name: String::new(), mru_seq: 1, ldac_quality: 0 };
         assert_eq!(paired_device_label(&device), "(unknown device) 11:22:33");
+    }
+
+    // --- pico-link-bgnd M2: Devices is long-lived, not rebuilt ---
+
+    /// The design's T3 shape (`.planning/design/2026-09-24-live-widgets-
+    /// retire-refresh-stack.md`, mirroring `pico-link-bgnd` M1's
+    /// `home_level_event_does_not_damage_the_whole_frame_or_the_title_bar`
+    /// in `crate::app::tests`): before this bead, `ScreenId::Devices`
+    /// returned `Refresh::Rebuild`, which always went through `Navigator::
+    /// replace_at` and therefore always forced `force_full_damage` -- a
+    /// device's name resolving would repaint the ENTIRE frame, title bar
+    /// included, even though nothing about the title bar changed. Fails on
+    /// pre-M2 `main`; passes once `ScreenId::Devices` returns `Refresh::
+    /// Keep` and `DevicesListView::sync` updates `list` in place.
+    #[test]
+    fn a_paired_device_rename_does_not_force_a_whole_frame_repaint() {
+        use embedded_graphics::prelude::{OriginDimensions, Point};
+        use embedded_graphics::primitives::Rectangle;
+
+        let mut app = App::new(240, 240);
+        let addr = [11, 11, 11, 11, 11, 11];
+        app.handle_event(upsert(addr, "Cans", 1));
+        open_devices(&mut app);
+        // Establish a clean baseline -- the very first render of a freshly
+        // pushed screen is always a full-frame cache miss (`Screen::
+        // render`'s `cache_miss` branch), so it proves nothing about the
+        // rename event's own damage on its own.
+        app.render();
+
+        app.handle_event(upsert(addr, "Renamed Cans", 2));
+        let output = app.render();
+        let whole_frame = Rectangle::new(Point::zero(), output.size());
+
+        assert_ne!(
+            output.damage, whole_frame,
+            "a paired-device rename must not force the whole frame to repaint -- Devices is being rebuilt, not kept live"
+        );
+        assert!(
+            output.damage.top_left.y >= i32::try_from(crate::render::chrome::TITLE_BAR_HEIGHT).expect("TITLE_BAR_HEIGHT is a small constant, fits in i32"),
+            "the title bar must not repaint on a Devices content change: damage={:?}",
+            output.damage
+        );
+    }
+
+    /// Proves the list actually reflects a live model change (the
+    /// complement to the damage test above, which only proves the SCOPE of
+    /// the repaint, not that anything repainted at all): a device's label
+    /// updates on screen without the screen having been popped/re-pushed.
+    #[test]
+    fn a_paired_device_rename_is_reflected_in_the_rendered_label() {
+        use crate::render::theme::palette;
+
+        let mut app = App::new(240, 240);
+        let addr = [12, 12, 12, 12, 12, 12];
+        app.handle_event(upsert(addr, "Old Name", 1));
+        open_devices(&mut app);
+        app.render();
+
+        app.handle_event(upsert(addr, "New Name", 2));
+        let output = app.render();
+        // A crude but real pixel-presence check, same technique
+        // `test_support::assert_home_hero_renders_connected` uses: the row
+        // is selected/focused, so it paints in the selection-fill ink, not
+        // `TEXT_PRIMARY` -- confirm some non-background ink is present in
+        // the damaged region rather than asserting a specific glyph.
+        assert!(
+            output.pixels().any(|p| p.0.y >= output.damage.top_left.y && p.1 != palette::BACKGROUND),
+            "the renamed row must actually repaint something inside the damaged region"
+        );
+    }
+
+    /// Proves focus/scroll survive [`VerticalList::set_items`] rather than
+    /// being reset by a rebuild -- with 8 paired devices plus the fixed
+    /// "Pair new headphones" row, the list must actually scroll on a 240px
+    /// panel; an unrelated field resolving on a device that is NOT the
+    /// selected one must not reset either the scroll position or the
+    /// selected row.
+    #[test]
+    fn scroll_and_selection_survive_an_in_place_update_from_a_scrolled_position() {
+        let mut app = App::new(240, 240);
+        for i in 0..8u8 {
+            app.handle_event(upsert([i; 6], "Device", u32::from(i)));
+        }
+        open_devices(&mut app);
+        app.handle_input(vec![NavIntent::Down; 8]); // lands on the fixed "Pair new headphones" row (index 8)
+        app.render();
+
+        let scroll_before = app.devices_scroll_top_for_test().expect("a scrolled Devices list must report a scroll-top row");
+        assert!(scroll_before > 0, "8 devices plus Pair-new on a 240px panel must actually need to scroll for this test to prove anything");
+        assert_eq!(app.devices_selected_index_for_test(), Some(8));
+
+        // Device 0's name resolves -- an unrelated field change, not a
+        // reorder or removal.
+        app.handle_event(upsert([0; 6], "Resolved Name", 0));
+        app.render();
+
+        assert_eq!(
+            app.devices_scroll_top_for_test(),
+            Some(scroll_before),
+            "an unrelated model change must not reset the scroll position"
+        );
+        assert_eq!(
+            app.devices_selected_index_for_test(),
+            Some(8),
+            "an unrelated model change must not disturb the selected row"
+        );
     }
 }
