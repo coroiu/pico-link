@@ -133,12 +133,6 @@ pub struct App {
     /// never rebuilt or replaced; only its shared state changes underneath
     /// it).
     wizard_phase: Rc<RefCell<WizardPhase>>,
-    /// A live mirror of `model.discovered`, shared with the wizard widget the
-    /// same way `wizard_phase` is -- kept in lockstep by [`App::add_device`]/
-    /// [`App::clear_devices`] purely so the wizard's scan-list rendering
-    /// doesn't need a borrowed reference into `App` itself (which nothing
-    /// living inside `Navigator`'s stack can hold).
-    wizard_devices: Rc<RefCell<Vec<DeviceEntry>>>,
     /// Which of Home's two faces is currently showing -- shared with
     /// whatever `HomeView` widget instance is currently the root screen's
     /// content, the same `Rc<RefCell<_>>`-mailbox shape [`App::wizard_phase`]
@@ -151,13 +145,6 @@ pub struct App {
     /// written) fresh by every freshly built `HomeView`, so the toggle
     /// survives a rebuild with no navigator involvement.
     home_face: Rc<RefCell<HomeFace>>,
-    /// The `why?` page's frozen block order -- shared with `HomeView`/
-    /// `build_why_page_screen` the same `Rc<RefCell<_>>`-mailbox shape
-    /// `home_face` uses, for the same reason: the page's ordering must
-    /// survive [`App::refresh_stack`] rebuilding it on every subsequent
-    /// fault event while it's open, only ever appending, never re-sorting
-    /// (see [`build_why_page_screen`]'s doc comment).
-    why_page_order: Rc<RefCell<Vec<FaultKey>>>,
     /// The screensaver dim/off + timeout setting's shared mailbox -- same
     /// `Rc<RefCell<_>>` shape as `home_face`/`wizard_phase`, for the same
     /// reason (the Settings screen and its pickers are pushed
@@ -175,21 +162,10 @@ impl App {
     pub fn new(width: u32, height: u32) -> Self {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
-        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
-        let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
         let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
-        let navigator = Navigator::new(build_home_screen(
-            &model,
-            &home_face,
-            &commands,
-            &wizard_phase,
-            &wizard_devices,
-            Instant::from_micros(0),
-            &why_page_order,
-            &display_settings,
-        ));
+        let navigator = Navigator::new(build_home_screen(&model, &home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings));
         Self {
             navigator,
             framebuffer: FrameBuffer565::new(width, height),
@@ -199,9 +175,7 @@ impl App {
             next_redraw_at: None,
             commands,
             wizard_phase,
-            wizard_devices,
             home_face,
-            why_page_order,
             display_settings,
         }
     }
@@ -305,7 +279,14 @@ impl App {
     /// live-refreshed is one match arm here; adding a new refreshable
     /// screen kind means adding a [`ScreenId`] variant and one arm, nothing
     /// else.
-    fn build_identified_screen(&self, id: ScreenId, carry: &ScreenCarry) -> Refresh {
+    // `carry` is unused as of bead `pico-link-bgnd` M4 -- every arm below
+    // now says so individually (M1-M4, one at a time). Left as a parameter
+    // rather than deleted: `ScreenCarry`/`Self::refresh_stack`'s caller
+    // still builds one per stack index, and M5 (design §6/§7) is the step
+    // that deletes `ScreenCarry`/`Refresh`/`refresh_stack` themselves --
+    // this function's signature is part of that same deletion, not this
+    // bead's to make alone.
+    fn build_identified_screen(&self, id: ScreenId, _carry: &ScreenCarry) -> Refresh {
         match id {
             // `HomeView` is built exactly once (`App::new`) and never
             // rebuilt again -- it reads the live model itself via
@@ -339,7 +320,16 @@ impl App {
                     Refresh::Gone
                 }
             }
-            ScreenId::WhyPage => build_why_page_screen(&self.model.borrow(), Instant::from_micros(self.now_us), &self.why_page_order, carry),
+            // `WhyPageView` is built once per push and never rebuilt again
+            // while it stays on the stack -- it reads the live model
+            // itself via `Widget::sync` every frame it's on top (bead
+            // `pico-link-bgnd` M4). `carry` is unused here for the same
+            // "nothing to carry forward into a rebuild that never happens"
+            // reason `ScreenId::Home`/`ScreenId::Devices` give above.
+            // Nothing here can ever vanish (this page has no subject that
+            // can disappear, unlike a device), so there is no liveness
+            // check to make.
+            ScreenId::WhyPage => Refresh::Keep,
             // The Settings screen and its two pickers are each built once
             // per push and never rebuilt again while they stay on the stack
             // -- all three read `display_settings` themselves via

@@ -22,7 +22,7 @@ use crate::render::{
 use super::device_page::build_device_page_screen;
 use super::super::model::MAX_PAIRED_DEVICES;
 use super::super::{
-    truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, DeviceEntry, ModelHandle, PairedDevice, Refresh, ScreenCarry, ScreenId,
+    truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, ModelHandle, PairedDevice, Refresh, ScreenCarry, ScreenId,
     WizardPhase,
 };
 
@@ -89,7 +89,6 @@ pub(crate) fn build_devices_screen(
     prev_scroll_top: Option<usize>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     wizard_phase: &Rc<RefCell<WizardPhase>>,
-    wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
 ) -> Screen {
     let (items, projection_key) = {
         let snapshot = model.borrow();
@@ -99,7 +98,6 @@ pub(crate) fn build_devices_screen(
     let model_for_activate = Rc::clone(model);
     let commands_for_activate = Rc::clone(commands);
     let wizard_phase_for_activate = Rc::clone(wizard_phase);
-    let wizard_devices_for_activate = Rc::clone(wizard_devices);
     let list = VerticalList::new(items)
         // The `Verb::Open` here is only the list's fallback default; every
         // row above carries its own override, so this value is never
@@ -118,12 +116,15 @@ pub(crate) fn build_devices_screen(
                 };
                 if under_capacity {
                     *wizard_phase_for_activate.borrow_mut() = WizardPhase::scanning_pending();
-                    wizard_devices_for_activate.borrow_mut().clear();
+                    // Clear `model.discovered` proactively -- see
+                    // `PairingWizardView::on_focus`'s identical rationale
+                    // for the `NothingFound` re-scan case.
+                    model_for_activate.borrow_mut().discovered.clear();
                     commands_for_activate.borrow_mut().push_back(Command::StartScan);
                     let phase = Rc::clone(&wizard_phase_for_activate);
-                    let devices = Rc::clone(&wizard_devices_for_activate);
+                    let model = Rc::clone(&model_for_activate);
                     let commands = Rc::clone(&commands_for_activate);
-                    return Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)));
+                    return Action::PushView(Box::new(move || build_wizard_screen(phase, model, commands)));
                 }
                 let commands = Rc::clone(&commands_for_activate);
                 return Action::PushView(Box::new(move || build_forget_picker_screen(paired_for_full, commands)));
@@ -176,9 +177,9 @@ pub(crate) fn build_devices_screen(
                 .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
             *wizard_phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
             let phase = Rc::clone(&wizard_phase_for_activate);
-            let devices = Rc::clone(&wizard_devices_for_activate);
+            let model = Rc::clone(&model_for_activate);
             let commands = Rc::clone(&commands_for_activate);
-            Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)))
+            Action::PushView(Box::new(move || build_wizard_screen(phase, model, commands)))
         })
         .with_selected_identity(prev_key, prev_index);
     let list = if let Some(top) = prev_scroll_top { list.with_scroll_top(top) } else { list };

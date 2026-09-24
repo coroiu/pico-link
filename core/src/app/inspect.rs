@@ -117,6 +117,18 @@ impl App {
         self.navigator.scroll_top_at(1)
     }
 
+    /// Test-only: the wizard scan list's own selection index, if the
+    /// wizard is currently on the navigator stack at index 2 (Home(1)/
+    /// Devices(2)/Wizard(3), 0-indexed here) -- the wizard's counterpart to
+    /// [`App::devices_selected_index_for_test`], proving
+    /// [`crate::render::wizard`]'s scan list carries the user's selection
+    /// forward across a new device arriving mid-scan (bead `pico-link-bgnd`
+    /// M4). Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn wizard_selected_index_for_test(&self) -> Option<usize> {
+        self.navigator.selected_index_at(2)
+    }
+
     /// Test-only: pushes an arbitrary screen onto the navigator stack, so
     /// tests can simulate "the user navigated away from root" without
     /// needing a real second screen. Not part of the public API.

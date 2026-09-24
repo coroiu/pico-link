@@ -92,7 +92,7 @@ use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
-    build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, DeviceAddr, DeviceEntry,
+    build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, DeviceAddr,
     DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase,
     LDAC_QUALITY_ADAPTIVE,
 };
@@ -138,18 +138,16 @@ const MENU_ROW_SETTINGS: usize = 1;
 /// for what *does* still need rebuild-era-style sharing (a genuine second
 /// writer, not rebuild survival).
 #[must_use]
-#[allow(clippy::too_many_arguments)] // Mirrors `HomeView::new`'s own allow -- this is a straight passthrough into it, plus the wizard/why-page Rcs every other screen builder in this crate threads through too.
+#[allow(clippy::too_many_arguments)] // Mirrors `HomeView::new`'s own allow -- this is a straight passthrough into it, plus the wizard Rc every other screen builder in this crate threads through too.
 pub(crate) fn build_home_screen(
     model: &ModelHandle,
     home_face: &Rc<RefCell<HomeFace>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     wizard_phase: &Rc<RefCell<WizardPhase>>,
-    wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
     now: Instant,
-    why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
     display_settings: &Rc<RefCell<DisplaySettingsState>>,
 ) -> Screen {
-    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, wizard_devices, now, why_page_order, display_settings);
+    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, now, display_settings);
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
@@ -216,14 +214,6 @@ struct HomeView {
     /// Never more than one frame stale, the same tolerance every other
     /// field on this struct has.
     now: Instant,
-    /// The `why?` page's frozen block order (design §8.1/orchestrator
-    /// ruling on `pico-link-9eq2.3.3`: ordering freezes on entry and only
-    /// ever appends) -- `ShortcutX` overwrites this with a fresh
-    /// most-recently-active-first sort every time it pushes the page;
-    /// [`crate::app::build_why_page_screen`] only ever appends to it,
-    /// never re-sorts. Shared with `App` the same `Rc<RefCell<_>>` shape
-    /// `home_face`/`wizard_phase`/`wizard_devices` use.
-    why_page_order: Rc<RefCell<Vec<FaultKey>>>,
 }
 
 impl HomeView {
@@ -337,9 +327,7 @@ impl HomeView {
         home_face: Rc<RefCell<HomeFace>>,
         commands: &Rc<RefCell<VecDeque<Command>>>,
         wizard_phase: &Rc<RefCell<WizardPhase>>,
-        wizard_devices: &Rc<RefCell<Vec<DeviceEntry>>>,
         now: Instant,
-        why_page_order: &Rc<RefCell<Vec<FaultKey>>>,
         display_settings: &Rc<RefCell<DisplaySettingsState>>,
     ) -> Self {
         let (hero, link_state, discovering, connected_addr, fault_log) = {
@@ -352,7 +340,6 @@ impl HomeView {
         let model_for_bluetooth = Rc::clone(model);
         let commands_for_bluetooth = Rc::clone(commands);
         let wizard_phase_for_bluetooth = Rc::clone(wizard_phase);
-        let wizard_devices_for_bluetooth = Rc::clone(wizard_devices);
         let display_settings_for_settings_row = Rc::clone(display_settings);
         let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Settings")]).on_activate_index(
             // `Verb::Open`: both rows push a deeper screen and draw a
@@ -371,8 +358,7 @@ impl HomeView {
                     let model = Rc::clone(&model_for_bluetooth);
                     let commands = Rc::clone(&commands_for_bluetooth);
                     let wizard_phase = Rc::clone(&wizard_phase_for_bluetooth);
-                    let wizard_devices = Rc::clone(&wizard_devices_for_bluetooth);
-                    Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, None, &commands, &wizard_phase, &wizard_devices)))
+                    Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, None, &commands, &wizard_phase)))
                 }
                 MENU_ROW_SETTINGS => {
                     let display_settings = Rc::clone(&display_settings_for_settings_row);
@@ -399,7 +385,6 @@ impl HomeView {
             commands: commands_for_shortcut_y,
             fault_log,
             now,
-            why_page_order: Rc::clone(why_page_order),
         }
     }
 
@@ -557,15 +542,15 @@ impl Widget for HomeView {
             // `pico-link-9eq2.3` has now landed). Empty strip: `Action::
             // None`, matching `chrome_contribution`'s unlabelled-X state
             // below so a mispress is always free (design rule 4). Non-
-            // empty: overwrites `why_page_order` with a FRESH most-
-            // recently-active-first sort of every key that has ever fired
-            // (including retired ones -- the `why?` page shows session
-            // history, design §8.2), THEN pushes the page built from that
-            // order. This is the one and only place this order is ever
-            // re-sorted -- every subsequent `App::refresh_stack` pass
-            // while the page is open only appends
-            // (`build_why_page_screen`'s own doc comment; orchestrator
-            // ruling on this bead).
+            // empty: computes a FRESH most-recently-active-first sort of
+            // every key that has ever fired (including retired ones -- the
+            // `why?` page shows session history, design §8.2) and seeds
+            // `WhyPageView` with it. This is the one and only place this
+            // order is ever sorted -- as of bead `pico-link-bgnd` M4,
+            // `WhyPageView` owns the order from here on and only ever
+            // appends to it in [`super::app::screens::why_page::
+            // WhyPageView::sync`], never re-sorts (see that struct's own
+            // doc comment).
             NavIntent::ShortcutX => {
                 if !self.fault_log.has_visible_entry(self.now) {
                     return Action::None;
@@ -576,19 +561,8 @@ impl Widget for HomeView {
                     let b_last = self.fault_log.entry(*b).map_or(Instant::from_micros(0), |e| e.last_seen);
                     b_last.cmp(&a_last) // descending: most-recently-active first
                 });
-                *self.why_page_order.borrow_mut() = fresh_order;
                 let model = Rc::clone(&self.model);
-                let now = self.now;
-                let why_page_order = Rc::clone(&self.why_page_order);
-                Action::PushView(Box::new(move || match build_why_page_screen(&model.borrow(), now, &why_page_order, &ScreenCarry::default()) {
-                    Refresh::Rebuild(screen) => screen,
-                    // Never actually returned (see that function's doc
-                    // comment) -- defensive fallback only, same shape as
-                    // `ShortcutY`'s above. `Refresh::Keep` is likewise
-                    // unreachable (bead pico-link-bgnd M0 -- no builder
-                    // returns it yet).
-                    Refresh::Gone | Refresh::Keep => Screen::new("Why?", vec![]),
-                }))
+                Action::PushView(Box::new(move || build_why_page_screen(&model, fresh_order)))
             }
             // `Left`/`Right` have no meaning on Home (design section 4:
             // identical to B/A elsewhere, but Home's exception already
@@ -788,10 +762,8 @@ mod tests {
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
-        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
-        let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
+        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings)
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -803,10 +775,8 @@ mod tests {
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
-        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
-        let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
+        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings)
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting
@@ -908,10 +878,8 @@ mod tests {
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
-        let wizard_devices = Rc::new(RefCell::new(Vec::new()));
-        let why_page_order = Rc::new(RefCell::new(Vec::new()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, &wizard_devices, Instant::from_micros(0), &why_page_order, &display_settings)
+        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings)
     }
 
     #[test]
