@@ -25,31 +25,22 @@ use super::super::{
     truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, DeviceEntry, PairedDevice, Refresh, ScreenCarry, ScreenId, WizardPhase,
 };
 
-/// The devices screen's "Pair new headphones" row's identity key (bead
-/// pico-link-4vb.4, design `.planning/design/2026-09-01-remembered-devices.md`
-/// section 4). Replaces the old `SCAN_ROW_KEY` -- the row it names no longer
-/// starts a scan directly (it opens the wizard, or the pick-one-to-forget
-/// flow when the store is full), so the old name was already stale. Not
+/// The devices screen's "Pair new headphones" row's identity key. Not
 /// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
-/// instead — see [`ListItemKey::from`]'s doc comment for why this can
+/// instead -- see [`ListItemKey::from`]'s doc comment for why this can
 /// never collide with a real device's key (a device key's top two bytes
-/// are always `0`; this sentinel's are always `0xFE` -- distinct from the
-/// old `0xFF` sentinel in case any stale carried-forward selection key from
-/// a pre-upgrade build is ever compared against it).
+/// are always `0`; this sentinel's are always `0xFE`).
 const PAIR_NEW_ROW_KEY: ListItemKey = ListItemKey::from_bytes([0xFE; 8]);
 
-/// The Devices screen's fixed title -- previously "Pico Link" from back
-/// when this screen was the navigator root (pre-`pico-link-znb.8`/E7);
-/// renamed now that it's reached by "A"/the menu face's "Bluetooth" row
-/// **from** Home, which owns the "Pico Link" brand title instead (design
-/// section 5's screen inventory).
+/// The Devices screen's fixed title -- reached by "A"/the menu face's
+/// "Bluetooth" row from Home, which owns the "Pico Link" brand title
+/// instead.
 pub(crate) const DEVICES_TITLE: &str = "Devices";
 
 /// A paired device's display label -- its name, or, if C never reported one
 /// (or it hasn't resolved yet), `(unknown device)` plus the address's last
-/// three bytes as the discriminator (design section 4/13's rule that a
-/// nameless row must still be distinguishable from every other nameless
-/// row).
+/// three bytes as the discriminator, so a nameless row is still
+/// distinguishable from every other nameless row.
 pub(in crate::app) fn paired_device_label(device: &PairedDevice) -> String {
     if device.name.is_empty() {
         format!("(unknown device) {:02X}:{:02X}:{:02X}", device.addr[3], device.addr[4], device.addr[5])
@@ -58,13 +49,13 @@ pub(in crate::app) fn paired_device_label(device: &PairedDevice) -> String {
     }
 }
 
-/// Builds the devices screen (bead pico-link-4vb.4, T5, design section 4):
-/// the connected device (if any) pinned first, sublabelled `Connected`;
-/// then every other paired device, MRU-descending, sublabelled `Paired`;
-/// then `Pair new headphones` last. **No RSSI, no address, no availability
-/// dot** -- design section 4/18: never claim availability that hasn't been
-/// verified, and the recurring "switch device" job belongs under the
-/// cursor while the rare "pair a new one" job belongs at the end.
+/// Builds the devices screen: the connected device (if any) pinned first,
+/// sublabelled `Connected`; then every other paired device,
+/// MRU-descending, sublabelled `Paired`; then `Pair new headphones` last.
+/// **No RSSI, no address, no availability dot** -- never claim
+/// availability that hasn't been verified, and the recurring "switch
+/// device" job belongs under the cursor while the rare "pair a new one"
+/// job belongs at the end.
 ///
 /// Replaces the old scan-result rendering entirely -- see
 /// [`BtModel::discovered`]/[`BtModel::paired`]'s doc comments for the
@@ -104,8 +95,7 @@ pub(crate) fn build_devices_screen(
             let sublabel = if Some(device.addr) == model.connected_addr { "Connected" } else { "Paired" };
             // `Verb::Open`: every paired row pushes a deeper screen --
             // device detail for the connected row, the wizard's
-            // `Connecting` phase for any other (design rule 4's
-            // assignment table treats both as "a paired device").
+            // `Connecting` phase for any other.
             ListItem::new(paired_device_label(device))
                 .with_sublabel(sublabel)
                 .with_key(ListItemKey::from(device.addr))
@@ -113,8 +103,7 @@ pub(crate) fn build_devices_screen(
         })
         .collect();
     // `Verb::Pair`: begins pairing -- including at the 8-device cap, where
-    // the forget-picker is the app making room, not a different intent
-    // (design rule 4's assignment table).
+    // the forget-picker is the app making room, not a different intent.
     items.push(ListItem::new("Pair new headphones").with_key(PAIR_NEW_ROW_KEY).with_verb(Verb::Pair));
 
     let paired_len = model.paired.len();
@@ -143,9 +132,7 @@ pub(crate) fn build_devices_screen(
             if let Some(device) = ordered_for_activate.get(index) {
                 if Some(device.addr) == connected_addr {
                     // A on the connected row: no reconnect to do -- push
-                    // the real device page (design section 4;
-                    // `.planning/design/2026-09-07-device-page-and-
-                    // single-select-picker.md` §3).
+                    // the real device page.
                     let addr = device.addr;
                     let fallback_title = paired_device_label(device);
                     let model = model_for_device_page.clone();
@@ -162,14 +149,14 @@ pub(crate) fn build_devices_screen(
                             // fallback rather than a panic if it ever is.
                             // `Refresh::Keep` is likewise unreachable:
                             // `build_device_page_screen` never returns it
-                            // (bead pico-link-bgnd M0 -- no builder does yet).
+                            // -- no builder does yet.
                             Refresh::Gone | Refresh::Keep => Screen::new(fallback_title, vec![]),
                         }
                     }));
                 }
                 // A on any other paired row: switch to it, reusing the
-                // wizard (design section 4/S8) -- `Command::Connect` +
-                // pushing straight into `Connecting`, no new phase.
+                // wizard -- `Command::Connect` + pushing straight into
+                // `Connecting`, no new phase.
                 commands_for_activate
                     .borrow_mut()
                     .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
@@ -180,9 +167,9 @@ pub(crate) fn build_devices_screen(
                 return Action::PushView(Box::new(move || build_wizard_screen(phase, devices, commands)));
             }
             // "Pair new headphones", the fixed last row. Gated on capacity
-            // *before* any radio work (design section 4): under the cap,
-            // open the wizard exactly as before; at the cap, open the
-            // pick-one-to-forget flow instead.
+            // *before* any radio work: under the cap, open the wizard
+            // exactly as before; at the cap, open the pick-one-to-forget
+            // flow instead.
             if paired_len < MAX_PAIRED_DEVICES {
                 *wizard_phase_for_activate.borrow_mut() = WizardPhase::scanning_pending();
                 wizard_devices_for_activate.borrow_mut().clear();
@@ -204,9 +191,9 @@ pub(crate) fn build_devices_screen(
     Screen::new(DEVICES_TITLE, vec![Box::new(view)]).with_id(ScreenId::Devices)
 }
 
-/// Wraps [`VerticalList`] to add the Devices screen's X action (design
-/// section 4: "X opens a forget confirm") on top of it -- `VerticalList`
-/// itself has no opinion about `ShortcutX` (see `crate::input::NavIntent::
+/// Wraps [`VerticalList`] to add the Devices screen's X action ("X opens
+/// a forget confirm") on top of it -- `VerticalList` itself has no
+/// opinion about `ShortcutX` (see `crate::input::NavIntent::
 /// ShortcutX`'s doc comment), so this is the same "small wrapper widget
 /// intercepts one `NavIntent` variant, delegates the rest" shape
 /// `crate::render::wizard::PairingWizardView` already uses for its own
@@ -277,8 +264,8 @@ impl Widget for DevicesListView {
 
     /// Forwards `list`'s own answer — see `Widget::scroll_top`'s doc
     /// comment on why a wrapper must forward this rather than let the
-    /// default `None` silently swallow it (the same pico-link-vxc D2
-    /// hazard `redraw_after` below already guards against).
+    /// default `None` silently swallow it (the same hazard
+    /// `redraw_after` below already guards against).
     fn scroll_top(&self) -> Option<usize> {
         self.list.scroll_top()
     }
@@ -287,8 +274,8 @@ impl Widget for DevicesListView {
         self.list.render(area, ctx, target)
     }
 
-    /// Forwards `list`'s own answer (pico-link-vxc, D2) -- without this the
-    /// default (`None`) would swallow it. `VerticalList` has no time-driven
+    /// Forwards `list`'s own answer -- without this the default (`None`)
+    /// would swallow it. `VerticalList` has no time-driven
     /// content today, but the wrapper must not be the thing that silently
     /// drops a future one under the dirty gate.
     fn redraw_after(&self, ctx: &RenderCtx) -> Option<core::time::Duration> {
@@ -296,11 +283,11 @@ impl Widget for DevicesListView {
     }
 }
 
-/// The pick-one-to-forget screen (design section 4): reached only when
-/// `Pair new headphones` is activated while `paired.len() ==
-/// MAX_PAIRED_DEVICES` -- fullness discovered and resolved entirely
-/// before any radio work. Every row pushes the same
-/// [`build_forget_confirm_screen`] a device row's X action does.
+/// The pick-one-to-forget screen: reached only when `Pair new headphones`
+/// is activated while `paired.len() == MAX_PAIRED_DEVICES` -- fullness
+/// discovered and resolved entirely before any radio work. Every row
+/// pushes the same [`build_forget_confirm_screen`] a device row's X
+/// action does.
 const FORGET_PICKER_TITLE: &str = "Pick one to forget";
 
 fn build_forget_picker_screen(paired: Vec<PairedDevice>, commands: Rc<RefCell<VecDeque<Command>>>) -> Screen {
@@ -320,7 +307,7 @@ fn build_forget_picker_screen(paired: Vec<PairedDevice>, commands: Rc<RefCell<Ve
 }
 
 /// The forget-confirmation screen -- destructive-action confirm, per
-/// [`ConfirmView`]'s own precedent (design section 4's X action, and the
+/// [`ConfirmView`]'s own precedent (the Devices X action, and the
 /// pick-one-to-forget flow above). Cancel is row 0 (the safe default);
 /// Forget is row 1, styled in [`palette::STATUS_ERROR`], and is the only
 /// row that queues [`Command::ForgetDevice`] -- `core` does not remove
@@ -348,13 +335,12 @@ mod tests {
 
     use super::*;
 
-    // --- pico-link-znb.4 / pico-link-4vb.4: selection carried by identity, not index ---
+    // --- Selection carried by identity, not index ---
     //
     // These prove the selection resolves to the *same device address* (not
-    // just the same index), across exactly the cases the design calls out:
-    // reordering by a fresh `mru_seq` (which the old append-only scan list
-    // could never produce, since MRU sorting is new to this bead), an
-    // update-in-place rename, and a forgotten device vanishing.
+    // just the same index), across three cases: reordering by a fresh
+    // `mru_seq`, an update-in-place rename, and a forgotten device
+    // vanishing.
 
     #[test]
     fn selecting_a_paired_device_survives_reordering_identified_by_address_not_just_index() {
@@ -421,7 +407,7 @@ mod tests {
         assert!(app.model().paired.iter().all(|d| d.addr != addr_b), "the forgotten device must be gone from the model");
     }
 
-    // --- pico-link-4vb.4 (T5): the new Devices screen's own behaviors ---
+    // --- The Devices screen's own behaviors ---
 
     #[test]
     fn the_connected_row_pins_first_and_a_pushes_its_device_detail_screen() {
@@ -434,8 +420,7 @@ mod tests {
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
         app.poll_command(); // drain PersistDevice
         // C echoes the upsert once the persist write actually lands --
-        // this is what actually refreshes the Devices screen's pinned row
-        // (design section 7's hazard 4).
+        // this is what actually refreshes the Devices screen's pinned row.
         app.handle_event(upsert(addr, "Connected Cans", 2));
 
         // The only paired device, now connected, pins at row 0; "Pair new
@@ -481,7 +466,7 @@ mod tests {
 
         // Rows: 8 paired devices (MRU-descending) then "Pair new
         // headphones" at index 8 -- gated on capacity *before* any radio
-        // work (design section 4).
+        // work.
         app.handle_input(vec![
             NavIntent::Down,
             NavIntent::Down,
