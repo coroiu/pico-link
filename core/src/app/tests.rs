@@ -115,7 +115,7 @@ fn a_bluetooth_event_mid_navigation_does_not_reset_the_screen_stack() {
     assert_eq!(app.current_screen_title(), "detail");
 
     // Three different Event variants, all of which fold through
-    // App::refresh_stack.
+    // App::mark_model_changed.
     app.handle_event(Event::DiscoveryStateChanged { scanning: true });
     assert_eq!(app.navigator_depth(), 2, "DiscoveryStateChanged must not pop the pushed screen");
     assert_eq!(app.current_screen_title(), "detail");
@@ -150,9 +150,9 @@ fn a_paired_device_upserted_mid_navigation_does_not_reset_the_devices_screens_se
     assert_eq!(app.devices_selected_index_for_test(), Some(1), "selection should be on Device A's row");
 
     // A third device, sorting below both, must not snap the selection
-    // back to row 0 -- proving `App::refresh_stack`'s
-    // `Navigator::replace_at(1, ...)` path carries the selection
-    // forward the way `replace_root` always has.
+    // back to row 0 -- proving `DevicesListView`'s live model read updates
+    // rows via `set_items` in place, preserving the current selection,
+    // rather than resetting it.
     app.handle_event(upsert([3, 3, 3, 3, 3, 3], "Device C", 0));
     assert_eq!(app.devices_selected_index_for_test(), Some(1), "a new device must not reset the user's selection");
 
@@ -161,9 +161,9 @@ fn a_paired_device_upserted_mid_navigation_does_not_reset_the_devices_screens_se
     assert_eq!(app.devices_selected_index_for_test(), Some(1), "a link-state change must not reset the user's selection");
 }
 
-/// A defect fix: `App::refresh_stack` carried the *selection* forward
-/// across a live-model rebuild but not `top_index`, so a scrolled
-/// Devices list snapped back to the top on any unrelated event and
+/// A defect fix: the old `App::refresh_stack` mechanism carried the
+/// *selection* forward across a live-model rebuild but not `top_index`, so
+/// a scrolled Devices list snapped back to the top on any unrelated event and
 /// `reconcile_top_index` then re-landed the selected row at the
 /// viewport's BOTTOM edge -- latent while only 4 rows fit, not latent
 /// once a page scrolls. `MAX_PAIRED_DEVICES` (8) paired rows + the fixed
@@ -435,10 +435,10 @@ fn a_live_bluetooth_event_does_not_flip_the_face_or_reset_the_navigator() {
     app.handle_input(vec![NavIntent::Select]); // status -> menu
     assert_eq!(menu_face_row0_pixel(&mut app), palette::SURFACE_ELEVATED, "menu face showing before the event");
 
-    // `App::refresh_stack` runs on every one of these -- proving the
-    // menu face (held in `App::home_face`, shared with the freshly
-    // rebuilt `HomeView` -- see `render::home`'s module doc) survives
-    // a root rebuild the same way a pushed screen survives one.
+    // `App::mark_model_changed` runs on every one of these -- proving the
+    // menu face (held in `App::home_face`, shared with the never-rebuilt
+    // `HomeView` -- see `render::home`'s module doc) isn't disturbed by an
+    // unrelated model event.
     app.handle_event(Event::DiscoveryStateChanged { scanning: true });
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 2, 3, 4, 5, 6], name: String::from("Cans"), rssi: -40, class_of_device: 0 }));
     app.handle_event(Event::DevicesCleared);
@@ -546,12 +546,11 @@ fn back_from_a_pushed_screen_to_home_does_not_disconnect() {
     assert_home_hero_renders_connected(&mut app);
 }
 
-/// Route 3: the `Navigator::replace_at` path `App::refresh_stack`
-/// drives -- not a Back press at all, but the other way Home's content
-/// changes while sitting at the root. Confirms a live
-/// Bluetooth event folding into an already-connected model, with Home
-/// as the current (root) screen the whole time, queues nothing and
-/// keeps rendering connected.
+/// Route 3: `HomeView`'s live `Widget::sync` read, not a Back press at
+/// all, but the other way Home's content changes while sitting at the
+/// root. Confirms a live Bluetooth event folding into an already-connected
+/// model, with Home as the current (root) screen the whole time, queues
+/// nothing and keeps rendering connected.
 #[test]
 fn a_bluetooth_event_while_home_is_root_does_not_disconnect_or_queue_commands() {
     let mut app = App::new(240, 240);
@@ -561,7 +560,7 @@ fn a_bluetooth_event_while_home_is_root_does_not_disconnect_or_queue_commands() 
     assert_link_still_connected(&app);
     assert_home_hero_renders_connected(&mut app);
 
-    // A second, unrelated event folds through `refresh_stack` again --
+    // A second, unrelated event folds through `mark_model_changed` again --
     // must not disturb the connected model or queue anything either.
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1, 1, 1, 1, 1, 1], name: String::from("Other"), rssi: -55, class_of_device: 0 }));
     assert_no_commands_queued(&mut app);
@@ -663,14 +662,14 @@ fn connect_succeeded_persists_even_with_the_wizard_closed() {
     assert_eq!(app.poll_command(), None);
 }
 
-// --- refresh_stack (the ScreenId refactor) ---
+// --- prune_stack (the ScreenId refactor) ---
 
-/// An unidentified screen (the wizard, `ConfirmView`s, Settings, or in
-/// this test's case an arbitrary probe screen standing in for any of
-/// them) must never be replaced OR truncated by `refresh_stack`, no
-/// matter how many unrelated model events fire while it's on the stack.
+/// An unidentified screen (the wizard, `ConfirmView`s, or in this test's
+/// case an arbitrary probe screen standing in for either) must never be
+/// truncated by `App::prune_stack`, no matter how many unrelated model
+/// events fire while it's on the stack.
 #[test]
-fn refresh_stack_never_touches_a_screen_with_no_screen_id() {
+fn prune_stack_never_touches_a_screen_with_no_screen_id() {
     let mut app = App::new(240, 240);
     open_devices(&mut app);
     let probe = Screen::new("PROBE", vec![Box::new(VerticalList::new(vec![ListItem::new("x")]))]);
@@ -680,31 +679,33 @@ fn refresh_stack_never_touches_a_screen_with_no_screen_id() {
     assert_eq!(app.current_screen_title(), "PROBE");
 
     // A handful of unrelated Bluetooth-domain events, each of which
-    // calls `refresh_stack` internally.
+    // calls `App::mark_model_changed` (and therefore `prune_stack`)
+    // internally.
     app.handle_event(Event::DiscoveryStateChanged { scanning: true });
     app.handle_event(upsert([9; 6], "Other", 3));
     app.handle_event(Event::PairedDeviceForgotten { addr: [9; 6] });
 
-    assert_eq!(app.navigator_depth(), 3, "an unidentified screen must never be popped/truncated by refresh_stack");
-    assert_eq!(app.current_screen_title(), "PROBE", "an unidentified screen must never be replaced by refresh_stack");
+    assert_eq!(app.navigator_depth(), 3, "an unidentified screen must never be truncated by prune_stack");
+    assert_eq!(app.current_screen_title(), "PROBE", "an unidentified screen must never be touched by prune_stack");
 }
 
 #[test]
-fn refresh_stack_keeps_home_and_devices_tagged_with_their_screen_ids() {
+fn prune_stack_keeps_home_and_devices_tagged_with_their_screen_ids() {
     let mut app = App::new(240, 240);
     assert_eq!(app.navigator.id_at(0), Some(ScreenId::Home));
     open_devices(&mut app);
     assert_eq!(app.navigator.id_at(1), Some(ScreenId::Devices));
-    // A model event refreshes both -- both must keep their identity
-    // (a stale/lost id here would silently stop refresh_stack from
-    // ever refreshing them again).
+    // A model event runs `prune_stack` over both -- neither has a subject
+    // that can vanish, so both must keep their identity untouched (a
+    // stale/lost id here would be a real regression even though it has no
+    // visible symptom for these two screen kinds).
     app.handle_event(upsert([1; 6], "Cans", 1));
     assert_eq!(app.navigator.id_at(0), Some(ScreenId::Home));
     assert_eq!(app.navigator.id_at(1), Some(ScreenId::Devices));
 }
 
-/// "Forget pops two levels", structural via `Refresh::Gone` rather than
-/// a hand-written double pop -- this fires even when the device
+/// "Forget pops two levels", structural via `App::prune_stack` rather
+/// than a hand-written double pop -- this fires even when the device
 /// disappears from a route *other than* the device page's own Forget
 /// row (here: forgetting it from the Devices screen underneath, one
 /// level below the open device page).
@@ -729,18 +730,18 @@ fn forgetting_the_device_shown_by_an_open_device_page_unwinds_the_stack_to_devic
 
 #[test]
 fn home_menu_selection_survives_a_live_refresh_while_streaming() {
-    // While music plays, volume/codec/meter events fire `refresh_stack`
-    // constantly (audio events, not user input). Before the fix,
-    // `ScreenId::Home`'s arm rebuilt `HomeView` without the
-    // `ScreenCarry` it had just read, so every one of those refreshes
-    // snapped the menu face back to row 0 (Bluetooth) even while the
-    // user was looking at Settings.
+    // While music plays, volume/codec/meter events fire `mark_model_changed`
+    // constantly (audio events, not user input). Before the M1 fix,
+    // `ScreenId::Home`'s arm rebuilt `HomeView` from scratch on every one
+    // of those, snapping the menu face back to row 0 (Bluetooth) even
+    // while the user was looking at Settings. As of M1, `HomeView` is
+    // never rebuilt at all, so there is nothing left to reset it.
     let mut app = App::new(240, 240);
     app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected, row 0)
     app.handle_input(vec![NavIntent::Down]); // move to Settings (row 1) -- not activated
     assert_eq!(app.navigator.selected_index_at(0), Some(1), "Down must move the menu's own selection to row 1 before any refresh");
 
-    // A model event that runs `refresh_stack` but has nothing to do
+    // A model event that runs `mark_model_changed` but has nothing to do
     // with the user's navigation -- the exact shape of the events that
     // fire continuously while streaming.
     app.handle_event(Event::LevelsChanged { peak_l: 10, peak_r: 10, rms_l: 10, rms_r: 10 });
@@ -753,10 +754,10 @@ fn home_menu_selection_survives_a_live_refresh_while_streaming() {
 /// `LevelsChanged` event on Home's connected status face must damage only
 /// the OUT meter's footprint, not the whole frame -- and in particular
 /// must not touch the title bar, which nothing about an OUT-level reading
-/// ever redraws. Fails on `main` before this bead (every model event
-/// forced `force_full_damage` via the old `ScreenId::Home` rebuild arm);
-/// passes once `HomeView` forwards `damage_hint`/`damage_region_key` to
-/// `hero` (`Widget::sync` + the M1 `Refresh::Keep` arm).
+/// ever redraws. Fails on pre-M1 `main` (every model event forced
+/// `force_full_damage` via the old `ScreenId::Home` rebuild arm); passes
+/// once `HomeView` forwards `damage_hint`/`damage_region_key` to `hero`
+/// (`Widget::sync`, plus `HomeView` never being rebuilt at all).
 #[test]
 fn home_level_event_does_not_damage_the_whole_frame_or_the_title_bar() {
     use embedded_graphics::prelude::{OriginDimensions, Point};

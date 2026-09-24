@@ -18,10 +18,9 @@
 //!
 //! As of `pico-link-bgnd` M1, `HomeView` is built exactly once (at
 //! `App::new`) and lives for the app's lifetime -- it is no longer rebuilt
-//! on every Bluetooth model event (see [`build_home_screen`]'s doc comment
-//! and [`crate::app::App::refresh_stack`]'s `ScreenId::Home` arm, which now
-//! returns `Refresh::Keep`). A rebuild-survival reason for the indirection
-//! no longer applies, but a genuine *second writer* does:
+//! on every Bluetooth model event (see [`build_home_screen`]'s doc comment).
+//! A rebuild-survival reason for the indirection no longer applies, but a
+//! genuine *second writer* does:
 //! [`crate::app::App`]'s `on_wizard_auto_dismiss` fold method forces the
 //! face back to `Status` when the pairing wizard auto-dismisses, and it has
 //! no other path to reach the live `HomeView` instance sitting inside the
@@ -30,8 +29,8 @@
 //! [`crate::app::App::home_face`] stays the shared mailbox: not because a
 //! plain field would be discarded by a rebuild (it no longer would), but
 //! because `App` itself is the other writer, the same "genuine two-writer
-//! state, not a rebuild workaround" exemption the design's WHAT ScreenCarry
-//! BECOMES section grants `wizard_phase`.
+//! state, not a rebuild workaround" exemption the live-widgets design
+//! grants `wizard_phase`.
 //!
 //! # The Home input exception (design section 4, stated once, only here)
 //!
@@ -93,8 +92,7 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
     build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, DeviceAddr,
-    DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, Refresh, ScreenCarry, ScreenId, VolumeSource, WizardPhase,
-    LDAC_QUALITY_ADAPTIVE,
+    DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
 };
 use crate::input::NavIntent;
 use crate::platform::Instant;
@@ -129,8 +127,7 @@ const MENU_ROW_BLUETOOTH: usize = 0;
 const MENU_ROW_SETTINGS: usize = 1;
 
 /// Builds the Home screen exactly once -- `pico-link-bgnd`'s only caller is
-/// `App::new`; `App::refresh_stack`'s `ScreenId::Home` arm now returns
-/// `Refresh::Keep` and never calls this again (see that arm's doc comment).
+/// `App::new`; Home is never rebuilt again for the app's lifetime.
 /// The status face's hero widget stays live by reading `model` (a live
 /// [`ModelHandle`], not a snapshot) inside [`HomeView::sync`] every frame
 /// Home is on top of the stack, not by this function being re-invoked --
@@ -362,7 +359,7 @@ impl HomeView {
                 }
                 MENU_ROW_SETTINGS => {
                     let display_settings = Rc::clone(&display_settings_for_settings_row);
-                    Action::PushView(Box::new(move || build_settings_screen(&display_settings, &ScreenCarry::default())))
+                    Action::PushView(Box::new(move || build_settings_screen(&display_settings)))
                 }
                 _ => Action::None,
             },
@@ -504,9 +501,9 @@ impl Widget for HomeView {
             // dropped so the same physical button does the same thing on
             // either face, per the ruling's "no face-dependent behaviour
             // to learn"). Connected: push the real device page, same
-            // `build_device_page_screen`/`Refresh` dance
-            // `build_devices_screen`'s own connected-row activation uses
-            // (`core/src/app.rs`). Not connected: an explicit "no device
+            // `build_device_page_screen` call `build_devices_screen`'s own
+            // connected-row activation uses (`core/src/app/screens/
+            // devices.rs`). Not connected: an explicit "no device
             // connected" message, not a silent no-op -- the bead is
             // explicit that Y must never look like a dead button when
             // there's nothing to open.
@@ -514,8 +511,7 @@ impl Widget for HomeView {
                 if let Some(addr) = self.connected_addr {
                     let model = Rc::clone(&self.model);
                     let commands = Rc::clone(&self.commands);
-                    Action::PushView(Box::new(move || match build_device_page_screen(&model, addr, &ScreenCarry::default(), &commands) {
-                        Refresh::Rebuild(screen) => screen,
+                    Action::PushView(Box::new(move || {
                         // The device we just read `connected_addr` for
                         // cannot have vanished between that read and this
                         // closure running on the very same input event --
@@ -523,11 +519,8 @@ impl Widget for HomeView {
                         // empty screen is a harmless fallback rather than
                         // a panic if it ever is (same shape as
                         // `build_devices_screen`'s own `fallback_title`
-                        // handling). `Refresh::Keep` is likewise
-                        // unreachable: `build_device_page_screen` never
-                        // returns it (bead pico-link-bgnd M0 -- no builder
-                        // does yet).
-                        Refresh::Gone | Refresh::Keep => Screen::new(NO_DEVICE_TITLE, vec![]),
+                        // handling).
+                        build_device_page_screen(&model, addr, &commands).unwrap_or_else(|| Screen::new(NO_DEVICE_TITLE, vec![]))
                     }))
                 } else {
                     Action::PushView(Box::new(|| {
@@ -634,14 +627,12 @@ impl Widget for HomeView {
         self.face() == HomeFace::Menu
     }
 
-    /// Reports the menu face's selected row so [`Navigator::selected_index_at`]
-    /// / [`crate::app::App::refresh_stack`] can carry it forward into the
-    /// next rebuild (bead `pico-link-hu97`) -- mirrors `DevicesListView::
-    /// selected_index` forwarding to its wrapped list. `None` on the status
-    /// face: there is nothing selected there (the module doc's Home input
-    /// exception), and reporting the menu's index anyway would make a
-    /// status-face rebuild spuriously seed the menu's selection from a
-    /// value the user never actually chose on this face.
+    /// Reports the menu face's selected row -- test/diagnostic
+    /// introspection only (bead `pico-link-hu97`'s original rebuild-era
+    /// reason no longer applies now that `HomeView` is never rebuilt, see
+    /// this struct's module doc) -- mirrors `DevicesListView::selected_index`
+    /// forwarding to its wrapped list. `None` on the status face: there is
+    /// nothing selected there (the module doc's Home input exception).
     fn selected_index(&self) -> Option<usize> {
         match self.face() {
             HomeFace::Status => None,
@@ -820,7 +811,7 @@ mod tests {
         let mut view = fresh_home_view();
         assert_eq!(view.face(), HomeFace::Status);
         let screen = pushed_screen(view.on_intent(NavIntent::ShortcutY));
-        assert_eq!(screen.id(), None, "the 'no device connected' screen must not be mistaken for a real device page by refresh_stack");
+        assert_eq!(screen.id(), None, "the 'no device connected' screen must not be mistaken for a real device page");
     }
 
     #[test]

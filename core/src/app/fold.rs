@@ -38,7 +38,7 @@ impl App {
             Event::FaultRaised { key, value, count } => self.on_fault_raised(key, value, count),
             Event::DisplaySettingsLoaded { mode, timeout_s } => {
                 self.set_display_settings(DisplaySettings::from_wire(mode, timeout_s));
-                self.refresh_stack();
+                self.mark_model_changed();
             }
         }
         self.stamp_pending_wizard_timestamp();
@@ -168,7 +168,7 @@ impl App {
         if let Some((addr, name)) = auto_reconnect {
             self.commands.borrow_mut().push_back(Command::Connect { addr, name });
         }
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Folds one [`Event::PairedDeviceUpserted`] into [`BtModel::paired`] --
@@ -184,7 +184,7 @@ impl App {
                 model.paired.push(device);
             }
         }
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Folds one [`Event::PairedDeviceForgotten`] into [`BtModel::paired`] --
@@ -192,7 +192,7 @@ impl App {
     /// known (e.g. a stray/duplicate echo).
     fn on_paired_device_forgotten(&mut self, addr: DeviceAddr) {
         self.model.borrow_mut().paired.retain(|d| d.addr != addr);
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Folds one [`Event::PairedStoreFull`] -- see that event's and
@@ -267,7 +267,7 @@ impl App {
                 model.ldac_live_kbps = None;
             }
         }
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Records whether the radio is running an inquiry. The SECOND,
@@ -280,7 +280,7 @@ impl App {
         if !scanning {
             self.on_scan_ended_if_applicable();
         }
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Records the live A2DP link's negotiated codec (or a renegotiation)
@@ -301,41 +301,41 @@ impl App {
             }
             model.connected_codec = Some(codec);
         }
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Folds one [`Event::VolumeChanged`] reading into [`BtModel::volume`].
-    /// Calls [`App::refresh_stack`] like every other `BtModel`-mutating
+    /// Calls [`App::mark_model_changed`] like every other `BtModel`-mutating
     /// fold, so a future screen can rely on that convention rather than
     /// each one deciding for itself whether a redraw is warranted.
     pub fn on_volume_changed(&mut self, level: u8, muted: bool, source: VolumeSource) {
         self.model.borrow_mut().volume = Some(VolumeState { level, muted, source });
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Folds one [`Event::LdacBitrateChanged`] reading into
     /// [`BtModel::ldac_live_kbps`] -- see that field's doc comment for the
-    /// "never snapped to the ladder" rule. Refreshes the stack so Home's
+    /// "never snapped to the ladder" rule. Marks the app dirty so Home's
     /// bitrate line and the device page's `QUALITY` row (its Adaptive
     /// trailing note) both pick up the new figure the same frame it
-    /// arrives.
+    /// arrives, via their own live `Widget::sync` reads.
     pub fn on_ldac_bitrate_changed(&mut self, kbps: u32) {
         self.model.borrow_mut().ldac_live_kbps = Some(kbps);
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Folds one [`Event::FaultRaised`] reading into
     /// [`BtModel::fault_log`]. Uses `self.now_us` (the FFI seam's own
     /// stored clock, see [`App::tick`]'s doc comment) rather than taking a
     /// clock parameter -- the same convention [`App::on_levels_changed`]'s
-    /// peak-hold already uses. Calls [`App::refresh_stack`] like every
+    /// peak-hold already uses. Calls [`App::mark_model_changed`] like every
     /// other `BtModel`-mutating fold, so a future screen can rely on that
     /// convention rather than each one deciding for itself whether a
     /// redraw is warranted.
     pub fn on_fault_raised(&mut self, key: FaultKey, value: Option<FaultValue>, count: u16) {
         let now = Instant::from_micros(self.now_us);
         self.model.borrow_mut().fault_log.record(key, now, value, count);
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Folds one [`Event::LevelsChanged`] reading into
@@ -405,7 +405,7 @@ impl App {
             attack_peak_l_at,
             attack_peak_r_at,
         });
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Adds (or, if `addr` is already known, updates the name/rssi of) one
@@ -423,14 +423,14 @@ impl App {
                 model.discovered.push(DeviceEntry { addr, name, rssi, class_of_device });
             }
         }
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Clears the discovered-device list, e.g. at the start of a fresh
     /// scan.
     pub fn clear_devices(&mut self) {
         self.model.borrow_mut().discovered.clear();
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 
     /// Records a failed connect attempt with its [`ConnectFailureReason`]
@@ -443,9 +443,9 @@ impl App {
         // `link_state` has exactly one writer: routed through
         // `set_link_state` rather than assigning the field directly, so
         // the "codec/addr/out_level cleared off `Connected`" invariant
-        // holds by construction. The `refresh_stack()` call below is
+        // holds by construction. The `mark_model_changed()` call below is
         // therefore redundant with the one inside `set_link_state`, but
-        // harmless -- `refresh_stack` is idempotent.
+        // harmless -- `mark_model_changed` is idempotent.
         self.set_link_state(LinkState::Idle);
         // Phase 4/5 -> phase 6 (failure outcome). Unconditional (not
         // gated on the wizard currently being open/mid-connect): a stray
@@ -455,6 +455,6 @@ impl App {
         // (`build_devices_screen`'s "Pair new headphones" row activation
         // resets it to `WizardPhase::scanning_pending`).
         *self.wizard_phase.borrow_mut() = WizardPhase::Failed { addr, reason };
-        self.refresh_stack();
+        self.mark_model_changed();
     }
 }

@@ -103,8 +103,8 @@ impl WizardPhase {
 /// argument). Lives in an `Rc<RefCell<_>>` shared with the `HomeView`
 /// widget instance the same way [`WizardPhase`] does -- see
 /// [`App::home_face`]'s doc comment for why that indirection is required
-/// (a fresh `HomeView` is constructed on every [`App::refresh_stack`],
-/// and the face must survive that).
+/// (`App` itself is a second writer -- see that doc comment's "genuine
+/// two-writer state" reasoning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HomeFace {
     /// The hero/status display.
@@ -127,8 +127,8 @@ pub enum HomeFace {
 /// value (seeding must never re-save what was just loaded).
 ///
 /// There used to be a third, purely presentational `refresh_pending` latch
-/// forcing `App::refresh_stack` to rebuild the Settings screen/its open
-/// picker on the same frame as a pick -- bead `pico-link-bgnd` M3 deleted
+/// forcing a rebuild of the Settings screen/its open picker on the same
+/// frame as a pick -- bead `pico-link-bgnd` M3 deleted
 /// it: the Settings screen and its pickers are now long-lived views that
 /// read this same `Rc<RefCell<_>>` handle directly via `Widget::sync` every
 /// frame, so a pick is visible on the very next sync with nothing needing

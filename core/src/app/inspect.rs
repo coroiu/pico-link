@@ -82,7 +82,7 @@ impl App {
     /// The currently visible screen's title. Exposed for tests/diagnostics
     /// -- in particular, proving that a Bluetooth [`Event`] mid-navigation
     /// doesn't silently pop the user back to the root screen (see
-    /// [`App::refresh_stack`]'s doc comment).
+    /// [`App::mark_model_changed`]'s doc comment).
     #[must_use]
     pub fn current_screen_title(&self) -> &str {
         &self.navigator.current().title
@@ -110,8 +110,9 @@ impl App {
     /// Test-only: the Devices screen's own scroll-top row index, if it's
     /// currently on the navigator stack at index 1 -- the scroll-position
     /// counterpart to [`App::devices_selected_index_for_test`], proving
-    /// [`App::refresh_stack`] carries the user's viewport forward across
-    /// an unrelated model event. Not part of the public API.
+    /// `DevicesListView`'s live model read leaves the user's viewport
+    /// untouched across an unrelated model event. Not part of the public
+    /// API.
     #[cfg(test)]
     pub(crate) fn devices_scroll_top_for_test(&self) -> Option<usize> {
         self.navigator.scroll_top_at(1)

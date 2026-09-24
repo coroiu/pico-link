@@ -116,8 +116,9 @@ fn draw_link_glyph(link_glyph: LinkGlyph, right_cursor: i32, title_mid_y: i32, t
 ///
 /// `region_key` (bead `pico-link-7h5.9`) IS cached, unlike `damage_hint`'s
 /// rectangle -- it is what makes narrowing to `damage_hint`'s rectangle
-/// trustworthy at all. A widget instance does not survive frames (it is
-/// routinely rebuilt from fresh model data), so "did only the narrow
+/// trustworthy at all. A leaf widget instance projected fresh from live
+/// state is not guaranteed to survive frames (see [`Widget::damage_region_key`]'s
+/// doc comment for the live-widgets-era caveat), so "did only the narrow
 /// sub-region change?" can only be answered by comparing THIS frame's
 /// [`Widget::damage_region_key`] against the value `Screen` itself cached
 /// last frame -- never by the widget remembering its own previous value,
@@ -292,10 +293,12 @@ impl Screen {
         }
     }
 
-    /// Tags this screen with a [`ScreenId`], making it eligible for
-    /// [`crate::app::App`]'s `refresh_stack` to rebuild it in place when
-    /// the model changes. A screen that never calls this (the wizard,
-    /// confirms, Settings) is never touched by `refresh_stack` -- see
+    /// Tags this screen with a [`ScreenId`] -- an identity/liveness marker
+    /// [`crate::app::App`]'s `prune_stack` uses to find a device-scoped
+    /// screen whose subject vanished and unwind the stack to just below it
+    /// (e.g. [`crate::app::ScreenId::DevicePage`] for a forgotten device).
+    /// A screen that never calls this (the wizard, confirms) has no
+    /// identity to check and is never touched by `prune_stack` -- see
     /// [`Screen::id`]'s doc comment.
     #[must_use]
     pub fn with_id(mut self, id: ScreenId) -> Self {
@@ -304,7 +307,7 @@ impl Screen {
     }
 
     /// This screen's [`ScreenId`], if it has one. `None` means
-    /// `refresh_stack` must skip it entirely.
+    /// `App::prune_stack` must skip it entirely.
     #[must_use]
     pub fn id(&self) -> Option<ScreenId> {
         self.id

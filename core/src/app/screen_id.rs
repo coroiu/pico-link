@@ -1,15 +1,17 @@
 use super::model::DeviceAddr;
 
-/// Identity for a screen that must stay live-synced to [`BtModel`] while it
-/// sits on the [`Navigator`]'s stack -- see [`App::refresh_stack`]'s doc
-/// comment for why this exists. `Screen::id()` returns `None` for every
-/// screen that never calls
-/// [`Screen::with_id`] (the wizard, `ConfirmView`s, Settings): `None` is
-/// the "never refresh me" sentinel, so tagging a screen is opt-in and every
-/// untagged screen is behaviour-identical to before this type existed.
+/// Identity/liveness tag for a screen that reads [`BtModel`] itself via
+/// `Widget::sync` while it sits on the [`Navigator`]'s stack -- see
+/// [`App::prune_stack`]'s doc comment for why this exists: a device-scoped
+/// screen's subject can vanish out from under it (a forgotten device), and
+/// this is what lets `prune_stack` find and unwind it. `Screen::id()`
+/// returns `None` for every screen that never calls [`Screen::with_id`]
+/// (the wizard, `ConfirmView`s): `None` means "no identity to check", so
+/// tagging a screen is opt-in and every untagged screen is
+/// behaviour-identical to before this type existed.
 ///
 /// `Copy`/`Eq`, like [`ListItemKey`] and for the same reason: cheap to
-/// carry around and compare on every [`App::refresh_stack`] pass.
+/// carry around and compare on every [`App::prune_stack`] pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenId {
     Home,

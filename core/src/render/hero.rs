@@ -1989,21 +1989,22 @@ mod tests {
     // once a genuine BODY change (not the OUT sample) is driven through
     // the real `Screen` diff. A widget-local memory of "my own body key
     // last frame" cannot answer that soundly, because a `HeroStatusView`
-    // instance does not survive frames in production (`HomeView::new` is
-    // called fresh from `App::refresh_stack`, which every
-    // `Event::LevelsChanged` triggers) -- see `Widget::damage_region_key`'s
-    // doc comment. This test drives the real `Screen::render` with
-    // `force_full_damage: false` on frame 2, deliberately NOT leaning on
-    // `Navigator::replace_root`'s own full-damage flag (which happens to
-    // paper over this exact bug in the shipped app today, but must not be
-    // what makes the MECHANISM itself correct).
+    // instance does not survive frames in production -- `HomeView::sync`
+    // re-projects it fresh from the live model every frame Home is on top
+    // (bead `pico-link-bgnd` M1, live-widgets design rule 3: a leaf display
+    // widget with no interaction state may be reconstructed from the
+    // projection each sync) -- see `Widget::damage_region_key`'s doc
+    // comment. This test drives the real `Screen::render` with
+    // `force_full_damage: false` on frame 2, deliberately NOT leaning on a
+    // caller-forced full-damage flag (which would paper over this exact
+    // bug, but must not be what makes the MECHANISM itself correct).
 
     /// Delegates every `Widget` method this test needs to a shared, swappable
     /// `HeroStatusView` -- `Rc<RefCell<_>>` so the test can hold its own
     /// handle to swap the widget's content between frames while `Screen`
     /// keeps the SAME widget slot identity, exactly reproducing the
-    /// "reconstructed-but-in-the-same-slot" shape `App::refresh_stack`
-    /// produces via `Navigator::replace_root` in production.
+    /// "reconstructed-but-in-the-same-slot" shape `HomeView::sync` produces
+    /// in production every time it re-projects `HeroStatusView`.
     struct HeroSlot(alloc::rc::Rc<core::cell::RefCell<HeroStatusView>>);
 
     impl Widget for HeroSlot {
@@ -2054,10 +2055,10 @@ mod tests {
         // Frame 2: ONLY the codec word changes -- a genuine BODY change,
         // not the OUT sample -- via the shared `Rc<RefCell<_>>`, so
         // `Screen` sees the SAME widget slot (same index, same area) it
-        // cached frame 1 against, exactly like a `Navigator::replace_at`
-        // that swaps a screen's content in place. `force_full_damage:
-        // false` this time: nothing external should be required to make
-        // this correct.
+        // cached frame 1 against, exactly like `HomeView::sync` swapping a
+        // freshly-projected `HeroStatusView` into the same slot in place.
+        // `force_full_damage: false` this time: nothing external should be
+        // required to make this correct.
         let frame2 = HeroStatusView::new(
             "Sony WH-1000XM5",
             CodecStatus::Connected { word: String::from("SBC"), fallback: None, bitrate: BitrateStatus::Kbps { kbps: 328, adaptive: false } },
