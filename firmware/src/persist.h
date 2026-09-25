@@ -319,6 +319,35 @@ void pl_persist_request_cushion_policy(uint8_t policy);
 // pl_persist_execute_pending_display_settings_write above.
 void pl_persist_execute_pending_cushion_policy_write(void);
 
+// Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-25-
+// adaptive-floor.md` sec 2: reads the PL:S:2 Adaptive-floor record loaded
+// at boot -- own kind index (2, under PL_PERSIST_KIND_SETTINGS), own
+// version byte, loaded independently of PL:S:0/PL:S:1's own lifecycles
+// (same "load before the PL:M:0 marker check" discipline as
+// pl_persist_boot_cushion_policy above). Returns false (leaving `*floor`
+// untouched) if the record was never written, was the wrong length,
+// failed its version check, or failed CRC -- callers (main.c) treat false
+// as "use the compiled-in default (330 kbps)".
+bool pl_persist_boot_abr_floor(uint8_t *floor);
+
+// Stages an Adaptive-floor write -- called from bt.c's
+// PL_COMMAND_TAG_SET_ABR_FLOOR handler (thread context, the superloop).
+// Same short-critical-section RAM-only staging idiom as
+// pl_persist_request_cushion_policy above; a SEPARATE staging slot (this
+// is also a global, not per-device, record).
+void pl_persist_request_abr_floor(uint8_t floor);
+
+// Performs the actual flash write for whatever Adaptive-floor save is
+// currently staged by pl_persist_request_abr_floor -- same calling
+// contract as pl_persist_execute_pending_cushion_policy_write (bt.c's
+// pending-queue drain, async_context ONLY).
+//
+// Design sec 4/D11 precedent: deliberately NOT gated on
+// pl_usb_audio_streaming()/pl_a2dp_streaming() -- a user-initiated write
+// may stall audio briefly and that is accepted, same discipline as
+// pl_persist_execute_pending_cushion_policy_write above.
+void pl_persist_execute_pending_abr_floor_write(void);
+
 // Andreas's ruling, 2026-09-01: writes the device record SYNCHRONOUSLY, as
 // part of establishing the connection -- see this header's module doc
 // (ORDERING) for the full rationale and the one carve-out
@@ -452,6 +481,12 @@ bool pl_persist_get_device_settings(const uint8_t addr[6], uint8_t *out_codec_id
 // established relative to PL_PERSIST_SCHEMA_VERSION (the device/marker
 // schema).
 #define PL_PERSIST_INDEX_CUSHION_POLICY 1u
+// Bead pico-link-d42g.3 (F3): PL:S:2, a THIRD, independent record under
+// PL_PERSIST_KIND_SETTINGS -- the global LDAC Adaptive floor. Own index
+// (2), own version byte (PL_PERSIST_ABR_FLOOR_VERSION in persist.c), same
+// independent-versioning discipline as PL_PERSIST_INDEX_CUSHION_POLICY
+// above.
+#define PL_PERSIST_INDEX_ABR_FLOOR 2u
 
 // Number of PL:D:<i> device slots the store holds, i in [0, PL_PERSIST_DEVICE_SLOTS).
 // Widened from a single slot (index 0 only) to 8 by bead pico-link-4vb.6

@@ -371,6 +371,13 @@ pub enum Event {
     /// decodes with [`crate::audio::CushionPolicy::from_wire`], same
     /// discipline as [`Self::DisplaySettingsLoaded`] above.
     CushionPolicyLoaded { policy: u8 },
+    /// C's flash-backed store finished loading the global LDAC Adaptive
+    /// floor (`PL:S:2`) at boot -- bead pico-link-d42g.3 (F3), design
+    /// `.planning/design/2026-09-25-adaptive-floor.md` sec 2. Wire value,
+    /// not [`crate::audio::AbrFloor`] itself: `core` decodes with
+    /// [`crate::audio::AbrFloor::from_wire`], same discipline as
+    /// [`Self::CushionPolicyLoaded`] above.
+    AbrFloorLoaded { floor: u8 },
 }
 
 /// Phase 4's four named connect sub-steps: naming the current one tells

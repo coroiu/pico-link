@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 
-use crate::audio::CushionPolicy;
+use crate::audio::{AbrFloor, CushionPolicy};
 use crate::render::{ListItem, VerticalList};
 
 use super::model::MAX_PAIRED_DEVICES;
@@ -982,4 +982,47 @@ fn request_cushion_policy_arms_the_save_latch_exactly_once() {
     assert_eq!(app.cushion_policy(), CushionPolicy::Stable);
     assert_eq!(app.take_cushion_policy_to_save(), Some(CushionPolicy::Stable));
     assert_eq!(app.take_cushion_policy_to_save(), None, "the save latch must drain to None after being taken once");
+}
+
+// --- Bead pico-link-d42g.3 (F3): the Adaptive-floor mailbox ---
+
+/// `App::new` defaults to `AbrFloor::Kbps330`, matching the design's
+/// default (330 kbps, no change from pre-bead behaviour).
+#[test]
+fn abr_floor_defaults_to_330() {
+    let app = App::new(240, 240);
+    assert_eq!(app.abr_floor(), AbrFloor::Kbps330);
+}
+
+/// Seeding (boot load, `Event::AbrFloorLoaded`) must set `current` but
+/// must NOT mark the save latch -- same discipline as
+/// `cushion_policy_loaded_event_seeds_without_arming_the_save_latch`.
+#[test]
+fn abr_floor_loaded_event_seeds_without_arming_the_save_latch() {
+    let mut app = App::new(240, 240);
+    app.handle_event(Event::AbrFloorLoaded { floor: 3 });
+    assert_eq!(app.abr_floor(), AbrFloor::Kbps198);
+    assert_eq!(app.take_abr_floor_to_save(), None, "a boot-load seed must never arm the save latch");
+}
+
+/// A wire value the enum doesn't understand (0 = unset, or anything past
+/// 3) falls back to `Kbps330`, the same per-field fallback discipline
+/// `CushionPolicy::from_wire` uses.
+#[test]
+fn abr_floor_loaded_event_falls_back_to_330_on_an_unrecognized_wire_value() {
+    let mut app = App::new(240, 240);
+    app.set_abr_floor(AbrFloor::Kbps198);
+    app.handle_event(Event::AbrFloorLoaded { floor: 7 });
+    assert_eq!(app.abr_floor(), AbrFloor::Kbps330, "an unrecognized wire value must fall back to the default, Kbps330");
+}
+
+/// A user-initiated pick (`request_abr_floor`, what a future F4 picker
+/// calls) sets `current` AND arms the save latch, drained exactly once.
+#[test]
+fn request_abr_floor_arms_the_save_latch_exactly_once() {
+    let mut app = App::new(240, 240);
+    app.request_abr_floor(AbrFloor::Kbps246);
+    assert_eq!(app.abr_floor(), AbrFloor::Kbps246);
+    assert_eq!(app.take_abr_floor_to_save(), Some(AbrFloor::Kbps246));
+    assert_eq!(app.take_abr_floor_to_save(), None, "the save latch must drain to None after being taken once");
 }

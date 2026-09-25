@@ -1174,6 +1174,21 @@ pub struct PlCushionPolicyPayload {
     pub policy: u8,
 }
 
+/// [`PlEvent`]'s payload when `tag == PlEventTag::AbrFloorLoaded`, and also
+/// [`PlCommand`]'s payload when `tag == PlCommandTag::SetAbrFloor` -- the
+/// same wire shape serves both directions (bead pico-link-d42g.3), matching
+/// `pico_link_core::audio::AbrFloor::to_wire`/`from_wire` exactly: `floor`
+/// (`0` = unset -> `Kbps330`, `1` = `Kbps330`, `2` = `Kbps246`, `3` =
+/// `Kbps198`; any other value falls back to `Kbps330`). `core` decodes with
+/// `AbrFloor::from_wire`, never a raw match here -- same "typed field would
+/// already be UB on a garbage discriminant" reasoning as every other
+/// payload struct in this union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlAbrFloorPayload {
+    pub floor: u8,
+}
+
 /// [`PlEvent`]'s payload when `tag == PlEventTag::DeviceDiscovered`. `name`
 /// points to `name_len` bytes of UTF-8 text, not necessarily
 /// NUL-terminated; invalid UTF-8 is replaced lossily rather than rejected
@@ -1817,6 +1832,14 @@ pub enum PlEventTag {
     /// is unchanged by this tag's own addition. See
     /// [`PlCushionPolicyPayload`]'s doc comment.
     CushionPolicyLoaded = 19,
+    /// Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-25-
+    /// adaptive-floor.md` sec 2: C's persisted global LDAC Adaptive floor
+    /// (`PL:S:2`) finished loading at boot (`main.c` pushes this right
+    /// after `pl_bt_init`, same context/timing as `CushionPolicyLoaded`
+    /// above). Purely additive, same discipline as every tag from
+    /// `LevelsChanged` (13) on -- [`PL_EVENT_ABI_VERSION`] is unchanged by
+    /// this tag's own addition. See [`PlAbrFloorPayload`]'s doc comment.
+    AbrFloorLoaded = 20,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1847,6 +1870,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             17 => Ok(PlEventTag::DiscoveryStateChanged),
             18 => Ok(PlEventTag::DisplaySettingsLoaded),
             19 => Ok(PlEventTag::CushionPolicyLoaded),
+            20 => Ok(PlEventTag::AbrFloorLoaded),
             _ => Err(()),
         }
     }
@@ -1898,6 +1922,8 @@ pub union PlEventPayload {
     /// Bead pico-link-8pp1.4. See [`PlCushionPolicyPayload`]'s doc
     /// comment.
     pub cushion_policy: PlCushionPolicyPayload,
+    /// Bead pico-link-d42g.3. See [`PlAbrFloorPayload`]'s doc comment.
+    pub abr_floor: PlAbrFloorPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -2297,6 +2323,15 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             let payload = unsafe { event.payload.cushion_policy };
             Event::CushionPolicyLoaded { policy: payload.policy }
         }
+        PlEventTag::AbrFloorLoaded => {
+            // SAFETY: `tag` says this union currently holds `abr_floor`.
+            // Reading it is sound regardless of its field value -- `core`'s
+            // own `AbrFloor::from_wire` (called inside `App::handle_event`)
+            // falls back on any out-of-range value, same as
+            // `CushionPolicyLoaded` above.
+            let payload = unsafe { event.payload.abr_floor };
+            Event::AbrFloorLoaded { floor: payload.floor }
+        }
     };
     ui.app.handle_event(core_event);
 }
@@ -2424,6 +2459,18 @@ pub enum PlCommandTag {
     /// [`PL_COMMAND_ABI_VERSION`], same reasoning as
     /// [`SetDisplaySettings`](Self::SetDisplaySettings)'s own addition.
     SetCushionPolicy = 10,
+    /// Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-25-
+    /// adaptive-floor.md` sec 2/4: the global LDAC Adaptive floor changed
+    /// (a future Settings-picker pick, F4), for C to persist under `PL:S:2`
+    /// and apply live via `pl_codec_ldac_set_floor`. Like
+    /// [`SetCushionPolicy`](Self::SetCushionPolicy), NOT drained from
+    /// `App`'s ordinary `commands` queue -- it comes from `App::take_
+    /// abr_floor_to_save`, checked in [`pl_ui_poll_command`] the same way
+    /// (design D9). Purely additive to the tag enum -- no existing payload
+    /// shape changed -- so this does not bump [`PL_COMMAND_ABI_VERSION`],
+    /// same reasoning as [`SetCushionPolicy`](Self::SetCushionPolicy)'s own
+    /// addition.
+    SetAbrFloor = 11,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -2504,6 +2551,8 @@ pub union PlCommandPayload {
     pub display_settings: PlDisplaySettingsPayload,
     /// See [`PlCushionPolicyPayload`]'s doc comment. Bead pico-link-8pp1.4.
     pub cushion_policy: PlCushionPolicyPayload,
+    /// See [`PlAbrFloorPayload`]'s doc comment. Bead pico-link-d42g.3.
+    pub abr_floor: PlAbrFloorPayload,
 }
 
 /// ABI version [`PlCommand`] consumers (C call sites, i.e. `bt.c`'s poll
@@ -2656,6 +2705,16 @@ pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::SetCushionPolicy,
             payload: PlCommandPayload { cushion_policy: PlCushionPolicyPayload { policy: policy.to_wire() } },
+        };
+    }
+    // Bead pico-link-d42g.3 (F3): the Adaptive-floor save latch, same
+    // checked-first-ahead-of-the-ordinary-queue shape as
+    // `take_cushion_policy_to_save` above (design D9).
+    if let Some(floor) = ui.app.take_abr_floor_to_save() {
+        return PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::SetAbrFloor,
+            payload: PlCommandPayload { abr_floor: PlAbrFloorPayload { floor: floor.to_wire() } },
         };
     }
     match ui.app.poll_command() {
@@ -2924,11 +2983,11 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past CushionPolicyLoaded = 19, the highest legal
-            // PlEventTag as of bead pico-link-8pp1.4 -- moved from 19 (one
-            // past the previous highest, DisplaySettingsLoaded = 18) when
-            // this bead added tag 19.
-            tag: 20,
+            // One past AbrFloorLoaded = 20, the highest legal PlEventTag as
+            // of bead pico-link-d42g.3 -- moved from 20 (one past the
+            // previous highest, CushionPolicyLoaded = 19) when this bead
+            // added tag 20.
+            tag: 21,
             payload: bogus_payload,
         };
         unsafe {
@@ -3576,15 +3635,15 @@ mod tests {
             PlEventTag::DiscoveryStateChanged,
             PlEventTag::DisplaySettingsLoaded,
             PlEventTag::CushionPolicyLoaded,
+            PlEventTag::AbrFloorLoaded,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 20 -- one past CushionPolicyLoaded = 19, the highest legal
-        // PlEventTag as of bead pico-link-8pp1.4 (moved from 19, one past
-        // the previous highest DisplaySettingsLoaded = 18, when this bead
-        // added tag 19).
-        assert!(PlEventTag::try_from(20u32).is_err());
+        // 21 -- one past AbrFloorLoaded = 20, the highest legal PlEventTag
+        // as of bead pico-link-d42g.3 (moved from 20, one past the previous
+        // highest CushionPolicyLoaded = 19, when this bead added tag 20).
+        assert!(PlEventTag::try_from(21u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
@@ -4085,6 +4144,44 @@ mod tests {
             assert_eq!(cmd.tag as u32, PlCommandTag::SetCushionPolicy as u32);
             let payload = cmd.payload.cushion_policy;
             assert_eq!(payload.policy, 2, "Stable must encode to wire value 2");
+
+            // Drained -- a second poll must not resurface it.
+            let cmd2 = pl_ui_poll_command(ui);
+            assert_eq!(cmd2.tag as u32, PlCommandTag::None as u32);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    // --- Bead pico-link-d42g.3 (F3): the Adaptive-floor FFI seam ---
+
+    #[test]
+    fn pl_ui_push_event_abr_floor_loaded_folds_into_the_model() {
+        let ui = new_ui();
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::AbrFloorLoaded as u32,
+            payload: PlEventPayload { abr_floor: PlAbrFloorPayload { floor: 3 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "AbrFloorLoaded is a legal tag");
+            assert_eq!((*ui).app.abr_floor(), pico_link_core::AbrFloor::Kbps198);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_poll_command_surfaces_an_abr_floor_save_ahead_of_the_ordinary_queue() {
+        // Design D9, same shape `take_cushion_policy_to_save` uses: checked
+        // FIRST by `pl_ui_poll_command`, ahead of `App`'s ordinary
+        // `commands` queue.
+        let ui = new_ui();
+        unsafe {
+            (*ui).app.request_abr_floor(pico_link_core::AbrFloor::Kbps246);
+            let cmd = pl_ui_poll_command(ui);
+            assert_eq!(cmd.tag as u32, PlCommandTag::SetAbrFloor as u32);
+            let payload = cmd.payload.abr_floor;
+            assert_eq!(payload.floor, 2, "Kbps246 must encode to wire value 2");
 
             // Drained -- a second poll must not resurface it.
             let cmd2 = pl_ui_poll_command(ui);

@@ -58,3 +58,61 @@ impl CushionPolicy {
         }
     }
 }
+
+/// The global LDAC Adaptive floor (bead `pico-link-d42g`, design
+/// `.planning/design/2026-09-25-adaptive-floor.md` sec 2/4): caps how far
+/// ABR may step the LDAC encoder down when a device's `QUALITY` setting is
+/// Adaptive. Not a pinned pick -- pins are unaffected (see the design's
+/// "Mid-stream behaviour" table). Global, not per-device, same reasoning as
+/// [`CushionPolicy`] above (Andreas's 2026-09-25 ruling: "the air varies,
+/// not the headset").
+///
+/// Wire: 1 byte, `0` = unset -> [`Self::default`] (`Kbps330`), `1` =
+/// `Kbps330`, `2` = `Kbps246`, `3` = `Kbps198`. Any other value falls back
+/// to [`Self::default`], the same per-field-fallback discipline
+/// [`CushionPolicy::from_wire`] uses. `firmware/src/codec_ldac.c`'s
+/// `pl_codec_ldac_set_floor` maps this exact wire byte to a ladder rung
+/// (330=rung4, 246=rung6, 198=rung8) -- `core` never sees a rung, only the
+/// wire enum, so the stored/transmitted format is independent of the
+/// firmware ladder's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AbrFloor {
+    /// 330 kbps (libldac MQ, rung 4). The default.
+    #[default]
+    Kbps330,
+    /// 246 kbps (libldac Q3, rung 6).
+    Kbps246,
+    /// 198 kbps (libldac Q5, rung 8, the rail).
+    Kbps198,
+}
+
+impl AbrFloor {
+    #[must_use]
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::Kbps330 => 1,
+            Self::Kbps246 => 2,
+            Self::Kbps198 => 3,
+        }
+    }
+
+    /// Any wire value other than `{1, 2, 3}` (including `0` = unset) falls
+    /// back to [`Self::default`] (`Kbps330`).
+    #[must_use]
+    pub const fn from_wire(value: u8) -> Self {
+        match value {
+            2 => Self::Kbps246,
+            3 => Self::Kbps198,
+            _ => Self::Kbps330,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Kbps330 => "330 kbps",
+            Self::Kbps246 => "246 kbps",
+            Self::Kbps198 => "198 kbps",
+        }
+    }
+}

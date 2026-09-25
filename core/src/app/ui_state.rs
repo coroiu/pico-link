@@ -1,4 +1,4 @@
-use crate::audio::CushionPolicy;
+use crate::audio::{AbrFloor, CushionPolicy};
 use crate::power::DisplaySettings;
 use crate::render::Instant;
 
@@ -155,5 +155,22 @@ pub struct DisplaySettingsState {
 #[derive(Default)]
 pub struct CushionPolicyState {
     pub(in crate::app) current: CushionPolicy,
+    pub(in crate::app) save_pending: bool,
+}
+
+/// Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-25-
+/// adaptive-floor.md` sec 2/4. Same `Rc<RefCell<_>>` mailbox shape as
+/// [`CushionPolicyState`] above, for the same reason (a future Settings row/
+/// picker, F4, is an `Action::PushView` closure with no path back to a live
+/// `&mut App`) and the same single-flag shape: `core` has nothing of its
+/// own to "apply" a floor to -- C applies it live via
+/// `pl_codec_ldac_set_floor` on every `PL_COMMAND_TAG_SET_ABR_FLOOR`.
+/// `save_pending` is set together with `current` on a user pick
+/// ([`super::App::request_abr_floor`]), but NOT on
+/// [`super::App::set_abr_floor`]'s initial seed from a loaded/default value
+/// (seeding must never re-save what was just loaded).
+#[derive(Default)]
+pub struct AbrFloorState {
+    pub(in crate::app) current: AbrFloor,
     pub(in crate::app) save_pending: bool,
 }
