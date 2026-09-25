@@ -32,10 +32,14 @@
 #include "usb_pump.h"
 #include "volume.h"
 
-// Longest valid line is "NAV SHORTCUT" territory -- "NAV SELECT\n" (11
-// chars) or "NAV JUMP -32768" (15 chars) -- 32 leaves comfortable headroom
-// without inviting a large static buffer.
-#define PL_DEBUG_REMOTE_LINE_MAX 32
+// Bead pico-link-ryw.11: the longest valid line used to be "NAV JUMP
+// -32768" (15 chars), so 32 was comfortable headroom. An "EQ <Equalizer
+// APO Filter line>" command is much longer -- e.g. "EQ Filter 8:  ON  PK
+// Fc 9250 Hz  Gain -4.7 dB  BW Oct 0.413" is ~60 chars -- so this is
+// raised to 96, still a small static buffer, with headroom past the
+// longest line the XM3 preset (or any similarly-sized Equalizer APO
+// document) actually needs.
+#define PL_DEBUG_REMOTE_LINE_MAX 96
 // Bounds how many raw bytes a single pl_debug_remote_poll() call drains
 // from the CDC RX side, so a runaway or garbled host stream can never stall
 // the main loop for one iteration -- generous relative to the longest valid
@@ -220,7 +224,32 @@ static void log_vol_snapshot(void) {
     );
 }
 
-size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
+// Bead pico-link-ryw.11: logs one pl_ui_debug_eq_command() result. `verb`
+// is the command word being acknowledged ("EQ BEGIN", "EQ END", "EQ OFF",
+// or "EQ line") -- kept separate from the raw line text so a rejected
+// line's exact content (which may be long) only appears once, from the
+// caller's own pl_log() of s_line.
+static void log_eq_result(const char *verb, PlEqCommandResult result) {
+    if (result.code == 0) {
+        pl_log("debug-remote: %s -> ok\r\n", verb);
+    } else {
+        pl_log("debug-remote: %s -> error code=%ld line=%lu\r\n", verb, (long)result.code, (unsigned long)result.line);
+    }
+}
+
+// Bead pico-link-ryw.11: logs the currently active debug EQ override's
+// band count/preamp via pl_ui_debug_eq_status(), or "inactive" if none.
+static void log_eq_status(struct PlUi *ui) {
+    uint8_t band_count = 0;
+    float preamp_db = 0.0f;
+    if (pl_ui_debug_eq_status(ui, &band_count, &preamp_db)) {
+        pl_log("debug-remote: EQ STATUS -> active bands=%u preamp=%.2fdB\r\n", (unsigned)band_count, (double)preamp_db);
+    } else {
+        pl_log("debug-remote: EQ STATUS -> inactive\r\n");
+    }
+}
+
+size_t pl_debug_remote_poll(struct PlUi *ui, PlIntent *out, size_t max) {
     size_t emitted = 0;
 
     // Bead pico-link-4v2.1 (VT1) "VOL WATCH": independent of whatever CDC
@@ -544,6 +573,32 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                     } else {
                         pl_log("debug-remote: DSPPROG %ld -> loaded\r\n", n);
                     }
+                } else if (strcmp(s_line, "EQ BEGIN") == 0) {
+                    // Bead pico-link-ryw.11: dispatched straight to Rust's
+                    // session state, same "direct dispatch, not through
+                    // `out`" pattern as DSPPROG/ABR FLOOR above.
+                    log_eq_result("EQ BEGIN", pl_ui_debug_eq_command(ui, "BEGIN", 5));
+                } else if (strcmp(s_line, "EQ END") == 0) {
+                    PlEqCommandResult result = pl_ui_debug_eq_command(ui, "END", 3);
+                    log_eq_result("EQ END", result);
+                    if (result.code == 0) {
+                        // Confirms the override actually took, with the
+                        // band count/preamp it was built with -- not just
+                        // that the command itself returned success.
+                        log_eq_status(ui);
+                    }
+                } else if (strcmp(s_line, "EQ OFF") == 0) {
+                    log_eq_result("EQ OFF", pl_ui_debug_eq_command(ui, "OFF", 3));
+                } else if (strcmp(s_line, "EQ STATUS") == 0) {
+                    log_eq_status(ui);
+                } else if (strncmp(s_line, "EQ ", 3) == 0) {
+                    // Anything else after "EQ " is one Equalizer APO text
+                    // line (a "Preamp: ..." or "Filter N: ..." line),
+                    // fed to the in-progress session. Must come AFTER the
+                    // exact BEGIN/END/OFF/STATUS matches above, since
+                    // those also start with "EQ ".
+                    const char *line_text = s_line + 3;
+                    log_eq_result("EQ line", pl_ui_debug_eq_command(ui, line_text, strlen(line_text)));
                 } else if (emitted < max) {
                     PlIntent intent;
                     if (parse_line(s_line, &intent)) {

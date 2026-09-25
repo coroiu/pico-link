@@ -91,6 +91,29 @@
 //                        would emit to each peer via pl_prio.h's slot 4.
 //                        Emits nothing for real -- nothing reads the
 //                        outbound latches yet.
+//   EQ BEGIN         -- bead pico-link-ryw.11: starts a fresh Equalizer
+//                        APO import session (discards any prior
+//                        never-`EQ END`ed one). Dispatched to Rust over
+//                        pl_ui_debug_eq_command(ui, "BEGIN", ...).
+//   EQ <line>        -- feeds one Equalizer APO text line (a "Preamp: <n>
+//                        dB" or "Filter N: ON|OFF LS|PK|HS Fc <n> Hz Gain
+//                        <n> dB (BW Oct <n>|Q <n>)" line, pasted verbatim)
+//                        into the in-progress session. Requires EQ BEGIN
+//                        first. See tools/usb-console/eq_import.py for the
+//                        host-side sender.
+//   EQ END           -- finishes the session and, on success, installs it
+//                        as a non-persisted debug DSP override that
+//                        core::app::App::dsp_program returns ahead of
+//                        everything else (the connected device's assigned
+//                        preset, or an open effects editor's preview).
+//                        Logs the resulting band count/preamp via
+//                        pl_ui_debug_eq_status() on success.
+//   EQ OFF           -- clears the debug override (and any in-progress
+//                        session), reverting to normal resolution. Also
+//                        the only way to clear it besides a reboot.
+//   EQ STATUS        -- logs whether an override is currently active and,
+//                        if so, its band count/explicit preamp -- does not
+//                        change anything.
 //   DSPPROG <n>      -- bead pico-link-ryw.1, design .planning/design/
 //                        2026-09-25-dsp-effects-stage.md sec 1.4: loads
 //                        one of 4 canned DSP programs (0=Off,
@@ -126,7 +149,14 @@
 // were written. Cheap and safe to call every superloop iteration alongside
 // pl_link_input_poll -- most calls read zero bytes and emit nothing.
 //
+// `ui` (bead pico-link-ryw.11) is needed only for the "EQ ..." family of
+// commands, which dispatch straight to pl_ui_debug_eq_command()/
+// pl_ui_debug_eq_status() -- every other command here still bypasses `ui`
+// the same way it always has (direct dispatch to the owning C module, or
+// PlIntent values appended to `out` for the caller's own pl_ui_input()
+// call).
+//
 // Call from main.c's superloop only.
-size_t pl_debug_remote_poll(PlIntent *out, size_t max);
+size_t pl_debug_remote_poll(struct PlUi *ui, PlIntent *out, size_t max);
 
 #endif // PICO_LINK_DEBUG_REMOTE_H
