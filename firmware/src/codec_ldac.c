@@ -278,17 +278,21 @@ static void pl_codec_ldac_apply_pending_tuning(void *state) {
         s_ldac_applied_rung--;
         s_ldac_abr_steps_up++;
     }
-    // Bead pico-link-7jol.5 (bead pico-link-qx8's doctrine: ASK THE
-    // LIBRARY, never restate its table). Safe here specifically because
-    // this function is the sole owner of `enc->handle` in this context --
-    // the same "no concurrent access" argument codec_ldac.c's init()
-    // already relies on for its own ldacBT_get_bitrate call, just at a
-    // different moment (after a successful step instead of after
-    // configuration).
-    int new_kbps = ldacBT_get_bitrate(enc->handle);
-    if (new_kbps > 0) {
-        s_ldac_current_kbps = (uint32_t)new_kbps;
-    }
+    // Bead pico-link-dge6 (one-pick lag): do NOT read
+    // ldacBT_get_bitrate() here. ldacBT_alter_eqmid_priority() only writes
+    // hLdacBT->tgt_eqmid/tgt_frmlen (ldacBT_internal.c's
+    // ldacBT_set_eqmid_core) -- the library's own hLdacBT->bitrate field
+    // is not updated until a LATER ldacBT_encode() call notices the
+    // target changed and adopts it at a frame boundary
+    // (ldacBT_internal.c's ldacBT_update_frmlen, invoked from
+    // ldacBT_api.c's ldacBT_encode). A synchronous read right here always
+    // fetched the PRE-transition bitrate, which is why Home's live
+    // readout lagged exactly one pick behind. pl_codec_ldac_encode() below
+    // now re-reads ldacBT_get_bitrate() after every successful encode call
+    // (same encoder-owning context) and republishes s_ldac_current_kbps
+    // when the library's own value has actually changed -- that is the
+    // only place the adoption is visible, so that is the only place that
+    // should ask.
 }
 
 // Bead pico-link-7jol.5, design sec 5: maps a FIXED (non-Adaptive)
@@ -579,6 +583,27 @@ static pl_codec_encode_result_t pl_codec_ldac_encode(void *state, const int16_t 
     int status = ldacBT_encode(enc->handle, (void *)(uintptr_t)pcm, &pcm_used, out, &stream_sz, &frame_num);
     if (status != 0) {
         return (pl_codec_encode_result_t){.ok = false, .bytes_written = 0, .frames_emitted = 0, .payload_complete = false};
+    }
+
+    // Bead pico-link-dge6 (one-pick lag): this is the ONLY place libldac
+    // actually adopts a pending eqmid/frmlen change into
+    // hLdacBT->bitrate -- ldacBT_encode() itself notices tgt_eqmid !=
+    // eqmid at a frame boundary and calls ldacBT_update_frmlen
+    // internally (ldacBT_internal.c). Re-reading ldacBT_get_bitrate()
+    // right here, in the same encoder-owning context that just called
+    // ldacBT_encode(), is therefore the earliest point the transition is
+    // actually visible -- unlike the old read inside
+    // pl_codec_ldac_apply_pending_tuning() (removed above), which fired
+    // before the library had adopted anything. Only write the volatile
+    // cache when the value actually changed, to keep this common-path
+    // encode call (~100/s) cheap on the no-op case. s_ldac_current_kbps
+    // is `volatile` and read cross-core by a2dp.c's
+    // pl_a2dp_poll_ldac_bitrate/pl_codec_ldac_current_kbps -- plain
+    // 32-bit-aligned access is atomic on Cortex-M33 (same doctrine as
+    // s_ldac_applied_rung above), so no additional barrier is needed.
+    int live_kbps = ldacBT_get_bitrate(enc->handle);
+    if (live_kbps > 0 && (uint32_t)live_kbps != s_ldac_current_kbps) {
+        s_ldac_current_kbps = (uint32_t)live_kbps;
     }
 
     return (pl_codec_encode_result_t){
