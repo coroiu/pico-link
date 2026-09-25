@@ -630,7 +630,7 @@ int main(void) {
         pl_wdt_mark(PL_WDT_CP_DEBUG_REMOTE);
         uint64_t debug_remote_start_us = time_us_64();
         PlIntent debug_intents[4];
-        size_t debug_n = pl_debug_remote_poll(debug_intents, 4);
+        size_t debug_n = pl_debug_remote_poll(ui, debug_intents, 4);
         if (debug_n > 0) {
             pl_ui_input(ui, debug_intents, debug_n);
         }

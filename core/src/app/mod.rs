@@ -19,7 +19,26 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::input::NavIntent;
 use crate::audio::{AbrFloor, CushionPolicy};
-use crate::dsp::{Preset, Program, PresetStore};
+use crate::dsp::{EqApoError, EqApoOverride, EqApoSession, Preset, Program, PresetStore};
+
+/// What can go wrong dispatching one `EQ BEGIN`/`EQ <line>`/`EQ END`
+/// console command against [`App`]'s session state -- a thin wrapper
+/// around [`crate::dsp::EqApoError`]/[`crate::dsp::EqApoLineError`] that
+/// adds the one failure mode the parser itself can't see:
+/// [`Self::NotInSession`], a command arriving with no `EQ BEGIN` open (or
+/// one already consumed by a prior `EQ END`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugEqCommandError {
+    /// `EQ <line>` or `EQ END` arrived with no in-progress session.
+    NotInSession,
+    /// `EQ <line>` failed to parse -- see [`crate::dsp::EqApoLineError`]
+    /// for the line number this line was within the session.
+    Line(crate::dsp::EqApoLineError),
+    /// `EQ END` finished a session that had no `Preamp:` line
+    /// ([`EqApoError::MissingPreamp`]) or no enabled filters
+    /// ([`EqApoError::NoBands`]) -- session-wide, not one line's fault.
+    Finish(EqApoError),
+}
 use crate::power::DisplaySettings;
 use crate::render::home::build_home_screen;
 use crate::render::{FrameBuffer565, Instant, Navigator, RenderCtx};
@@ -214,6 +233,21 @@ pub struct App {
     /// ruling: "applies to the stream instantly, independent of the
     /// save").
     editor_preview: Rc<RefCell<Option<(Preset, bool)>>>,
+    /// In-progress `EQ BEGIN` .. `EQ END` console session (bead
+    /// `pico-link-ryw.11`), or `None` between sessions. Plain field, not
+    /// `Rc<RefCell<_>>` like `editor_preview`/`editor_preset_id`: nothing
+    /// in the `Navigator`'s screen stack reads or writes this -- only
+    /// `ui-ffi`'s `pl_ui_debug_eq_command` reaches it, directly through
+    /// `&mut App`.
+    eq_import_session: Option<EqApoSession>,
+    /// The debug DSP override a finished `EQ END` session produced, if
+    /// any -- [`Self::dsp_program`] returns this AHEAD of the editor
+    /// preview and the connected device's assigned preset (bead
+    /// description: "returns first"). Non-persisted: cleared by `EQ OFF`
+    /// ([`Self::debug_eq_off`]) or a reboot (this field simply doesn't
+    /// exist across one). Survives Bluetooth connect/disconnect cycles
+    /// untouched -- nothing here folds on any [`Event`].
+    debug_dsp_override: Option<EqApoOverride>,
 }
 
 impl App {
@@ -263,6 +297,8 @@ impl App {
             presets,
             editor_preset_id,
             editor_preview,
+            eq_import_session: None,
+            debug_dsp_override: None,
         }
     }
 
@@ -413,6 +449,15 @@ impl App {
     /// "assigned to a since-deleted preset," same as
     /// [`crate::dsp::PresetStore::resolve`]'s own doc comment.
     ///
+    /// Bead `pico-link-ryw.11` adds a debug override AHEAD of everything
+    /// below: if `EQ END` has produced an [`EqApoOverride`] (and it
+    /// hasn't since been cleared by `EQ OFF`/reboot), it wins
+    /// unconditionally -- even over an open DSP effects editor's live
+    /// preview. It is checked first and returned early, same "checked
+    /// first, returned early" shape the editor-preview paragraph below
+    /// already documents for its own precedence over the connected
+    /// device's stored assignment.
+    ///
     /// design sec 5.1 overrides this whole resolution while a DSP effects
     /// editor is open (bead `pico-link-ryw.7`, review fix): rule 1 (not
     /// bypassed) previews [`App::editor_preview`]'s draft; rule 2
@@ -423,6 +468,9 @@ impl App {
     /// whether the draft has been saved yet.
     #[must_use]
     pub fn dsp_program(&self, fs_hz: u32) -> Program {
+        if let Some(over) = self.debug_dsp_override.as_ref() {
+            return over.to_program(fs_hz);
+        }
         if let Some((draft, bypassed)) = self.editor_preview.borrow().as_ref() {
             return if *bypassed { Program::off(fs_hz) } else { Program::from_preset(draft, fs_hz) };
         }
@@ -436,6 +484,55 @@ impl App {
             Some(preset) => Program::from_preset(preset, fs_hz),
             None => Program::off(fs_hz),
         }
+    }
+
+    /// `EQ BEGIN`: starts a fresh [`EqApoSession`], discarding any
+    /// in-progress (never-`END`ed) one. Does NOT touch
+    /// [`Self::debug_dsp_override`] -- the previously loaded override (if
+    /// any) keeps playing until this new session successfully reaches
+    /// `EQ END` (or `EQ OFF` clears it explicitly).
+    pub fn debug_eq_begin(&mut self) {
+        self.eq_import_session = Some(EqApoSession::new());
+    }
+
+    /// `EQ <line>`: feeds one Equalizer APO text line into the
+    /// in-progress session. [`DebugEqCommandError::NotInSession`] if `EQ
+    /// BEGIN` hasn't been called (or was already consumed by `EQ END`).
+    pub fn debug_eq_line(&mut self, line: &str) -> Result<(), DebugEqCommandError> {
+        let session = self.eq_import_session.as_mut().ok_or(DebugEqCommandError::NotInSession)?;
+        session.feed_line(line).map_err(DebugEqCommandError::Line)
+    }
+
+    /// `EQ END`: finishes the in-progress session and, on success,
+    /// installs its [`EqApoOverride`] as [`Self::debug_dsp_override`] --
+    /// the next [`Self::dsp_program`] call picks it up immediately.
+    /// [`DebugEqCommandError::NotInSession`] if `EQ BEGIN` hasn't been
+    /// called. Leaves the previous override in place on failure (a
+    /// malformed `EQ END` must not silently kill whatever was already
+    /// playing).
+    pub fn debug_eq_end(&mut self) -> Result<(), DebugEqCommandError> {
+        let session = self.eq_import_session.take().ok_or(DebugEqCommandError::NotInSession)?;
+        let doc = session.finish().map_err(DebugEqCommandError::Finish)?;
+        self.debug_dsp_override = Some(EqApoOverride::from_parsed(doc));
+        Ok(())
+    }
+
+    /// `EQ OFF`: drops any in-progress session and clears
+    /// [`Self::debug_dsp_override`] -- [`Self::dsp_program`] falls back to
+    /// whatever it would have resolved to otherwise (the open editor's
+    /// preview, or the connected device's assigned preset). The only
+    /// other way the override clears is a reboot.
+    pub fn debug_eq_off(&mut self) {
+        self.eq_import_session = None;
+        self.debug_dsp_override = None;
+    }
+
+    /// The active override's band count and explicit preamp, for a debug
+    /// status line (`EQ STATUS`/the post-`EQ END` log line) -- `None` if
+    /// no override is currently active.
+    #[must_use]
+    pub fn debug_eq_override_info(&self) -> Option<(u8, f32)> {
+        self.debug_dsp_override.as_ref().map(|over| (over.band_count(), over.preamp_db()))
     }
 
     /// Drops any screen on the [`Navigator`]'s stack (and everything above

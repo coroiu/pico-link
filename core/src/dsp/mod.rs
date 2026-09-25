@@ -21,6 +21,7 @@
 //! future FFI layer can copy field-for-field.
 
 pub mod coeffs;
+pub mod eqapo;
 pub mod preset;
 pub mod store;
 
@@ -31,5 +32,6 @@ pub use coeffs::{
     auto_preamp_db, crossfeed_coeffs, rbj_high_shelf, rbj_low_shelf, rbj_peaking, Biquad, CrossfeedCoeffs, Program,
     MAX_BOOST_HEADROOM_DB, MIN_BOOST_HEADROOM_DB,
 };
+pub use eqapo::{bw_oct_to_q, EqApoError, EqApoLineError, EqApoOverride, EqApoSession, ParsedDocument, ParsedFilter};
 pub use preset::{Band, BandKind, CrossfeedLevel, Preset, BLOB_LEN, MAX_BANDS, MAX_NAME_BYTES};
 pub use store::PresetStore;
