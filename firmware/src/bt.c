@@ -644,6 +644,10 @@ static void pl_bt_handle_inquiry_result(const uint8_t *packet) {
 // presence.
 static uint32_t s_scan_mode_changes;
 
+// Bead pico-link-pigd: count of inbound classic connection requests refused
+// by pl_bt_connection_filter (defined below, after pl_bt_scan_mode_changes).
+static uint32_t s_rejected_inbound_count;
+
 static bool pl_bt_any_acl_up(void) {
     btstack_linked_list_iterator_t it;
     hci_connections_get_iterator(&it);
@@ -686,6 +690,78 @@ bool pl_bt_scan_connectable(void) {
 
 uint32_t pl_bt_scan_mode_changes(void) {
     return s_scan_mode_changes;
+}
+
+// --- pico-link-pigd: refuse inbound classic connections from unpaired devices ---
+//
+// Follow-up to pico-link-oevr's Q2 (Ada's DESIGN comment there). We are an
+// A2DP SOURCE: the only legitimate inbound classic connection is
+// already-paired headphones re-paging us after a link loss (a2dp.c's
+// 0x0b-retry path documents this). Everything else that pages us -- a
+// stranger, or the Mac that paired with us on 2026-09-24 while we were
+// briefly discoverable (pico-link-oevr's Q3 already turns discoverable off
+// permanently, but an address that already knows us doesn't need inquiry to
+// find us again) -- should never get past the connection request.
+//
+// gap_register_classic_connection_filter's callback (hci.c:3798-3803) fires
+// synchronously from HCI_EVENT_CONNECTION_REQUEST handling, BEFORE
+// create_connection_for_bd_addr_and_type allocates an hci_connection_t and
+// before any SSP/pairing exchange starts. Returning 0 makes hci.c decline
+// with ERROR_CODE_CONNECTION_REJECTED_DUE_TO_SECURITY_REASONS and `return`
+// out of the case (packet[11] link_type covers both HCI_LINK_TYPE_ACL and
+// SCO/eSCO -- an SCO request only ever follows an ACL from the same address,
+// which this same filter already vetted, so applying the same known-device
+// check to every link_type is correct, not just harmless). This is THE ONLY
+// call site gap_classic_accept_callback has in vendored BTstack (grepped
+// hci.c) -- it cannot fire for anything else:
+//   - outbound connects (pl_bt_connect, the pairing wizard's paging): this
+//     device is the one calling hci_send_cmd(&hci_create_connection), never
+//     the one receiving CONNECTION_REQUEST.
+//   - GAP_EVENT_INQUIRY_RESULT / inquiry: a completely different HCI event,
+//     handled by pl_bt_handle_inquiry_result above; this filter never runs
+//     for it.
+//   - the pairing wizard in general: pairing with a FRESH device is always
+//     us paging out (see pico-link-oevr's Q2 note "Pairing wizard:
+//     unaffected. Pairing is outbound").
+//
+// "Known" is decided against BOTH our persisted device store (persist.c,
+// the source of truth for what pico-link's UI calls "paired" -- Settings'
+// Forget action removes a device from here) AND BTstack's own link key DB.
+// Requiring both, not either, closes the one disagreement that matters:
+// pl_persist_forget_device already deletes the BTstack link key in the same
+// call (persist.c:976-982, "forgetting removes the link key too"), so in
+// steady state the two never disagree -- but if they ever did (a forgotten
+// device whose link key somehow survived in the TLV, or a link key that was
+// never actually completed for a record we still hold), accepting the
+// re-page would mean re-pairing (or resuming a session) with a device our
+// own UI says we don't trust, which is exactly the hole this bead exists to
+// close. So either side saying "not known" rejects -- there is no
+// legitimate case where a device should connect that our persisted store
+// doesn't also recognise.
+static int pl_bt_connection_filter(bd_addr_t addr, hci_link_type_t link_type) {
+    uint8_t codec_id, ldac_quality;
+    bool known_to_persist = pl_persist_get_device_settings(addr, &codec_id, &ldac_quality);
+
+    link_key_t link_key;
+    link_key_type_t link_key_type;
+    bool has_link_key = gap_get_link_key_for_bd_addr(addr, link_key, &link_key_type);
+
+    if (known_to_persist && has_link_key) {
+        return 1;
+    }
+
+    s_rejected_inbound_count++;
+    pl_log(
+        "BT: refused inbound connection from %02x:%02x:%02x:%02x:%02x:%02x link_type=%u -- "
+        "known_to_persist=%d has_link_key=%d (not a paired device)\r\n",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], (unsigned)link_type, (int)known_to_persist,
+        (int)has_link_key
+    );
+    return 0;
+}
+
+uint32_t pl_bt_rejected_inbound_count(void) {
+    return s_rejected_inbound_count;
 }
 
 static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -1132,6 +1208,14 @@ void pl_bt_init(struct PlUi *ui) {
     // waiting for HCI_STATE_WORKING) is what actually reaches the
     // controller once the stack comes up.
     pl_bt_update_scan_mode();
+
+    // Bead pico-link-pigd: registered once, at init, same as every other
+    // classic GAP callback in this function -- gap_register_classic_
+    // connection_filter just stores a function pointer (hci.c:9740), no
+    // ordering dependency on hci_power_control like pl_a2dp_init's service
+    // registration has, but init is still the natural single place every
+    // other one-time HCI callback in this file lives.
+    gap_register_classic_connection_filter(&pl_bt_connection_filter);
 
     pl_log("BT: powering on HCI (async -- BTSTACK_EVENT_STATE/HCI_STATE_WORKING follows)\r\n");
     hci_power_control(HCI_POWER_ON);
