@@ -102,6 +102,7 @@ use crate::platform::Instant;
 use super::ctx::RenderCtx;
 use super::framebuffer::FrameBuffer565;
 use super::hero::{BitrateStatus, CodecStatus, HeroStatusView, HeroVolume, HeroVolumeSource, OutLevelDisplay};
+use super::list::ListItemKey;
 use super::menu::{MenuItem, MenuList};
 use super::message::MessageView;
 use super::paint_key::PaintKey;
@@ -154,6 +155,7 @@ pub(crate) fn build_home_screen(
     presets: &Rc<RefCell<PresetStore>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
     editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
+    import_focus: &Rc<RefCell<Option<ListItemKey>>>,
 ) -> Screen {
     let view = HomeView::new(
         model,
@@ -167,6 +169,7 @@ pub(crate) fn build_home_screen(
         presets,
         editor_preset_id,
         editor_preview,
+        import_focus,
     );
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
@@ -379,6 +382,7 @@ impl HomeView {
         presets: &Rc<RefCell<PresetStore>>,
         editor_preset_id: &Rc<RefCell<Option<u16>>>,
         editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
+        import_focus: &Rc<RefCell<Option<ListItemKey>>>,
     ) -> Self {
         let (hero, link_state, discovering, connecting, connected_addr, fault_log) = {
             let snapshot = model.borrow();
@@ -406,6 +410,7 @@ impl HomeView {
         let commands_for_effects = Rc::clone(commands);
         let editor_preset_id_for_effects = Rc::clone(editor_preset_id);
         let editor_preview_for_effects = Rc::clone(editor_preview);
+        let import_focus_for_effects = Rc::clone(import_focus);
         let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Effects"), MenuItem::new("Settings")]).on_activate_index(
             // `Verb::Open`: both rows push a deeper screen and draw a
             // caret (design section 4's assignment table -- Home menu's A
@@ -432,7 +437,10 @@ impl HomeView {
                     let commands = Rc::clone(&commands_for_effects);
                     let editor_preset_id = Rc::clone(&editor_preset_id_for_effects);
                     let editor_preview = Rc::clone(&editor_preview_for_effects);
-                    Action::PushView(Box::new(move || build_effects_list_screen(&model, &presets, &commands, &editor_preset_id, &editor_preview)))
+                    let import_focus = Rc::clone(&import_focus_for_effects);
+                    Action::PushView(Box::new(move || {
+                        build_effects_list_screen(&model, &presets, &commands, &editor_preset_id, &editor_preview, &import_focus)
+                    }))
                 }
                 MENU_ROW_SETTINGS => {
                     let display_settings = Rc::clone(&display_settings_for_settings_row);
@@ -842,9 +850,10 @@ mod tests {
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
+        let import_focus = Rc::new(RefCell::new(None));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id, &editor_preview,
+            &editor_preset_id, &editor_preview, &import_focus,
         )
     }
 
@@ -863,9 +872,10 @@ mod tests {
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
+        let import_focus = Rc::new(RefCell::new(None));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id, &editor_preview,
+            &editor_preset_id, &editor_preview, &import_focus,
         )
     }
 
@@ -998,9 +1008,10 @@ mod tests {
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
+        let import_focus = Rc::new(RefCell::new(None));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id, &editor_preview,
+            &editor_preset_id, &editor_preview, &import_focus,
         )
     }
 

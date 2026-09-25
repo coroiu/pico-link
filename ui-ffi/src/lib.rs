@@ -3315,6 +3315,170 @@ pub unsafe extern "C" fn pl_ui_debug_eq_status(ui: *mut PlUi, out_band_count: *m
     true
 }
 
+// --- Bead pico-link-ryw.12.4: whole-document preset import ---
+//
+// `firmware/src/*` (bead `pico-link-ryw.12.5`, built in parallel) owns ITF 6
+// ("Pico Link Config")'s `IMPORT_PRESET` control transfer: it copies the
+// host's `{name, APO text}` payload into a static buffer and, once the
+// superloop sees the pending flag, calls `pl_ui_import_preset` below --
+// currently routed through `pl_ui_debug_eq_command` as a placeholder single
+// seam, per `pico-link-ryw.12`'s design sec 5's ordering ("Deps: 4 (FFI
+// signature)"); ryw.12.5 switches that one call site to this function once
+// it lands.
+
+/// [`pl_ui_import_preset`]'s outcome -- mirrors
+/// [`pico_link_core::dsp::ImportOutcome`] plus a negative-`code` error path,
+/// the same "`code == 0` success, `code < 0` failure" shape
+/// [`PlEqCommandResult`] already uses for the debug EQ console.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlImportResult {
+    /// `0` on success (`Created`/`Replaced`/`Renamed`, distinguished by
+    /// [`Self::outcome`]), negative on failure -- see the `match` arms in
+    /// [`import_error_result`] for the exact mapping.
+    pub code: i32,
+    /// Valid only when `code == 0`: `0` = `Created`, `1` = `Replaced`,
+    /// `2` = `Renamed` (see [`pico_link_core::dsp::ImportOutcome`]).
+    pub outcome: u8,
+    /// Valid only when `code == 0` -- the imported/updated preset's id
+    /// (the same id a `Command::SavePreset`/`Event::PresetLoaded` round
+    /// trip resolves to).
+    pub preset_id: u16,
+    /// The 1-based source line a parse failure occurred at
+    /// ([`pico_link_core::dsp::ImportError::Line`]), else `0` -- same
+    /// "`0` if not applicable" convention [`PlEqCommandResult::line`]
+    /// already uses.
+    pub line: u32,
+    /// The 1-based `Filter N:` band index a range-check failure names
+    /// ([`GainOutOfRange`](pico_link_core::dsp::ImportError::GainOutOfRange)/
+    /// [`FreqOutOfRange`](pico_link_core::dsp::ImportError::FreqOutOfRange)/
+    /// [`QOutOfRange`](pico_link_core::dsp::ImportError::QOutOfRange)),
+    /// else `0` (a preamp range failure has no band index, same as a
+    /// parse failure).
+    pub band_index: u32,
+    /// The offending value a range-check failure carries (a gain in dB,
+    /// a frequency in Hz, a Q, or a preamp in dB, depending on which
+    /// `ImportError` variant `code` maps to), else `0.0`.
+    pub value: f32,
+}
+
+impl PlImportResult {
+    const NULL_OR_INVALID_UTF8: Self = Self { code: -1, outcome: 0, preset_id: 0, line: 0, band_index: 0, value: 0.0 };
+
+    fn success(preset_id: u16, outcome: pico_link_core::dsp::ImportOutcome) -> Self {
+        use pico_link_core::dsp::ImportOutcome::{Created, Renamed, Replaced};
+        let outcome = match outcome {
+            Created => 0,
+            Replaced => 1,
+            Renamed => 2,
+        };
+        Self { code: 0, outcome, preset_id, line: 0, band_index: 0, value: 0.0 }
+    }
+}
+
+/// Maps an [`pico_link_core::dsp::ImportError`] to a [`PlImportResult`]'s
+/// error shape. Negative codes `-2`..`-9` reuse [`eq_apo_error_code`]/
+/// [`PlEqCommandResult`]'s own scheme where an [`ImportError`] wraps the
+/// same underlying [`pico_link_core::dsp::EqApoError`] (`Line`/`Session`) --
+/// one parse-error vocabulary, not two independently-numbered ones. `-10`
+/// onward are this bead's own range-check/store-full codes, which
+/// `pl_ui_debug_eq_command`'s console path can never produce (the debug
+/// console has no `to_preset` limits check -- `pico-link-ryw.11`'s module
+/// doc).
+fn import_error_result(e: pico_link_core::dsp::ImportError) -> PlImportResult {
+    use pico_link_core::dsp::ImportError::{
+        FreqOutOfRange, GainOutOfRange, Line, PreampOutOfRange, QOutOfRange, Session, StoreFull,
+    };
+    match e {
+        Line(line_err) => {
+            // Same "always tiny" reasoning `debug_eq_command_error_result`
+            // already documents for this exact cast.
+            #[allow(clippy::cast_possible_truncation)]
+            let line = line_err.line as u32;
+            PlImportResult { code: eq_apo_error_code(line_err.error), outcome: 0, preset_id: 0, line, band_index: 0, value: 0.0 }
+        }
+        Session(error) => PlImportResult { code: eq_apo_error_code(error), outcome: 0, preset_id: 0, line: 0, band_index: 0, value: 0.0 },
+        GainOutOfRange { band_index, gain_db } => {
+            PlImportResult { code: -10, outcome: 0, preset_id: 0, line: 0, band_index: band_index as u32, value: gain_db }
+        }
+        FreqOutOfRange { band_index, freq_hz } => {
+            PlImportResult { code: -11, outcome: 0, preset_id: 0, line: 0, band_index: band_index as u32, value: freq_hz }
+        }
+        QOutOfRange { band_index, q } => {
+            PlImportResult { code: -12, outcome: 0, preset_id: 0, line: 0, band_index: band_index as u32, value: q }
+        }
+        PreampOutOfRange { preamp_db } => {
+            PlImportResult { code: -13, outcome: 0, preset_id: 0, line: 0, band_index: 0, value: preamp_db }
+        }
+        StoreFull => PlImportResult { code: -14, outcome: 0, preset_id: 0, line: 0, band_index: 0, value: 0.0 },
+    }
+}
+
+/// Imports a whole Equalizer APO / `AutoEQ` document (`text`, `text_len`
+/// bytes, need not be NUL-terminated) against `ui`'s [`App`], naming it
+/// `name` (`name_len` bytes) if the document itself has no `Name:` line --
+/// [`pico_link_core::app::App::import_preset`] does the actual parse +
+/// convert + place-in-store work (see its own doc comment for the full
+/// replace/suffix/reject duplicate-name policy). On success, queues
+/// exactly one `Command::SavePreset` IMMEDIATELY (Andreas's ruling: no
+/// on-device confirm) -- the caller's next [`pl_ui_poll_command`] call
+/// drains it, same as every other queued command.
+///
+/// Returns [`PlImportResult::NULL_OR_INVALID_UTF8`] (`code == -1`) if
+/// `ui`/`text` is null, `text` isn't valid UTF-8, or `name` is non-null
+/// but isn't valid UTF-8, without touching `ui`'s state. A null `name`
+/// with `name_len == 0` is accepted as an empty fallback name (only ever
+/// used if the document also has no `Name:` line, in which case
+/// `crate::dsp::import`'s name resolution falls through to an empty
+/// string -- the same "never partially mutates on an error path"
+/// discipline applies, but an empty resolved name is not itself an error
+/// this function rejects; that is `core`'s call, not this FFI seam's).
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `text`, if non-null, must point to at least `text_len`
+/// valid, readable bytes for the duration of this call; `name`, if
+/// non-null, must point to at least `name_len` valid, readable bytes for
+/// the duration of this call. Neither is retained past the call.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_import_preset(
+    ui: *mut PlUi,
+    text: *const u8,
+    text_len: usize,
+    name: *const u8,
+    name_len: usize,
+) -> PlImportResult {
+    if ui.is_null() || text.is_null() {
+        return PlImportResult::NULL_OR_INVALID_UTF8;
+    }
+    // SAFETY: caller contract above -- `ui` is a live `pl_ui_create`
+    // pointer, `text` points to `text_len` valid bytes for this call's
+    // duration.
+    let ui = unsafe { &mut *ui };
+    let text_bytes = unsafe { core::slice::from_raw_parts(text, text_len) };
+    let Ok(text) = core::str::from_utf8(text_bytes) else {
+        return PlImportResult::NULL_OR_INVALID_UTF8;
+    };
+
+    let host_name = if name.is_null() {
+        ""
+    } else {
+        // SAFETY: caller contract above -- `name` points to `name_len`
+        // valid bytes for this call's duration.
+        let name_bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(host_name) = core::str::from_utf8(name_bytes) else {
+            return PlImportResult::NULL_OR_INVALID_UTF8;
+        };
+        host_name
+    };
+
+    match ui.app.import_preset(text, host_name) {
+        Ok((preset_id, outcome)) => PlImportResult::success(preset_id, outcome),
+        Err(e) => import_error_result(e),
+    }
+}
+
 // --- Tests: pico-link-ptu, checked tag conversion ---
 //
 // Host-only (`#[cfg(test)]`, run via `cargo test -p ui-ffi` -- this crate is
@@ -5178,6 +5342,112 @@ mod tests {
             assert_eq!(result.code, -1);
 
             assert!(!pl_ui_debug_eq_status(core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut()));
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    // --- Tests: pico-link-ryw.12.4, pl_ui_import_preset ---
+
+    /// Andreas's real WH-1000XM3 EQ APO curve -- `tests/fixtures/xm3-
+    /// preset.txt`, the same 10-band/1-preamp text
+    /// `dsp::import::tests::XM3_PRESET` already round-trips at the `core`
+    /// layer; this bead's tests exercise it through the real FFI entry
+    /// point instead.
+    const XM3_TEXT: &str = include_str!("../tests/fixtures/xm3-preset.txt");
+
+    #[test]
+    fn pl_ui_import_preset_the_xm3_file_returns_created_and_queues_exactly_one_save_preset() {
+        let ui = new_ui();
+        unsafe {
+            let name = "XM3 Harman";
+            let result = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
+            assert_eq!(result.code, 0, "the XM3 file must import cleanly");
+            assert_eq!(result.outcome, 0, "a brand-new name must report Created");
+            assert_ne!(result.preset_id, 0, "a real preset id must be allocated");
+
+            let command = pl_ui_poll_command(ui);
+            assert_eq!(command.tag as u32, PlCommandTag::SavePreset as u32, "import must queue exactly one SavePreset");
+            assert_eq!(command.payload.save_preset.preset_id, result.preset_id);
+
+            let next = pl_ui_poll_command(ui);
+            assert_eq!(next.tag as u32, PlCommandTag::None as u32, "import must queue EXACTLY one command, not more");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Re-importing the same (unsuffixed-collision) name reports
+    /// `Replaced` with the SAME id -- `dsp::import`'s replace-in-place
+    /// policy, proven here through the real FFI round trip rather than
+    /// just `core`'s own unit test.
+    #[test]
+    fn pl_ui_import_preset_re_import_returns_replaced_with_the_same_id() {
+        let ui = new_ui();
+        unsafe {
+            let name = "XM3 Harman";
+            let first = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
+            assert_eq!(first.code, 0);
+            assert_eq!(first.outcome, 0, "Created");
+            let _ = pl_ui_poll_command(ui); // drain the first SavePreset
+
+            let second = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
+            assert_eq!(second.code, 0);
+            assert_eq!(second.outcome, 1, "a same-name re-import of an imported effect must report Replaced");
+            assert_eq!(second.preset_id, first.preset_id, "a replace must keep the same id");
+
+            let command = pl_ui_poll_command(ui);
+            assert_eq!(command.tag as u32, PlCommandTag::SavePreset as u32, "a replace must ALSO queue a SavePreset");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// A full store (8 differently-named hand-made effects already
+    /// occupying every slot) rejects a genuinely new imported name with
+    /// `ImportError::StoreFull` (`code == -14`), and queues nothing.
+    #[test]
+    fn pl_ui_import_preset_a_full_store_returns_the_error() {
+        let ui = new_ui();
+        unsafe {
+            // Fill the 8-slot store via 8 real imports under 8 distinct
+            // names -- the FFI surface has no other way to seed the
+            // store, and each import is itself proven to succeed above.
+            for i in 0..8 {
+                let name = alloc::format!("Hand {i}");
+                let result = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
+                assert_eq!(result.code, 0, "seeding import {i} must succeed");
+                let _ = pl_ui_poll_command(ui); // drain each seeding SavePreset
+            }
+
+            let name = "One Too Many";
+            let result = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
+            assert_eq!(result.code, -14, "a full store must reject a new name with StoreFull's code");
+
+            let command = pl_ui_poll_command(ui);
+            assert_eq!(command.tag as u32, PlCommandTag::None as u32, "a rejected import must queue nothing");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_import_preset_null_or_invalid_utf8_reports_code_negative_one_without_touching_state() {
+        let ui = new_ui();
+        unsafe {
+            let name = "X";
+            let result = pl_ui_import_preset(core::ptr::null_mut(), XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
+            assert_eq!(result.code, -1);
+
+            let result = pl_ui_import_preset(ui, core::ptr::null(), 0, name.as_ptr(), name.len());
+            assert_eq!(result.code, -1);
+
+            let invalid_utf8: &[u8] = &[0xFF, 0xFE];
+            let result = pl_ui_import_preset(ui, invalid_utf8.as_ptr(), invalid_utf8.len(), name.as_ptr(), name.len());
+            assert_eq!(result.code, -1);
+
+            let command = pl_ui_poll_command(ui);
+            assert_eq!(command.tag as u32, PlCommandTag::None as u32, "a rejected/null import must queue nothing");
 
             pl_ui_destroy(ui);
         }

@@ -19,7 +19,8 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::input::NavIntent;
 use crate::audio::{AbrFloor, CushionPolicy};
-use crate::dsp::{EqApoError, EqApoOverride, EqApoSession, Preset, Program, PresetStore};
+use crate::dsp::{import_preset, EqApoError, EqApoOverride, EqApoSession, ImportError, ImportOutcome, Preset, Program, PresetStore};
+use crate::render::ListItemKey;
 
 /// What can go wrong dispatching one `EQ BEGIN`/`EQ <line>`/`EQ END`
 /// console command against [`App`]'s session state -- a thin wrapper
@@ -240,6 +241,19 @@ pub struct App {
     /// `ui-ffi`'s `pl_ui_debug_eq_command` reaches it, directly through
     /// `&mut App`.
     eq_import_session: Option<EqApoSession>,
+    /// The effects list's one-shot "focus this row" mailbox -- bead
+    /// `pico-link-ryw.12.4`, Uma's design (`ryw12-3-ux.md` sec 2): "move
+    /// FOCUS to the new/updated row." Same `Rc<RefCell<_>>`-mailbox shape
+    /// [`Self::editor_preview`]/[`Self::wizard_phase`] use for the same
+    /// "a pushed screen buried in the `Navigator`'s stack has no other
+    /// path back from `App`" reason. Set by [`Self::import_preset`] on a
+    /// successful import; consumed (and cleared) by
+    /// `EffectsListView::sync`'s [`crate::render::FieldList::focus_key`]
+    /// call the next time the effects list screen is on top and syncs --
+    /// a stale target left behind (the list screen was never open) is
+    /// simply never consumed, matching Uma's "anywhere else: nothing on
+    /// screen" rule.
+    import_focus: Rc<RefCell<Option<ListItemKey>>>,
     /// The debug DSP override a finished `EQ END` session produced, if
     /// any -- [`Self::dsp_program`] returns this AHEAD of the editor
     /// preview and the connected device's assigned preset (bead
@@ -268,6 +282,7 @@ impl App {
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
+        let import_focus = Rc::new(RefCell::new(None));
         let navigator = Navigator::new(build_home_screen(
             &model,
             &home_face,
@@ -280,6 +295,7 @@ impl App {
             &presets,
             &editor_preset_id,
             &editor_preview,
+            &import_focus,
         ));
         Self {
             navigator,
@@ -299,6 +315,7 @@ impl App {
             editor_preview,
             eq_import_session: None,
             debug_dsp_override: None,
+            import_focus,
         }
     }
 
@@ -533,6 +550,55 @@ impl App {
     #[must_use]
     pub fn debug_eq_override_info(&self) -> Option<(u8, f32)> {
         self.debug_dsp_override.as_ref().map(|over| (over.band_count(), over.preamp_db()))
+    }
+
+    /// Imports a whole Equalizer APO / `AutoEQ` document over the ITF-6
+    /// config transport (bead `pico-link-ryw.12.4`, `crate::dsp::import`)
+    /// -- distinct from [`Self::debug_eq_begin`]/[`Self::debug_eq_line`]/
+    /// [`Self::debug_eq_end`]'s line-at-a-time debug console session: this
+    /// is one whole-document call. `host_name` is the host-resolved
+    /// fallback name (used only when `text` has no `Name:` line) -- see
+    /// [`crate::dsp::import`]'s module doc for the full replace/suffix/
+    /// reject duplicate-name policy this defers to.
+    ///
+    /// On success, queues exactly one [`Command::SavePreset`] IMMEDIATELY
+    /// -- Andreas's ruling (`pico-link-ryw.12.2`'s review comment,
+    /// restated on this bead): there is no on-device confirm, so
+    /// `crate::dsp::import::import`'s in-memory-only mutation must be
+    /// followed by a save in the SAME call, not deferred to a later user
+    /// press. Also arms [`Self::import_focus`] with the resulting row's
+    /// key, but ONLY while the effects list screen is currently on top of
+    /// the navigator's stack (Uma's design, `ryw12-3-ux.md` sec 2:
+    /// "Effects list on top: ... move FOCUS to the new/updated row.
+    /// Anywhere else: nothing on screen") -- `EffectsListView::sync`
+    /// consumes it the next time that screen syncs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`ImportError`] encountered, without touching
+    /// [`Self::presets`] or queuing any [`Command`] -- see
+    /// [`crate::dsp::import::import`]'s own doc comment for the exact
+    /// "never partially mutates on an error path" guarantee this forwards.
+    pub fn import_preset(&mut self, text: &str, host_name: &str) -> Result<(u16, ImportOutcome), ImportError> {
+        let outcome = {
+            let mut presets = self.presets.borrow_mut();
+            import_preset(&mut presets, text, host_name)
+        }?;
+        let (id, _) = outcome;
+
+        let blob = self.presets.borrow().get(id).map(Preset::to_wire);
+        if let Some(blob) = blob {
+            self.commands.borrow_mut().push_back(Command::SavePreset { preset_id: id, blob: blob.to_vec() });
+        }
+
+        let effects_list_on_top = self.navigator.depth() > 0
+            && self.navigator.id_at(self.navigator.depth() - 1) == Some(ScreenId::EffectsList);
+        if effects_list_on_top {
+            *self.import_focus.borrow_mut() = Some(screens::effects::effect_row_key(id));
+        }
+
+        self.mark_model_changed();
+        Ok(outcome)
     }
 
     /// Drops any screen on the [`Navigator`]'s stack (and everything above

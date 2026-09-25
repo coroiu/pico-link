@@ -133,6 +133,13 @@ pub enum ValueFont {
     /// [`font::label`] (`helvB08`) — the small face a dense value (e.g.
     /// a Bluetooth address) needs to fit its column.
     Small,
+    /// [`font::username`] (`helvR10`) -- bead `pico-link-ryw.12.4`'s
+    /// imported-preset band rows' last-resort width degrade (Uma's
+    /// design, `ryw12-3-ux.md` sec 4: "then band values in
+    /// `font::username`"), one size down from [`Self::Normal`] but not as
+    /// small/bold as [`Self::Small`] (which is styled for a *label*, not
+    /// a dense numeric value row).
+    Compact,
 }
 
 impl ValueFont {
@@ -140,6 +147,7 @@ impl ValueFont {
         match self {
             ValueFont::Normal => font::value(),
             ValueFont::Small => font::label(),
+            ValueFont::Compact => font::username(),
         }
     }
 }
@@ -158,6 +166,11 @@ pub struct FieldRow {
     value_color: Rgb565,
     value_font: ValueFont,
     leading: Option<char>,
+    /// Bead `pico-link-ryw.12.4`: an imported effect's row (the effects
+    /// list, the device-page effect picker) draws a padlock right after
+    /// its (ellipsis-truncated-if-needed) label -- see
+    /// [`Self::with_lock`].
+    locked: bool,
     /// The A-rail verb for this row when it's a [`FieldKind::Action`]
     /// row and focused (e.g. `Verb::Pair`, or an exception word for
     /// "forget"). `None` defaults to [`Verb::Open`] -- see
@@ -176,6 +189,7 @@ impl FieldRow {
             value_color: palette::TEXT_PRIMARY,
             value_font: ValueFont::Normal,
             leading: None,
+            locked: false,
             verb: None,
             key: None,
         }
@@ -228,6 +242,26 @@ impl FieldRow {
     #[must_use]
     pub fn with_small_value(mut self) -> Self {
         self.value_font = ValueFont::Small;
+        self
+    }
+
+    /// Draws this row's trailing value in [`ValueFont::Compact`] --
+    /// bead `pico-link-ryw.12.4`'s last-resort band-row width degrade
+    /// (see [`ValueFont::Compact`]'s doc comment).
+    #[must_use]
+    pub fn with_compact_value(mut self) -> Self {
+        self.value_font = ValueFont::Compact;
+        self
+    }
+
+    /// Marks this row as an imported/locked effect -- draws a padlock
+    /// right after the label, ellipsis-truncating the label first rather
+    /// than letting the padlock (or a trailing value) clip. See
+    /// [`Self::locked`]'s doc comment and `menu::draw_row`'s `locked`
+    /// branch.
+    #[must_use]
+    pub fn with_lock(mut self) -> Self {
+        self.locked = true;
         self
     }
 
@@ -444,6 +478,22 @@ impl FieldList {
         self.rows.get(self.selected).and_then(|row| row.key)
     }
 
+    /// Moves the selection to the row carrying `key`, if one exists --
+    /// bead `pico-link-ryw.12.4`'s import-focus-follow (Uma's design,
+    /// `ryw12-3-ux.md` sec 2: "move FOCUS to the new/updated row"), a
+    /// one-shot programmatic jump distinct from [`Self::set_rows`]'s own
+    /// "preserve whatever was already selected" rule. Returns whether
+    /// `key` was found (a caller uses this to decide whether to keep
+    /// retrying on a later frame, e.g. before the row has appeared yet).
+    pub fn focus_key(&mut self, key: ListItemKey) -> bool {
+        if let Some(index) = self.rows.iter().position(|row| row.key == Some(key)) {
+            self.selected = index;
+            true
+        } else {
+            false
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.rows.is_empty() {
             return;
@@ -622,11 +672,13 @@ impl Widget for FieldList {
             key = key.fold(match row.value_font {
                 ValueFont::Normal => 0,
                 ValueFont::Small => 1,
+                ValueFont::Compact => 2,
             });
             key = key.fold(match row.leading {
                 Some(c) => u64::from(u32::from(c)) + 1,
                 None => 0,
             });
+            key = key.fold(u64::from(row.locked));
         }
         key
     }
@@ -680,6 +732,7 @@ impl Widget for FieldList {
                 row.leading,
                 &trailing,
                 selected,
+                row.locked,
             )?;
 
             // Value-row chevrons -- drawn on the FOCUSED value row only
