@@ -91,6 +91,17 @@
 //                        would emit to each peer via pl_prio.h's slot 4.
 //                        Emits nothing for real -- nothing reads the
 //                        outbound latches yet.
+//   DSPPROG <n>      -- bead pico-link-ryw.1, design .planning/design/
+//                        2026-09-25-dsp-effects-stage.md sec 1.4: loads
+//                        one of 4 canned DSP programs (0=Off,
+//                        1=crossfeed only, 2=10 peaking bands + crossfeed
+//                        (worst case), 3=+9dB low shelf clip test) into
+//                        dsp.c's core1 realtime kernel via
+//                        pl_dsp_debug_load_program(). Dispatched directly,
+//                        not a NavIntent -- same pattern as ABR FLOOR/LDAC
+//                        RUNG above. Exists to measure the DSP stage
+//                        (ryw.2's M0-M3 hardware gate) before any Rust
+//                        preset UI does.
 //   VOL HOSTUP [n]   -- pushes n (default 1, max 100) HID Consumer Volume
 //   VOL HOSTDOWN [n]    Increment/Decrement taps via media_keys.c's
 //                        already-proven ring, to measure whether it moves

@@ -308,6 +308,13 @@ add_executable(pico_link
     # (main.c), so it costs flash but changes no runtime behaviour when the
     # flag is off.
     src/ldac_bench.c
+    # Bead pico-link-ryw.1 (design .planning/design/2026-09-25-dsp-effects-
+    # stage.md sec 1-3): the DSP effects fixed-rate stage -- see dsp.h's
+    # module doc. Compiled unconditionally: the realtime kernel and bank
+    # handoff exist in every build (a program is simply never submitted in
+    # a shipping build until ryw.5/ryw.6 land); only the canned debug-
+    # program loader inside dsp.c is PL_DEBUG_REMOTE-gated.
+    src/dsp.c
 )
 
 if(PL_DEBUG_REMOTE)
@@ -523,6 +530,13 @@ target_compile_definitions(pico_link PRIVATE PL_FORCED_REPAINT_MS=${PL_FORCED_RE
 
 target_link_libraries(pico_link
     pico_stdlib
+    # Bead pico-link-ryw.1: dsp.c's pl_dsp_rt_core1_init() calls the CMSIS
+    # core intrinsics __get_FPSCR/__set_FPSCR (via RP2350.h) directly --
+    # nothing else in this codebase has needed CMSIS's own headers before
+    # (everything else goes through pico-sdk's hardware/regs/* wrappers),
+    # so this target needs an explicit dependency on the interface library
+    # that supplies RP2350.h's include path.
+    cmsis_core
     hardware_spi
     hardware_dma
     hardware_gpio
@@ -597,5 +611,18 @@ add_custom_command(TARGET pico_link POST_BUILD
         -DLDAC_ARCHIVE=$<TARGET_FILE:pl_ldac_enc>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_ldac_not_in_flash.cmake
     COMMENT "pico-link-nli.9: verifying libldac is not resident in flash"
+    VERBATIM
+)
+
+# Bead pico-link-ryw.1, design sec 1.2: sibling check for the DSP realtime
+# kernel -- see cmake/check_dsp_not_in_flash.cmake's own header comment
+# for why this needs no archive cross-reference the way the libldac check
+# does.
+add_custom_command(TARGET pico_link POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DELF_FILE=$<TARGET_FILE:pico_link>
+        -DNM=${CMAKE_NM}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_dsp_not_in_flash.cmake
+    COMMENT "pico-link-ryw.1: verifying the DSP realtime kernel is not resident in flash"
     VERBATIM
 )

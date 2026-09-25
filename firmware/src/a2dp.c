@@ -98,6 +98,7 @@
 #include "codec_ldac.h"
 #include "codec_sbc.h"
 #include "codec_table.h"
+#include "dsp.h"
 #include "hardware/sync.h" // __dmb() -- tx ring cross-core barriers, see s_ctx.tx doc comment
 #include "media_keys.h"
 #include "pcm_ring.h"
@@ -1613,6 +1614,12 @@ static void pl_a2dp_fill(void) {
         s_ctx.codec->apply_pending_tuning(s_ctx.codec->state);
     }
 
+    // Bead pico-link-ryw.1, design sec 1.2/3.3: the DSP program handoff's
+    // apply step, once per fill -- same decide/apply split and same
+    // encoder-owning-context safety argument as apply_pending_tuning
+    // above. Never blocks (dsp.h's doc comment on pl_dsp_rt_apply_pending).
+    pl_dsp_rt_apply_pending();
+
     uint16_t frame_bytes = s_ctx.frame.encoded_frame_bytes;
     uint16_t pcm_frame_count = s_ctx.frame.pcm_frames_per_encoded_frame;
     uint32_t pcm_bytes_needed = (uint32_t)pcm_frame_count * PL_PCM_FRAME_BYTES;
@@ -1784,29 +1791,50 @@ static void pl_a2dp_fill(void) {
             break;
         }
 
+        // Bead pico-link-ryw.1, design sec 1.2: t0 moved up here (was
+        // right before encode) so dwell_us's final delta covers the DSP
+        // stage too, not just encode -- see PL_DSP_WORST_CASE_US's doc
+        // comment on the quiesce _Static_assert below for why that
+        // honesty matters. pl_dsp_rt_process is in-place, int16 in and
+        // out, and is a structural no-op (bit-exact bypass) when no
+        // program is active.
+        uint64_t t0 = time_us_64();
+        pl_dsp_rt_process(s_pcm_scratch, pcm_frame_count);
+        uint64_t t_dsp = time_us_64();
+        pl_dsp_rt_record_time((uint32_t)(t_dsp - t0));
+
         // Bead pico-link-du0: fold this unit's PCM into the OUT-meter
-        // accumulator right where it's already sitting for encoding --
-        // before the encode call below, so this addition is never mixed
-        // into dwell_us/enc_max_us's own encode-cost accounting.
+        // accumulator right where it's already sitting for encoding.
+        // Bead pico-link-ryw.1: now reads POST-DSP (design sec 1.2's
+        // "should the meter read post-DSP" recommendation) -- this call
+        // moved below the pl_dsp_rt_process above, still before encode,
+        // so this addition is still never mixed into dwell_us/enc_max_us's
+        // own encode-cost accounting.
         pl_a2dp_accumulate_levels(s_pcm_scratch, pcm_frame_count);
 
-        uint64_t t0 = time_us_64();
         pl_codec_encode_result_t result = s_ctx.codec->encode(
             s_ctx.codec->state, s_pcm_scratch, &head->data[head->len], (uint16_t)(sizeof(head->data) - head->len)
         );
-        uint32_t dt = (uint32_t)(time_us_64() - t0);
-        if (dt > s_ctx.enc_max_us) {
-            s_ctx.enc_max_us = dt;
+        uint32_t dt_enc = (uint32_t)(time_us_64() - t_dsp);
+        if (dt_enc > s_ctx.enc_max_us) {
+            s_ctx.enc_max_us = dt_enc;
         }
         // Bead pico-link-nli.9 (P1): windowed sum/count/max for
         // pl_a2dp_report's enc_mean_us -- see the struct fields' doc
-        // comment for the producer/consumer discipline.
-        s_ctx.enc_sum_us += dt;
+        // comment for the producer/consumer discipline. Encode-only (dt_enc,
+        // not dt0), per design sec 1.3: "Keep enc_* encode-only, so the two
+        // costs stay separable."
+        s_ctx.enc_sum_us += dt_enc;
         s_ctx.enc_count++;
-        if (dt > s_ctx.enc_win_max_us) {
-            s_ctx.enc_win_max_us = dt;
+        if (dt_enc > s_ctx.enc_win_max_us) {
+            s_ctx.enc_win_max_us = dt_enc;
         }
-        dwell_us += dt;
+        // Bead pico-link-ryw.1, design sec 1.2/1.3: dwell_us's final delta
+        // is measured from t0 (before DSP), not t_dsp -- so this ONE
+        // increment already covers DSP + encode combined for this unit;
+        // adding dt_enc a second time here would double-count the encode
+        // portion.
+        dwell_us += (uint32_t)(time_us_64() - t0);
         if (dwell_us > s_ctx.dwell_max_us) {
             s_ctx.dwell_max_us = dwell_us;
         }
@@ -2437,11 +2465,18 @@ static volatile uint32_t s_enc_quiesce_timeouts;
 // more worst-case encode can still complete after the cap fires -- see
 // PL_A2DP_CORE1_FILL_BUDGET_US's own doc comment above.
 #define PL_A2DP_WORST_CASE_ENCODE_US_MAX 2000u
+// Bead pico-link-ryw.1, design sec 1.3: "The DSP MUST be added to
+// dwell_us. Otherwise a call's real duration exceeds what the quiesce
+// _Static_assert claims." dsp.h's PL_DSP_WORST_CASE_US (300) is that
+// term -- one more worst-case DSP block, same "checked only between
+// units" reasoning as PL_A2DP_WORST_CASE_ENCODE_US_MAX above (the
+// in-flight unit's DSP call can still be running when the 2ms cap trips
+// between units).
 _Static_assert(
-    PL_A2DP_CORE1_FILL_BUDGET_US + PL_A2DP_WORST_CASE_ENCODE_US_MAX < PL_A2DP_QUIESCE_TIMEOUT_US,
-    "PL_A2DP_CORE1_FILL_BUDGET_US plus one more worst-case encode call must stay under "
-    "PL_A2DP_QUIESCE_TIMEOUT_US, or core0's quiesce handshake can time out against a fill() "
-    "call that is still legitimately finishing, not a wedged core1"
+    PL_A2DP_CORE1_FILL_BUDGET_US + PL_A2DP_WORST_CASE_ENCODE_US_MAX + PL_DSP_WORST_CASE_US < PL_A2DP_QUIESCE_TIMEOUT_US,
+    "PL_A2DP_CORE1_FILL_BUDGET_US plus one more worst-case encode call plus one more worst-case "
+    "DSP block must stay under PL_A2DP_QUIESCE_TIMEOUT_US, or core0's quiesce handshake can time "
+    "out against a fill() call that is still legitimately finishing, not a wedged core1"
 );
 
 // core1's own credit-clock tick source (design sec 4.1 change 1): a
@@ -2468,6 +2503,10 @@ static bool s_enc_was_running;
 // boot and never reset).
 static void pl_a2dp_core1_entry(void) {
     pl_flash_lockout_core1_init();
+    // Bead pico-link-ryw.1, design sec 1.2: FPSCR.FZ, once, before this
+    // core ever runs the DSP kernel -- see pl_dsp_rt_core1_init's doc
+    // comment.
+    pl_dsp_rt_core1_init();
     s_enc_last_tick_us = time_us_64();
 
     for (;;) {
@@ -2570,6 +2609,10 @@ static void pl_a2dp_core1_entry(void) {
         bool entering_running = !s_enc_was_running;
         s_enc_was_running = true;
         if (entering_running) {
+            // Bead pico-link-ryw.1, design sec 1.2: "zeroed on the
+            // entering-RUNNING edge" -- covers both a fresh stream start
+            // and a resume, same edge as the clock reset just below.
+            pl_dsp_rt_reset_state();
             s_enc_last_tick_us = now;
         } else {
             uint32_t elapsed_us = (uint32_t)(now - s_enc_last_tick_us);
@@ -4396,6 +4439,20 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
         pl_log(
             "a2dp: enc_mean_us=%lu enc_win_max_us=%lu enc_count=%lu\r\n", (unsigned long)enc_mean_us,
             (unsigned long)enc_win_max_now, (unsigned long)enc_count_now
+        );
+    }
+    // Bead pico-link-ryw.1, design sec 1.3: "Add windowed dsp_mean_us,
+    // dsp_win_max_us and dsp_clip to pl_a2dp_report." Same
+    // read-resets-the-window discipline as the enc_* block above --
+    // pl_dsp_report_window() owns the snapshot-then-reset itself (dsp.c).
+    {
+        uint32_t dsp_mean_us = 0;
+        uint32_t dsp_win_max_us = 0;
+        uint32_t dsp_clip = 0;
+        pl_dsp_report_window(&dsp_mean_us, &dsp_win_max_us, &dsp_clip);
+        pl_log(
+            "a2dp: dsp_mean_us=%lu dsp_win_max_us=%lu dsp_clip=%lu\r\n", (unsigned long)dsp_mean_us,
+            (unsigned long)dsp_win_max_us, (unsigned long)dsp_clip
         );
     }
     // Cumulative, never reset -- compute deltas between two consecutive
