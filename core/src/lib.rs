@@ -55,6 +55,7 @@ extern crate alloc;
 
 pub mod app;
 pub mod audio;
+pub mod dsp;
 pub mod input;
 pub mod panel;
 pub mod platform;
