@@ -24,9 +24,9 @@
 // collision-impossible by construction (design point 1).
 //
 // TWO STORES, not one blob (design point 2, Andreas's constraint from
-// pico-link-ryw 2026-09-01): a future global preset store (PL_PERSIST_KIND_PRESET,
-// declared below but not yet implemented -- hardening, not MVP-blocking) and
-// per-device records that hold a preset id REFERENCE
+// pico-link-ryw 2026-09-01): a global preset store (PL_PERSIST_KIND_PRESET,
+// bead pico-link-ryw.6, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 2) and per-device records that hold a preset id REFERENCE
 // (pl_persist_device_record_t::preset_id), so forgetting a device never
 // destroys its EQ. Per-record tags, not one blob -- wear + CRC failure
 // isolation + no MRU-bump rewrite storm (design point 6).
@@ -151,8 +151,11 @@ uint8_t pl_persist_boot_device_count(void);
 // quality pick (0 = unset) from this record's slot mirror, same value
 // pl_persist_get_device_settings would return for this address -- needed
 // so bt.c's boot-restore PairedDeviceUpserted echo carries the real value
-// instead of silently zero-initialising it.
-void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq, uint8_t *out_ldac_quality);
+// instead of silently zero-initialising it. `out_preset_id` added by bead
+// pico-link-ryw.6, same reasoning: 0 or an id the preset store no longer
+// holds both mean Off, resolved by `core`, never by this module (design
+// `.planning/design/2026-09-25-dsp-effects-stage.md` sec 2.3).
+void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq, uint8_t *out_ldac_quality, uint16_t *out_preset_id);
 
 // Stages `addr` (and, optionally, `name`/`name_len`) to be persisted as the
 // last-used device -- called from bt.c's PL_COMMAND_TAG_PERSIST_DEVICE
@@ -229,30 +232,52 @@ void pl_persist_request_urgent_flush(void);
 // centralized.
 pl_persist_write_result_t pl_persist_execute_pending_write(void);
 
-// Bead pico-link-7jol.5, design `.planning/design/2026-09-07-ldac-quality-
-// selector.md` §5.2: stages a per-device SETTINGS write (today, only
-// `ldac_quality`) -- a SEPARATE staging slot from
-// pl_persist_request_save_device's pairing-write one above, deliberately:
-// mixing a settings pick into the pairing slot's settle/rate-limit timers
-// would delay a "no confirm, applies live" UI action behind unrelated
-// pairing-write debouncing it has no reason to inherit. Same short-
-// critical-section pattern (RAM only, no flash) -- thread-context safe,
-// the same "one settle window, then pl_persist_service() flushes it" shape
-// as the pairing path, just with no settle delay: a user-initiated pick is
-// already the debounced event (there is no burst of these to coalesce).
-// `pl_persist_service()` (below) picks this up on the same "not
-// streaming" gate as every other flash write in this file.
-void pl_persist_request_ldac_quality(const uint8_t addr[6], uint8_t ldac_quality);
+// Bead pico-link-ryw.6, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 2.3: ONE field-masked staged per-device SETTINGS write,
+// replacing bead pico-link-7jol.5's bespoke `pl_persist_request_ldac_quality`
+// / `pl_persist_execute_pending_ldac_quality_write` pair. The design named
+// the quick fix ("a fifth bespoke staging slot plus execute_pending pair"
+// for preset assignment, on top of the four -- ldac_quality, display,
+// cushion, abr floor -- persist.h already had) and rejected it: this
+// function absorbs what used to be the ldac_quality-only pair AND carries
+// `preset_id`, so a future per-device field needs no sixth pair either,
+// just one more `PL_PERSIST_DEVICE_FIELD_*` bit.
+//
+// `field_mask` is an OR of `PL_PERSIST_DEVICE_FIELD_*` (below) -- only the
+// masked-in fields of `codec_id`/`ldac_quality`/`preset_id` are staged to
+// overwrite the on-flash record; every other field (including ones NOT in
+// this call's mask but already staged by an earlier, not-yet-drained call
+// for the SAME address) rides through untouched, same RMW discipline
+// `pl_persist_rmw` (persist.c) already applies at write time. A call for a
+// DIFFERENT address supersedes whatever was staged before, same "freshest
+// wins" behaviour `pl_persist_request_save_device` already has.
+//
+// A SEPARATE staging slot from `pl_persist_request_save_device`'s
+// pairing-write one above, deliberately: mixing a settings pick into the
+// pairing slot's settle/rate-limit timers would delay a "no confirm,
+// applies live" UI action behind unrelated pairing-write debouncing it has
+// no reason to inherit. Same short-critical-section pattern (RAM only, no
+// flash) -- thread-context safe. No settle delay: a user-initiated pick or
+// edit is already the debounced event (design sec 2.5: "save and assign
+// are user-initiated, so they are not stream-gated"; Andreas's ryw.6
+// ruling extends this to "save immediately on every value change" for the
+// effects editor -- a burst of stage calls before the heartbeat drains
+// coalesces to the LATEST value, same as every other staging slot in this
+// file, so this never queues unboundedly no matter how fast the caller
+// stages). `pl_persist_service()` (below) picks this up on the same "not
+// streaming" gate every other user-initiated write in this file uses
+// (design sec 2.5 / D11 precedent).
+void pl_persist_request_device_settings(const uint8_t addr[6], uint8_t field_mask, uint8_t codec_id, uint8_t ldac_quality, uint16_t preset_id);
 
 // Performs the actual flash write for whatever settings save is currently
-// staged by pl_persist_request_ldac_quality -- same calling contract as
+// staged by pl_persist_request_device_settings -- same calling contract as
 // pl_persist_execute_pending_write (bt.c's pending-queue drain, async_
-// context ONLY), and the same "bails, leaving the request pending, if the
-// streaming gate flipped true again" behaviour. Reads the device's
-// EXISTING codec_id first (pl_persist_get_device_settings) so this write
-// can never clobber it -- `ldac_quality` is the only field this bead's UI
-// ever changes.
-void pl_persist_execute_pending_ldac_quality_write(void);
+// context ONLY). Unlike the old ldac_quality-only pair, this never needs to
+// pre-read the existing record to avoid clobbering a field this call didn't
+// touch -- `pl_persist_rmw`'s RMW core already starts from the existing
+// record and only applies `field_mask`'s bits, so an unmasked field simply
+// rides through.
+void pl_persist_execute_pending_device_settings_write(void);
 
 // Bead pico-link-qivj.5 (S11), design `.planning/design/2026-09-24-
 // screensaver-dim-and-timeout.md` (bead pico-link-qivj.1 closed comment):
@@ -269,14 +294,14 @@ bool pl_persist_boot_display_settings(uint8_t *mode, uint16_t *timeout_s);
 // Stages a display-settings write -- called from bt.c's
 // PL_COMMAND_TAG_SET_DISPLAY_SETTINGS handler (thread context, the
 // superloop). Same short-critical-section RAM-only staging idiom as
-// pl_persist_request_ldac_quality above; a SEPARATE staging slot from both
+// pl_persist_request_device_settings above; a SEPARATE staging slot from both
 // the pairing-write slot and the per-device-settings slot (design point 11
 // D9/D11: this is a global, not per-device, record).
 void pl_persist_request_display_settings(uint8_t mode, uint16_t timeout_s);
 
 // Performs the actual flash write for whatever display-settings save is
 // currently staged by pl_persist_request_display_settings -- same calling
-// contract as pl_persist_execute_pending_ldac_quality_write (bt.c's
+// contract as pl_persist_execute_pending_device_settings_write (bt.c's
 // pending-queue drain, async_context ONLY).
 //
 // Bead pico-link-xcmx / this design's D11 (Andreas's ruling): deliberately
@@ -413,44 +438,39 @@ bool pl_persist_forget_device(const uint8_t addr[6]);
 // 660 kbps, 3 = 330 kbps, 4 = Adaptive -- IMPLEMENTED, bead pico-link-7jol.3;
 // NOT a raw LDACBT_EQMID_* value, since LDACBT_EQMID_HQ is literally 0 and
 // would make "never chosen" and "explicitly chose 990" the same byte
-// forever). Shares ONE
-// read-modify-write core with pl_persist_do_write (persist.c) rather than
-// forking the RMW logic.
+// forever). Bead pico-link-ryw.6 folded the actual write into a `static`
+// helper inside persist.c (no longer a public function -- nothing outside
+// persist.c ever called it directly; every caller goes through the staged
+// pl_persist_request_device_settings/pl_persist_execute_pending_device_
+// settings_write pair above) that shares ONE read-modify-write core with
+// pl_persist_do_write (persist.c) rather than forking the RMW logic.
 //
 // Does NOT bump mru_seq: setting a preference is not using a device, and
 // core's auto-reconnect policy is paired.iter().max_by_key(|d| d.mru_seq)
 // -- bumping here would make a pinned-but-unconnected device the boot
 // reconnect target.
 //
-// Does NOT create a slot: returns false, writing nothing, if no slot
-// currently holds `addr`. The device page is only reachable for a
-// remembered device or the connected one (a connected device is written at
-// pairing time via pl_persist_save_device_now/pl_persist_request_save_device)
-// -- there is no legitimate "pin a codec on a device we've never stored"
-// path, and inventing one would let a pin consume one of
+// Does NOT create a slot: refuses, writing nothing, if no slot currently
+// holds `addr`. The device page is only reachable for a remembered device
+// or the connected one (a connected device is written at pairing time via
+// pl_persist_save_device_now/pl_persist_request_save_device) -- there is no
+// legitimate "pin a codec (or assign a preset) on a device we've never
+// stored" path, and inventing one would let a pin consume one of
 // PL_PERSIST_DEVICE_SLOTS slots without pairing.
-//
-// # Calling contract
-//
-// Identical to pl_persist_execute_pending_write's: cyw43/BTstack background
-// async_context ONLY, via bt.c's pending queue. Calling this from thread
-// context reintroduces the exact race code-review finding 1 closed (see
-// this header's module doc, Reentrancy section).
 //
 // On an actual write, pushes PlEventTag::PairedDeviceUpserted, same as
 // every other successful write in this file (design point 3's single-writer
 // rule: no echo means no row) -- see pl_persist_do_write's doc comment.
-bool pl_persist_write_device_settings(const uint8_t addr[6], uint8_t codec_id, uint8_t ldac_quality);
 
 // Design finding 1.4 (.planning/design/2026-09-02-device-page-seam.md sec
 // 1.4, bead pico-link-ay0.1): reads the LIVE in-RAM slot mirror -- no flash
 // access, no allocation. Kept live by every write (pl_persist_do_write and
-// pl_persist_write_device_settings both funnel through the same RMW core,
-// which updates this mirror as part of the same write), NOT just populated
-// once at boot -- so a pin set now is visible to a2dp.c's next connection
-// attempt immediately, not only after a power cycle (the exact failure this
-// bead exists to prevent). Returns false, leaving the outputs untouched, if
-// `addr` is not currently remembered.
+// the field-masked device-settings write above both funnel through the
+// same RMW core, which updates this mirror as part of the same write), NOT
+// just populated once at boot -- so a pin set now is visible to a2dp.c's
+// next connection attempt immediately, not only after a power cycle (the
+// exact failure this bead exists to prevent). Returns false, leaving the
+// outputs untouched, if `addr` is not currently remembered.
 //
 // Safe to call from the cyw43/BTstack background async_context (a2dp.c's
 // CAPABILITIES_COMPLETE handler, design sec 3.3) -- the mirror is only ever
@@ -458,12 +478,34 @@ bool pl_persist_write_device_settings(const uint8_t addr[6], uint8_t codec_id, u
 // read, not a cross-context one.
 bool pl_persist_get_device_settings(const uint8_t addr[6], uint8_t *out_codec_id, uint8_t *out_ldac_quality);
 
-// Tag namespace, exposed so a future preset-store implementation (hardening,
-// not MVP -- design point 8/pico-link-ryw) reuses this exact scheme rather
-// than inventing a second one. tag = ('P'<<24)|('L'<<16)|(kind<<8)|index.
+// Bead pico-link-ryw.6, design sec 2.3: field-mask bits for
+// pl_persist_request_device_settings/pl_persist_execute_pending_device_
+// settings_write's shared staging slot -- which of
+// pl_persist_device_record_t's Tier-2 fields a given staged write should
+// overwrite. OR multiple bits together to write more than one field in the
+// same flash write (e.g. a future combined codec+quality pick).
+typedef enum {
+    PL_PERSIST_DEVICE_FIELD_CODEC_ID = 1u << 0,
+    PL_PERSIST_DEVICE_FIELD_LDAC_QUALITY = 1u << 1,
+    // Bead pico-link-ryw.6: PL_COMMAND_TAG_ASSIGN_PRESET writes preset_id
+    // through this same field-masked path -- see persist.h's doc comment
+    // on pl_persist_request_device_settings.
+    PL_PERSIST_DEVICE_FIELD_PRESET_ID = 1u << 2,
+} pl_persist_device_field_mask_t;
+
+// Tag namespace. tag = ('P'<<24)|('L'<<16)|(kind<<8)|index.
 #define PL_PERSIST_KIND_MARKER 0x4Du // 'M'
 #define PL_PERSIST_KIND_DEVICE 0x44u // 'D'
-#define PL_PERSIST_KIND_PRESET 0x50u // 'P' -- reserved, not yet implemented
+// Bead pico-link-ryw.6, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 2.2: PL:P:<slot>, the global DSP-preset store. Opaque to C
+// (this module stores and moves the blob bytes, never parses them -- `core`
+// owns the wire format, same discipline as every PL:S:<i> value byte
+// above). Own version byte (PL_PERSIST_PRESET_VERSION in persist.c), own
+// slot count (PL_PERSIST_PRESET_SLOTS below) -- independent of
+// PL_PERSIST_DEVICE_SLOTS, and loaded/wiped alongside the device slots on a
+// PL_PERSIST_SCHEMA_VERSION mismatch (both are "our own records", per this
+// header's module doc).
+#define PL_PERSIST_KIND_PRESET 0x50u // 'P'
 // Bead pico-link-qivj.5 (S11): PL:S:0, the global display-settings record
 // (screensaver mode + idle timeout) -- its own kind byte, its own version
 // byte (see PL_PERSIST_SETTINGS_VERSION in persist.c), loaded independently
@@ -494,5 +536,94 @@ bool pl_persist_get_device_settings(const uint8_t addr[6], uint8_t *out_codec_id
 // stays 1: an existing single-slot (v1) store's slot-0 record loads cleanly
 // under the new 8-slot reader (slots 1-7 simply read as absent/unoccupied).
 #define PL_PERSIST_DEVICE_SLOTS 8u
+
+// Bead pico-link-ryw.6, design sec 2.2: number of PL:P:<slot> preset slots
+// -- independent budget from PL_PERSIST_DEVICE_SLOTS (a preset is not a
+// device). "Live contents: ... 8 presets at about 90B ... for about 1.5KB
+// of 4KB" (design sec 2.5).
+#define PL_PERSIST_PRESET_SLOTS 8u
+
+// Bead pico-link-ryw.6, design sec 2.2: the fixed on-flash preset blob
+// width, matching ui-ffi's PL_DSP_PRESET_BLOB_LEN (80) -- an independent
+// literal, not a shared constant, same "own reservation, `core`'s own wire
+// length may grow within it without an ABI bump" convention
+// PL_DSP_PRESET_BLOB_LEN's own doc comment documents on the Rust side.
+#define PL_PERSIST_PRESET_BLOB_LEN 80u
+
+// Bead pico-link-ryw.6, design sec 2.2: NO_PRESET_ID -- 0 always means "no
+// preset assigned" (never allocated to a real preset), matching
+// pico_link_core::dsp::store::NO_PRESET_ID and
+// pl_persist_device_record_t::preset_id's own "0 means none" convention.
+#define PL_PERSIST_PRESET_ID_NONE 0u
+
+// Bead pico-link-ryw.6, design sec 2.2: how many valid PL:P records are
+// currently loaded in the live slot mirror -- computed live, same
+// "boot-time snapshot built once, before any write can run" contract as
+// pl_persist_boot_device_count.
+uint8_t pl_persist_boot_preset_count(void);
+
+// Bead pico-link-ryw.6, design sec 2.2: the `index`-th (0-based, in slot
+// order) occupied preset slot's id and blob -- same "seen == index" walk as
+// pl_persist_boot_device_at. `out_blob` must point to
+// PL_PERSIST_PRESET_BLOB_LEN bytes; `out_blob_len` is how many of them are
+// meaningful, the rest is unspecified padding, same convention as
+// PlPresetLoadedPayload's own doc comment. Out-of-range `index` zeroes
+// every output.
+void pl_persist_boot_preset_at(uint8_t index, uint16_t *out_id, uint8_t *out_blob_len, uint8_t out_blob[PL_PERSIST_PRESET_BLOB_LEN]);
+
+// Bead pico-link-ryw.6: mirrors pl_persist_boot_status but for the PL:P
+// store's own load pass -- see persist.c's pl_persist_init for exactly what
+// this reflects (first-boot / loaded / a per-record CRC drop / a
+// PL_PERSIST_SCHEMA_VERSION mismatch, same statuses as the device store,
+// since presets are wiped alongside devices on a schema mismatch -- see
+// PL_PERSIST_KIND_PRESET's doc comment above).
+pl_persist_status_t pl_persist_preset_boot_status(void);
+
+// Bead pico-link-ryw.6, design sec 2.2/2.5: stages a preset save --
+// `preset_id == PL_PERSIST_PRESET_ID_NONE` (0) means "allocate a fresh,
+// never-before-used id" (ids are monotonic and never reused, design sec
+// 2.2: "a delete-then-create in the same slot gets a new id, and a stale
+// device reference dangles rather than aliasing another EQ"); a non-zero
+// id means "overwrite the existing preset with this id in place". Same
+// short-critical-section RAM-only staging idiom as
+// pl_persist_request_device_settings -- a burst of edits (Andreas's ryw.6
+// ruling: "save immediately on every value change") coalesces to the
+// LATEST blob, never queues unboundedly. `blob_len` bytes of `blob` are
+// staged; the rest is not read. Called from bt.c's
+// PL_COMMAND_TAG_SAVE_PRESET handler (thread context, the superloop).
+void pl_persist_request_save_preset(uint16_t preset_id, uint8_t blob_len, const uint8_t *blob);
+
+// Performs the actual flash write for whatever save is currently staged by
+// pl_persist_request_save_preset -- same calling contract as
+// pl_persist_execute_pending_write (bt.c's pending-queue drain, async_
+// context ONLY). On an actual write (a fresh allocation, or overwriting an
+// existing id in place), pushes PlEventTag::PresetLoaded with whichever id
+// was actually used -- the SavePreset echo (design sec 2.2/3.2), same
+// single-writer-echo discipline as every other write in this file. If
+// `preset_id` was non-zero but no slot currently holds it, or a fresh
+// allocation finds every PL_PERSIST_PRESET_SLOTS slot occupied, the write
+// is refused and logged -- no echo, no row, same "no echo means no row"
+// rule pl_persist_do_write's doc comment states for devices.
+void pl_persist_execute_pending_save_preset_write(void);
+
+// Bead pico-link-ryw.6, design sec 2.4: stages a preset delete. Same
+// short-critical-section RAM-only staging idiom as
+// pl_persist_request_save_preset. Called from bt.c's
+// PL_COMMAND_TAG_DELETE_PRESET handler (thread context, the superloop).
+void pl_persist_request_delete_preset(uint16_t preset_id);
+
+// Performs the actual flash delete for whatever request is currently
+// staged by pl_persist_request_delete_preset -- same calling contract as
+// pl_persist_execute_pending_write (bt.c's pending-queue drain, async_
+// context ONLY). Design sec 2.4: deletes ONLY the PL:P:<slot> tag -- never
+// rewrites any PL:D device record, so a device still referencing this id
+// keeps a dangling reference that `core` resolves as Off (never
+// garbage-collected back onto another preset -- design sec 2.4: "NEVER
+// garbage-collect a preset because its last device was forgotten" extends
+// symmetrically to "because the preset itself was deleted"). Pushes
+// PlEventTag::PresetDeleted on an actual deletion only -- a delete request
+// for an id no slot currently holds is a silent no-op (matches
+// pl_persist_forget_device's own "no slot holds it -- no-op" contract).
+void pl_persist_execute_pending_delete_preset_write(void);
 
 #endif // PL_PERSIST_H
