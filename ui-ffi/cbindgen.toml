@@ -18,6 +18,14 @@ line_length = 100
 tab_width = 4
 documentation = true
 documentation_style = "doxy"
+# Bead pico-link-ryw.5: `PlBiquad`/`PlDspProgram` are declared independently
+# in firmware/src/dsp.h (bead pico-link-ryw.1's realtime kernel already owns
+# that exact struct shape) -- pull that header in so the generated
+# `pl_ui_take_dsp_program` declaration below can reference those types
+# without cbindgen emitting a second, colliding definition of the same
+# names (see `[export].exclude` below and `ui-ffi/src/lib.rs`'s own module
+# section doc on this pull API for the full rationale).
+after_includes = "#include \"dsp.h\""
 
 [export]
 prefix = ""
@@ -46,6 +54,15 @@ include = [
     "PL_COMMAND_ABI_VERSION",
     "PlDisplayPower",
 ]
+# Bead pico-link-ryw.5: `PlBiquad`/`PlDspProgram` are reachable from
+# `pl_ui_take_dsp_program`'s signature (so cbindgen would otherwise emit
+# them automatically) but must NOT be emitted here -- `firmware/src/dsp.h`
+# already defines both, independently pinned (this module section's own
+# doc comment). Excluding them and pulling `dsp.h` in via `after_includes`
+# above is what lets `pl_ui_take_dsp_program`'s C declaration reference
+# `struct PlDspProgram` without a duplicate-definition error in any
+# translation unit that includes both headers (`main.c` does).
+exclude = ["PlBiquad", "PlDspProgram"]
 
 [fn]
 prefix = ""

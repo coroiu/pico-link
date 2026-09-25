@@ -19,6 +19,7 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::input::NavIntent;
 use crate::audio::{AbrFloor, CushionPolicy};
+use crate::dsp::{Program, PresetStore};
 use crate::power::DisplaySettings;
 use crate::render::home::build_home_screen;
 use crate::render::{FrameBuffer565, Instant, Navigator, RenderCtx};
@@ -160,6 +161,21 @@ pub struct App {
     /// [`AbrFloorState`]'s doc comment for why it carries only one flag,
     /// not two.
     abr_floor: Rc<RefCell<AbrFloorState>>,
+    /// The global DSP effects preset store -- bead `pico-link-ryw.5`,
+    /// design sec 2.2/3.1. Populated purely by folding
+    /// [`Event::PresetLoaded`]/[`Event::PresetDeleted`] (boot load AND
+    /// every [`Command::SavePreset`] echo use the same incremental
+    /// [`PresetStore::load`] call -- see [`App::on_preset_loaded`]'s doc
+    /// comment for why this bead does not use [`PresetStore::from_loaded`]'s
+    /// batch constructor the way a one-shot boot sequence could). No
+    /// `save_pending`/`apply_pending` latch shape here, unlike
+    /// `cushion_policy`/`abr_floor` above: [`Command::SavePreset`]/
+    /// [`Command::DeletePreset`]/[`Command::AssignPreset`] are ordinary
+    /// queued [`Command`]s (Andreas's "every value change in the editor
+    /// saves immediately" ruling means a future editor screen pushes one
+    /// per edit, not a single coalesced latch -- see [`Command::SavePreset`]'s
+    /// doc comment).
+    presets: PresetStore,
 }
 
 impl App {
@@ -200,6 +216,7 @@ impl App {
             display_settings,
             cushion_policy,
             abr_floor,
+            presets: PresetStore::new(),
         }
     }
 
@@ -331,6 +348,37 @@ impl App {
             Some(state.current)
         } else {
             None
+        }
+    }
+
+    /// The DSP program the connected device's assigned preset compiles to
+    /// at `fs_hz` -- bead `pico-link-ryw.5`, design sec 3.1's "active-preset
+    /// resolution (connected device's `preset_id`, else Off)". `ui-ffi`'s
+    /// pull API (`pl_ui_take_dsp_program`) calls this once per superloop
+    /// iteration and hands the result to C over the FFI boundary; `core`
+    /// never submits it itself (no Bluetooth/DSP engine of its own to
+    /// submit to).
+    ///
+    /// Resolution order: no connected device, OR a connected device whose
+    /// `preset_id` is [`crate::dsp::store::NO_PRESET_ID`]/dangling, both
+    /// produce [`Program::off`] (Andreas's ruling: new/unassigned devices
+    /// get Off) -- `core` never distinguishes "never assigned" from
+    /// "assigned to a since-deleted preset," same as
+    /// [`crate::dsp::PresetStore::resolve`]'s own doc comment. A future
+    /// preset editor (`pico-link-ryw.7`) overriding this with the preset
+    /// currently being live-previewed is that bead's own addition -- this
+    /// bead's resolution is deliberately just the connected-device case,
+    /// since no editor exists yet to have a preview state to prefer.
+    #[must_use]
+    pub fn dsp_program(&self, fs_hz: u32) -> Program {
+        let model = self.model.borrow();
+        let preset = model
+            .connected_addr
+            .and_then(|addr| model.paired.iter().find(|d| d.addr == addr))
+            .and_then(|device| self.presets.resolve(device.preset_id));
+        match preset {
+            Some(preset) => Program::from_preset(preset, fs_hz),
+            None => Program::off(fs_hz),
         }
     }
 

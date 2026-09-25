@@ -97,7 +97,24 @@ void pl_dsp_service(void) {
 }
 
 void pl_dsp_submit(const PlDspProgram *p) {
+    if (p == NULL) {
+        return;
+    }
     s_pending = *p;
+    // Bead pico-link-ryw.5's CONTRACT comment: validate n_biquads at this
+    // FFI boundary. `core` is the sole producer and its own preset model
+    // caps a preset at PL_DSP_MAX_BIQUADS bands (dsp::preset::MAX_BANDS),
+    // so this should never actually fire -- but n_biquads rides in from
+    // across the FFI seam as a plain uint8_t with no compiler-enforced
+    // bound, and pl_dsp_rt_process's per-block loop
+    // (`for (i = 0; i < prog->n_biquads; i++) ... prog->biquad[i]`) would
+    // otherwise read past the fixed 10-slot biquad[] array embedded in
+    // this same struct -- not a wild out-of-bounds access (it reads
+    // whatever bytes happen to follow within s_bank/s_pending), but
+    // definitely not defined behaviour either. Clamp rather than trust.
+    if (s_pending.n_biquads > PL_DSP_MAX_BIQUADS) {
+        s_pending.n_biquads = PL_DSP_MAX_BIQUADS;
+    }
     s_pending_valid = true;
     pl_dsp_service();
 }

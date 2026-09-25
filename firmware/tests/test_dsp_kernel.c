@@ -274,6 +274,103 @@ static void test_report_window_resets(void) {
     printf("test_report_window_resets: OK\n");
 }
 
+// Bead pico-link-ryw.5's CONTRACT comment: pl_dsp_submit must clamp
+// n_biquads at the FFI boundary rather than trust a value that could crash
+// or misbehave when it walks past the fixed 10-slot biquad[] array. Sets
+// n_biquads to 255 (an obviously-malformed value no real Rust producer
+// would send, since core's own preset model caps at PL_DSP_MAX_BIQUADS
+// bands) with only the first 10 biquad slots meaningfully populated (a
+// gain-of-0.5 stage followed by 9 identity stages) -- if the clamp landed
+// at exactly PL_DSP_MAX_BIQUADS (not one more, not one fewer), processing
+// a block is both crash-free AND numerically exact: 0.5 gain through 9
+// identity stages is still exactly *0.5.
+static void test_submit_clamps_out_of_range_n_biquads(void) {
+    reset_all();
+    PlDspProgram p;
+    memset(&p, 0, sizeof(p));
+    p.fs_hz = PL_DSP_EXPECTED_FS_HZ;
+    p.preamp = 1.0f;
+    p.n_biquads = 255; // malformed -- far past PL_DSP_MAX_BIQUADS (10)
+    p.biquad[0].b0 = 0.5f; // gain-of-0.5
+    for (uint32_t i = 1; i < PL_DSP_MAX_BIQUADS; i++) {
+        p.biquad[i].b0 = 1.0f; // identity
+    }
+    pl_dsp_submit(&p);
+    pl_dsp_rt_apply_pending();
+
+    int16_t warmup[8] = {0};
+    pl_dsp_rt_process(warmup, 4);
+    pl_dsp_rt_apply_pending();
+
+    int16_t pcm[4] = {1000, -2000, 4000, -8000};
+    pl_dsp_rt_process(pcm, 2);
+    assert(pcm[0] == 500);
+    assert(pcm[1] == -1000);
+    assert(pcm[2] == 2000);
+    assert(pcm[3] == -4000);
+    printf("test_submit_clamps_out_of_range_n_biquads: OK\n");
+}
+
+// Bead pico-link-ryw.5's CONTRACT comment: the exact field mapping from
+// core::dsp::coeffs::CrossfeedCoeffs to PlDspProgram (lo_b0 -> xfeed_lp_b0,
+// lo_a1 -> xfeed_lp_a1, hi_b0/hi_b1/hi_a1 -> xfeed_hs_b0/b1/a1, norm_gain ->
+// xfeed_norm, xfeed_gain ALWAYS 1.0). The coefficients below are
+// core::dsp::coeffs::crossfeed_coeffs(CrossfeedLevel::Weak, 48000)'s real
+// output (captured via a one-off `cargo test -p pico-link-core --lib
+// dsp::tests -- --nocapture` run against a temporary print, per this
+// bead's dispatch -- see the bead's completion comment) and the
+// xfeed_process reference outputs are core::dsp::coeffs::CrossfeedCoeffs::
+// process()'s own per-sample reference application of those SAME
+// coefficients (the function core's own coeffs.rs tests trust) -- so this
+// test proves the C kernel, fed the CONTRACT-mapped fields, reproduces
+// core's reference response, not just that a copy is a copy.
+static void test_ryw5_crossfeed_field_mapping_matches_rust_reference(void) {
+    reset_all();
+    PlDspProgram p;
+    memset(&p, 0, sizeof(p));
+    p.fs_hz = PL_DSP_EXPECTED_FS_HZ;
+    p.preamp = 1.0f;
+    p.n_biquads = 0;
+    p.xfeed_on = 1;
+    p.xfeed_lp_b0 = 0.04025238f; // lo_b0
+    p.xfeed_lp_a1 = 0.91244286f; // lo_a1
+    p.xfeed_gain = 1.0f; // CONTRACT: always 1.0, never derived
+    p.xfeed_hs_b0 = 0.97213835f; // hi_b0
+    p.xfeed_hs_b1 = -0.87791145f; // hi_b1
+    p.xfeed_hs_a1 = 0.87791145f; // hi_a1
+    p.xfeed_norm = 0.81200564f; // norm_gain
+    pl_dsp_submit(&p);
+    pl_dsp_rt_apply_pending();
+
+    // Absorb the one-block crossfade with silence so it doesn't perturb
+    // the steady-state samples asserted on below.
+    int16_t warmup[8] = {0};
+    pl_dsp_rt_process(warmup, 4);
+    pl_dsp_rt_apply_pending();
+
+    // core::dsp::coeffs::CrossfeedCoeffs::process()'s own reference output
+    // for these four stereo input pairs, fed through the SAME coefficients
+    // above (see this function's doc comment for provenance).
+    int16_t pcm[8] = {9000, -6000, 3000, 3000, -1500, 6000, 0, 0};
+    pl_dsp_rt_process(pcm, 4);
+
+    // Rounded to nearest int16 (round-half-away-from-zero, matching
+    // pl_dsp_saturate) from the f32 reference outputs:
+    //   [9000,-6000]   -> [6908.325,  -4442.1245]  -> [6908,  -4442]
+    //   [3000, 3000]   -> [2108.5054,  2853.7813]  -> [2109,   2854]
+    //   [-1500,6000]   -> [-1278.281,  5066.6777]  -> [-1278,  5067]
+    //   [0, 0]         -> [-48.69039,   180.73375] -> [-49,     181]
+    assert(pcm[0] == 6908);
+    assert(pcm[1] == -4442);
+    assert(pcm[2] == 2109);
+    assert(pcm[3] == 2854);
+    assert(pcm[4] == -1278);
+    assert(pcm[5] == 5067);
+    assert(pcm[6] == -49);
+    assert(pcm[7] == 181);
+    printf("test_ryw5_crossfeed_field_mapping_matches_rust_reference: OK\n");
+}
+
 #ifdef PL_DEBUG_REMOTE
 static void test_debug_loader_off_is_bypass(void) {
     reset_all();
@@ -302,6 +399,8 @@ int main(void) {
     test_saturation_clips_and_counts();
     test_crossfade_endpoints();
     test_report_window_resets();
+    test_submit_clamps_out_of_range_n_biquads();
+    test_ryw5_crossfeed_field_mapping_matches_rust_reference();
 #ifdef PL_DEBUG_REMOTE
     test_debug_loader_off_is_bypass();
 #endif

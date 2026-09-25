@@ -33,13 +33,13 @@ pub(in crate::app) fn open_wizard(app: &mut App) {
 /// only by [`Event::PairedDeviceUpserted`]/[`Event::PairedDeviceForgotten`].
 /// Shorthand for building one such event in these tests.
 pub(in crate::app) fn upsert(addr: [u8; 6], name: &str, mru_seq: u32) -> Event {
-    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality: 0 })
+    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality: 0, preset_id: 0 })
 }
 
 /// Like [`upsert`] but with a real `ldac_quality`, for tests of the
 /// `QUALITY` row/picker's stored-echo behaviour.
 pub(in crate::app) fn upsert_with_quality(addr: [u8; 6], name: &str, mru_seq: u32, ldac_quality: u8) -> Event {
-    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality })
+    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality, preset_id: 0 })
 }
 
 pub(in crate::app) const DGX_ADDR: DeviceAddr = [9, 8, 7, 6, 5, 4];

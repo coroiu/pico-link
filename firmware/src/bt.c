@@ -1442,6 +1442,49 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             break;
         }
 
+        case PL_COMMAND_TAG_SAVE_PRESET: {
+            // Bead pico-link-ryw.5, design sec 2.2/3.2: **not yet
+            // persisted** -- the PL:P:<slot> flash store, id allocation
+            // and PresetLoaded echo are pico-link-ryw.6 (deferred out of
+            // this bead's scope, same "define the shape now, wire the
+            // producer later" precedent PL_COMMAND_TAG_FORGET_DEVICE set
+            // in bead pico-link-4vb.6). Unreachable in practice today: no
+            // screen queues this command yet (pico-link-ryw.7). Logged
+            // only, so a console capture can see the wire shape land
+            // correctly ahead of ryw.6's real flash write.
+            uint16_t preset_id = command.payload.save_preset.preset_id;
+            uint8_t blob_len = command.payload.save_preset.blob_len;
+            pl_log("BT: PL_CMD_SAVE_PRESET preset_id=%u blob_len=%u (not yet persisted -- see pico-link-ryw.6)\r\n", (unsigned)preset_id, (unsigned)blob_len);
+            break;
+        }
+
+        case PL_COMMAND_TAG_DELETE_PRESET: {
+            // Bead pico-link-ryw.5, design sec 2.4: same "not yet
+            // persisted, deferred to pico-link-ryw.6" story as
+            // PL_COMMAND_TAG_SAVE_PRESET above.
+            uint16_t preset_id = command.payload.delete_preset.preset_id;
+            pl_log("BT: PL_CMD_DELETE_PRESET preset_id=%u (not yet persisted -- see pico-link-ryw.6)\r\n", (unsigned)preset_id);
+            break;
+        }
+
+        case PL_COMMAND_TAG_ASSIGN_PRESET: {
+            // Bead pico-link-ryw.5, design sec 3.2: same "not yet
+            // persisted, deferred to pico-link-ryw.6" story as
+            // PL_COMMAND_TAG_SAVE_PRESET above. The LIVE half of this
+            // command (the pull API in main.c recomputing the active
+            // program from whatever `core` now resolves for the connected
+            // device) already works without any C-side handling here --
+            // this handler only owns the flash-persist half.
+            const uint8_t *addr = command.payload.assign_preset.addr;
+            uint16_t preset_id = command.payload.assign_preset.preset_id;
+            pl_log(
+                "BT: PL_CMD_ASSIGN_PRESET %02x:%02x:%02x:%02x:%02x:%02x preset_id=%u (not yet persisted -- see "
+                "pico-link-ryw.6)\r\n",
+                addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], (unsigned)preset_id
+            );
+            break;
+        }
+
         case PL_COMMAND_TAG_NONE:
             pl_wdt_mark(PL_WDT_CP_CMD_NONE);
             break;

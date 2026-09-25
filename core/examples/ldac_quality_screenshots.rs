@@ -46,7 +46,7 @@ fn save_zoomed_png(app: &mut App, out_dir: &Path, name: &str) {
 }
 
 fn upsert(addr: [u8; 6], name: &str, mru_seq: u32, ldac_quality: u8) -> Event {
-    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality })
+    Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from(name), mru_seq, ldac_quality, preset_id: 0 })
 }
 
 fn open_devices(app: &mut App) {
