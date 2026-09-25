@@ -20,11 +20,14 @@
 // (a) copy up to 1KB into a static buffer, gated so at most one import is
 // in flight, and (b) report the last result. The one flash side effect --
 // saving a preset -- happens inside pl_config_itf_poll()'s Rust call,
-// which today (this bead) routes through the SAME debug-override session
-// API pico-link-ryw.11 already proved end to end
-// (pl_ui_debug_eq_command); ryw.12.2/12.4 replace that call with a real
-// named-preset save behind this exact function, which is the one seam
-// meant to change.
+// `pl_ui_import_preset` (bead pico-link-ryw.12.4): on success it queues a
+// `Command::SavePreset` IMMEDIATELY (Andreas's ruling: no on-device
+// confirm), so `PL_CFG_STATE_SAVED` below is only ever reported after that
+// queueing has already happened -- never before, never speculatively.
+// (An earlier revision of this bead routed through
+// `pl_ui_debug_eq_command`'s live-only audition override, which is never
+// persisted; that was a review finding, fixed by switching to the real
+// `pl_ui_import_preset` call below.)
 //
 // IRQ DISCIPLINE (pico-link-6o2 / pico-link-tfj): tud_task() runs in the
 // 0xC0 user-IRQ worker in this project, so BOTH configd_control_xfer_cb
@@ -35,7 +38,7 @@
 // sets a flag; pl_config_itf_poll() -- called from main.c's superloop,
 // thread context only, same call site as pl_link_input_poll /
 // pl_debug_remote_poll -- is the one place that flag is consumed and the
-// one place pl_ui_debug_eq_command() is called.
+// one place pl_ui_import_preset() is called.
 //
 // WIRE PROTOCOL (vendor class, interface recipient, wIndex ==
 // ITF_NUM_CONFIG). Exactly two requests, matching tools/usb-console/
@@ -43,15 +46,18 @@
 //   0x01 IMPORT_PRESET, OUT, wLength 2..1024:
 //     byte 0: proto version, must be 1
 //     byte 1: name_len, <= PL_CONFIG_NAME_MAX (16)
-//     bytes [2, 2+name_len): name, UTF-8 (not yet consumed by this bead's
-//       debug-override target -- validated and available for ryw.12.4)
-//     bytes [2+name_len, wLength): Equalizer APO text, one filter/preamp
-//       line per '\n' (or "\r\n")-terminated line, fed line by line to the
-//       SAME parser BEGIN/<line>/END drives over the CDC console.
+//     bytes [2, 2+name_len): name, UTF-8, passed to `pl_ui_import_preset`
+//       as the fallback name (used only if the document itself has no
+//       `Name:` line -- see that function's own doc comment)
+//     bytes [2+name_len, wLength): Equalizer APO / AutoEQ text, passed to
+//       `pl_ui_import_preset` whole (not split into a BEGIN/<line>/END
+//       debug session -- that was an interim seam, replaced).
 //     SETUP stalls (returns false) if an import is already pending, or
 //     wLength is 0 or exceeds the 1KB buffer -- see PL_CONFIG_IMPORT_BUF_LEN.
-//   0x02 GET_STATUS, IN, exactly sizeof(pl_cfg_status_wire_t) (4) bytes:
-//     {u8 state, u8 error, u16 line} -- see the enum and struct below.
+//   0x02 GET_STATUS, IN, exactly sizeof(pl_cfg_status_wire_t) bytes:
+//     {u8 state, u8 error, u8 outcome, u8 reserved, u16 preset_id,
+//      u16 line, u16 band_index, f32 value} -- see the enums and struct
+//     below for which fields are valid in which state.
 #ifndef PICO_LINK_USB_CONFIG_ITF_H
 #define PICO_LINK_USB_CONFIG_ITF_H
 
@@ -84,18 +90,49 @@ enum {
     PL_CFG_STATE_REJECTED = 4,
 };
 
+// GET_STATUS's `outcome` byte, valid only when state == SAVED. Mirrors
+// `pico_link_core::dsp::ImportOutcome` via `PlImportResult::outcome`
+// (ui-ffi/src/lib.rs).
+enum {
+    PL_CFG_OUTCOME_CREATED = 0,
+    PL_CFG_OUTCOME_REPLACED = 1,
+    PL_CFG_OUTCOME_RENAMED = 2,
+};
+
 // GET_STATUS's `error` byte when state == REJECTED: the magnitude of
-// pico_link_core::dsp::EqApoError / DebugEqCommandError's negative `code`
-// (see ui-ffi/src/lib.rs's eq_apo_error_code / debug_eq_command_error_result
-// -- 2..9), or one of these transport-level codes for failures that never
-// reach the parser.
+// `PlImportResult::code` (ui-ffi/src/lib.rs's `import_error_result` --
+// 1..14, reusing `eq_apo_error_code`'s 2..8 for parse errors), or one of
+// these transport-level codes for failures that never reach the parser.
 #define PL_CFG_ERR_MALFORMED_HEADER 254
 
-// The 4-byte GET_STATUS reply, wire-exact (no padding -- packed).
+// The GET_STATUS reply, wire-exact (no padding -- packed). Wider than the
+// original 4-byte reply (pico-link-ryw.12.5's review finding: the transport
+// needs to carry `pl_ui_import_preset`'s real outcome/preset_id/error
+// detail, not just state+error+line) -- see `pl_config_itf_poll`'s own
+// comment for how the wider struct stays consistent across the
+// IRQ-context reader / thread-context writer boundary despite no longer
+// fitting in one atomic word.
 typedef struct __attribute__((packed)) {
     uint8_t state;
+    // Valid only when state == REJECTED: PL_CFG_ERR_* or an
+    // import-error magnitude (see above).
     uint8_t error;
+    // Valid only when state == SAVED: PL_CFG_OUTCOME_*.
+    uint8_t outcome;
+    uint8_t reserved;
+    // Valid only when state == SAVED: the imported/updated preset's id.
+    uint16_t preset_id;
+    // Valid only when state == REJECTED and the failure is a parse
+    // error: the 1-based source line, else 0.
     uint16_t line;
+    // Valid only when state == REJECTED and the failure is a
+    // range-check error (gain/freq/Q/preamp out of range): the 1-based
+    // `Filter N:` band index, else 0.
+    uint16_t band_index;
+    // Valid only when state == REJECTED and the failure is a
+    // range-check error: the offending value (dB, Hz or Q, matching
+    // `error`), else 0.0.
+    float value;
 } pl_cfg_status_wire_t;
 
 // Returns the TinyUSB class driver for ITF_NUM_CONFIG, for

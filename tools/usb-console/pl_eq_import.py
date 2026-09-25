@@ -17,7 +17,14 @@ Wire protocol (see usb_config_itf.h for the authoritative doc):
   IMPORT_PRESET (bRequest 0x01), OUT, vendor/interface, wIndex=ITF_NUM_CONFIG:
     payload = proto(1) + name_len(1) + name(name_len) + APO text
   GET_STATUS (bRequest 0x02), IN, vendor/interface, wIndex=ITF_NUM_CONFIG:
-    reply = state(1) + error(1) + line(2, little-endian)
+    reply = state(1) + error(1) + outcome(1) + reserved(1) +
+            preset_id(2) + line(2) + band_index(2) + value(4, f32), all
+            little-endian -- 14 bytes total, matches pl_cfg_status_wire_t.
+    A "saved" reply reflects a Command::SavePreset the firmware has
+    already QUEUED (pico-link-ryw.12.4's pl_ui_import_preset queues it
+    synchronously on success) -- the actual flash write happens
+    asynchronously afterward, so this tool reports the preset as queued
+    for saving, not as already durably persisted.
 
 Usage:
   python3 pl_eq_import.py xm3-preset.txt
@@ -76,10 +83,19 @@ STATE_NAMES = {
     4: "rejected",
 }
 
-# Mirrors ui-ffi/src/lib.rs's eq_apo_error_code / debug_eq_command_error_result
-# match arms (magnitudes of PlEqCommandResult.code), plus
-# usb_config_itf.h's PL_CFG_ERR_MALFORMED_HEADER for header-level failures
-# that never reach the parser.
+# Mirrors ui-ffi/src/lib.rs's PlImportResult::outcome (0=Created,
+# 1=Replaced, 2=Renamed) -- valid only when state == saved.
+OUTCOME_NAMES = {
+    0: "Created",
+    1: "Replaced",
+    2: "Renamed",
+}
+
+# Mirrors ui-ffi/src/lib.rs's import_error_result match arms (magnitudes of
+# PlImportResult.code), plus usb_config_itf.h's PL_CFG_ERR_MALFORMED_HEADER
+# for header-level failures that never reach the parser. Note: 9 (the
+# debug-console-only "not in session" code) can never appear on this
+# transport -- it has no console session to be "not in".
 ERROR_NAMES = {
     0: "ok",
     1: "invalid utf-8 / null args",
@@ -90,9 +106,16 @@ ERROR_NAMES = {
     6: "missing preamp",
     7: "no bands",
     8: "duplicate preamp",
-    9: "not in session",
+    10: "gain out of range",
+    11: "frequency out of range",
+    12: "Q out of range",
+    13: "preamp out of range",
+    14: "preset store full",
     254: "malformed transport header",
 }
+
+STATUS_WIRE_FORMAT = "<BBBBHHHf"
+STATUS_WIRE_LEN = struct.calcsize(STATUS_WIRE_FORMAT)  # 14 bytes
 
 
 def get_backend():
@@ -148,19 +171,44 @@ def find_device(vid, pid):
     return devs[0]
 
 
-def get_status(dev) -> tuple[int, int, int]:
-    """Sends GET_STATUS and returns (state, error, line)."""
-    reply = dev.ctrl_transfer(BM_REQUEST_TYPE_IN, REQ_GET_STATUS, 0, ITF_NUM_CONFIG, 4)
-    state, error, line = struct.unpack("<BBH", bytes(reply))
-    return state, error, line
+def get_status(dev) -> dict:
+    """Sends GET_STATUS and returns a dict decoding pl_cfg_status_wire_t."""
+    reply = dev.ctrl_transfer(BM_REQUEST_TYPE_IN, REQ_GET_STATUS, 0, ITF_NUM_CONFIG, STATUS_WIRE_LEN)
+    state, error, outcome, _reserved, preset_id, line, band_index, value = struct.unpack(
+        STATUS_WIRE_FORMAT, bytes(reply)
+    )
+    return {
+        "state": state,
+        "error": error,
+        "outcome": outcome,
+        "preset_id": preset_id,
+        "line": line,
+        "band_index": band_index,
+        "value": value,
+    }
 
 
-def format_status(state: int, error: int, line: int) -> str:
+def format_status(status: dict, name: str) -> str:
+    """Formats a GET_STATUS reply for the human. Never implies success
+    (a preset was queued for saving) unless state == saved -- which the
+    firmware only ever reports after pl_ui_import_preset has already
+    queued the Command::SavePreset (see this file's module doc)."""
+    state = status["state"]
     state_name = STATE_NAMES.get(state, f"unknown({state})")
-    if state != 4:  # not REJECTED
+
+    if state == 2:  # saved
+        outcome_name = OUTCOME_NAMES.get(status["outcome"], f"unknown({status['outcome']})")
+        return f"{outcome_name} {name!r} (id {status['preset_id']}) -- queued for saving"
+
+    if state != 4:  # not rejected
         return f"state={state_name}"
-    error_name = ERROR_NAMES.get(error, f"unknown({error})")
-    return f"state={state_name} error={error_name} line={line}"
+
+    error_name = ERROR_NAMES.get(status["error"], f"unknown({status['error']})")
+    if status["line"]:
+        return f"error on line {status['line']}: {error_name}"
+    if status["band_index"]:
+        return f"error: {error_name} (band {status['band_index']}, value={status['value']:.3g})"
+    return f"error: {error_name}"
 
 
 def build_payload(name: str, apo_text: str) -> bytes:
@@ -214,8 +262,8 @@ def main() -> int:
     except usb.core.USBError:
         pass  # already configured -- benign on macOS
 
-    state, _error, _line = get_status(dev)
-    if state == 1:  # busy
+    status = get_status(dev)
+    if status["state"] == 1:  # busy
         print("error: device reports an import already in progress (state=busy)", file=sys.stderr)
         return 1
 
@@ -223,16 +271,16 @@ def main() -> int:
     dev.ctrl_transfer(BM_REQUEST_TYPE_OUT, REQ_IMPORT_PRESET, 0, ITF_NUM_CONFIG, payload)
 
     deadline = time.monotonic() + args.poll_timeout
-    state, error, line = get_status(dev)
-    while state == 1 and time.monotonic() < deadline:  # busy
+    status = get_status(dev)
+    while status["state"] == 1 and time.monotonic() < deadline:  # busy
         time.sleep(args.poll_interval)
-        state, error, line = get_status(dev)
+        status = get_status(dev)
 
-    print(f"GET_STATUS: {format_status(state, error, line)}")
+    print(f"GET_STATUS: {format_status(status, name)}")
 
-    if state == 2:  # saved
+    if status["state"] == 2:  # saved -- and ONLY saved means success
         return 0
-    if state == 1:
+    if status["state"] == 1:
         print("error: still busy after poll timeout -- device may be stuck", file=sys.stderr)
         return 1
     return 1

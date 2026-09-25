@@ -17,9 +17,10 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <string.h>
 
 #include "tusb.h"
+
+#include "hardware/sync.h"
 
 #include "pico_link_ui.h"
 #include "usb_descriptors.h"
@@ -41,30 +42,36 @@ static uint8_t s_import_buf[PL_CONFIG_IMPORT_BUF_LEN];
 static volatile uint16_t s_import_len;
 static volatile bool s_import_pending;
 
-// GET_STATUS's reply, packed into one 32-bit word so a single aligned
-// load/store is atomic between the IRQ-context reader (GET_STATUS's SETUP
-// handler) and the thread-context writer (pl_config_itf_poll) without
-// needing an IRQ-disable critical section -- Cortex-M word-aligned
-// word accesses are indivisible.
-static volatile uint32_t s_status_word;
+// GET_STATUS's reply. No longer fits in one atomic word (widened past 4
+// bytes to carry pl_ui_import_preset's real outcome/preset_id/error
+// detail -- see usb_config_itf.h's struct comment), so the IRQ-context
+// reader (GET_STATUS's SETUP handler) / thread-context writer
+// (pl_config_itf_poll) boundary instead uses a short IRQ-disable critical
+// section on the WRITER side only: configd_control_xfer_cb already runs
+// with interrupts effectively excluded for the duration of its own
+// handler (it IS the IRQ), so it can never observe a torn struct as long
+// as the writer never leaves a partially-written s_status visible to an
+// interrupt. save_and_disable_interrupts/restore_interrupts around the
+// write is the same pattern bt.c/media_keys.c already use for this exact
+// shape of problem.
+static pl_cfg_status_wire_t s_status;
 
-static void set_status(uint8_t state, uint8_t error, uint16_t line) {
-    pl_cfg_status_wire_t wire = { .state = state, .error = error, .line = line };
-    uint32_t word;
-    memcpy(&word, &wire, sizeof(word));
-    s_status_word = word;
+static void set_status(pl_cfg_status_wire_t wire) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    s_status = wire;
+    restore_interrupts(irq_state);
 }
 
-// Maps a PlEqCommandResult's `code` (0 on success, else one of the small
-// negative EqApoError/DebugEqCommandError codes documented in
-// ui-ffi/src/lib.rs) to GET_STATUS's single unsigned error byte.
-static uint8_t eq_error_byte(int32_t code) {
+// Maps a PlImportResult's `code` (0 on success, else one of the small
+// negative codes documented in ui-ffi/src/lib.rs's import_error_result)
+// to GET_STATUS's single unsigned error byte.
+static uint8_t import_error_byte(int32_t code) {
     if (code >= 0) {
         return 0;
     }
-    // These codes are always small in magnitude (see
-    // debug_eq_command_error_result's match arms: -1..-9) -- never
-    // anywhere near 256, so the narrowing below never wraps.
+    // These codes are always small in magnitude (see import_error_result's
+    // match arms: -1..-14) -- never anywhere near 256, so the narrowing
+    // below never wraps.
     int32_t mag = -code;
     if (mag > 253) {
         mag = 253; // stay below the reserved PL_CFG_ERR_* range
@@ -72,10 +79,10 @@ static uint8_t eq_error_byte(int32_t code) {
     return (uint8_t)mag;
 }
 
-// Truncates a PlEqCommandResult's `line` (a usize widened to u32 on the
-// Rust side, always tiny -- see its own doc comment) to the wire's u16.
-static uint16_t eq_line_u16(uint32_t line) {
-    return (line > 0xFFFFu) ? 0xFFFFu : (uint16_t)line;
+// Truncates a PlImportResult u32 field (`line`/`band_index`, always tiny
+// -- see PlImportResult's own doc comment) to the wire's u16.
+static uint16_t import_u16(uint32_t value) {
+    return (value > 0xFFFFu) ? 0xFFFFu : (uint16_t)value;
 }
 
 void pl_config_itf_poll(struct PlUi *ui) {
@@ -84,11 +91,11 @@ void pl_config_itf_poll(struct PlUi *ui) {
     }
 
     uint16_t len = s_import_len;
-    set_status(PL_CFG_STATE_BUSY, 0, 0);
+    set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_BUSY });
 
     if (len < 2) {
         pl_log("usb-config: IMPORT_PRESET rejected -- header too short (len=%u)\r\n", (unsigned)len);
-        set_status(PL_CFG_STATE_REJECTED, PL_CFG_ERR_MALFORMED_HEADER, 0);
+        set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_REJECTED, .error = PL_CFG_ERR_MALFORMED_HEADER });
         s_import_pending = false;
         return;
     }
@@ -101,87 +108,53 @@ void pl_config_itf_poll(struct PlUi *ui) {
             "usb-config: IMPORT_PRESET rejected -- bad header (proto=%u name_len=%u len=%u)\r\n", (unsigned)proto,
             (unsigned)name_len, (unsigned)len
         );
-        set_status(PL_CFG_STATE_REJECTED, PL_CFG_ERR_MALFORMED_HEADER, 0);
+        set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_REJECTED, .error = PL_CFG_ERR_MALFORMED_HEADER });
         s_import_pending = false;
         return;
     }
 
-    // ryw.12.5 seam: this bead proves the transport end to end by routing
-    // the imported APO text through the SAME debug-override session API
-    // (pl_ui_debug_eq_command) the "EQ BEGIN"/"EQ <line>"/"EQ END" CDC
-    // console commands drive (pico-link-ryw.11). The name bytes above are
-    // already extracted and length-validated for the real save path;
-    // ryw.12.2/12.4 replace the body below with a call that uses them --
-    // the surrounding header parse, buffer/flag handshake and GET_STATUS
-    // reporting do not change.
+    // Real save path (pico-link-ryw.12.4): one call, whole document. On
+    // success this has ALREADY queued a Command::SavePreset before
+    // returning (see pl_ui_import_preset's own doc comment) -- so
+    // PL_CFG_STATE_SAVED below is only ever reported once that queueing
+    // has happened, never before.
+    const uint8_t *name = s_import_buf + 2;
     const uint8_t *text = s_import_buf + header_len;
     size_t text_len = (size_t)len - header_len;
 
-    PlEqCommandResult result = pl_ui_debug_eq_command(ui, (const uint8_t *)"BEGIN", 5);
+    PlImportResult result = pl_ui_import_preset(ui, text, text_len, name, (size_t)name_len);
     if (result.code != 0) {
-        pl_log("usb-config: IMPORT_PRESET BEGIN failed code=%ld\r\n", (long)result.code);
-        set_status(PL_CFG_STATE_REJECTED, eq_error_byte(result.code), eq_line_u16(result.line));
-        s_import_pending = false;
-        return;
-    }
-
-    bool failed = false;
-    PlEqCommandResult fail_result = { .code = 0, .line = 0 };
-    size_t i = 0;
-    while (i < text_len) {
-        size_t start = i;
-        while (i < text_len && text[i] != '\n') {
-            i++;
-        }
-        size_t end = i;
-        if (end > start && text[end - 1] == '\r') {
-            end--;
-        }
-        if (i < text_len) {
-            i++; // skip the '\n'
-        }
-        if (end == start) {
-            continue; // blank line -- same tolerance feed_line() gives a trimmed empty line
-        }
-        result = pl_ui_debug_eq_command(ui, text + start, end - start);
-        if (result.code != 0) {
-            failed = true;
-            fail_result = result;
-            break;
-        }
-    }
-
-    if (failed) {
-        // Best-effort: leave no half-built session active. Its own result
-        // is not reported -- the ORIGINAL parse failure above is what the
-        // host needs to see.
-        (void)pl_ui_debug_eq_command(ui, (const uint8_t *)"OFF", 3);
         pl_log(
-            "usb-config: IMPORT_PRESET line %lu failed code=%ld\r\n", (unsigned long)fail_result.line,
-            (long)fail_result.code
+            "usb-config: IMPORT_PRESET rejected code=%ld line=%lu band=%lu\r\n", (long)result.code,
+            (unsigned long)result.line, (unsigned long)result.band_index
         );
-        set_status(PL_CFG_STATE_REJECTED, eq_error_byte(fail_result.code), eq_line_u16(fail_result.line));
+        set_status((pl_cfg_status_wire_t){
+            .state = PL_CFG_STATE_REJECTED,
+            .error = import_error_byte(result.code),
+            .line = import_u16(result.line),
+            .band_index = import_u16(result.band_index),
+            .value = result.value,
+        });
         s_import_pending = false;
         return;
     }
 
-    result = pl_ui_debug_eq_command(ui, (const uint8_t *)"END", 3);
-    if (result.code != 0) {
-        pl_log("usb-config: IMPORT_PRESET END failed code=%ld\r\n", (long)result.code);
-        set_status(PL_CFG_STATE_REJECTED, eq_error_byte(result.code), eq_line_u16(result.line));
-        s_import_pending = false;
-        return;
-    }
-
-    pl_log("usb-config: IMPORT_PRESET applied ok (name_len=%u, %u text bytes)\r\n", (unsigned)name_len, (unsigned)text_len);
-    set_status(PL_CFG_STATE_SAVED, 0, 0);
+    pl_log(
+        "usb-config: IMPORT_PRESET queued for saving (name_len=%u, %u text bytes, preset_id=%u, outcome=%u)\r\n",
+        (unsigned)name_len, (unsigned)text_len, (unsigned)result.preset_id, (unsigned)result.outcome
+    );
+    set_status((pl_cfg_status_wire_t){
+        .state = PL_CFG_STATE_SAVED,
+        .outcome = result.outcome,
+        .preset_id = result.preset_id,
+    });
     s_import_pending = false;
 }
 
 static void configd_init(void) {
     s_import_pending = false;
     s_import_len = 0;
-    set_status(PL_CFG_STATE_IDLE, 0, 0);
+    set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_IDLE });
 }
 
 static void configd_reset(uint8_t __unused rhport) {
@@ -237,12 +210,13 @@ static bool configd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_
         if (request->bRequest == PL_CFG_REQ_GET_STATUS &&
             request->bmRequestType_bit.direction == TUSB_DIR_IN &&
             request->wLength >= sizeof(pl_cfg_status_wire_t)) {
-            // Single aligned word read -- see s_status_word's own comment
-            // for why this needs no lock against pl_config_itf_poll's
-            // (thread-context) writes.
-            uint32_t word = s_status_word;
+            // Plain read -- see s_status's own comment for why this needs
+            // no lock here: the writer (pl_config_itf_poll, thread
+            // context) excludes this IRQ for the duration of its own
+            // write, so whatever is in s_status right now is always a
+            // complete, non-torn snapshot.
             static pl_cfg_status_wire_t reply;
-            memcpy(&reply, &word, sizeof(reply));
+            reply = s_status;
             return tud_control_xfer(rhport, request, &reply, sizeof(reply));
         }
 
