@@ -35,7 +35,10 @@
 
 // --- Copied from a2dp.c's ABR constants ---
 #define PL_LDAC_ABR_Q_HI (4 * 256)
-#define PL_LDAC_ABR_Q_LO (1 * 256)
+// Bead pico-link-ge8s, 2026-09-25: 1*256(1.0) -> 2*256(2.0). See a2dp.c's
+// own doc comment on this constant for the full measured table (HQ/SQ/MQ
+// resting depths); mirrored in test (h) below.
+#define PL_LDAC_ABR_Q_LO (2 * 256)
 #define PL_LDAC_ABR_SETTLE_US 1000000ULL
 #define PL_LDAC_ABR_UP_DWELL_US 10000000ULL // pico-link-qiow: shortened from 60s 2026-09-24
 
@@ -443,6 +446,61 @@ int main(void) {
         assert(c.steps_down == 1);
         printf("ok:   a genuine apply fault is counted distinctly from a rail hit and retries cleanly, "
                "even when it carries libldac's own LIMITED error code\n");
+    }
+
+    // --- (h) bead pico-link-ge8s: a REALISTIC resting EMA (not an idle/
+    // empty-queue plant like (c)/(c-2)/(d) above) at the up-step's own
+    // rung steps up once a clean dwell elapses, where the OLD threshold
+    // (Q_LO=1*256=1.0) would have blocked it forever. tx_count=5 against
+    // an 8-slot queue settles the EMA at 5*256=1280 (5.0)... no -- q_ema
+    // tracks tx_count directly in Q8 units, so to model the measured SQ
+    // resting depth (~1.19-1.32 slots, this bead's hardware measurement)
+    // the plant must alternate tx_count between 1 and 2 so the EMA settles
+    // in between, exactly like a real tx queue's sawtooth between seals
+    // and grants (a2dp.c's own doc comment on this same q_ema line).
+    {
+        model_abr_t c;
+        model_abr_reset(&c, 0);
+        c.applied_rung = 1; // SQ, as if arrived at via a prior down-step
+        c.target_rung = 1;
+        uint64_t now = 0;
+        for (int i = 0; i < 1001; i++) { // 10.01s, past UP_DWELL_US
+            now += 10000;
+            uint32_t tx_count = (i % 4 == 0) ? 2u : 1u; // settles ~1.25 slots
+            model_decide(&c, tx_count, now, 0);
+            model_apply(&c);
+        }
+        // A realistic resting EMA in the 1.0-2.0 range (this bead's
+        // measured SQ range was 1.10-1.32) must have crossed
+        // PL_LDAC_ABR_Q_LO at some point in a 10s clean dwell and stepped
+        // up -- this is exactly the case the old Q_LO=1.0 threshold made
+        // structurally unreachable (root cause of pico-link-ge8s).
+        assert(c.steps_up == 1);
+        assert(c.applied_rung == 0);
+        printf("ok:   a realistic ~1.25-slot resting EMA at SQ steps up after a clean dwell (the bug "
+               "this bead fixes -- unreachable under the old Q_LO=1.0)\n");
+    }
+
+    // --- (h-2) a depth resting near Q_HI (but still inside the dead band,
+    // never triggering the down-step) NEVER steps up, dwell or not --
+    // proves the raised Q_LO has not made the gate toothless. ---
+    {
+        model_abr_t c;
+        model_abr_reset(&c, 0);
+        c.applied_rung = 1;
+        c.target_rung = 1;
+        uint64_t now = 0;
+        for (int i = 0; i < 2001; i++) { // 20s, well past UP_DWELL_US
+            now += 10000;
+            uint32_t tx_count = (i % 2 == 0) ? 4u : 3u; // settles ~3.5 slots, near Q_HI(4.0)
+            model_decide(&c, tx_count, now, 0);
+            model_apply(&c);
+        }
+        assert(c.steps_up == 0);
+        assert(c.steps_down == 0);
+        assert(c.applied_rung == 1);
+        printf("ok:   a resting depth near Q_HI never steps up, even across a 20s dwell -- the raised "
+               "Q_LO still gates real congestion\n");
     }
 
     printf("ALL LDAC ABR CONTROLLER MODEL TESTS PASSED\n");

@@ -170,8 +170,38 @@ _Static_assert(
 // 2026-09-24 (bead pico-link-qiow, Andreas approved): 60s of q_ema<=Q_LO
 // plus zero stop_queue_full meant a real link practically never returned
 // to HQ (detective finding on pico-link-dge6).
+//
+// Bead pico-link-ge8s, 2026-09-25: PL_LDAC_ABR_Q_LO raised 1*256(1.0) ->
+// 2*256(2.0). Root cause (Nova's investigation, this bead's comments): the
+// tx queue's real steady-state resting depth is NOT a fixed property of
+// "healthy" -- it rises monotonically with the applied rung's bitrate
+// (more bytes sealed per packet -> more natural queue occupancy), so a
+// single absolute floor calibrated against a low-bitrate rung's baseline
+// is unreachable at a high-bitrate rung even on a perfectly clean link.
+// Measured on hardware (headphones connected, real music, this bead's own
+// a2dp.c change making q_ema run whenever an LDAC stream is up -- not only
+// Adaptive -- is what made a PINNED rung's baseline measurable at all),
+// each window 60+s with stop_queue_full flat (zero events) throughout:
+//   HQ  (rung0, 990kbps, adaptive-resting): abr_q_ema 1.55-1.79, median 1.68
+//   SQ  (rung1, 660kbps, pinned):           abr_q_ema 1.10-1.32, median 1.19
+//   MQ  (rung4, 330kbps, pinned):           abr_q_ema 0.64-0.71, median 0.67
+// (The picker only exposes rungs 0/1/4 -- the two intermediate rungs,
+// 492/396 kbps, are Adaptive-only and unmeasured here, but since the
+// series above is monotone in bitrate, their baselines fall between SQ's
+// and HQ's, i.e. still comfortably under this constant.) HQ is the
+// bitrate ceiling of the ladder, so it is also the ceiling of this
+// monotone resting-depth series -- anchoring Q_LO just above HQ's
+// observed max (1.79) with margin therefore covers every rung's up-step,
+// including a future step INTO HQ (the one this bead's bug report is
+// about) and any step between the lower rungs (whose baselines are all
+// lower still). 2.0 gives ~12% margin over the measured HQ max while
+// sitting at exactly half of Q_HI (4.0), so HQ retains a large window
+// before an up-step's post-step EMA (reseeded from the live tx_count,
+// see the reseed comment at the step-up call site) could ever trip the
+// down-gate and bounce. Do not lower this without a fresh multi-minute
+// HQ capture -- see this bead's comments for the raw numbers.
 #define PL_LDAC_ABR_Q_HI (4 * 256)
-#define PL_LDAC_ABR_Q_LO (1 * 256)
+#define PL_LDAC_ABR_Q_LO (2 * 256)
 #define PL_LDAC_ABR_SETTLE_US 1000000ULL
 #define PL_LDAC_ABR_UP_DWELL_US 10000000ULL
 
@@ -2767,13 +2797,16 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
     // side lives in pl_codec_ldac_apply_pending_tuning, called from
     // pl_a2dp_fill in whichever context owns the encoder (sec 6.2).
     //
-    // Gating (sec 2.4): streaming (already established above),
-    // !host_silent (a paused host must not be stepped toward MQ on its
-    // way to auto-pause -- same reasoning as the fhf trim's own
-    // host_silent skip below), and the active row must be LDAC in
-    // Adaptive mode (pl_codec_ldac_is_adaptive() -- no codec-identity
-    // branch; this queries declared state, not codec_id).
-    if (!host_silent && s_ctx.codec != NULL && pl_codec_ldac_is_adaptive()) {
+    // Bead pico-link-ge8s: the q_ema EMA itself now runs whenever an LDAC
+    // stream is up (codec_id check below), Adaptive or pinned -- it is a
+    // cheap shift-and-add, and running it unconditionally is what let this
+    // bead's own investigation measure the tx queue's real resting depth
+    // at a PINNED rung (a fixed HQ/SQ/MQ selection never runs the DECIDE
+    // step logic below, so without this the report has nothing to show
+    // for a pinned quality). The step logic (down/up requests) stays
+    // Adaptive-only, gated separately just below.
+    bool ldac_stream_up = (s_ctx.codec != NULL) && (s_ctx.codec->codec_id == PL_CODEC_ID_LDAC);
+    if (!host_silent && ldac_stream_up) {
         // Q8 fixed point (units of 1/256 of a tx-queue slot). Shift 4 =>
         // tau ~= 16 ticks ~= 160ms (design sec 2.2, same discipline as
         // fhf's fb_fill_ema: EMA, never raw -- raw tx_count sawtooths by a
@@ -2790,7 +2823,18 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
             s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
             s_ctx.abr_up_clean_since_us = pbv_now_us;
         }
+    }
 
+    // Gating (sec 2.4): streaming (already established above),
+    // !host_silent (a paused host must not be stepped toward MQ on its
+    // way to auto-pause -- same reasoning as the fhf trim's own
+    // host_silent skip below), and the active row must be LDAC in
+    // Adaptive mode (pl_codec_ldac_is_adaptive() -- no codec-identity
+    // branch for the step logic itself; this queries declared state, not
+    // codec_id -- the q_ema measurement above already used codec_id, for
+    // a different reason: it must also run while PINNED).
+    if (!host_silent && ldac_stream_up && pl_codec_ldac_is_adaptive()) {
+        uint32_t tx_count_now = pl_a2dp_tx_count();
         int32_t applied_rung = pl_codec_ldac_applied_rung();
         bool past_settle = (pbv_now_us - s_ctx.abr_last_step_us) > PL_LDAC_ABR_SETTLE_US;
 
@@ -4392,13 +4436,20 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // "ask the library"), NOT re-derived from the rung counter -- reads 0
     // for a non-LDAC/non-Adaptive stream, which is a legitimate reading,
     // not a fault.
+    // Bead pico-link-ge8s: live_kbps added (pl_codec_ldac_current_kbps,
+    // reads 0 for a non-LDAC stream) -- the detective's trap on this same
+    // bead is that the OTHER bitrate field further down this function
+    // (s_ctx.frame.nominal_bitrate_bps) is the static negotiated value,
+    // not live; this field is the one to read when measuring ABR/pinned
+    // rungs by ear against the console.
     pl_log(
         "a2dp: abr_adaptive=%d quality_requested=%ld quality_applied=%ld abr_steps_down=%lu abr_steps_up=%lu "
-        "abr_rail_hits=%lu abr_apply_fail=%lu abr_q_ema=%ld.%02ld\r\n",
+        "abr_rail_hits=%lu abr_apply_fail=%lu abr_q_ema=%ld.%02ld live_kbps=%lu\r\n",
         (int)pl_codec_ldac_is_adaptive(), (long)pl_codec_ldac_requested_rung(), (long)pl_codec_ldac_applied_rung(),
         (unsigned long)pl_codec_ldac_abr_steps_down(), (unsigned long)pl_codec_ldac_abr_steps_up(),
         (unsigned long)pl_codec_ldac_abr_rail_hits(), (unsigned long)pl_codec_ldac_abr_apply_fail(),
-        (long)(s_ctx.abr_q_ema >> 8), (long)(((s_ctx.abr_q_ema & 0xFF) * 100) >> 8)
+        (long)(s_ctx.abr_q_ema >> 8), (long)(((s_ctx.abr_q_ema & 0xFF) * 100) >> 8),
+        (unsigned long)pl_codec_ldac_current_kbps()
     );
     // Bead pico-link-pbv round 2 (C2-2), retuned by pico-link-85v: stop-
     // reason breakdown for pl_a2dp_fill's loop. stop_dwell must read 0 in
