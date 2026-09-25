@@ -14,7 +14,9 @@ use super::coeffs::{
     auto_preamp_db, band_to_biquad, crossfeed_coeffs, rbj_high_shelf, rbj_low_shelf, rbj_peaking, CrossfeedState,
     Program, MAX_BOOST_HEADROOM_DB,
 };
-use super::preset::{q_from_index, Band, BandKind, CrossfeedLevel, Preset, Q_TABLE, BLOB_LEN};
+use super::preset::{
+    nearest_q_index, q_from_index, q_milli_from_index, Band, BandKind, CrossfeedLevel, Preamp, Preset, Q_TABLE, BLOB_LEN,
+};
 use super::store::{PresetStore, NO_PRESET_ID};
 
 const FS: f32 = 48_000.0;
@@ -136,7 +138,7 @@ fn band_to_biquad_clamps_freq_above_nyquist() {
     // A corrupt/implausible stored freq_hz (above this fs's Nyquist)
     // must not produce a NaN/unstable filter -- it should behave as if
     // clamped to just under Nyquist.
-    let band = Band { kind: BandKind::Peak, freq_hz: 30_000, gain_half_db: 12, q_idx: 3 };
+    let band = Band { kind: BandKind::Peak, freq_half_hz: (30_000) * 2, gain_cdb: (12) * 50, q_milli: q_milli_from_index(3) };
     let bq = band_to_biquad(band, 44_100);
     assert!(bq.b0.is_finite() && bq.b1.is_finite() && bq.b2.is_finite() && bq.a1.is_finite() && bq.a2.is_finite());
 }
@@ -147,7 +149,7 @@ fn auto_preamp_is_zero_for_cuts_only() {
     // signal, so the design's "why not a fixed -6dB" point should hold:
     // the auto preamp must be 0dB (no needless headroom sacrificed).
     let bands = vec![band_to_biquad(
-        Band { kind: BandKind::Peak, freq_hz: 1_000, gain_half_db: -12, q_idx: 3 },
+        Band { kind: BandKind::Peak, freq_half_hz: (1_000) * 2, gain_cdb: (-12) * 50, q_milli: q_milli_from_index(3) },
         48_000,
     )];
     let preamp = auto_preamp_db(&bands, 48_000);
@@ -160,7 +162,7 @@ fn auto_preamp_clamps_to_minus_12db() {
     // return an arbitrarily large negative preamp (design sec 1.2:
     // "clamped to [-12, 0] dB").
     let bands = vec![band_to_biquad(
-        Band { kind: BandKind::Peak, freq_hz: 1_000, gain_half_db: 48, q_idx: 3 }, // +24dB
+        Band { kind: BandKind::Peak, freq_half_hz: (1_000) * 2, gain_cdb: (48) * 50, q_milli: q_milli_from_index(3) }, // +24dB
         48_000,
     )];
     let preamp = auto_preamp_db(&bands, 48_000);
@@ -175,7 +177,7 @@ fn auto_preamp_cancels_a_known_boost_within_grid_resolution() {
     // preamp should cancel a +6dB boost to within the response grid's
     // resolution, verified against a magnitude computed directly via
     // `Biquad::magnitude_at`, not via `auto_preamp_db`'s own peak search.
-    let band = Band { kind: BandKind::Peak, freq_hz: 1_000, gain_half_db: 12, q_idx: 3 }; // +6dB, Q=1.0
+    let band = Band { kind: BandKind::Peak, freq_half_hz: (1_000) * 2, gain_cdb: (12) * 50, q_milli: q_milli_from_index(3) }; // +6dB, Q=1.0
     let bq = band_to_biquad(band, 48_000);
     let preamp = auto_preamp_db(&[bq], 48_000);
     let center_db = db(bq.magnitude_at(1_000.0, 48_000.0));
@@ -298,7 +300,7 @@ fn off_preset_compiles_to_bypass_program() {
 fn program_biquad_count_matches_band_count() {
     let mut preset = Preset::new("Three bands");
     for freq in [200u16, 1_000, 6_000] {
-        assert!(preset.push_band(Band { kind: BandKind::Peak, freq_hz: freq, gain_half_db: 6, q_idx: 3 }));
+        assert!(preset.push_band(Band { kind: BandKind::Peak, freq_half_hz: (freq) * 2, gain_cdb: (6) * 50, q_milli: q_milli_from_index(3) }));
     }
     let program = Program::from_preset(&preset, 48_000);
     assert_eq!(program.biquads.len(), 3);
@@ -308,9 +310,9 @@ fn program_biquad_count_matches_band_count() {
 fn preset_push_band_respects_max_bands() {
     let mut preset = Preset::new("Overflow");
     for i in 0..u16::try_from(super::preset::MAX_BANDS).unwrap() {
-        assert!(preset.push_band(Band { kind: BandKind::Peak, freq_hz: 100 + i, gain_half_db: 0, q_idx: 0 }));
+        assert!(preset.push_band(Band { kind: BandKind::Peak, freq_half_hz: (100 + i) * 2, gain_cdb: 0, q_milli: q_milli_from_index(0) }));
     }
-    assert!(!preset.push_band(Band { kind: BandKind::Peak, freq_hz: 9_999, gain_half_db: 0, q_idx: 0 }));
+    assert!(!preset.push_band(Band { kind: BandKind::Peak, freq_half_hz: (9_999) * 2, gain_cdb: 0, q_milli: q_milli_from_index(0) }));
     assert_eq!(preset.bands.len(), super::preset::MAX_BANDS);
 }
 
@@ -337,9 +339,9 @@ fn q_from_index_clamps_out_of_range() {
 fn wire_round_trip_preserves_all_fields() {
     let mut preset = Preset::new("Bright & Wide");
     preset.crossfeed = CrossfeedLevel::Medium;
-    preset.push_band(Band { kind: BandKind::LowShelf, freq_hz: 120, gain_half_db: 10, q_idx: 3 });
-    preset.push_band(Band { kind: BandKind::Peak, freq_hz: 3_200, gain_half_db: -7, q_idx: 5 });
-    preset.push_band(Band { kind: BandKind::HighShelf, freq_hz: 9_000, gain_half_db: 4, q_idx: 1 });
+    preset.push_band(Band { kind: BandKind::LowShelf, freq_half_hz: (120) * 2, gain_cdb: (10) * 50, q_milli: q_milli_from_index(3) });
+    preset.push_band(Band { kind: BandKind::Peak, freq_half_hz: (3_200) * 2, gain_cdb: (-7) * 50, q_milli: q_milli_from_index(5) });
+    preset.push_band(Band { kind: BandKind::HighShelf, freq_half_hz: (9_000) * 2, gain_cdb: (4) * 50, q_milli: q_milli_from_index(1) });
 
     let wire = preset.to_wire();
     assert_eq!(wire.len(), BLOB_LEN);
@@ -355,6 +357,145 @@ fn wire_round_trip_empty_preset() {
     let preset = Preset::new("");
     let restored = Preset::from_wire(&preset.to_wire());
     assert_eq!(restored, preset);
+}
+
+// ---------------------------------------------------------------------
+// Blob v2 (bead pico-link-ryw.12.1)
+// ---------------------------------------------------------------------
+
+#[test]
+fn v1_blob_reads_exactly_and_widens_to_v2_exactly() {
+    // Hand-built v1 wire blob (design sec 2.2 layout, frozen and
+    // documented in `preset`'s module doc / `v1_layout`): `{version=1,
+    // name_len, name[16], crossfeed, band_count, band[10] * {kind,
+    // freq_hz u16 LE, gain_half_db i8, q_idx u8}}`.
+    let mut raw = [0u8; BLOB_LEN];
+    raw[0] = 1; // BLOB_VERSION_V1
+    let name = b"V1 Preset";
+    raw[1] = u8::try_from(name.len()).unwrap();
+    raw[2..2 + name.len()].copy_from_slice(name);
+    let crossfeed_off = 2 + 16;
+    raw[crossfeed_off] = 2; // Medium
+    let band_count_off = crossfeed_off + 1;
+    raw[band_count_off] = 2;
+    let bands_off = band_count_off + 1;
+
+    // Band 0: Peak, 1000Hz, +6dB (gain_half_db 12), q_idx 3.
+    raw[bands_off] = 0;
+    raw[bands_off + 1..bands_off + 3].copy_from_slice(&1_000u16.to_le_bytes());
+    #[allow(clippy::cast_sign_loss)]
+    {
+        raw[bands_off + 3] = 12i8 as u8;
+    }
+    raw[bands_off + 4] = 3;
+
+    // Band 1: LowShelf, 120Hz, -5dB (gain_half_db -10), q_idx 5.
+    let b1 = bands_off + 5; // v1's fixed 5-byte band record
+    raw[b1] = 1;
+    raw[b1 + 1..b1 + 3].copy_from_slice(&120u16.to_le_bytes());
+    #[allow(clippy::cast_sign_loss)]
+    {
+        raw[b1 + 3] = (-10i8) as u8;
+    }
+    raw[b1 + 4] = 5;
+
+    let preset = Preset::from_wire(&raw);
+
+    assert_eq!(preset.name, "V1 Preset");
+    assert_eq!(preset.crossfeed, CrossfeedLevel::Medium);
+    assert_eq!(preset.preamp, Preamp::Auto, "a v1-sourced preset always widens to Preamp::Auto");
+    assert!(!preset.eq_locked, "a v1-sourced preset is never locked");
+    assert_eq!(preset.bands.len(), 2);
+    assert_eq!(
+        preset.bands[0],
+        Band { kind: BandKind::Peak, freq_half_hz: 2_000, gain_cdb: 600, q_milli: q_milli_from_index(3) },
+        "1000Hz*2, +6dB(12 half-dB)*50=600cdb, Q_TABLE[3] widened exactly"
+    );
+    assert_eq!(
+        preset.bands[1],
+        Band { kind: BandKind::LowShelf, freq_half_hz: 240, gain_cdb: -500, q_milli: q_milli_from_index(5) },
+        "120Hz*2, -5dB(-10 half-dB)*50=-500cdb, Q_TABLE[5] widened exactly"
+    );
+
+    // Saving a v1-sourced preset rewrites it as v2 -- no separate
+    // migration pass, no flash write at boot (ryw.12 sec 2).
+    let rewritten = preset.to_wire();
+    assert_eq!(rewritten.len(), BLOB_LEN);
+    assert_eq!(rewritten[0], 2, "a save always rewrites as BLOB_VERSION_V2");
+    assert_eq!(Preset::from_wire(&rewritten), preset, "v1 -> v2 -> v1-again must be lossless");
+}
+
+#[test]
+fn v1_blob_in_the_store_survives_load_then_save_as_v2() {
+    // Same v1 bytes as `v1_blob_reads_exactly_and_widens_to_v2_exactly`,
+    // but exercised through the exact load/to_wire/from_wire sequence a
+    // `PresetStore` boot-load-then-save round trip performs.
+    let mut raw = [0u8; BLOB_LEN];
+    raw[0] = 1;
+    let name = b"Old";
+    raw[1] = u8::try_from(name.len()).unwrap();
+    raw[2..2 + name.len()].copy_from_slice(name);
+    raw[2 + 16] = 1; // Weak crossfeed
+    raw[2 + 16 + 1] = 0; // no bands
+
+    let loaded = Preset::from_wire(&raw);
+    assert_eq!(loaded.name, "Old");
+    assert_eq!(loaded.crossfeed, CrossfeedLevel::Weak);
+
+    let saved = loaded.to_wire();
+    assert_eq!(saved[0], 2, "the next save always writes v2, regardless of what version was loaded");
+    assert_eq!(Preset::from_wire(&saved), loaded);
+}
+
+#[test]
+fn q_table_milli_matches_q_table() {
+    // Every `Q_TABLE` entry, widened to milli-Q via `* 1000`, must equal
+    // `q_milli_from_index`'s corresponding entry exactly -- no rounding
+    // uncertainty (see `Q_TABLE_MILLI`'s own doc comment in `preset`).
+    for (idx, &q) in Q_TABLE.iter().enumerate() {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        // Every Q_TABLE entry is well within u16 range (max 8000 milli),
+        // and never negative -- an exact table lookup, not a lossy cast.
+        let expected_milli = libm::roundf(q * 1000.0) as u16;
+        let idx_u8 = u8::try_from(idx).unwrap();
+        assert_eq!(
+            q_milli_from_index(idx_u8),
+            expected_milli,
+            "Q_TABLE[{idx}] = {q} must widen exactly to {expected_milli} milli-Q"
+        );
+    }
+}
+
+#[test]
+fn nearest_q_index_finds_the_closest_table_entry_and_round_trips_editor_values() {
+    // Every `q_milli` the editor itself ever produces is exactly
+    // `q_milli_from_index(idx)` for some table entry -- `nearest_q_index`
+    // must recover that same index for every one of them (this is what
+    // makes `step_q`'s "snap to nearest, then move one" identical to the
+    // old index-only stepping for every value the editor can reach).
+    for idx in 0..u8::try_from(Q_TABLE.len()).unwrap() {
+        let milli = q_milli_from_index(idx);
+        assert_eq!(nearest_q_index(milli), idx, "q_milli_from_index({idx}) must round-trip through nearest_q_index");
+    }
+    // An out-of-table value picks whichever entry is numerically closest.
+    assert_eq!(nearest_q_index(0), 0, "0 is closest to Q_TABLE[0] (400 milli)");
+    assert_eq!(nearest_q_index(9_000), 7, "9000 is closest to Q_TABLE[7] (8000 milli), the top entry");
+}
+
+#[test]
+fn wire_round_trip_preserves_an_explicit_imported_preamp() {
+    // An imported preset's Preamp::Explicit value must survive a wire
+    // round trip verbatim -- it is never recomputed from the bands (that
+    // would defeat the whole point of importing a published curve).
+    let mut preset = Preset::new("Imported");
+    preset.preamp = Preamp::Explicit(-350); // -3.50dB, an arbitrary published value
+    preset.eq_locked = true;
+
+    let wire = preset.to_wire();
+    let restored = Preset::from_wire(&wire);
+
+    assert_eq!(restored.preamp, Preamp::Explicit(-350));
+    assert!(restored.eq_locked);
 }
 
 #[test]
