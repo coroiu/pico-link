@@ -64,7 +64,7 @@ Counts: **P0: 0 · P1: 2 · P2: 6 · P3: 1 batch (12 nits)**.
   The fault evaluator's host test exercises the pre-connect burst, host-silent gating,
   raise/clear/refresh cadence and dynamic severity.
 - **Explicit-feedback USB**, gated on alt-1 so `tud_audio_fb_set` never claims EP0
-  (`usb_pump.c:281-283`), 10.14/3-byte format for full-speed macOS, one setpoint shared by
+  (`usb_pump.c:283-285`), 10.14/3-byte format for full-speed macOS, one setpoint shared by
   PRIMING, the feedback loop and the trim (`pl_pcm_set_target_fill_bytes`).
 - **Flash safety while streaming**: `persist.c:791,938` refuse to write while
   `pl_usb_audio_streaming() || pl_a2dp_streaming()`, and `flash_lockout.c` uses the timeout
@@ -105,7 +105,7 @@ in the design docs are stale after the file grew. Neither is a code bug.
 
 ### F-audio-01: The ISR ISO-OUT patch still defers a full-FIFO packet into the unpatched stock path that kills the endpoint, and double-counts it on the way
 - Severity: P1   Confidence: High (patch text) / Medium (stock 0.18.0 body, from memory + CLAUDE.md's own `audio_device.c:759-762` citation)   Effort: S   Tier: Sonnet
-- Location: `tools/apply-sdk-patches.sh:326-334, 455-462` (the `PATCHED4D`/`PATCHED6` bodies, i.e. what is actually in the SDK); `firmware/src/usb_audio.c:333-347` (`tud_audio_rx_done_pre_read_cb`); `firmware/src/usb_pump.c:485-489` (`usb_lost_bytes`)
+- Location: `tools/apply-sdk-patches.sh:326-334, 455-462` (the `PATCHED4D`/`PATCHED6` bodies, i.e. what is actually in the SDK); `firmware/src/usb_audio.c:333-347` (`tud_audio_rx_done_pre_read_cb`); `firmware/src/usb_pump.c:557-561` (`usb_lost_bytes`)
 - Evidence: in `audiod_xfer_isr` the app callback runs first, then the FIFO write; a full FIFO returns `false`, which patch 04b turns into "queue the completion for `tud_task()`":
   ```
   if (!tud_audio_rx_done_pre_read_cb(...)) { return false; }      // packet_count++, rx_bytes_total += n  (usb_audio.c:337-341)
@@ -167,7 +167,7 @@ in the design docs are stale after the file grew. Neither is a code bug.
 ### F-audio-07: `a2dp.c` is five modules and 55 % bead archaeology
 - Severity: P2   Confidence: High   Effort: L   Tier: Opus (moves IRQ/core1-owned state across files)
 - Location: `firmware/src/a2dp.c` (4492 lines: 2478 comment, 256 blank, 1758 code; 274 `pico-link-` bead references)
-- Evidence: five cohesive regions with distinct ownership: (1) AVRCP target/controller/volume service, `:1120-1400` — file statics only, zero `s_ctx` coupling; (2) OUT-meter accumulate + seqlock + `poll_levels`, `:860-1110` — touches three `s_ctx` counters; (3) the drain: tx ring, fill, seal, send, credit, resync, core1 section, `:1440-2560`; (4) signalling: negotiation, retry/wizard timers, the 700-line packet handler, init, `:2860-4060`; (5) getters, report, publish, `:4090-4492`. The report function alone is 300 lines of `pl_log`.
+- Evidence: five cohesive regions with distinct ownership: (1) AVRCP target/controller/volume service, `:1147-1400` — file statics only, zero `s_ctx` coupling; (2) OUT-meter accumulate + seqlock + `poll_levels`, `:934-1110` — touches three `s_ctx` counters; (3) the drain: tx ring, fill, seal, send, credit, resync, core1 section, `:1440-2560`; (4) signalling: negotiation, retry/wizard timers, the 700-line packet handler, init, `:2849-4050`; (5) getters, report, publish, `:4090-4492`. The report function alone is 300 lines of `pl_log`.
 - Why it matters: a maintainability cost, not a defect: every change to the hot path is reviewed against a file where 3 of 5 lines are history, and the AVRCP and levels code share nothing with the encoder they sit between. It is the single file every audio bead touches, so merge conflicts and review load concentrate here.
 - Fix sketch: (a) `a2dp_avrcp.c` first — pure extraction, `s_avrcp_*` statics move verbatim, one exported `pl_a2dp_avrcp_init()`; (b) `a2dp_levels.c` with three counter pointers or its own counters; (c) `a2dp_internal.h` exposing `s_ctx`'s type and the three tx/fill entry points so (d) `a2dp_drain.c` (+ core1 section) and `a2dp_signaling.c` can split. Move bead history into `.planning/design/` cross-references and keep only the *invariant* in the comment ("no pl_log here: pico-link-0d2"), which cuts the file roughly in half without losing a decision.
 - Verification: `wc -l` per file ≤ ~1200; firmware cross-compiles both `PL_ENCODER_ON_CORE1` configs; `pl_a2dp_report` output byte-identical on a soak.
@@ -175,7 +175,7 @@ in the design docs are stale after the file grew. Neither is a code bug.
 
 ### F-audio-08: The FIFO-loss instrument and the SUPPLY LOW fault inherit F-audio-01's double count
 - Severity: P2   Confidence: High   Effort: S   Tier: Sonnet
-- Location: `firmware/src/usb_pump.c:485-489`; `firmware/src/fault.c:296-322`
+- Location: `firmware/src/usb_pump.c:557-561`; `firmware/src/fault.c:297-323`
 - Evidence: `usb_lost_bytes = rx_bytes_total − pcm_bytes_total`, `supply_q8 = d_bytes·256/nominal` with `d_bytes` from `rx_bytes_total`. Both are correct only if each ISO packet increments `rx_bytes_total` exactly once, which F-audio-01 breaks on every full-FIFO deferral.
 - Why it matters: the 9ziq success criterion "`usb_lost_bytes` delta 0" can read non-zero with no loss, and "USB SUPPLY LOW" reads ~healthy when the host is short by one packet per deferral. Fixed for free by F-audio-01; listed separately so the synthesis knows the instruments are downstream of it.
 - Fix sketch: none beyond F-audio-01; optionally count `packet_count` in the ISR only (patch 04d) and make the stock task path's `pre_read_cb` a no-op for `ep_out`.
@@ -185,16 +185,16 @@ in the design docs are stale after the file grew. Neither is a code bug.
 ### F-audio-09: Nits (batched)
 - Severity: P3   Confidence: High unless stated   Effort: S each   Tier: Haiku unless stated
 - Location / evidence / fix, one line each:
-  - **a.** `pcm_ring.c:120` publishes `s_tail` after the data loads with no `__dmb()`, and `:45-83` reads `s_tail` then stores data with none; the tx ring has both halves (`a2dp.c:1944-1946`). Correct on an in-order M33, not by the ARMv8-M memory model; add the two barriers for symmetry. (Tier Sonnet.)
+  - **a.** `pcm_ring.c:120` publishes `s_tail` after the data loads with no `__dmb()`, and `:45-83` reads `s_tail` then stores data with none; the tx ring has both halves (`a2dp.c:1940`). Correct on an in-order M33, not by the ARMv8-M memory model; add the two barriers for symmetry. (Tier Sonnet.)
   - **b.** `a2dp.c:4246-4248` resets `enc_count/enc_sum_us/enc_win_max_us` from core0 while core1 increments them — cross-core RMW on a diagnostic; snapshot-and-subtract instead of reset.
   - **c.** `a2dp.c:1924` writes `slot->data[0] = (uint8_t)slot->frames` unmasked; the AVDTP media header's `num_frames` is 4 bits. LDAC's hint clamps to 15, so safe today; mask `& 0x0F` so a future codec cannot set the fragmentation bits by accident.
   - **d.** `codec_ldac.c:539` `(void)out_cap` — safe only because every LDAC emission seals immediately (so `head->len` is always `header_bytes` when libldac writes). Add `if (out_cap < PL_LDAC_INIT_MTU) return !ok` so the invariant is checked, not assumed.
   - **e.** `a2dp.c:2676-2684`: PRIMING calls `a2dp_source_start_stream` on every ~10 ms tick until STREAM_STARTED; BTstack rejects the repeats (`COMMAND_DISALLOWED`) but latch a `start_requested` flag anyway.
-  - **f.** After a sink-initiated `STREAM_SUSPENDED` (→IDLE) the media timer keeps running at 100 Hz forever (`timer_armed` only cleared at RELEASED / CONNECTION_RELEASED, `a2dp.c:3826-3900`).
-  - **g.** `PL_A2DP_HOST_SILENT_TICKS` (`a2dp.c:266-268`, "200 ms / 10 ms tick = 20 ticks") is stale under ON: `silent_ticks` counts core1 polls (~100 k/s), so 20 is ~200 µs. The real 200 ms gate is `host_silent`; either count on core0 or rewrite the comment.
+  - **f.** After a sink-initiated `STREAM_SUSPENDED` (→IDLE) the media timer keeps running at 100 Hz forever (`timer_armed` only cleared at RELEASED / CONNECTION_RELEASED, `a2dp.c:3797-3900`).
+  - **g.** `PL_A2DP_HOST_SILENT_TICKS` (`a2dp.c:271-274`, "200 ms / 10 ms tick = 20 ticks") is stale under ON: `silent_ticks` counts core1 polls (~100 k/s), so 20 is ~200 µs. The real 200 ms gate is `host_silent`; either count on core0 or rewrite the comment.
   - **h.** Codec identity leaks into `a2dp.c` despite the 2026-08-29 ruling: pointer compares `s_ctx.codec == &pl_codec_ldac` at `:4119` and `:4129`, and the ABR decide (`:2715-2760`) calls `pl_codec_ldac_is_adaptive/applied_rung/request_rung` directly rather than via a vtable slot. The ABR design sanctions the calls; the pointer compares it does not. (Tier Sonnet.)
-  - **i.** Live pin→Adaptive via `pl_codec_ldac_pin_now` (`codec_ldac.c:303-323`) does not reset `s_ctx.abr_q_ema/abr_last_step_us` (ABR design §5.2's fourth reset event); the frozen EMA from the last adaptive period is used for ~16 ticks. Harmless; wire a `pl_a2dp_abr_reset()` or accept and document.
-  - **j.** `s_ldac_abr_steps_down/up/rail_hits/apply_fail` (`codec_ldac.c:167-170`) are plain `uint32_t` written on core1 and read on core0 while every sibling is `volatile`.
+  - **i.** Live pin→Adaptive via `pl_codec_ldac_pin_now` (`codec_ldac.c:314-334`) does not reset `s_ctx.abr_q_ema/abr_last_step_us` (ABR design §5.2's fourth reset event); the frozen EMA from the last adaptive period is used for ~16 ticks. Harmless; wire a `pl_a2dp_abr_reset()` or accept and document.
+  - **j.** `s_ldac_abr_steps_down/up/rail_hits/apply_fail` (`codec_ldac.c:151-154`) are plain `uint32_t` written on core1 and read on core0 while every sibling is `volatile`.
   - **k.** `test_paired_device_upserted_ldac_quality_echo.c`'s build line needs `firmware/include/pico_link_ui.h`, which only exists after CMake runs cbindgen; document `cbindgen --config cbindgen.toml --crate ui-ffi --output …` in the header. All eight test headers emit `-Wcomment` from their own backslash-continued example commands.
   - **l.** (Confidence Low) `A2DP_SUBEVENT_STREAM_STARTED` arriving from IDLE (sink-initiated resume after a sink-initiated suspend) starts STREAMING with an empty ring and no PRIMING; the 500 ppm loop then needs ~60 s to build a cushion. Consider transitioning IDLE→PRIMING on such a start instead.
 - Verification: each is a one-site edit; existing host tests plus a firmware cross-compile of both `PL_ENCODER_ON_CORE1` configs.
