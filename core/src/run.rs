@@ -1670,14 +1670,16 @@ mod tests {
     fn picking_a_screensaver_mode_on_the_settings_screen_persists_it_exactly_once() {
         // Drives the real Settings picker through ordinary input, end to
         // end: Home status -> menu face, Down to Settings, Select opens
-        // it, Select opens the ScreensaverMode picker (row 0, "IDLE
-        // SCREEN"), Select picks its first option -- proving
-        // `Runner::step` actually persists a real user pick, not just a
-        // hand-built `DisplaySettings` value.
+        // it (landing on row 0, "BUFFER" -- bead `pico-link-8pp1.2` S4),
+        // Down to row 1 ("IDLE SCREEN"), Select opens the ScreensaverMode
+        // picker, Select picks its first option -- proving `Runner::step`
+        // actually persists a real user pick, not just a hand-built
+        // `DisplaySettings` value.
         let RecordingSetup { mut platform, storage_sets, .. } = recording_platform(vec![
             vec![NavIntent::Select],
             vec![NavIntent::Down],
             vec![NavIntent::Select],
+            vec![NavIntent::Down],
             vec![NavIntent::Select],
             vec![NavIntent::Select],
             Vec::new(),
@@ -1687,7 +1689,7 @@ mod tests {
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {
             iterations += 1;
-            iterations <= 6
+            iterations <= 7
         });
 
         let sets = storage_sets.borrow();

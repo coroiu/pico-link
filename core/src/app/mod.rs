@@ -170,7 +170,8 @@ impl App {
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
         let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
         let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
-        let navigator = Navigator::new(build_home_screen(&model, &home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings));
+        let navigator =
+            Navigator::new(build_home_screen(&model, &home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy));
         Self {
             navigator,
             framebuffer: FrameBuffer565::new(width, height),

@@ -52,5 +52,8 @@ pub enum PickerKind {
 pub enum SettingsPickerKind {
     ScreensaverMode,
     ScreensaverTimeout,
+    /// The BUFFER row's picker (bead `pico-link-8pp1.2`, S4) -- picks the
+    /// global congestion-cushion policy ([`crate::audio::CushionPolicy`]).
+    Cushion,
 }
 
