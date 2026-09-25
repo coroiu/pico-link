@@ -146,7 +146,7 @@ fn device_page_rows(model: &BtModel, addr: DeviceAddr) -> Vec<FieldRow> {
         // via `build_device_page_screen`, which bails to `None` first) --
         // kept defensive since this function is pure and called directly
         // by tests with hand-built models.
-        let default_device = PairedDevice { addr, name: String::new(), mru_seq: 0, ldac_quality: 0 };
+        let default_device = PairedDevice { addr, name: String::new(), mru_seq: 0, ldac_quality: 0, preset_id: 0 };
         let device = model.paired.iter().find(|d| d.addr == addr).unwrap_or(&default_device);
         rows.push(
             FieldRow::action("QUALITY")
@@ -402,7 +402,7 @@ mod tests {
     fn device_page_rows_shows_the_live_codec_when_connected() {
         let mut model = BtModel::default();
         let addr = [1; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 0 });
         model.connected_addr = Some(addr);
         model.connected_codec = Some(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 });
 
@@ -415,7 +415,7 @@ mod tests {
     fn device_page_rows_shows_automatic_when_disconnected_and_never_dashes_the_codec() {
         let mut model = BtModel::default();
         let addr = [2; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 0 });
         // Not connected: `connected_addr` stays `None`.
 
         let rows = device_page_rows(&model, addr);
@@ -526,7 +526,7 @@ mod tests {
     fn device_page_quality_row_absent_for_a_never_touched_device() {
         let mut model = BtModel::default();
         let addr = [20; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 0 });
         // Not connected, ldac_quality == 0 -- no first-run prompt, the
         // row simply doesn't exist yet.
         let rows = device_page_rows(&model, addr);
@@ -537,7 +537,7 @@ mod tests {
     fn device_page_quality_row_present_when_connected_and_ldac() {
         let mut model = BtModel::default();
         let addr = [21; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 0 });
         model.connected_addr = Some(addr);
         model.connected_codec = Some(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 });
         let rows = device_page_rows(&model, addr);
@@ -549,7 +549,7 @@ mod tests {
     fn device_page_quality_row_absent_when_connected_but_not_ldac() {
         let mut model = BtModel::default();
         let addr = [22; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE, preset_id: 0 });
         model.connected_addr = Some(addr);
         model.connected_codec = Some(ConnectedCodec { addr, word: String::from("SBC"), nominal_bitrate_bps: 328_000 });
         let rows = device_page_rows(&model, addr);
@@ -560,7 +560,7 @@ mod tests {
     fn device_page_quality_row_present_while_disconnected_if_previously_chosen() {
         let mut model = BtModel::default();
         let addr = [23; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 2 });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 2, preset_id: 0 });
         // Not connected -- "picking a quality while disconnected is
         // allowed", and a previously pinned device stays visible.
         let rows = device_page_rows(&model, addr);
@@ -572,7 +572,7 @@ mod tests {
     fn device_page_quality_row_adaptive_streaming_shows_the_live_number_with_the_middle_dot_form() {
         let mut model = BtModel::default();
         let addr = [24; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE, preset_id: 0 });
         model.connected_addr = Some(addr);
         model.connected_codec = Some(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 });
         model.ldac_live_kbps = Some(660);
@@ -585,7 +585,7 @@ mod tests {
     fn device_page_quality_row_adaptive_but_no_live_reading_yet_is_plain() {
         let mut model = BtModel::default();
         let addr = [25; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE, preset_id: 0 });
         model.connected_addr = Some(addr);
         model.connected_codec = Some(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 });
         // No `ldac_live_kbps` yet -- fresh connect, before the first
@@ -599,7 +599,7 @@ mod tests {
     fn device_page_quality_row_adaptive_disconnected_is_plain() {
         let mut model = BtModel::default();
         let addr = [26; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: LDAC_QUALITY_ADAPTIVE, preset_id: 0 });
         let rows = device_page_rows(&model, addr);
         let row = rows.iter().find(|r| r.label == "QUALITY").unwrap();
         assert_eq!(row.value(), Some("Adaptive"));
@@ -609,7 +609,7 @@ mod tests {
     fn device_page_forget_row_stays_last_and_pressable_when_quality_is_present() {
         let mut model = BtModel::default();
         let addr = [27; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 0 });
         model.connected_addr = Some(addr);
         model.connected_codec = Some(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 });
         let rows = device_page_rows(&model, addr);
@@ -654,7 +654,7 @@ mod tests {
     fn picking_while_disconnected_is_allowed_and_the_note_reads_varies_not_a_live_number() {
         let mut model = BtModel::default();
         let addr = [30; 6];
-        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 1 });
+        model.paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 1, preset_id: 0 });
         // Not connected.
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let handle: ModelHandle = Rc::new(RefCell::new(model));

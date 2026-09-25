@@ -789,7 +789,7 @@ mod tests {
     /// `addr` -- for `pico-link-hr30`'s `ShortcutY` -> device-page tests.
     fn connected_home_view(addr: crate::app::DeviceAddr) -> HomeView {
         let mut model = BtModel { connected_addr: Some(addr), ..BtModel::default() };
-        model.paired.push(crate::app::PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 });
+        model.paired.push(crate::app::PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 0 });
         let model = Rc::new(RefCell::new(model));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let commands = Rc::new(RefCell::new(VecDeque::new()));

@@ -124,6 +124,12 @@ typedef struct {
 // that a still-unacked previous bank blocked (e.g. every superloop
 // iteration) should call pl_dsp_service() again on its own -- see that
 // function.
+//
+// A no-op if p is NULL. Clamps n_biquads to PL_DSP_MAX_BIQUADS if a caller
+// (i.e. Rust, across the pico-link-ryw.5 FFI seam) ever sends more --
+// n_biquads has no compiler-enforced bound of its own once it crosses that
+// seam as a plain uint8_t, and pl_dsp_rt_process's per-block loop indexes
+// biquad[] with it directly.
 void pl_dsp_submit(const PlDspProgram *p);
 
 // Attempts to move s_pending into the free bank, if the previous publish

@@ -48,6 +48,9 @@ impl App {
             Event::AbrFloorLoaded { floor } => {
                 self.set_abr_floor(AbrFloor::from_wire(floor));
             }
+            Event::PresetLoaded { id, blob } => self.on_preset_loaded(id, &blob),
+            Event::PresetDeleted { id } => self.on_preset_deleted(id),
+            Event::PresetStoreLoaded { count, status } => self.on_preset_store_loaded(count, status),
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -494,6 +497,52 @@ impl App {
         // (`build_devices_screen`'s "Pair new headphones" row activation
         // resets it to `WizardPhase::scanning_pending`).
         *self.wizard_phase.borrow_mut() = WizardPhase::Failed { addr, reason };
+        self.mark_model_changed();
+    }
+
+    /// Folds one [`Event::PresetLoaded`] into [`App::presets`] -- bead
+    /// `pico-link-ryw.5`, design sec 2.2/3.2. Uses
+    /// [`crate::dsp::PresetStore::load`]'s incremental insert (explicit
+    /// `id`, never reallocated) rather than
+    /// [`crate::dsp::PresetStore::from_loaded`]'s batch constructor: this
+    /// same event fires one-at-a-time both during C's boot push (ahead of
+    /// [`Event::PresetStoreLoaded`]) and as a live
+    /// [`Command::SavePreset`] echo well after boot, and both need "insert
+    /// this one id now," not "rebuild the whole store and lose every
+    /// other already-loaded preset." `blob` is decoded with
+    /// [`crate::dsp::preset::Preset::from_wire`]'s per-field-fallback
+    /// discipline -- a corrupt or short blob degrades that one preset
+    /// rather than dropping the whole load.
+    fn on_preset_loaded(&mut self, id: u16, blob: &[u8]) {
+        let preset = crate::dsp::preset::Preset::from_wire(blob);
+        self.presets.load(id, preset);
+        self.mark_model_changed();
+    }
+
+    /// Folds one [`Event::PresetDeleted`] into [`App::presets`] -- the
+    /// [`Command::DeletePreset`] echo, a real deletion C's flash store
+    /// performed. Per design sec 2.4, this deliberately does NOT touch
+    /// any [`PairedDevice::preset_id`] that referenced `id` -- a dangling
+    /// reference resolves to Off by construction (see
+    /// [`crate::dsp::PresetStore::resolve`]'s doc comment), so no
+    /// up-to-8-device rewrite belongs here.
+    fn on_preset_deleted(&mut self, id: u16) {
+        self.presets.delete(id);
+        self.mark_model_changed();
+    }
+
+    /// Folds one [`Event::PresetStoreLoaded`] -- the terminator of C's
+    /// boot-time `count` x [`Event::PresetLoaded`] push sequence, same
+    /// shape [`App::on_store_loaded`] is for the paired-device store.
+    /// Unlike that method, there is no reconnect-style policy decision to
+    /// make here -- every loaded preset already folded into
+    /// [`App::presets`] via [`Self::on_preset_loaded`] by the time this
+    /// arrives, so this is purely a dirty-marking terminator. `count` and
+    /// `status` are not yet read by anything (no preset-store-health
+    /// screen exists, `pico-link-ryw.7`), same "not yet read" status
+    /// [`Event::StoreLoaded`]'s own `count` field once had.
+    fn on_preset_store_loaded(&mut self, count: u16, status: StoreStatus) {
+        let _ = (count, status);
         self.mark_model_changed();
     }
 }

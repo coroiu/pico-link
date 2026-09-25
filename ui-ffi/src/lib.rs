@@ -321,6 +321,15 @@ pub struct PlUi {
     /// core-side move to multiple damage rects (design section 5) only
     /// grows how many of these slots get filled, not the FFI shape.
     last_damage_rects: [PlDamageRect; 1],
+    /// The last [`pico_link_core::dsp::Program`] handed to C by
+    /// [`pl_ui_take_dsp_program`], if any -- the "newest wins, pull only
+    /// on change" seqlock-style state design sec 3.2 describes ("the
+    /// PROGRAM IS STATE, NOT AN EVENT"). Compared by value against a
+    /// freshly recomputed [`App::dsp_program`] on every call; `None`
+    /// until the first successful take, which always counts as a change
+    /// (the initial Off program still needs to reach C's engine once, so
+    /// its own bypass path is armed correctly at boot).
+    last_dsp_program: Option<pico_link_core::dsp::Program>,
 }
 
 /// Creates a new UI instance rendering into a `width`x`height` framebuffer,
@@ -375,6 +384,7 @@ pub extern "C" fn pl_ui_create(width: u32, height: u32) -> *mut PlUi {
         volume_wake_since_last_tick: false,
         malformed_tag_count: 0,
         last_damage_rects: [PlDamageRect { x: 0, y: 0, w: 0, h: 0 }; 1],
+        last_dsp_program: None,
     };
     Box::into_raw(Box::new(ui))
 }
@@ -1195,6 +1205,61 @@ pub struct PlAbrFloorPayload {
     pub floor: u8,
 }
 
+/// `PL_DSP_PRESET_BLOB_LEN` -- the fixed on-wire preset blob buffer width
+/// shared by [`PlPresetLoadedPayload`]/[`PlSavePresetPayload`] (bead
+/// `pico-link-ryw.5`, design sec 2.2/3.2). A literal, not
+/// `pico_link_core::dsp::preset::BLOB_LEN` (`70`): cbindgen needs a
+/// concrete integer for a C array size, and this width is deliberately
+/// C's own on-flash reservation (design sec 2.2: "C's on-flash record
+/// reserves `blob[80]`... for headroom past" `core`'s current wire length)
+/// -- `core`'s own `BLOB_LEN` may grow within this budget without an ABI
+/// bump, same "`name[32]`, not a `core`-side constant" convention
+/// [`PlPairedDeviceUpsertedPayload::name`] already uses.
+pub const PL_DSP_PRESET_BLOB_LEN: usize = 80;
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::PresetLoaded` (bead
+/// `pico-link-ryw.5`, design sec 2.2/3.2). Pushed either at boot (C's
+/// `count` x this event ahead of [`PlEventTag::PresetStoreLoaded`]) or as
+/// the [`PlCommandTag::SavePreset`] echo -- `id` is C's allocated id
+/// either way and is never `0` (`0` is [`pico_link_core::dsp::store::
+/// NO_PRESET_ID`], reserved and never assigned to a real preset). `blob`
+/// is an inline fixed buffer copied by value, following
+/// [`PlPairedDeviceUpsertedPayload::name`]'s convention -- `blob_len`
+/// bytes are meaningful, the rest is unspecified padding; `core` treats
+/// `blob` as entirely opaque (design sec 2.2: "C NEVER parses the blob"),
+/// decoding only the `blob_len`-byte prefix with
+/// [`pico_link_core::dsp::preset::Preset::from_wire`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlPresetLoadedPayload {
+    pub id: u16,
+    pub blob_len: u8,
+    pub blob: [u8; PL_DSP_PRESET_BLOB_LEN],
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::PresetDeleted` (bead
+/// `pico-link-ryw.5`, design sec 2.4) -- the [`PlCommandTag::DeletePreset`]
+/// echo, a real deletion C's flash store performed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlPresetDeletedPayload {
+    pub id: u16,
+}
+
+/// [`PlEvent`]'s payload when `tag == PlEventTag::PresetStoreLoaded` (bead
+/// `pico-link-ryw.5`, design sec 2.2) -- the terminator of C's boot-time
+/// `count` x [`PlEventTag::PresetLoaded`] push sequence, same shape
+/// [`PlStoreLoadedPayload`] is for [`PlEventTag::PairedDeviceUpserted`].
+/// `status` is a plain `u8`, not [`PlStoreStatus`] -- same reason as every
+/// other union-member tag/state/status field in this module; convert via
+/// [`PlStoreStatus::try_from`], never by transmuting.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlPresetStoreLoadedPayload {
+    pub count: u16,
+    pub status: u8,
+}
+
 /// [`PlEvent`]'s payload when `tag == PlEventTag::DeviceDiscovered`. `name`
 /// points to `name_len` bytes of UTF-8 text, not necessarily
 /// NUL-terminated; invalid UTF-8 is replaced lossily rather than rejected
@@ -1557,6 +1622,14 @@ pub struct PlPairedDeviceUpsertedPayload {
     /// shape the `QUALITY` row/picker's "check follows the stored echo,
     /// never the press" rule depends on.
     pub ldac_quality: u8,
+    /// The assigned DSP effects preset's id, `0`
+    /// ([`pico_link_core::dsp::store::NO_PRESET_ID`]) meaning "none" --
+    /// [`pico_link_core::app::PairedDevice::preset_id`]'s doc comment.
+    /// Added by bead `pico-link-ryw.5`, design sec 3.2: a non-additive
+    /// shape change to this EXISTING tag's payload (same class of change
+    /// `ldac_quality`'s own addition was), hence the
+    /// [`PL_EVENT_ABI_VERSION`] bump 5 -> 6.
+    pub preset_id: u16,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::PairedDeviceForgotten`
@@ -1846,6 +1919,28 @@ pub enum PlEventTag {
     /// `LevelsChanged` (13) on -- [`PL_EVENT_ABI_VERSION`] is unchanged by
     /// this tag's own addition. See [`PlAbrFloorPayload`]'s doc comment.
     AbrFloorLoaded = 20,
+    /// Bead `pico-link-ryw.5`, design sec 2.2/3.2: one DSP effects preset
+    /// the flash store holds (boot push, or a [`PlCommandTag::SavePreset`]
+    /// echo). Purely additive, same discipline as every tag from
+    /// `LevelsChanged` (13) on -- [`PL_EVENT_ABI_VERSION`] is unchanged by
+    /// THIS tag's own addition (the bump this bead needed was for
+    /// `PlPairedDeviceUpsertedPayload` gaining `preset_id`, an existing
+    /// tag's payload, not this new one). See [`PlPresetLoadedPayload`]'s
+    /// doc comment.
+    PresetLoaded = 21,
+    /// Bead `pico-link-ryw.5`, design sec 2.4: a DSP effects preset was
+    /// deleted (the [`PlCommandTag::DeletePreset`] echo). Purely
+    /// additive, same discipline as [`Self::PresetLoaded`] above. See
+    /// [`PlPresetDeletedPayload`]'s doc comment.
+    PresetDeleted = 22,
+    /// Bead `pico-link-ryw.5`, design sec 2.2: C's flash-backed DSP
+    /// preset store (`PL:P:<slot>`) finished loading at boot -- the
+    /// terminator of C's `count` x [`Self::PresetLoaded`] boot push
+    /// sequence, same shape [`Self::StoreLoaded`] is for
+    /// [`Self::PairedDeviceUpserted`]. Purely additive, same discipline
+    /// as [`Self::PresetLoaded`] above. See [`PlPresetStoreLoadedPayload`]'s
+    /// doc comment.
+    PresetStoreLoaded = 23,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1877,6 +1972,9 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             18 => Ok(PlEventTag::DisplaySettingsLoaded),
             19 => Ok(PlEventTag::CushionPolicyLoaded),
             20 => Ok(PlEventTag::AbrFloorLoaded),
+            21 => Ok(PlEventTag::PresetLoaded),
+            22 => Ok(PlEventTag::PresetDeleted),
+            23 => Ok(PlEventTag::PresetStoreLoaded),
             _ => Err(()),
         }
     }
@@ -1930,6 +2028,13 @@ pub union PlEventPayload {
     pub cushion_policy: PlCushionPolicyPayload,
     /// Bead pico-link-d42g.3. See [`PlAbrFloorPayload`]'s doc comment.
     pub abr_floor: PlAbrFloorPayload,
+    /// Bead pico-link-ryw.5. See [`PlPresetLoadedPayload`]'s doc comment.
+    pub preset_loaded: PlPresetLoadedPayload,
+    /// Bead pico-link-ryw.5. See [`PlPresetDeletedPayload`]'s doc comment.
+    pub preset_deleted: PlPresetDeletedPayload,
+    /// Bead pico-link-ryw.5. See [`PlPresetStoreLoadedPayload`]'s doc
+    /// comment.
+    pub preset_store_loaded: PlPresetStoreLoadedPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -1960,7 +2065,16 @@ pub union PlEventPayload {
 // PlPairedDeviceUpsertedPayload gained `ldac_quality` -- a non-additive
 // shape change to an existing tag's payload, same class of bump as all
 // three above (see that field's doc comment).
-pub const PL_EVENT_ABI_VERSION: u32 = 5;
+//
+// Bead pico-link-ryw.5, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 3.2: bumped 5 -> 6. PlPairedDeviceUpsertedPayload gained
+// `preset_id` -- a non-additive shape change to an existing tag's payload,
+// same class of bump as the 4->5 one above (see that field's doc comment).
+// The three new tags this bead adds (PresetLoaded/PresetDeleted/
+// PresetStoreLoaded) are purely additive on their own and would not have
+// required a bump by themselves -- same discipline every tag from
+// `LevelsChanged` (13) on documents.
+pub const PL_EVENT_ABI_VERSION: u32 = 6;
 
 /// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
@@ -2147,7 +2261,13 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             let payload = unsafe { event.payload.paired_device_upserted };
             let name_len = usize::from(payload.name_len).min(payload.name.len());
             let name = String::from_utf8_lossy(&payload.name[..name_len]).into_owned();
-            Event::PairedDeviceUpserted(PairedDevice { addr: payload.addr, name, mru_seq: payload.mru_seq, ldac_quality: payload.ldac_quality })
+            Event::PairedDeviceUpserted(PairedDevice {
+                addr: payload.addr,
+                name,
+                mru_seq: payload.mru_seq,
+                ldac_quality: payload.ldac_quality,
+                preset_id: payload.preset_id,
+            })
         }
         PlEventTag::PairedDeviceForgotten => {
             // SAFETY: same as the `PairedDeviceUpserted` arm above.
@@ -2338,6 +2458,41 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             let payload = unsafe { event.payload.abr_floor };
             Event::AbrFloorLoaded { floor: payload.floor }
         }
+        PlEventTag::PresetLoaded => {
+            // SAFETY: `tag` says this union currently holds
+            // `preset_loaded`. Reading it is sound regardless of field
+            // values -- every field is a plain integer/byte-array type
+            // with no validity invariant to violate (see
+            // `PlPresetLoadedPayload`'s doc comment); `core`'s own
+            // `Preset::from_wire` degrades per-field on a malformed blob,
+            // never panics.
+            let payload = unsafe { event.payload.preset_loaded };
+            let blob_len = usize::from(payload.blob_len).min(payload.blob.len());
+            let blob = alloc::vec::Vec::from(&payload.blob[..blob_len]);
+            Event::PresetLoaded { id: payload.id, blob }
+        }
+        PlEventTag::PresetDeleted => {
+            // SAFETY: `tag` says this union currently holds
+            // `preset_deleted`. `id` is a plain `u16` with no validity
+            // invariant to violate.
+            let payload = unsafe { event.payload.preset_deleted };
+            Event::PresetDeleted { id: payload.id }
+        }
+        PlEventTag::PresetStoreLoaded => {
+            // SAFETY: `tag` says this union currently holds
+            // `preset_store_loaded`. Reading it is sound regardless of
+            // field values; `status` is range-checked below before use,
+            // same discipline as `PlEventTag::StoreLoaded` above.
+            let payload = unsafe { event.payload.preset_store_loaded };
+            let status = match PlStoreStatus::try_from(payload.status) {
+                Ok(status) => status,
+                Err(()) => {
+                    ui.malformed_tag_count += 1;
+                    return;
+                }
+            };
+            Event::PresetStoreLoaded { count: payload.count, status: status.into() }
+        }
     };
     ui.app.handle_event(core_event);
 }
@@ -2477,6 +2632,24 @@ pub enum PlCommandTag {
     /// same reasoning as [`SetCushionPolicy`](Self::SetCushionPolicy)'s own
     /// addition.
     SetAbrFloor = 11,
+    /// Bead `pico-link-ryw.5`, design sec 3.2: create (`preset_id == 0`)
+    /// or overwrite a DSP effects preset. Drained from `App`'s ordinary
+    /// `commands` queue, unlike `SetDisplaySettings`/`SetCushionPolicy`/
+    /// `SetAbrFloor` above -- Andreas's "every value change in the editor
+    /// saves immediately" ruling means each edit is its own queued
+    /// command, not a single coalesced latch (see
+    /// `pico_link_core::app::Command::SavePreset`'s doc comment). See
+    /// [`PlSavePresetPayload`]'s doc comment.
+    SavePreset = 12,
+    /// Bead `pico-link-ryw.5`, design sec 2.4/3.2: delete a DSP effects
+    /// preset. Drained from the ordinary `commands` queue, same shape as
+    /// [`Self::SavePreset`]. See [`PlDeletePresetPayload`]'s doc comment.
+    DeletePreset = 13,
+    /// Bead `pico-link-ryw.5`, design sec 3.2: assign (or clear) a
+    /// device's DSP effects preset. Drained from the ordinary `commands`
+    /// queue, same shape as [`Self::SavePreset`]. See
+    /// [`PlAssignPresetPayload`]'s doc comment.
+    AssignPreset = 14,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -2535,6 +2708,41 @@ pub struct PlSetDeviceLdacQualityPayload {
     pub ldac_quality: u8,
 }
 
+/// [`PlCommand`]'s payload when `tag == PlCommandTag::SavePreset` (bead
+/// `pico-link-ryw.5`, design sec 3.2). `preset_id == 0`
+/// ([`pico_link_core::dsp::store::NO_PRESET_ID`]) means "allocate a fresh
+/// id"; C's [`PlEventTag::PresetLoaded`] echo carries whichever id was
+/// actually used (the one supplied, or the freshly allocated one). `blob`
+/// is an inline fixed buffer copied by value, `blob_len` bytes meaningful
+/// -- same shape as [`PlPresetLoadedPayload`], and C treats it exactly as
+/// opaquely (design sec 2.2: "C NEVER parses the blob").
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlSavePresetPayload {
+    pub preset_id: u16,
+    pub blob_len: u8,
+    pub blob: [u8; PL_DSP_PRESET_BLOB_LEN],
+}
+
+/// [`PlCommand`]'s payload when `tag == PlCommandTag::DeletePreset` (bead
+/// `pico-link-ryw.5`, design sec 2.4/3.2).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlDeletePresetPayload {
+    pub preset_id: u16,
+}
+
+/// [`PlCommand`]'s payload when `tag == PlCommandTag::AssignPreset` (bead
+/// `pico-link-ryw.5`, design sec 3.2). `preset_id ==
+/// `[`pico_link_core::dsp::store::NO_PRESET_ID`]`` clears the assignment
+/// (Off).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlAssignPresetPayload {
+    pub addr: [u8; 6],
+    pub preset_id: u16,
+}
+
 /// The union of every [`PlCommand`] payload shape -- mirrors
 /// [`PlEventPayload`]'s shape (one member per tag that carries data;
 /// `StartScan`/`None` carry none). Kept as a real union rather than a flat
@@ -2559,6 +2767,12 @@ pub union PlCommandPayload {
     pub cushion_policy: PlCushionPolicyPayload,
     /// See [`PlAbrFloorPayload`]'s doc comment. Bead pico-link-d42g.3.
     pub abr_floor: PlAbrFloorPayload,
+    /// See [`PlSavePresetPayload`]'s doc comment. Bead pico-link-ryw.5.
+    pub save_preset: PlSavePresetPayload,
+    /// See [`PlDeletePresetPayload`]'s doc comment. Bead pico-link-ryw.5.
+    pub delete_preset: PlDeletePresetPayload,
+    /// See [`PlAssignPresetPayload`]'s doc comment. Bead pico-link-ryw.5.
+    pub assign_preset: PlAssignPresetPayload,
 }
 
 /// ABI version [`PlCommand`] consumers (C call sites, i.e. `bt.c`'s poll
@@ -2573,7 +2787,18 @@ pub union PlCommandPayload {
 // `PlConnectSucceededPayload` gaining `addr`, bead pico-link-cz0.6) -- so
 // every producer/consumer in this one coordinated build picks up the new
 // field together.
-pub const PL_COMMAND_ABI_VERSION: u32 = 2;
+//
+// Bead pico-link-ryw.5, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 3.2: bumped 2 -> 3, "because the union grows" (the design's
+// own stated rationale) -- `PlCommandPayload` gains `save_preset`, whose
+// `blob: [u8; PL_DSP_PRESET_BLOB_LEN]` (80 bytes) is far larger than any
+// existing member, growing `sizeof(PlCommandPayload)` itself rather than
+// merely adding a same-scale member the way `SetDeviceLdacQuality`/
+// `SetDisplaySettings`/`SetCushionPolicy`/`SetAbrFloor` did (none of which
+// bumped this constant). `SavePreset`/`DeletePreset`/`AssignPreset`'s tag
+// values themselves are still purely additive -- this bump is about the
+// union's size, not about any *existing* tag's payload shape changing.
+pub const PL_COMMAND_ABI_VERSION: u32 = 3;
 
 /// One user-initiated command, Rust -> C. See [`PlCommandPayload`]'s doc
 /// comment for the extensibility rationale and [`PL_COMMAND_ABI_VERSION`]
@@ -2670,6 +2895,32 @@ fn pl_command_from(command: Command) -> PlCommand {
             tag: PlCommandTag::SetDeviceLdacQuality,
             payload: PlCommandPayload { set_device_ldac_quality: PlSetDeviceLdacQualityPayload { addr, ldac_quality } },
         },
+        Command::SavePreset { preset_id, blob } => {
+            // `core` is the sole producer of `Command` values and its own
+            // `Preset::to_wire` never emits more than `dsp::preset::
+            // BLOB_LEN` (70) bytes, well inside the 80-byte wire buffer --
+            // the `.min()` here is defensive only, same discipline
+            // `Command::Connect`'s `name` truncation above uses.
+            let mut blob_buf = [0u8; PL_DSP_PRESET_BLOB_LEN];
+            let len = blob.len().min(blob_buf.len());
+            blob_buf[..len].copy_from_slice(&blob[..len]);
+            let blob_len = u8::try_from(len).unwrap_or(u8::MAX);
+            PlCommand {
+                version: PL_COMMAND_ABI_VERSION,
+                tag: PlCommandTag::SavePreset,
+                payload: PlCommandPayload { save_preset: PlSavePresetPayload { preset_id, blob_len, blob: blob_buf } },
+            }
+        }
+        Command::DeletePreset { preset_id } => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::DeletePreset,
+            payload: PlCommandPayload { delete_preset: PlDeletePresetPayload { preset_id } },
+        },
+        Command::AssignPreset { addr, preset_id } => PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::AssignPreset,
+            payload: PlCommandPayload { assign_preset: PlAssignPresetPayload { addr, preset_id } },
+        },
     }
 }
 
@@ -2727,6 +2978,181 @@ pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
         Some(command) => pl_command_from(command),
         None => pl_command_none(),
     }
+}
+
+// --- The DSP effects program pull API (bead pico-link-ryw.5, design sec
+// 3.2) ---
+//
+// `PlBiquad`/`PlDspProgram` are declared in `firmware/src/dsp.h`, NOT
+// generated by cbindgen from this crate -- see `ui-ffi/cbindgen.toml`'s
+// `export.exclude` and its `after_includes` injection of `#include
+// "dsp.h"`. Both sides are pinned INDEPENDENTLY, matching this module's
+// existing `PlStoreStatus`/`persist.h` convention (see that type's doc
+// comment): `dsp.c`'s realtime kernel already owns this exact struct shape
+// (bead `pico-link-ryw.1`, built before this bead), and a second,
+// cbindgen-generated definition of the same name would collide with it in
+// any translation unit that includes both `dsp.h` and the generated
+// `pico_link_ui.h` (which `main.c` does). The two struct definitions below
+// exist purely so THIS crate has a concrete Rust type to build a
+// [`PlDspProgram`] value with at the FFI boundary -- they must stay
+// field-for-field identical to `dsp.h`'s C definitions (order, types, and
+// therefore layout) or the two sides silently disagree about what a given
+// byte range means. `#[repr(C)]` on both makes this crate's own layout
+// follow the same C ABI rules `dsp.h`'s structs do, so as long as the
+// field lists match, the layouts match too.
+
+/// Mirrors `firmware/src/dsp.h`'s `PlBiquad` exactly (one a0-normalised
+/// biquad in Transposed Direct Form II) -- see this module section's doc
+/// comment for why this is a second, independently-pinned definition
+/// rather than a cbindgen-generated one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlBiquad {
+    pub b0: f32,
+    pub b1: f32,
+    pub b2: f32,
+    pub a1: f32,
+    pub a2: f32,
+}
+
+/// `PL_DSP_MAX_BIQUADS` -- mirrors `firmware/src/dsp.h`'s constant of the
+/// same name exactly (independently pinned, same convention as
+/// [`PlBiquad`]/[`PlDspProgram`] themselves). [`pl_dsp_program_to_wire`]
+/// clamps to this even though `core`'s own [`pico_link_core::dsp::preset::MAX_BANDS`]
+/// already caps a [`pico_link_core::dsp::preset::Preset`] at the same
+/// count -- the FFI boundary's own defensive backstop, same discipline
+/// this bead's CONTRACT comment asks `dsp.c`'s `pl_dsp_submit` to apply on
+/// the C side of the same value.
+const PL_DSP_MAX_BIQUADS: usize = 10;
+
+/// The realtime DSP path is fixed at 48kHz -- mirrors `dsp.h`'s
+/// `PL_DSP_EXPECTED_FS_HZ` exactly (independently pinned; design sec 1.2:
+/// "fs is fixed at 48k... The program carries `fs_hz`, and the kernel
+/// bypasses on mismatch"). `core` never has occasion to compile a
+/// [`pico_link_core::dsp::Program`] at any other rate, so this is the one
+/// value [`pl_ui_take_dsp_program`] ever calls
+/// [`pico_link_core::app::App::dsp_program`] with.
+const PL_DSP_FS_HZ: u32 = 48_000;
+
+/// Mirrors `firmware/src/dsp.h`'s `PlDspProgram` exactly -- field order,
+/// types and therefore layout, per this module section's doc comment.
+/// `xfeed_on`/`n_biquads` are plain `u8` (not `bool`), matching `dsp.h`'s
+/// own field types (its kernel reads them with C truthiness, not as a
+/// validated boolean -- see `pl_dsp_program_is_active` in `dsp.c`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlDspProgram {
+    pub fs_hz: u32,
+    pub preamp: f32,
+    pub n_biquads: u8,
+    pub xfeed_on: u8,
+    pub xfeed_lp_b0: f32,
+    pub xfeed_lp_a1: f32,
+    pub xfeed_gain: f32,
+    pub xfeed_hs_b0: f32,
+    pub xfeed_hs_b1: f32,
+    pub xfeed_hs_a1: f32,
+    pub xfeed_norm: f32,
+    pub biquad: [PlBiquad; PL_DSP_MAX_BIQUADS],
+}
+
+/// Maps a [`pico_link_core::dsp::Program`] to its wire [`PlDspProgram`]
+/// shape -- the exact field mapping this bead's CONTRACT comment (bead
+/// `pico-link-ryw.5`'s dispatch, from the ryw.1/ryw.2 code review) pins:
+/// `CrossfeedCoeffs::lo_b0 -> xfeed_lp_b0`, `lo_a1 -> xfeed_lp_a1`,
+/// `hi_b0/hi_b1/hi_a1 -> xfeed_hs_b0/b1/a1`, `norm_gain -> xfeed_norm`, and
+/// `xfeed_gain` is ALWAYS `1.0` -- `g_lo` is already folded into `lo_b0`
+/// (see [`pico_link_core::dsp::CrossfeedCoeffs`]'s own doc comment), so
+/// deriving `xfeed_gain` from any `CrossfeedCoeffs` field would double-
+/// apply it. `preamp`/`fs_hz`/the biquad field order and sign convention
+/// already match `core`'s own [`pico_link_core::dsp::Biquad`] one-to-one,
+/// no conversion needed beyond a plain copy.
+///
+/// A pure function (no `PlUi`/FFI involved), same "the actual risk here is
+/// unit-testable directly" reasoning [`pl_command_from`]'s doc comment
+/// gives for its own pure-mapping shape.
+// `n as u8`: `n <= PL_DSP_MAX_BIQUADS == 10`, so this never truncates --
+// same reasoning as `pl_command_from`'s own `name_len` cast. The
+// `xfeed_lp_*`/`xfeed_hs_*` local names are deliberately kept close to
+// `PlDspProgram`'s own field names (this bead's CONTRACT mapping is
+// checkable line-by-line against them), same rationale
+// `pico_link_core::dsp::coeffs::crossfeed_coeffs`'s own
+// `#[allow(clippy::similar_names)]` gives for its `gb_lo`/`g_lo`/`gb_hi`/
+// `g_hi` locals.
+#[allow(clippy::cast_possible_truncation, clippy::similar_names)]
+fn pl_dsp_program_to_wire(program: &pico_link_core::dsp::Program) -> PlDspProgram {
+    let mut biquad = [PlBiquad { b0: 0.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }; PL_DSP_MAX_BIQUADS];
+    let n = program.biquads.len().min(PL_DSP_MAX_BIQUADS);
+    for (slot, bq) in biquad.iter_mut().zip(program.biquads.iter()).take(n) {
+        *slot = PlBiquad { b0: bq.b0, b1: bq.b1, b2: bq.b2, a1: bq.a1, a2: bq.a2 };
+    }
+    let n_biquads = n as u8;
+
+    let (xfeed_on, xfeed_lp_b0, xfeed_lp_a1, xfeed_gain, xfeed_hs_b0, xfeed_hs_b1, xfeed_hs_a1, xfeed_norm) =
+        match program.crossfeed {
+            Some(xf) => (1u8, xf.lo_b0, xf.lo_a1, 1.0f32, xf.hi_b0, xf.hi_b1, xf.hi_a1, xf.norm_gain),
+            None => (0u8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        };
+
+    PlDspProgram {
+        fs_hz: program.fs_hz,
+        preamp: program.preamp_linear,
+        n_biquads,
+        xfeed_on,
+        xfeed_lp_b0,
+        xfeed_lp_a1,
+        xfeed_gain,
+        xfeed_hs_b0,
+        xfeed_hs_b1,
+        xfeed_hs_a1,
+        xfeed_norm,
+        biquad,
+    }
+}
+
+/// The DSP program pull (design sec 3.2: "the PROGRAM IS STATE, NOT AN
+/// EVENT, so it gets its own pull API, not a `PlCommand`" -- a
+/// level-seqlock, newest wins, that keeps ~250B out of every `PlCommand`
+/// copy). Returns `true` and writes `*out` when the currently active
+/// program -- [`pico_link_core::app::App::dsp_program`], resolved from the
+/// connected device's assigned preset, see that method's doc comment --
+/// differs from the last value this function returned; returns `false`
+/// and leaves `*out` untouched otherwise.
+///
+/// C is expected to call this once per superloop iteration, next to
+/// `pl_a2dp_poll_levels` (design sec 3.2): `if
+/// (pl_ui_take_dsp_program(ui, &program)) { pl_dsp_submit(&program); }`,
+/// then unconditionally `pl_dsp_service()` regardless of this call's
+/// result -- that second call retries a still-unacked previous publish
+/// (see `dsp.h`'s `pl_dsp_service` doc comment), which is why it must run
+/// every iteration and not only on a `true` return here.
+///
+/// Returns `false` (and never writes `*out`) if `ui` or `out` is null --
+/// same "never write into a pointer the caller didn't validate" contract
+/// [`pl_ui_render_ex`] documents for its own out-param.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `out`, if non-null, must point to valid, writable
+/// [`PlDspProgram`] storage.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_take_dsp_program(ui: *mut PlUi, out: *mut PlDspProgram) -> bool {
+    if ui.is_null() || out.is_null() {
+        return false;
+    }
+    // SAFETY: caller contract above.
+    let ui = &mut *ui;
+    let program = ui.app.dsp_program(PL_DSP_FS_HZ);
+    if ui.last_dsp_program.as_ref() == Some(&program) {
+        return false;
+    }
+    let wire = pl_dsp_program_to_wire(&program);
+    // SAFETY: `out` is non-null and, per the caller contract, points to
+    // valid writable `PlDspProgram` storage.
+    unsafe { *out = wire };
+    ui.last_dsp_program = Some(program);
+    true
 }
 
 // --- Tests: pico-link-ptu, checked tag conversion ---
@@ -2989,11 +3415,11 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past AbrFloorLoaded = 20, the highest legal PlEventTag as
-            // of bead pico-link-d42g.3 -- moved from 20 (one past the
-            // previous highest, CushionPolicyLoaded = 19) when this bead
-            // added tag 20.
-            tag: 21,
+            // One past PresetStoreLoaded = 23, the highest legal PlEventTag
+            // as of bead pico-link-ryw.5 -- moved from 21 (one past the
+            // previous highest, AbrFloorLoaded = 20) when this bead added
+            // tags 21-23.
+            tag: 24,
             payload: bogus_payload,
         };
         unsafe {
@@ -3459,14 +3885,14 @@ mod tests {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::PairedDeviceUpserted as u32,
             payload: PlEventPayload {
-                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_old, name: [0u8; 32], name_len: 0, mru_seq: 1, ldac_quality: 0 },
+                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_old, name: [0u8; 32], name_len: 0, mru_seq: 1, ldac_quality: 0, preset_id: 0 },
             },
         };
         let upsert_new = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::PairedDeviceUpserted as u32,
             payload: PlEventPayload {
-                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_new, name, name_len: 3, mru_seq: 2, ldac_quality: 0 },
+                paired_device_upserted: PlPairedDeviceUpsertedPayload { addr: addr_new, name, name_len: 3, mru_seq: 2, ldac_quality: 0, preset_id: 0 },
             },
         };
         let store_loaded = PlEvent {
@@ -3537,7 +3963,7 @@ mod tests {
         let upsert = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::PairedDeviceUpserted as u32,
-            payload: PlEventPayload { paired_device_upserted: PlPairedDeviceUpsertedPayload { addr, name, name_len: 2, mru_seq: 7, ldac_quality: 0 } },
+            payload: PlEventPayload { paired_device_upserted: PlPairedDeviceUpsertedPayload { addr, name, name_len: 2, mru_seq: 7, ldac_quality: 0, preset_id: 0 } },
         };
         let forget = PlEvent {
             version: PL_EVENT_ABI_VERSION,
@@ -3642,14 +4068,18 @@ mod tests {
             PlEventTag::DisplaySettingsLoaded,
             PlEventTag::CushionPolicyLoaded,
             PlEventTag::AbrFloorLoaded,
+            PlEventTag::PresetLoaded,
+            PlEventTag::PresetDeleted,
+            PlEventTag::PresetStoreLoaded,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 21 -- one past AbrFloorLoaded = 20, the highest legal PlEventTag
-        // as of bead pico-link-d42g.3 (moved from 20, one past the previous
-        // highest CushionPolicyLoaded = 19, when this bead added tag 20).
-        assert!(PlEventTag::try_from(21u32).is_err());
+        // 24 -- one past PresetStoreLoaded = 23, the highest legal
+        // PlEventTag as of bead pico-link-ryw.5 (moved from 21, one past
+        // the previous highest AbrFloorLoaded = 20, when this bead added
+        // tags 21-23).
+        assert!(PlEventTag::try_from(24u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
@@ -4228,6 +4658,211 @@ mod tests {
             // Drained -- a second poll must not resurface it.
             let cmd2 = pl_ui_poll_command(ui);
             assert_eq!(cmd2.tag as u32, PlCommandTag::None as u32);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_push_event_accepts_the_ryw5_preset_tags() {
+        // Bead pico-link-ryw.5: the three new event tags round-trip
+        // through the checked-conversion path without being rejected as
+        // malformed and without panicking -- same shape
+        // `pl_ui_push_event_accepts_the_znb7_wizard_tags` uses for its own
+        // new tags.
+        let ui = new_ui();
+        let events = [
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::PresetLoaded as u32,
+                payload: PlEventPayload {
+                    preset_loaded: PlPresetLoadedPayload { id: 1, blob_len: 0, blob: [0u8; PL_DSP_PRESET_BLOB_LEN] },
+                },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::PresetDeleted as u32,
+                payload: PlEventPayload { preset_deleted: PlPresetDeletedPayload { id: 1 } },
+            },
+            PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::PresetStoreLoaded as u32,
+                payload: PlEventPayload { preset_store_loaded: PlPresetStoreLoadedPayload { count: 1, status: PlStoreStatus::Loaded as u8 } },
+            },
+        ];
+        unsafe {
+            for event in events {
+                pl_ui_push_event(ui, event);
+            }
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "every tag above is legal -- none should be counted as malformed");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_command_from_maps_the_three_ryw5_preset_commands() {
+        // `pl_command_from` is a pure function purely so this mapping is
+        // unit-testable directly -- same rationale its own doc comment
+        // gives, applied to the three commands this bead adds.
+        let blob = alloc::vec![1u8, 2, 3];
+        let save = pl_command_from(pico_link_core::Command::SavePreset { preset_id: 0, blob: blob.clone() });
+        assert_eq!(save.version, PL_COMMAND_ABI_VERSION);
+        assert_eq!(save.tag as u32, PlCommandTag::SavePreset as u32);
+        unsafe {
+            let payload = save.payload.save_preset;
+            assert_eq!(payload.preset_id, 0);
+            assert_eq!(payload.blob_len, 3);
+            assert_eq!(&payload.blob[..3], &blob[..]);
+        }
+
+        let delete = pl_command_from(pico_link_core::Command::DeletePreset { preset_id: 9 });
+        assert_eq!(delete.tag as u32, PlCommandTag::DeletePreset as u32);
+        unsafe {
+            assert_eq!(delete.payload.delete_preset.preset_id, 9);
+        }
+
+        let addr = [9u8, 8, 7, 6, 5, 4];
+        let assign = pl_command_from(pico_link_core::Command::AssignPreset { addr, preset_id: 4 });
+        assert_eq!(assign.tag as u32, PlCommandTag::AssignPreset as u32);
+        unsafe {
+            let payload = assign.payload.assign_preset;
+            assert_eq!(payload.addr, addr);
+            assert_eq!(payload.preset_id, 4);
+        }
+    }
+
+    // --- Tests: pico-link-ryw.5, the DSP effects program pull API ---
+
+    fn zeroed_dsp_program() -> PlDspProgram {
+        PlDspProgram {
+            fs_hz: 0,
+            preamp: 0.0,
+            n_biquads: 0,
+            xfeed_on: 0,
+            xfeed_lp_b0: 0.0,
+            xfeed_lp_a1: 0.0,
+            xfeed_gain: 0.0,
+            xfeed_hs_b0: 0.0,
+            xfeed_hs_b1: 0.0,
+            xfeed_hs_a1: 0.0,
+            xfeed_norm: 0.0,
+            biquad: [PlBiquad { b0: 0.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }; PL_DSP_MAX_BIQUADS],
+        }
+    }
+
+    #[test]
+    fn pl_ui_take_dsp_program_null_args_return_false() {
+        let ui = new_ui();
+        let mut out = zeroed_dsp_program();
+        unsafe {
+            assert!(!pl_ui_take_dsp_program(core::ptr::null_mut(), &mut out));
+            assert!(!pl_ui_take_dsp_program(ui, core::ptr::null_mut()));
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_take_dsp_program_no_connected_device_resolves_off_once_then_reports_no_change() {
+        // No `ConnectSucceeded`/`PairedDeviceUpserted` at all -- `App::
+        // dsp_program` resolves `Program::off` (design sec 3.1's
+        // "connected device's preset_id, else Off"). The FIRST call still
+        // returns `true` (the initial Off program must reach C's engine
+        // once, per `PlUi::last_dsp_program`'s doc comment); the SECOND,
+        // with nothing changed, returns `false`.
+        let ui = new_ui();
+        let mut out = zeroed_dsp_program();
+        unsafe {
+            assert!(pl_ui_take_dsp_program(ui, &mut out));
+            assert_eq!(out.fs_hz, PL_DSP_FS_HZ);
+            assert_eq!(out.preamp, 1.0);
+            assert_eq!(out.n_biquads, 0);
+            assert_eq!(out.xfeed_on, 0);
+
+            let mut out2 = zeroed_dsp_program();
+            assert!(
+                !pl_ui_take_dsp_program(ui, &mut out2),
+                "an unchanged Off program must not be reported as a change on the second call"
+            );
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_take_dsp_program_maps_crossfeed_coeffs_per_the_ryw5_contract() {
+        // Bead pico-link-ryw.5's CONTRACT comment: lo_b0->xfeed_lp_b0,
+        // lo_a1->xfeed_lp_a1, hi_b0/hi_b1/hi_a1->xfeed_hs_b0/b1/a1,
+        // norm_gain->xfeed_norm, and xfeed_gain is ALWAYS 1.0 (never
+        // derived from CrossfeedCoeffs -- g_lo is already folded into
+        // lo_b0). Connects a device, assigns it a crossfeed-only preset
+        // (no bands, so preamp stays unity and this isolates exactly the
+        // crossfeed field mapping), and checks the wire program's fields
+        // against a fresh, independent `crossfeed_coeffs` call -- not
+        // against hardcoded literals, so this doesn't silently pass if
+        // `core`'s own coefficient formula ever changes.
+        use pico_link_core::dsp::preset::{CrossfeedLevel, Preset};
+
+        let addr = [1u8, 2, 3, 4, 5, 6];
+        let mut preset = Preset::new("Xfeed");
+        preset.crossfeed = CrossfeedLevel::Weak;
+        let wire_blob = preset.to_wire();
+        let mut blob = [0u8; PL_DSP_PRESET_BLOB_LEN];
+        blob[..wire_blob.len()].copy_from_slice(&wire_blob);
+
+        let ui = new_ui();
+        unsafe {
+            pl_ui_push_event(
+                ui,
+                PlEvent {
+                    version: PL_EVENT_ABI_VERSION,
+                    tag: PlEventTag::PairedDeviceUpserted as u32,
+                    payload: PlEventPayload {
+                        paired_device_upserted: PlPairedDeviceUpsertedPayload {
+                            addr,
+                            name: [0u8; 32],
+                            name_len: 0,
+                            mru_seq: 1,
+                            ldac_quality: 0,
+                            preset_id: 7,
+                        },
+                    },
+                },
+            );
+            pl_ui_push_event(
+                ui,
+                PlEvent {
+                    version: PL_EVENT_ABI_VERSION,
+                    tag: PlEventTag::PresetLoaded as u32,
+                    payload: PlEventPayload {
+                        preset_loaded: PlPresetLoadedPayload { id: 7, blob_len: wire_blob.len() as u8, blob },
+                    },
+                },
+            );
+            pl_ui_push_event(
+                ui,
+                PlEvent {
+                    version: PL_EVENT_ABI_VERSION,
+                    tag: PlEventTag::ConnectSucceeded as u32,
+                    payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { addr, degraded: 0 } },
+                },
+            );
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+
+            let mut out = zeroed_dsp_program();
+            assert!(pl_ui_take_dsp_program(ui, &mut out));
+            assert_eq!(out.fs_hz, PL_DSP_FS_HZ);
+            assert_eq!(out.preamp, 1.0, "a band-less preset needs no auto-preamp headroom");
+            assert_eq!(out.n_biquads, 0);
+            assert_eq!(out.xfeed_on, 1);
+            assert_eq!(out.xfeed_gain, 1.0, "xfeed_gain must be the CONTRACT's hardcoded constant, never derived");
+
+            let expected = pico_link_core::dsp::crossfeed_coeffs(CrossfeedLevel::Weak, PL_DSP_FS_HZ)
+                .expect("Weak is not Off, must produce coefficients");
+            assert_eq!(out.xfeed_lp_b0, expected.lo_b0);
+            assert_eq!(out.xfeed_lp_a1, expected.lo_a1);
+            assert_eq!(out.xfeed_hs_b0, expected.hi_b0);
+            assert_eq!(out.xfeed_hs_b1, expected.hi_b1);
+            assert_eq!(out.xfeed_hs_a1, expected.hi_a1);
+            assert_eq!(out.xfeed_norm, expected.norm_gain);
+
             pl_ui_destroy(ui);
         }
     }

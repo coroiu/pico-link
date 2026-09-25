@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn a_nameless_paired_device_renders_the_unknown_device_fallback_label() {
-        let device = PairedDevice { addr: [0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33], name: String::new(), mru_seq: 1, ldac_quality: 0 };
+        let device = PairedDevice { addr: [0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33], name: String::new(), mru_seq: 1, ldac_quality: 0, preset_id: 0 };
         assert_eq!(paired_device_label(&device), "(unknown device) 11:22:33");
     }
 

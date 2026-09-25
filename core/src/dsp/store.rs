@@ -49,6 +49,27 @@ impl PresetStore {
         Self { presets, next_id }
     }
 
+    /// Inserts (or overwrites) `preset` under an EXPLICIT `id`, bumping
+    /// `next_id` past it if needed -- the incremental counterpart to
+    /// [`Self::from_loaded`]'s batch constructor, for a caller that folds
+    /// records in one at a time rather than collecting them first (bead
+    /// `pico-link-ryw.5`: C's boot push is `count` x one-record-at-a-time
+    /// [`Event::PresetLoaded`](crate::app::Event::PresetLoaded), and the
+    /// SAME event is also a live [`Command::SavePreset`](crate::app::Command::SavePreset)
+    /// echo arriving well after boot -- both cases need "insert this one
+    /// id now," not "rebuild the whole store"). `id == 0`
+    /// ([`NO_PRESET_ID`]) is a no-op: C is never expected to send it (its
+    /// own allocator starts at 1, same as this store's `next_id`), and
+    /// accepting it would let a preset alias the sentinel "no preset
+    /// assigned" value.
+    pub fn load(&mut self, id: u16, preset: Preset) {
+        if id == NO_PRESET_ID {
+            return;
+        }
+        self.presets.insert(id, preset);
+        self.next_id = self.next_id.max(id.saturating_add(1)).max(1);
+    }
+
     /// Allocates a fresh, never-before-used id and inserts `preset` under
     /// it. Returns the allocated id (design sec 3.2: `PresetLoaded` "is
     /// also the save echo and carries the allocated id").

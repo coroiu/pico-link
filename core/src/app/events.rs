@@ -68,6 +68,38 @@ pub enum Command {
     /// the [`Event::PairedDeviceUpserted`] echo this write produces, never
     /// the press itself.
     SetDeviceLdacQuality { addr: DeviceAddr, ldac_quality: u8 },
+    /// User-initiated: create (`preset_id == 0`) or overwrite (`preset_id`
+    /// nonzero) a DSP effects preset with `blob`'s contents -- bead
+    /// `pico-link-ryw.5`, design sec 3.2. Andreas's ruling: "every value
+    /// change in the editor saves immediately," so a future preset editor
+    /// (`pico-link-ryw.7`) queues this on EVERY field edit, not just on
+    /// exit -- `core` never stages/coalesces these the way
+    /// `SetDisplaySettings`'s latch does (design D9), because there is no
+    /// "last write wins before C polls" race to close here: C's flash
+    /// write is the source of truth for the allocated id, and every save
+    /// (including a rapid burst) must reach it so
+    /// [`Event::PresetLoaded`]'s echo can confirm each one in turn. `blob`
+    /// is [`crate::dsp::preset::Preset::to_wire`]'s exact output -- `core`
+    /// owns the wire format, C stores it opaquely (design sec 2.2: "C
+    /// NEVER parses the blob").
+    SavePreset { preset_id: u16, blob: alloc::vec::Vec<u8> },
+    /// User-initiated: delete a DSP effects preset (the preset list's
+    /// delete-confirm flow, `pico-link-ryw.7`). Per design sec 2.4, C does
+    /// NOT rewrite any device record that referenced this id -- a dangling
+    /// reference resolves to Off by construction
+    /// ([`crate::dsp::PresetStore::resolve`]'s doc comment), so no
+    /// up-to-8-device rewrite is needed here.
+    DeletePreset { preset_id: u16 },
+    /// User-initiated: assign (or clear, with [`crate::dsp::store::NO_PRESET_ID`])
+    /// `addr`'s DSP effects preset -- the device page's preset-assignment
+    /// row (`pico-link-ryw.7`). Applies live immediately (the pull API in
+    /// `ui-ffi` recomputes the active program from whatever `core` now
+    /// resolves for the connected device, design sec 3.2's "core computes
+    /// the program from the active preset"); C additionally stages the
+    /// flash write, same discipline as [`Self::SetDeviceLdacQuality`]. The
+    /// check follows the [`Event::PairedDeviceUpserted`] echo this write
+    /// produces, never the local press.
+    AssignPreset { addr: DeviceAddr, preset_id: u16 },
 }
 
 /// Why a connect attempt failed, as reported by C over
@@ -388,6 +420,33 @@ pub enum Event {
     /// [`crate::audio::AbrFloor::from_wire`], same discipline as
     /// [`Self::CushionPolicyLoaded`] above.
     AbrFloorLoaded { floor: u8 },
+    /// One DSP effects preset the flash store holds -- bead
+    /// `pico-link-ryw.5`, design sec 2.2/3.2. Pushed either at boot (C's
+    /// `count` x this event ahead of [`Event::PresetStoreLoaded`], same
+    /// boot-sequence shape [`Event::PairedDeviceUpserted`]/
+    /// [`Event::StoreLoaded`] use) OR as the save echo for
+    /// [`Command::SavePreset`] -- `id` is C's allocated id either way
+    /// (`preset_id == 0` on the command meant "allocate", and this event's
+    /// `id` is never `0`: [`crate::dsp::store::NO_PRESET_ID`] is reserved
+    /// and never assigned to a real preset). `blob` is opaque to C
+    /// (design sec 2.2: "C NEVER parses the blob") -- `core` decodes it
+    /// with [`crate::dsp::preset::Preset::from_wire`], same
+    /// per-field-fallback discipline every other `*Loaded` wire decode in
+    /// this module uses.
+    PresetLoaded { id: u16, blob: alloc::vec::Vec<u8> },
+    /// A DSP effects preset was deleted -- the [`Command::DeletePreset`]
+    /// echo, a REAL deletion C's flash store performed, not merely
+    /// requested (same "echo, not the request" discipline
+    /// [`Event::PairedDeviceForgotten`]'s doc comment describes).
+    PresetDeleted { id: u16 },
+    /// C's flash-backed DSP preset store (`PL:P:<slot>`) finished loading
+    /// at boot -- the terminator of C's `count` x [`Event::PresetLoaded`]
+    /// boot push sequence, same shape [`Event::StoreLoaded`] is for
+    /// [`Event::PairedDeviceUpserted`]. `status` reuses [`StoreStatus`]'s
+    /// four variants (the device store's own boot-status vocabulary
+    /// already covers "first boot / loaded / one record's CRC failed /
+    /// schema version mismatch" and nothing about it is device-specific).
+    PresetStoreLoaded { count: u16, status: StoreStatus },
 }
 
 /// Phase 4's four named connect sub-steps: naming the current one tells

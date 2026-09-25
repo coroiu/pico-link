@@ -67,6 +67,7 @@ fn bench_full_render() {
         name: String::from("Sony WH-1000XM5"),
         mru_seq: 1,
         ldac_quality: 0,
+        preset_id: 0,
     }));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec {

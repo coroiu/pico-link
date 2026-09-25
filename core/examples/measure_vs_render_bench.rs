@@ -57,7 +57,7 @@ fn home_connected_with_out_level() -> App {
     let mut app = App::new(240, 240);
     let addr = [7u8; 6];
     app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
-    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0 }));
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 0 }));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.tick(1);
     app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });

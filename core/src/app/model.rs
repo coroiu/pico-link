@@ -390,6 +390,19 @@ pub struct PairedDevice {
     /// [`build_single_select_screen`]'s `checked` parameter and the
     /// `QUALITY` row's check both read -- never the local press.
     pub ldac_quality: u8,
+    /// The assigned DSP effects preset's id (bead `pico-link-ryw.5`, design
+    /// `.planning/design/2026-09-25-dsp-effects-stage.md` sec 2.3/3.2):
+    /// [`crate::dsp::store::NO_PRESET_ID`] (`0`) means "no preset assigned"
+    /// (Andreas's ruling -- new and unassigned devices get Off), and ANY id
+    /// this build's [`crate::dsp::PresetStore`] doesn't hold (a dangling
+    /// reference -- the preset was deleted) also resolves to Off, by
+    /// construction -- see [`crate::dsp::PresetStore::resolve`]'s doc
+    /// comment. `core` resolves both cases identically; C never
+    /// special-cases either. Same stored-echo discipline as `ldac_quality`
+    /// above: a picker's local press is never trusted, only the
+    /// [`Event::PairedDeviceUpserted`] echo the write it queues eventually
+    /// produces.
+    pub preset_id: u16,
 }
 
 /// The live A2DP link's negotiated codec, as reported by C over

@@ -43,6 +43,7 @@
 #include "a2dp.h"
 #include "codec_ldac.h"
 #include "bt.h"
+#include "dsp.h"
 #ifdef PL_DEBUG_REMOTE
 #include "debug_remote.h"
 #endif
@@ -714,6 +715,19 @@ int main(void) {
         // kept adjacent purely because both are "poll a live a2dp.c
         // reading, push if changed" calls.
         pl_a2dp_poll_ldac_bitrate(ui);
+        // Bead pico-link-ryw.5, design sec 3.2: pull the active DSP
+        // program (core computes it from the connected device's assigned
+        // preset) and submit it to core1's engine only when it changed;
+        // pl_dsp_service() then runs UNCONDITIONALLY every iteration
+        // regardless of this call's result, to retry a still-unacked
+        // previous publish (see dsp.h's pl_dsp_service doc comment) --
+        // same "poll a live reading, act if changed" shape as
+        // pl_a2dp_poll_ldac_bitrate above, kept adjacent for that reason.
+        PlDspProgram dsp_program;
+        if (pl_ui_take_dsp_program(ui, &dsp_program)) {
+            pl_dsp_submit(&dsp_program);
+        }
+        pl_dsp_service();
 #endif
 
         // Idle-screensaver seam (pico-link-i3e, extended by pico-link-
