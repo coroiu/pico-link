@@ -1671,7 +1671,8 @@ mod tests {
         // Drives the real Settings picker through ordinary input, end to
         // end: Home status -> menu face, Down to Settings, Select opens
         // it (landing on row 0, "BUFFER" -- bead `pico-link-8pp1.2` S4),
-        // Down to row 1 ("IDLE SCREEN"), Select opens the ScreensaverMode
+        // Down twice to row 2 ("IDLE SCREEN" -- row 1 is now "LDAC MIN",
+        // bead `pico-link-d42g.4` F4), Select opens the ScreensaverMode
         // picker, Select picks its first option -- proving `Runner::step`
         // actually persists a real user pick, not just a hand-built
         // `DisplaySettings` value.
@@ -1679,6 +1680,7 @@ mod tests {
             vec![NavIntent::Select],
             vec![NavIntent::Down],
             vec![NavIntent::Select],
+            vec![NavIntent::Down],
             vec![NavIntent::Down],
             vec![NavIntent::Select],
             vec![NavIntent::Select],
@@ -1689,7 +1691,7 @@ mod tests {
         let mut iterations = 0;
         run(&mut platform, &mut app, Duration::from_millis(0), None, None, || {
             iterations += 1;
-            iterations <= 7
+            iterations <= 8
         });
 
         let sets = storage_sets.borrow();

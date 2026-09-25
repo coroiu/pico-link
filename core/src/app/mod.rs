@@ -177,8 +177,16 @@ impl App {
         let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
         let abr_floor = Rc::new(RefCell::new(AbrFloorState::default()));
         let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
-        let navigator =
-            Navigator::new(build_home_screen(&model, &home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy));
+        let navigator = Navigator::new(build_home_screen(
+            &model,
+            &home_face,
+            &commands,
+            &wizard_phase,
+            Instant::from_micros(0),
+            &display_settings,
+            &cushion_policy,
+            &abr_floor,
+        ));
         Self {
             navigator,
             framebuffer: FrameBuffer565::new(width, height),
