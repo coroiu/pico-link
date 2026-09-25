@@ -3231,6 +3231,29 @@ static void pl_a2dp_wizard_dismiss_timer_cancel(void) {
     s_ctx.wizard_dismiss_armed = false;
 }
 
+// Bead pico-link-sfw6, design `.planning/design/2026-09-25-device-switch-
+// break-before-make.md` sec 2: bt.c calls this the instant a switch starts
+// (before gap_disconnect on A's ACL), so neither of A's own in-flight
+// timers can fire into B's session -- the 0x0b retry would reissue
+// establish_stream against A's stale pending_addr, and the wizard-dismiss
+// timer would auto-pop Home mid-switch. Same two calls pl_a2dp_connect
+// makes for a fresh top-level attempt; a switch is just a connect attempt
+// that happens to be preceded by a teardown.
+void pl_a2dp_prepare_switch(void) {
+    pl_a2dp_reconnect_retry_cancel();
+    pl_a2dp_wizard_dismiss_timer_cancel();
+}
+
+// Bead pico-link-sfw6: true once the AVDTP/AVRCP session has fully
+// quiesced (a2dp_cid cleared by STREAM_RELEASED/SIGNALING_CONNECTION_
+// RELEASED, design sec 2) -- bt.c's switch heartbeat pages B only once
+// this AND pl_bt_any_acl_up() are both false, so a slot that's merely
+// free at the HCI layer but still mid-AVDTP-teardown can't race a fresh
+// establish_stream.
+bool pl_a2dp_session_idle(void) {
+    return s_ctx.a2dp_cid == 0;
+}
+
 static void pl_a2dp_wizard_dismiss_timer_handler(btstack_timer_source_t *ts) {
     (void)ts;
     s_ctx.wizard_dismiss_armed = false;

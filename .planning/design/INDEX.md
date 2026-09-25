@@ -55,6 +55,7 @@ status in `.planning/progress.md`.
 | 2026-09-25 | `2026-09-25-adaptive-floor.md` | Adaptive floor: global PL:S:2, libldac rail to Q5, 9-rung ladder (pico-link-d42g) | Live |
 | 2026-09-25 | `2026-09-25-dsp-effects-stage.md` | DSP effects fixed-rate stage on core1 (`pl_a2dp_fill`, `pl_dsp_rt_*` kernel, two-bank generation-acked program handoff, structural bypass, one-block crossfade), the `PL:P:<slot>` preset store, and the C/Rust FFI split (Rust owns coefficients, C owns the realtime kernel). Child bead breakdown ryw.1-ryw.8. | Design of record; ryw.1 (C DSP engine) implemented |
 | 2026-09-25 | `2026-09-25-dsp-effects-ux.md` | DSP effects UX (Uma): effects list, one-screen editor (Left/Right value rows), delete confirm, device page EFFECT row/picker, Home FX line. Implementation notes at the bottom record the save-immediately ruling and two other deviations. | Design of record; implemented on pico-link-ryw.7 |
+| 2026-09-25 | `2026-09-25-device-switch-break-before-make.md` | Break-before-make device switching (Ada): firmware-owned switch state machine in bt.c (gap_disconnect the full ACL, wait for the HCI slot, page B), scan-mode gate, additive ConnectStep Disconnecting, MRU stays on failed-switch A. Bead pico-link-sfw6. | Design of record; implemented on pico-link-sfw6 |
 
 ## Platform / power / tooling
 

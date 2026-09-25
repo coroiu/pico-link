@@ -452,6 +452,16 @@ pub enum Event {
 /// Phase 4's four named connect sub-steps: naming the current one tells
 /// the user *and us* where a stalled connect attempt actually got stuck,
 /// which a single generic "Connecting..." spinner cannot.
+///
+/// `Disconnecting` (bead `pico-link-sfw6`, design `.planning/design/2026-
+/// 09-25-device-switch-break-before-make.md` sec 3) is a fifth, additive
+/// variant: A's teardown at the start of a break-before-make device
+/// switch, before B's own four named sub-steps begin. Deliberately kept
+/// out of [`ConnectStep::all`] -- that fixed four-element array is still
+/// "the four named sub-steps of *a connect attempt*", and `Disconnecting`
+/// is a distinct phase that precedes one, not a fifth step within it (see
+/// `crate::render::wizard`'s `render_connecting_steps`, which renders it as
+/// its own line rather than inserting it into that array).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectStep {
     /// ACL connect.
@@ -462,6 +472,8 @@ pub enum ConnectStep {
     SettingUpAudio,
     /// Codec negotiation.
     NegotiatingCodec,
+    /// Tearing down the previous device's ACL before paging this one.
+    Disconnecting,
 }
 
 impl ConnectStep {
@@ -472,12 +484,14 @@ impl ConnectStep {
             ConnectStep::Pairing => "Pairing",
             ConnectStep::SettingUpAudio => "Setting up audio",
             ConnectStep::NegotiatingCodec => "Negotiating codec",
+            ConnectStep::Disconnecting => "Disconnecting",
         }
     }
 
     /// The fixed display order phase 4 always shows the four steps in:
     /// "1 Connecting ... 2 Pairing ... 3 Setting up audio ... 4 Negotiating
-    /// codec".
+    /// codec". Does NOT include [`ConnectStep::Disconnecting`] -- see this
+    /// enum's doc comment.
     #[must_use]
     pub fn all() -> [ConnectStep; 4] {
         [ConnectStep::Connecting, ConnectStep::Pairing, ConnectStep::SettingUpAudio, ConnectStep::NegotiatingCodec]

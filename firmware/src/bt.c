@@ -122,6 +122,38 @@ static btstack_timer_source_t s_wdt_heartbeat_timer;
 // BTstack's gap_inquiry.c example) -- the EIR name field cannot exceed this.
 #define PL_BT_RING_NAME_CAP 240
 
+// --- Bead pico-link-sfw6: break-before-make device switching ---
+//
+// Design `.planning/design/2026-09-25-device-switch-break-before-make.md`.
+// No dual connection (MAX_NR_HCI_CONNECTIONS stays 1) -- switching devices
+// means disconnecting A's ACL, waiting for BTstack to actually free the
+// HCI slot (hci.c frees it only AFTER DISCONNECTION_COMPLETE is emitted to
+// every handler, well after core sees LinkStateChanged(Idle)), then paging
+// B. Run-loop/IRQ context only, same as everything else pico-link-ouw
+// already gates: pl_bt_connect_or_switch runs from pl_bt_pending_service,
+// pl_bt_switch_service runs from the heartbeat right after it.
+typedef enum {
+    PL_BT_SWITCH_NONE,
+    PL_BT_SWITCH_WAIT_ACL_DOWN,
+    PL_BT_SWITCH_PAGING,
+} pl_bt_switch_state_t;
+
+// Andreas's ruling (bead comments): B failing must leave the device fully
+// disconnected, never reconnect A. 5s covers a real page timeout
+// (~5.1s, a2dp.c:3287's SIGNALING_CONNECTION_ESTABLISHED status path) with
+// margin against a slot that somehow never frees.
+#define PL_BT_SWITCH_DEADLINE_US 5000000ull
+
+static pl_bt_switch_state_t s_switch_state;
+static bd_addr_t s_switch_target;
+static uint64_t s_switch_deadline_us;
+
+// Forward declarations: pl_bt_push_connect_succeeded/_failed (below) hook
+// the switch state machine's terminal-outcome edge, but pl_bt_any_acl_up/
+// pl_bt_update_scan_mode aren't defined until later in this file.
+static bool pl_bt_any_acl_up(void);
+static void pl_bt_update_scan_mode(void);
+
 typedef struct {
     struct PlEvent event;
     // Backing storage for event.payload.device_discovered.name once
@@ -366,6 +398,16 @@ void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded) {
     };
     memcpy(event.payload.connect_succeeded.addr, addr, 6);
     pl_bt_ring_push(event, NULL, 0);
+    // Bead pico-link-sfw6, design sec 2: this and pl_bt_push_connect_failed
+    // below are the only two terminal-outcome call sites a2dp.c has for a
+    // connect attempt (rejected/timeout/refused/no-sink/success) -- hooking
+    // both here covers every switch-target outcome with no a2dp.c edits.
+    // Only PAGING matters: a plain connect-from-idle (state NONE) has
+    // nothing to end here.
+    if (s_switch_state == PL_BT_SWITCH_PAGING) {
+        s_switch_state = PL_BT_SWITCH_NONE;
+        pl_bt_update_scan_mode();
+    }
 }
 
 void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason) {
@@ -376,6 +418,16 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason) {
     };
     memcpy(event.payload.connect_failed.addr, addr, 6);
     pl_bt_ring_push(event, NULL, 0);
+    // Bead pico-link-sfw6: see pl_bt_push_connect_succeeded's doc comment
+    // above -- same hook, same reasoning. Covers every B-failure path
+    // (a2dp.c:3168/3287/3503/3579/3644) with no a2dp.c edits. The
+    // WAIT_ACL_DOWN deadline-timeout path (pl_bt_switch_service) clears
+    // state and updates scan mode itself instead, since it's not PAGING
+    // when it fires.
+    if (s_switch_state == PL_BT_SWITCH_PAGING) {
+        s_switch_state = PL_BT_SWITCH_NONE;
+        pl_bt_update_scan_mode();
+    }
 }
 
 // Bead pico-link-1v5: pushes Event::CodecChanged. `name`'s bytes are
@@ -703,16 +755,52 @@ static bool pl_bt_any_acl_up(void) {
     return false;
 }
 
-// Sets connectable = !any_acl_up(), discoverable = always off. Idempotent
-// (gap_connectable_control/gap_discoverable_control no-op on an unchanged
-// value, hci.c:5824) -- safe to call redundantly from every call site
-// below. Logs and counts only on an edge, not every call, so the periodic
-// debug report's scan_mode_changes counter reflects real transitions.
+// Bead pico-link-sfw6, design sec 2 + sec 6: the full-ACL teardown the
+// switch needs. pl_a2dp_disconnect (a2dp.c) is AVDTP-only -- it closes the
+// AVDTP signaling channel but leaves AVRCP's channel up, which keeps the
+// ACL (and the HCI slot) alive. gap_disconnect on an OPEN ACL instead tears
+// down the whole ACL in one call; L2CAP then closes every channel riding on
+// it (AVDTP media + signaling, AVRCP), so the existing STREAM_RELEASED/
+// SIGNALING_CONNECTION_RELEASED handlers in a2dp.c already do the rest --
+// core1 quiesce, tx flush, pl_pcm_reset, a2dp_cid cleared, Idle pushed --
+// with no new code there. Same iterator as pl_bt_any_acl_up above; with
+// MAX_NR_HCI_CONNECTIONS == 1 this loop only ever finds at most one ACL,
+// but stays correct if that pool size ever changes. Shared by the switch
+// (pl_bt_connect_or_switch below) and by PL_BT_PENDING_DISCONNECT's
+// servicing (pl_bt_pending_service) -- see that case's comment for why
+// user Disconnect needed this fold-in too.
+static void pl_bt_disconnect_all_open_acl(void) {
+    btstack_linked_list_iterator_t it;
+    hci_connections_get_iterator(&it);
+    while (btstack_linked_list_iterator_has_next(&it)) {
+        hci_connection_t *connection = (hci_connection_t *)btstack_linked_list_iterator_next(&it);
+        if (connection->state == OPEN && gap_get_connection_type(connection->con_handle) == GAP_CONNECTION_ACL) {
+            uint8_t status = gap_disconnect(connection->con_handle);
+            pl_log("BT: gap_disconnect handle=0x%04x status=0x%02x\r\n", connection->con_handle, status);
+        }
+    }
+}
+
+// Sets connectable = !any_acl_up() && switch.state == NONE, discoverable =
+// always off. Idempotent (gap_connectable_control/gap_discoverable_control
+// no-op on an unchanged value, hci.c:5824) -- safe to call redundantly from
+// every call site below. Logs and counts only on an edge, not every call,
+// so the periodic debug report's scan_mode_changes counter reflects real
+// transitions.
+//
+// Bead pico-link-sfw6, design sec 4 "Scan-mode owner": the switch.state
+// term closes the one window any_acl_up() alone leaves open -- A's ACL
+// drops (any_acl_up() -> false) while B is still being paged, and without
+// this term scan would flip connectable=1 for the ~100ms-5s gap in
+// between, letting A re-page us and steal the pool-of-one slot out from
+// under B's own page. This function stays the ONLY caller of
+// gap_connectable_control (ENABLE_EXPLICIT_CONNECTABLE_MODE_CONTROL,
+// btstack_config.h, is untouched -- no new call site).
 static void pl_bt_update_scan_mode(void) {
     static bool s_last_connectable = true;
     static bool s_have_last = false;
 
-    bool connectable = !pl_bt_any_acl_up();
+    bool connectable = !pl_bt_any_acl_up() && s_switch_state == PL_BT_SWITCH_NONE;
     if (!s_have_last || connectable != s_last_connectable) {
         pl_log("BT: scan mode connectable=%d discoverable=0\r\n", (int)connectable);
         s_scan_mode_changes++;
@@ -726,9 +814,11 @@ static void pl_bt_update_scan_mode(void) {
 // Bead pico-link-oevr, hardware verification (Tess): exposes current scan
 // state and transition count for the periodic debug report (a2dp.c's
 // pl_a2dp_report), so a hardware round can read scan state instead of
-// inferring it.
+// inferring it. Bead pico-link-sfw6: mirrors pl_bt_update_scan_mode's
+// switch.state gate exactly, so this report can never claim connectable
+// during a switch's disconnect/paging window.
 bool pl_bt_scan_connectable(void) {
-    return !pl_bt_any_acl_up();
+    return !pl_bt_any_acl_up() && s_switch_state == PL_BT_SWITCH_NONE;
 }
 
 uint32_t pl_bt_scan_mode_changes(void) {
@@ -1118,6 +1208,77 @@ static void pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
     );
 }
 
+// Bead pico-link-sfw6, design sec 2: turns a Connect that arrives while an
+// ACL is up into a break-before-make switch. Called from
+// pl_bt_pending_service's PL_BT_PENDING_CONNECT case below (run-loop/IRQ
+// context) instead of calling pl_a2dp_connect directly -- state, the
+// prepare-switch cancels, pl_bt_update_scan_mode and gap_disconnect all
+// require that context (pico-link-ouw).
+static void pl_bt_connect_or_switch(const uint8_t *addr) {
+    if (s_switch_state == PL_BT_SWITCH_WAIT_ACL_DOWN) {
+        // A second Connect while still waiting for A's slot to free:
+        // last press wins, same attempt otherwise unchanged.
+        memcpy(s_switch_target, addr, sizeof(bd_addr_t));
+        pl_log(
+            "BT: switch target overwritten target=%02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2],
+            addr[3], addr[4], addr[5]
+        );
+        return;
+    }
+    if (pl_bt_any_acl_up()) {
+        // No ACL up but state == PAGING (an attempt already in flight, no
+        // slot occupied yet) falls through to the plain pl_a2dp_connect
+        // below, same as state == NONE -- both keep today's behaviour
+        // (today's instant 0x56 failure for the in-flight case).
+        memcpy(s_switch_target, addr, sizeof(bd_addr_t));
+        s_switch_state = PL_BT_SWITCH_WAIT_ACL_DOWN;
+        s_switch_deadline_us = time_us_64() + PL_BT_SWITCH_DEADLINE_US;
+        pl_log(
+            "BT: switch start target=%02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4],
+            addr[5]
+        );
+        pl_bt_push_connect_step(PL_CONNECT_STEP_DISCONNECTING);
+        pl_a2dp_prepare_switch();
+        pl_bt_update_scan_mode();
+        pl_bt_disconnect_all_open_acl();
+        return;
+    }
+    pl_a2dp_connect(addr);
+}
+
+// Bead pico-link-sfw6, design sec 2: the switch state machine's other
+// half. Called from pl_bt_wdt_heartbeat_handler right after
+// pl_bt_pending_service, same 100ms period and IRQ/run-loop context -- a
+// switch that started this same tick is only serviced starting next tick,
+// which is harmless (gap_disconnect just fired; the ACL cannot be down
+// yet regardless).
+static void pl_bt_switch_service(void) {
+    if (s_switch_state != PL_BT_SWITCH_WAIT_ACL_DOWN) {
+        return;
+    }
+    if (!pl_bt_any_acl_up() && pl_a2dp_session_idle()) {
+        s_switch_state = PL_BT_SWITCH_PAGING;
+        pl_log(
+            "BT: switch ACL down, paging %02x:%02x:%02x:%02x:%02x:%02x\r\n", s_switch_target[0], s_switch_target[1],
+            s_switch_target[2], s_switch_target[3], s_switch_target[4], s_switch_target[5]
+        );
+        pl_bt_push_connect_step(PL_CONNECT_STEP_CONNECTING);
+        pl_a2dp_connect(s_switch_target);
+        return;
+    }
+    if (time_us_64() >= s_switch_deadline_us) {
+        pl_log("BT: switch timeout waiting for ACL down\r\n");
+        pl_bt_push_connect_failed(s_switch_target, PL_FAILURE_REASON_RADIO_ERROR);
+        // Andreas's ruling: B failing leaves the device disconnected, no
+        // reconnect-A fallback. state = NONE here (not PAGING) is exactly
+        // why pl_bt_push_connect_failed's own hook doesn't already do this
+        // -- a late DISCONNECTION_COMPLETE for A must only ever produce
+        // Idle from here on, never page B.
+        s_switch_state = PL_BT_SWITCH_NONE;
+        pl_bt_update_scan_mode();
+    }
+}
+
 // Drains every request currently queued and makes the real BTstack call for
 // each. Called only from pl_bt_wdt_heartbeat_handler (IRQ context) -- the
 // single consumer, so it only ever touches s_bt_pending_tail and needs no
@@ -1140,10 +1301,21 @@ static void pl_bt_pending_service(void) {
                 pl_bt_cancel_scan_radio();
                 break;
             case PL_BT_PENDING_CONNECT:
-                pl_a2dp_connect(entry.addr);
+                // Bead pico-link-sfw6: was a direct pl_a2dp_connect call --
+                // now routed through the switch decision (a plain connect
+                // from idle still ends up calling pl_a2dp_connect exactly
+                // as before).
+                pl_bt_connect_or_switch(entry.addr);
                 break;
             case PL_BT_PENDING_DISCONNECT:
+                // Bead pico-link-sfw6, design sec 6: pl_a2dp_disconnect
+                // alone is AVDTP-only and can leave AVRCP's channel (and
+                // therefore the ACL) up -- fold in the same full-ACL
+                // teardown the switch uses, so a user-initiated Disconnect
+                // (bt.c's PL_COMMAND_TAG_DISCONNECT) actually frees the
+                // slot too.
                 pl_a2dp_disconnect();
+                pl_bt_disconnect_all_open_acl();
                 break;
             case PL_BT_PENDING_PERSIST_WRITE:
                 // Bead pico-link-cz0.6, code-review finding 1: the ONLY
@@ -1253,6 +1425,11 @@ static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_add_timer(ts);
     pl_wdt_kick(PL_WDT_BTSTACK);
     pl_bt_pending_service();
+    // Bead pico-link-sfw6: the switch state machine's WAIT_ACL_DOWN ->
+    // PAGING advance and 5s deadline check -- right after
+    // pl_bt_pending_service so a switch that just started this same tick
+    // (via PL_BT_PENDING_CONNECT above) is observed starting next tick.
+    pl_bt_switch_service();
     // T3 (pico-link-4v2.3), design sec 9: the "-> pl_bt_wdt_heartbeat_handler
     // (0xFF) -> avrcp_controller_set_absolute_volume" hop. Same context as
     // pl_bt_pending_service above, so it's safe to call a2dp.c's AVRCP API

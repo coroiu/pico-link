@@ -175,8 +175,14 @@ fn main() {
     app.handle_event(Event::LinkStateChanged(pico_link_core::LinkState::Idle));
     save_zoomed_png(&mut app, &out_dir, "03_nothing_found");
 
-    // --- Phase 4: all four named connecting sub-steps ---
+    // --- Phase 4: all four named connecting sub-steps, plus pico-link-
+    // sfw6's additive fifth -- Disconnecting, A's teardown at the start of
+    // a break-before-make device switch (design `.planning/design/2026-09-
+    // 25-device-switch-break-before-make.md` sec 7, S4). Rendered as its
+    // own highlighted line above the four normal steps, all shown
+    // not-yet-reached -- see `render_connecting_steps`'s doc comment.
     let steps = [
+        (pico_link_core::app::ConnectStep::Disconnecting, "04z_connecting_disconnecting"),
         (pico_link_core::app::ConnectStep::Connecting, "04a_connecting_acl"),
         (pico_link_core::app::ConnectStep::Pairing, "04b_connecting_pairing"),
         (pico_link_core::app::ConnectStep::SettingUpAudio, "04c_connecting_audio"),
