@@ -30,6 +30,12 @@ u8g2-fonts = { version = "0.5.2", features = ["embedded_graphics_textstyle"] }
 # robustness property, not a diagnostic opt-in like `frame-timing` below,
 # which still uses this same dependency.
 log = { version = "0.4", default-features = false }
+# `no_std` transcendental math (sin/cos/exp/log10/powf) for `dsp.rs`'s RBJ
+# biquad and bs2b crossfeed coefficient computation. Pure Rust, no libc --
+# fine on the `thumbv8m.main-none-eabihf` target. See
+# `.planning/design/2026-09-25-dsp-effects-stage.md` sec 3.1: "Uses the
+# `libm` crate (pure Rust, `no_std`, platform-free)".
+libm = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 image = { version = "0.25.6", default-features = false, features = ["png"] }
