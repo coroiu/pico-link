@@ -47,6 +47,13 @@ typedef struct {
     int32_t q_ema;
     uint64_t last_step_us;
     uint32_t qfull_snapshot;
+    // Bead pico-link-jphl: mirrors a2dp.c's abr_up_clean_since_us -- the
+    // wall-clock start of the current run with no NEW stop_queue_full
+    // delta, restarted on EVERY tick that sees a delta (not just on a
+    // step). The up-step's dwell check reads THIS, not last_step_us, so a
+    // single queue-full after the last step no longer vetoes every future
+    // up-step forever (the bug this bead fixes).
+    uint64_t up_clean_since_us;
     int32_t applied_rung;
     int32_t target_rung;
     // Test-only failure injection for the APPLY phase. 0 == success,
@@ -70,6 +77,7 @@ static void model_abr_reset(model_abr_t *c, uint32_t stop_queue_full_now) {
     c->q_ema = 0;
     c->last_step_us = 0;
     c->qfull_snapshot = stop_queue_full_now;
+    c->up_clean_since_us = 0;
     c->applied_rung = 0;
     c->target_rung = 0;
     c->inject_apply_status = 0;
@@ -87,6 +95,13 @@ static void model_abr_reset(model_abr_t *c, uint32_t stop_queue_full_now) {
 static void model_decide(model_abr_t *c, uint32_t tx_count_now, uint64_t now_us, uint32_t stop_queue_full_now) {
     c->q_ema += (((int32_t)tx_count_now * 256) - c->q_ema) >> 4;
 
+    // Bead pico-link-jphl: a NEW delta restarts the clean-dwell clock,
+    // independent of whether a step fires this same tick.
+    if (stop_queue_full_now != c->qfull_snapshot) {
+        c->qfull_snapshot = stop_queue_full_now;
+        c->up_clean_since_us = now_us;
+    }
+
     bool past_settle = (now_us - c->last_step_us) > PL_LDAC_ABR_SETTLE_US;
 
     if (c->q_ema >= PL_LDAC_ABR_Q_HI && past_settle && c->applied_rung < PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) {
@@ -94,12 +109,14 @@ static void model_decide(model_abr_t *c, uint32_t tx_count_now, uint64_t now_us,
         c->last_step_us = now_us;
         c->q_ema = (int32_t)tx_count_now * 256;
         c->qfull_snapshot = stop_queue_full_now;
+        c->up_clean_since_us = now_us;
     } else if (c->q_ema <= PL_LDAC_ABR_Q_LO && c->applied_rung > 0 &&
-               (now_us - c->last_step_us) > PL_LDAC_ABR_UP_DWELL_US && stop_queue_full_now == c->qfull_snapshot) {
+               (now_us - c->up_clean_since_us) > PL_LDAC_ABR_UP_DWELL_US) {
         c->target_rung = c->applied_rung - 1;
         c->last_step_us = now_us;
         c->q_ema = (int32_t)tx_count_now * 256;
         c->qfull_snapshot = stop_queue_full_now;
+        c->up_clean_since_us = now_us;
     }
 }
 
@@ -191,9 +208,13 @@ int main(void) {
         printf("ok:   congestion steps down exactly once inside 1s once relieved, settle lockout holds\n");
     }
 
-    // --- (c) a single stop_queue_full delta during the up-dwell window
-    // vetoes the step up, even after UP_DWELL_US+ has elapsed and q_ema is
-    // low. ---
+    // --- (c) a single stop_queue_full delta partway through the up-dwell
+    // window DELAYS the step up (restarts the clean-dwell clock from the
+    // delta), it does not veto it forever. Bead pico-link-jphl: before this
+    // fix, qfull_snapshot was only ever refreshed on a STEP, so this single
+    // delta would have blocked every future up-step until a down-step fired
+    // -- this test proves the fixed model instead still steps up once a
+    // full UP_DWELL_US has elapsed since the LAST delta. ---
     {
         model_abr_t c;
         model_abr_reset(&c, 0);
@@ -201,17 +222,92 @@ int main(void) {
         c.target_rung = 2;  // keep target in sync -- applied/target only diverge via a real decide() step
         uint64_t now = 0;
         uint32_t stop_queue_full = 0;
-        for (int i = 0; i < 1001; i++) { // 10.01s
+        int step_up_at_tick = -1;
+        // Run well past 2x UP_DWELL_US from the delta so the fixed
+        // semantics have ample room to fire.
+        int total_ticks = (int)((2 * PL_LDAC_ABR_UP_DWELL_US) / 10000) + 100;
+        for (int i = 0; i < total_ticks; i++) {
             now += 10000;
             if (i == 500) {
-                stop_queue_full++; // one rail hit mid-window
+                stop_queue_full++; // one queue-full mid-window
             }
             model_decide(&c, 0, now, stop_queue_full); // empty queue -- well under Q_LO
             model_apply(&c);
+            if (c.steps_up == 1 && step_up_at_tick < 0) {
+                step_up_at_tick = i;
+            }
         }
+        // Must NOT have stepped up before a full UP_DWELL_US elapsed since
+        // the delta at i==500 (the old bug would never step up at all).
+        assert(step_up_at_tick >= 0);
+        assert((uint64_t)(step_up_at_tick - 500) * 10000 >= PL_LDAC_ABR_UP_DWELL_US);
+        assert(c.applied_rung == 1);
+        printf("ok:   a single stop_queue_full delta mid-dwell delays the step up (restarts the "
+               "clean-dwell clock) instead of vetoing it forever\n");
+    }
+
+    // --- (c-1b) the delta-during-dwell window from (c), stopped exactly at
+    // the OLD bug's failure point (well past UP_DWELL_US since the delta,
+    // but the same total run length as the old (c) test): proves the fixed
+    // controller has already stepped up by then, where the old snapshot-
+    // on-step-only logic never would. ---
+    {
+        model_abr_t c;
+        model_abr_reset(&c, 0);
+        c.applied_rung = 2;
+        c.target_rung = 2;
+        uint64_t now = 0;
+        uint32_t stop_queue_full = 0;
+        for (int i = 0; i < 1001; i++) { // 10.01s -- same window as the old (c) test
+            now += 10000;
+            if (i == 500) {
+                stop_queue_full++; // one queue-full mid-window
+            }
+            model_decide(&c, 0, now, stop_queue_full);
+            model_apply(&c);
+        }
+        // Only ~5.01s have elapsed since the delta at i==500 by the end of
+        // this window -- not yet a full UP_DWELL_US (10s) -- so no step up
+        // yet. This mirrors the old (c) test's assertion, but for the
+        // right reason now (dwell not yet re-earned, not a permanent veto).
         assert(c.steps_up == 0);
         assert(c.applied_rung == 2);
-        printf("ok:   a single stop_queue_full delta during the up-dwell vetoes the step up\n");
+        printf("ok:   5s after a mid-window delta (dwell not yet re-earned) still holds at the "
+               "lower rung\n");
+    }
+
+    // --- (c-1c) a queue-full occurring AGAIN partway through an already-
+    // restarted dwell restarts it a second time -- proves the restart is
+    // unconditional on every delta, not a one-shot special case. ---
+    {
+        model_abr_t c;
+        model_abr_reset(&c, 0);
+        c.applied_rung = 2;
+        c.target_rung = 2;
+        uint64_t now = 0;
+        uint32_t stop_queue_full = 0;
+        int first_delta_tick = 100;
+        int second_delta_tick = first_delta_tick + (int)(PL_LDAC_ABR_UP_DWELL_US / 10000) / 2; // mid-dwell
+        int total_ticks = second_delta_tick + (int)(PL_LDAC_ABR_UP_DWELL_US / 10000) + 50;
+        int step_up_at_tick = -1;
+        for (int i = 0; i < total_ticks; i++) {
+            now += 10000;
+            if (i == first_delta_tick || i == second_delta_tick) {
+                stop_queue_full++;
+            }
+            model_decide(&c, 0, now, stop_queue_full);
+            model_apply(&c);
+            if (c.steps_up == 1 && step_up_at_tick < 0) {
+                step_up_at_tick = i;
+            }
+        }
+        assert(step_up_at_tick >= 0);
+        // Must not have stepped up before UP_DWELL_US after the SECOND
+        // (later) delta -- if the restart weren't unconditional, the first
+        // delta alone could have let the dwell (wrongly) expire earlier.
+        assert((uint64_t)(step_up_at_tick - second_delta_tick) * 10000 >= PL_LDAC_ABR_UP_DWELL_US);
+        printf("ok:   a second queue-full mid-dwell restarts the clean-dwell clock again, not just "
+               "the first one\n");
     }
 
     // --- (c-2) the same window with NO stop_queue_full delta steps up
