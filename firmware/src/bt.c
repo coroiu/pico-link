@@ -600,6 +600,94 @@ static void pl_bt_handle_inquiry_result(const uint8_t *packet) {
     pl_bt_push_device_discovered(addr, (const uint8_t *)name_buf, name_len, rssi, class_of_device);
 }
 
+// --- pico-link-oevr: page scan / inquiry scan ownership ---
+//
+// Design (Ada, bead pico-link-oevr DESIGN comment, Q1/Q3/Q4/Q5): the sole
+// owner of gap_connectable_control/gap_discoverable_control in this tree.
+// connectable = "no ACL up" -- with MAX_NR_HCI_CONNECTIONS 1, any page
+// received while an ACL already exists is declined anyway (hci.
+// c:3787-3820, 0x0d limited resources), so page scan then is pure air-time
+// cost with zero function; ACL gating strictly dominates gating on the
+// A2DP stream (fewer transitions, no race against AVDTP signaling, covers
+// the 0x0b stale-ACL retry path). discoverable is always off -- a source
+// has no reason to be found by inquiry, and the pairing wizard is
+// outbound (gap_inquiry_start / paging), needing neither scan.
+//
+// Recomputes "any ACL up" from BTstack's own connection list on every
+// call rather than tracking a local bool, so this can never drift from
+// ground truth (Q4) -- cheap, since MAX_NR_HCI_CONNECTIONS is 1.
+//
+// Requires ENABLE_EXPLICIT_CONNECTABLE_MODE_CONTROL (btstack_config.h):
+// without it, l2cap_register_service silently re-enables page scan behind
+// this function's back the first time anything registers a service at
+// runtime (l2cap.c:5023-5026) -- this is the load-bearing #define that
+// makes this function's ownership real rather than accidental.
+//
+// Measured on hardware (bead pico-link-oevr verification round): BTstack
+// allocates an hci_connection_t -- and gap_get_connection_type on its
+// handle already reports GAP_CONNECTION_ACL -- the moment an OUTBOUND
+// connection attempt starts (hci.c's SEND_CREATE_CONNECTION/
+// SENT_CREATE_CONNECTION states), long before HCI_EVENT_CONNECTION_COMPLETE
+// fires, and it stays in the list through teardown
+// (SEND_DISCONNECT/SENT_DISCONNECT/RECEIVED_DISCONNECTION_COMPLETE) --
+// hci.c:4707-4718 emits HCI_EVENT_DISCONNECTION_COMPLETE to this file's
+// packet handler BEFORE hci_shutdown_connection() frees it. A plain
+// "does an ACL-type hci_connection_t exist" check therefore reports ACL-up
+// during an in-flight outbound connect (this file never calls
+// pl_bt_update_scan_mode during that window, so it doesn't affect the
+// actual gating decision -- but it WOULD lie to the pl_bt_scan_connectable
+// report below) and, more seriously, would still read true at the exact
+// moment the DISCONNECTION_COMPLETE handler calls
+// pl_bt_update_scan_mode() to turn scan back on. Only CONNECTION_STATE
+// OPEN means an ACL that is actually established and would draw the
+// 0x0d page decline this whole design leans on -- check state, not just
+// presence.
+static uint32_t s_scan_mode_changes;
+
+static bool pl_bt_any_acl_up(void) {
+    btstack_linked_list_iterator_t it;
+    hci_connections_get_iterator(&it);
+    while (btstack_linked_list_iterator_has_next(&it)) {
+        hci_connection_t *connection = (hci_connection_t *)btstack_linked_list_iterator_next(&it);
+        if (connection->state == OPEN && gap_get_connection_type(connection->con_handle) == GAP_CONNECTION_ACL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Sets connectable = !any_acl_up(), discoverable = always off. Idempotent
+// (gap_connectable_control/gap_discoverable_control no-op on an unchanged
+// value, hci.c:5824) -- safe to call redundantly from every call site
+// below. Logs and counts only on an edge, not every call, so the periodic
+// debug report's scan_mode_changes counter reflects real transitions.
+static void pl_bt_update_scan_mode(void) {
+    static bool s_last_connectable = true;
+    static bool s_have_last = false;
+
+    bool connectable = !pl_bt_any_acl_up();
+    if (!s_have_last || connectable != s_last_connectable) {
+        pl_log("BT: scan mode connectable=%d discoverable=0\r\n", (int)connectable);
+        s_scan_mode_changes++;
+        s_last_connectable = connectable;
+        s_have_last = true;
+    }
+    gap_connectable_control(connectable ? 1 : 0);
+    gap_discoverable_control(0);
+}
+
+// Bead pico-link-oevr, hardware verification (Tess): exposes current scan
+// state and transition count for the periodic debug report (a2dp.c's
+// pl_a2dp_report), so a hardware round can read scan state instead of
+// inferring it.
+bool pl_bt_scan_connectable(void) {
+    return !pl_bt_any_acl_up();
+}
+
+uint32_t pl_bt_scan_mode_changes(void) {
+    return s_scan_mode_changes;
+}
+
 static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -639,6 +727,15 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                     pl_bt_push_paired_device_upserted(boot_addr, boot_name, boot_name_len, boot_mru_seq, boot_ldac_quality);
                 }
                 pl_bt_push_store_loaded((uint32_t)pl_persist_boot_status(), boot_device_count);
+
+                // Bead pico-link-oevr: no ACL up yet at this point (the
+                // radio has only just come up), so this reasserts
+                // connectable=1/discoverable=0 -- same state pl_bt_init
+                // already set below, before hci_power_control, but
+                // restated here per the design's explicit call-site list
+                // (Q5 step 3) in case anything reset it between init and
+                // HCI_STATE_WORKING.
+                pl_bt_update_scan_mode();
 
                 pl_bt_start_scan();
             }
@@ -699,6 +796,31 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                 "link_type=%u encryption=%u\r\n",
                 status, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], handle, packet[11], packet[12]
             );
+            // Bead pico-link-oevr, Q4: a failed CONNECTION_COMPLETE
+            // (status != 0, e.g. 0x0b ACL_CONNECTION_ALREADY_EXISTS) must
+            // not turn scan off -- no ACL actually came up.
+            if (status == 0) {
+                pl_bt_update_scan_mode();
+            }
+            break;
+        }
+
+        // Bead pico-link-oevr, Q1/Q5: the other half of the ACL-up edge --
+        // an ACL going away (headset power-off, out of range, link loss)
+        // must turn page scan back on so the headset (or a fresh pairing)
+        // can page us again. pl_bt_any_acl_up() recomputes from BTstack's
+        // own connection list rather than trusting this event's handle, so
+        // this is correct even for a handle this file never logged a
+        // CONNECTION_COMPLETE for.
+        case HCI_EVENT_DISCONNECTION_COMPLETE: {
+            uint8_t status = hci_event_disconnection_complete_get_status(packet);
+            uint16_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
+            uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
+            pl_log(
+                "BT: HCI_EVENT_DISCONNECTION_COMPLETE status=0x%02x handle=0x%04x reason=0x%02x\r\n", status, handle,
+                reason
+            );
+            pl_bt_update_scan_mode();
             break;
         }
 
@@ -999,6 +1121,17 @@ void pl_bt_init(struct PlUi *ui) {
     btstack_run_loop_set_timer_handler(&s_wdt_heartbeat_timer, pl_bt_wdt_heartbeat_handler);
     btstack_run_loop_set_timer(&s_wdt_heartbeat_timer, PL_WDT_BTSTACK_HEARTBEAT_MS);
     btstack_run_loop_add_timer(&s_wdt_heartbeat_timer);
+
+    // Bead pico-link-oevr, Q4/Q5 step 3: set the initial scan state
+    // explicitly before power-on. Required with
+    // ENABLE_EXPLICIT_CONNECTABLE_MODE_CONTROL defined (btstack_config.h)
+    // -- l2cap no longer sets connectable=1 on its own, so without this
+    // call the radio would come up non-connectable. No ACL exists yet, so
+    // this reads connectable=1/discoverable=0. BTstack replays these flags
+    // across power-on (hci.c:4875/4897), so setting them here (rather than
+    // waiting for HCI_STATE_WORKING) is what actually reaches the
+    // controller once the stack comes up.
+    pl_bt_update_scan_mode();
 
     pl_log("BT: powering on HCI (async -- BTSTACK_EVENT_STATE/HCI_STATE_WORKING follows)\r\n");
     hci_power_control(HCI_POWER_ON);
