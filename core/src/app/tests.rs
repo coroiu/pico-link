@@ -296,6 +296,95 @@ fn failure_from_idle_stays_idle() {
     assert!(!app.model().connecting);
 }
 
+// --- Bead pico-link-sfw6: break-before-make device switching, design
+// `.planning/design/2026-09-25-device-switch-break-before-make.md` sec 7
+// (S1/S2). Firmware (bt.c) owns the switch state machine; these tests only
+// prove core's side of the additive `ConnectStep::Disconnecting` wire item
+// and the "never reconnect A on a failed switch" guarantee -- core's own
+// event-fold rules (this test file's `switch_success_follows_new_device`/
+// `failed_switch_keeps_established_link` above) already cover the rest,
+// unchanged by this bead. ---
+
+/// S1: a full switch success passes through `Disconnecting`. A is
+/// connected and streaming; the switch starts (`ConnectAttemptStarted`,
+/// then `ConnectStepChanged(Disconnecting)`); A's link drops
+/// (`LinkStateChanged(Idle)`) while the attempt stays live; B is paged
+/// (`ConnectStepChanged(Connecting)`) and succeeds.
+#[test]
+fn switch_success_passes_through_disconnecting() {
+    let mut app = App::new(240, 240);
+    let addr_a = [1; 6];
+    let addr_b = [2; 6];
+
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    app.poll_command(); // drain PersistDevice(A)
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_a, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+    assert_eq!(app.model().link_state, LinkState::Connected, "A is up before the switch starts");
+
+    // The switch starts: firmware pushes ConnectAttemptStarted, then the
+    // new Disconnecting step, both before A's ACL has actually dropped.
+    app.handle_event(Event::ConnectAttemptStarted);
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Disconnecting));
+    assert_eq!(app.model().link_state, LinkState::Connected, "A's link is untouched by the step change alone");
+    assert!(app.model().connecting, "the attempt has started");
+
+    // A's ACL actually drops.
+    app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+    assert_eq!(app.model().connected_addr, None, "A's connected fields clear on its own Idle");
+    assert!(app.model().connecting, "the attempt at B is still in flight, unaffected by A's drop (Busy, not idle)");
+
+    // B is paged and succeeds.
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Connecting));
+    app.handle_event(Event::ConnectSucceeded { addr: addr_b, degraded: false });
+    app.poll_command(); // drain PersistDevice(B)
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_b, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+
+    assert_eq!(app.model().connected_addr, Some(addr_b));
+    assert_eq!(app.model().link_state, LinkState::Connected);
+    assert!(!app.model().connecting, "the attempt is over");
+}
+
+/// S2: a failed switch stays disconnected and never reconnects A --
+/// Andreas's ruling (bead comments, supersedes the design description's
+/// original make-before-break recommendation). Same shape as S1 through
+/// A's Idle, then the switch fails outright instead of succeeding: no
+/// `Command::Connect` for A (or anyone) is ever queued as a side effect.
+#[test]
+fn switch_failure_stays_disconnected_and_never_reconnects_a() {
+    let mut app = App::new(240, 240);
+    let addr_a = [1; 6];
+    let addr_b = [2; 6];
+
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    app.poll_command(); // drain PersistDevice(A)
+
+    app.handle_event(Event::ConnectAttemptStarted);
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Disconnecting));
+    app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+    assert!(app.model().connecting, "the attempt at B is still in flight");
+
+    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::Timeout });
+
+    assert_eq!(app.model().link_state, LinkState::Idle, "no reconnect to A -- the device stays disconnected");
+    assert_eq!(app.model().connected_addr, None);
+    assert!(!app.model().connecting, "the attempt is over");
+    assert_eq!(app.wizard_phase_for_test(), WizardPhase::Failed { addr: addr_b, reason: ConnectFailureReason::Timeout });
+
+    // The load-bearing assertion: core must never queue a Connect for A
+    // (or for anyone) as a reaction to this failure. Auto-reconnect only
+    // ever fires from Event::StoreLoaded at boot (a new session) -- a
+    // failed switch is not a boot, so draining every queued command here
+    // must find none.
+    let mut queued = alloc::vec::Vec::new();
+    while let Some(command) = app.poll_command() {
+        queued.push(command);
+    }
+    assert!(queued.is_empty(), "a failed switch must queue no commands at all, above all no Connect{{addr: addr_a, ..}}: got {queued:?}");
+}
+
 #[test]
 fn tick_records_now_us_instead_of_discarding_it() {
     let mut app = App::new(240, 240);

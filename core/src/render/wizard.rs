@@ -161,16 +161,40 @@ pub(crate) const ELAPSED_REDRAW_INTERVAL: core::time::Duration = core::time::Dur
 fn render_connecting_steps(area: Rectangle, current: ConnectStep, elapsed: core::time::Duration, target: &mut FrameBuffer565) {
     let center_x = area.top_left.x + area.size.width as i32 / 2;
     let steps = ConnectStep::all();
-    let current_index = steps.iter().position(|&s| s == current).unwrap_or(0);
+
+    // Bead pico-link-sfw6, design sec 3: `Disconnecting` is deliberately
+    // outside `ConnectStep::all()` (see that enum's doc comment) -- it's a
+    // virtual "step -1" shown as its own highlighted line, with the four
+    // normal steps below it all rendered not-yet-reached, rather than
+    // being spliced into the fixed four-element array. `row_offset` shifts
+    // every normal-step row down by one line to make room for it;
+    // `current_index` is signed (`isize`, not `usize`) so "step -1 is
+    // current" correctly leaves every real index (0..=3) `Greater` --
+    // not-yet-reached -- rather than wrapping to `usize::MAX` and reading
+    // every real step as already-completed.
+    let (current_index, row_offset): (isize, i32) = if current == ConnectStep::Disconnecting {
+        let y = area.top_left.y + STEPS_TOP_PADDING + name_top_offset();
+        let _ = font::name().render_aligned(
+            format!("- {}", ConnectStep::Disconnecting.label()).as_str(),
+            Point::new(center_x, y),
+            VerticalPosition::Top,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(palette::BRAND_BRIGHT),
+            target,
+        );
+        (-1, 1)
+    } else {
+        (steps.iter().position(|&s| s == current).unwrap_or(0) as isize, 0)
+    };
 
     for (index, step) in steps.iter().enumerate() {
-        let (color, prefix) = match index.cmp(&current_index) {
+        let (color, prefix) = match (index as isize).cmp(&current_index) {
             core::cmp::Ordering::Less => (palette::TEXT_SECONDARY, "> "),
             core::cmp::Ordering::Equal => (palette::BRAND_BRIGHT, "- "),
             core::cmp::Ordering::Greater => (palette::DIVIDER, "  "),
         };
         let line = format!("{prefix}{}", step.label());
-        let y = area.top_left.y + STEPS_TOP_PADDING + name_top_offset() + index as i32 * STEP_ROW_HEIGHT;
+        let y = area.top_left.y + STEPS_TOP_PADDING + name_top_offset() + (index as i32 + row_offset) * STEP_ROW_HEIGHT;
         let _ = font::name().render_aligned(
             line.as_str(),
             Point::new(center_x, y),
@@ -181,7 +205,8 @@ fn render_connecting_steps(area: Rectangle, current: ConnectStep, elapsed: core:
         );
     }
 
-    let elapsed_y = area.top_left.y + STEPS_TOP_PADDING + name_top_offset() + steps.len() as i32 * STEP_ROW_HEIGHT + ELAPSED_GAP;
+    let elapsed_y =
+        area.top_left.y + STEPS_TOP_PADDING + name_top_offset() + (steps.len() as i32 + row_offset) * STEP_ROW_HEIGHT + ELAPSED_GAP;
     let elapsed_line = format!("{}s", elapsed.as_secs());
     let _ = font::username().render_aligned(
         elapsed_line.as_str(),

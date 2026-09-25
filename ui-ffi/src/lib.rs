@@ -1089,9 +1089,13 @@ impl From<PlFailureReason> for ConnectFailureReason {
     }
 }
 
-/// Mirrors [`pico_link_core::ConnectStep`]'s four variants 1:1 (added by
-/// pico-link-znb.7 / E5, the pairing wizard's phase-4 named sub-steps).
-/// Explicit discriminants pinned for the same reason as [`PlLinkState`]'s.
+/// Mirrors [`pico_link_core::ConnectStep`]'s five variants 1:1 (four added
+/// by pico-link-znb.7 / E5, the pairing wizard's phase-4 named sub-steps;
+/// `Disconnecting` added by pico-link-sfw6, design `.planning/design/2026-
+/// 09-25-device-switch-break-before-make.md` sec 3 -- A's teardown during a
+/// break-before-make device switch). Explicit discriminants pinned for the
+/// same reason as [`PlLinkState`]'s. Additive: existing discriminants 0-3
+/// are unchanged, so this is not an ABI version bump (pico-link-ptu).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub enum PlConnectStep {
@@ -1099,6 +1103,7 @@ pub enum PlConnectStep {
     Pairing = 1,
     SettingUpAudio = 2,
     NegotiatingCodec = 3,
+    Disconnecting = 4,
 }
 
 impl core::convert::TryFrom<u32> for PlConnectStep {
@@ -1112,6 +1117,7 @@ impl core::convert::TryFrom<u32> for PlConnectStep {
             1 => Ok(PlConnectStep::Pairing),
             2 => Ok(PlConnectStep::SettingUpAudio),
             3 => Ok(PlConnectStep::NegotiatingCodec),
+            4 => Ok(PlConnectStep::Disconnecting),
             _ => Err(()),
         }
     }
@@ -1124,6 +1130,7 @@ impl From<PlConnectStep> for ConnectStep {
             PlConnectStep::Pairing => ConnectStep::Pairing,
             PlConnectStep::SettingUpAudio => ConnectStep::SettingUpAudio,
             PlConnectStep::NegotiatingCodec => ConnectStep::NegotiatingCodec,
+            PlConnectStep::Disconnecting => ConnectStep::Disconnecting,
         }
     }
 }
@@ -4015,12 +4022,48 @@ mod tests {
     }
 
     #[test]
+    fn pl_ui_push_event_decodes_wire_step_4_as_disconnecting_and_still_rejects_5() {
+        // Bead pico-link-sfw6, design sec 7 (S3): the one new wire value
+        // this bead adds -- step 4 must decode cleanly to
+        // ConnectStep::Disconnecting, and the next value up (5, still
+        // unknown) must still be rejected as malformed, not silently
+        // accepted because 4 now is.
+        let ui = new_ui();
+        let disconnecting_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::ConnectStepChanged as u32,
+            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 4 } },
+        };
+        let unknown_event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::ConnectStepChanged as u32,
+            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 5 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, disconnecting_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "wire step 4 (Disconnecting) must decode cleanly");
+
+            pl_ui_push_event(ui, unknown_event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 1, "wire step 5 is still unknown and must be rejected");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
     fn pl_connect_step_try_from_round_trips_every_legal_discriminant() {
-        let legal = [PlConnectStep::Connecting, PlConnectStep::Pairing, PlConnectStep::SettingUpAudio, PlConnectStep::NegotiatingCodec];
+        let legal = [
+            PlConnectStep::Connecting,
+            PlConnectStep::Pairing,
+            PlConnectStep::SettingUpAudio,
+            PlConnectStep::NegotiatingCodec,
+            PlConnectStep::Disconnecting,
+        ];
         for step in legal {
             assert!(PlConnectStep::try_from(step as u32).is_ok());
         }
-        assert!(PlConnectStep::try_from(4u32).is_err());
+        // Bead pico-link-sfw6: 4 (Disconnecting) is now legal; the first
+        // unknown value moves to 5.
+        assert!(PlConnectStep::try_from(5u32).is_err());
         assert!(PlConnectStep::try_from(u32::MAX).is_err());
     }
 

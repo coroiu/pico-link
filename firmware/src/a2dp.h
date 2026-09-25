@@ -75,6 +75,21 @@ void pl_a2dp_connect(const uint8_t *addr);
 // of scope here.
 void pl_a2dp_disconnect(void);
 
+// Bead pico-link-sfw6, design sec 2: cancels A's in-flight 0x0b retry and
+// wizard-dismiss timers so neither can fire into the switch attempt that's
+// about to start. Called from bt.c's pl_bt_connect_or_switch, run-loop/IRQ
+// context (same as pl_a2dp_connect/pl_a2dp_disconnect above), right before
+// gap_disconnect tears down A's ACL.
+void pl_a2dp_prepare_switch(void);
+
+// Bead pico-link-sfw6: true once the AVDTP/AVRCP session has fully
+// quiesced (a2dp_cid == 0). Called from bt.c's switch heartbeat, alongside
+// pl_bt_any_acl_up(), to decide when it's safe to page the switch target.
+// Thread-context safe to call (reads one field, no BTstack call), but in
+// practice only ever called from run-loop/IRQ context alongside its sibling
+// check.
+bool pl_a2dp_session_idle(void);
+
 // Bead pico-link-cz0.6 (M5 persistence): true whenever the media pipeline is
 // PRIMING or STREAMING (i.e. not IDLE) -- part of persist.c's "NO flash
 // write while streaming" gate alongside pl_usb_audio_streaming(). PRIMING is
@@ -174,6 +189,10 @@ void pl_a2dp_avrcp_volume_service(uint64_t now_us);
 #define PL_CONNECT_STEP_PAIRING 1u
 #define PL_CONNECT_STEP_SETTING_UP_AUDIO 2u
 #define PL_CONNECT_STEP_NEGOTIATING_CODEC 3u
+// Bead pico-link-sfw6, design sec 3: additive fifth step -- A's teardown
+// during a break-before-make device switch. Matches ui-ffi's
+// PlConnectStep::Disconnecting = 4 and core's ConnectStep::Disconnecting.
+#define PL_CONNECT_STEP_DISCONNECTING 4u
 
 // --- Bead pico-link-9eq2.3.2, design `.planning/design/2026-09-07-audio-
 // fault-model.md` §7.2: the seam fault.c evaluates against. Plain getters
