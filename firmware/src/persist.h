@@ -286,6 +286,39 @@ void pl_persist_request_display_settings(uint8_t mode, uint16_t timeout_s);
 // delay the picker's own feedback.
 void pl_persist_execute_pending_display_settings_write(void);
 
+// Bead pico-link-8pp1.4 (S3), design `.planning/design/2026-09-24-
+// congestion-cushion.md` sec 4: reads the PL:S:1 cushion-policy record
+// loaded at boot -- own kind index (1, under PL_PERSIST_KIND_SETTINGS),
+// own version byte, loaded independently of the device-store AND of
+// PL:S:0's own lifecycle (same "load before the PL:M:0 marker check"
+// discipline as pl_persist_boot_display_settings above, so neither a
+// first-boot early-return nor a device-schema mismatch can skip it).
+// Returns false (leaving `*policy` untouched) if the record was never
+// written, was the wrong length, failed its version check, or failed CRC
+// -- callers (main.c) treat false as "use the compiled-in default (Low)",
+// same fallback shape as pl_persist_boot_display_settings above.
+bool pl_persist_boot_cushion_policy(uint8_t *policy);
+
+// Stages a cushion-policy write -- called from bt.c's
+// PL_COMMAND_TAG_SET_CUSHION_POLICY handler (thread context, the
+// superloop). Same short-critical-section RAM-only staging idiom as
+// pl_persist_request_display_settings above; a SEPARATE staging slot (this
+// is also a global, not per-device, record -- Andreas's 2026-09-24
+// ruling).
+void pl_persist_request_cushion_policy(uint8_t policy);
+
+// Performs the actual flash write for whatever cushion-policy save is
+// currently staged by pl_persist_request_cushion_policy -- same calling
+// contract as pl_persist_execute_pending_display_settings_write (bt.c's
+// pending-queue drain, async_context ONLY).
+//
+// Andreas's 2026-09-24 ruling (bead pico-link-8pp1's design sec 4, "not
+// gated on streaming, D11 precedent"): deliberately NOT gated on
+// pl_usb_audio_streaming()/pl_a2dp_streaming() -- a user-initiated write
+// may stall audio briefly and that is accepted, same discipline as
+// pl_persist_execute_pending_display_settings_write above.
+void pl_persist_execute_pending_cushion_policy_write(void);
+
 // Andreas's ruling, 2026-09-01: writes the device record SYNCHRONOUSLY, as
 // part of establishing the connection -- see this header's module doc
 // (ORDERING) for the full rationale and the one carve-out
@@ -408,6 +441,17 @@ bool pl_persist_get_device_settings(const uint8_t addr[6], uint8_t *out_codec_id
 // of PL_PERSIST_KIND_MARKER/PL_PERSIST_KIND_DEVICE's lifecycle so a
 // device-store first-boot or version-mismatch can never wipe it.
 #define PL_PERSIST_KIND_SETTINGS 0x53u // 'S'
+// Bead pico-link-8pp1.4 (S3): PL:S:1, a SECOND, independent record under
+// the same PL_PERSIST_KIND_SETTINGS kind byte -- the global congestion-
+// cushion policy. Its own index (1, not 0 -- PL:S:0 above is the display-
+// settings record, unrelated), its own version byte
+// (PL_PERSIST_CUSHION_POLICY_VERSION in persist.c). Do NOT bump
+// PL_PERSIST_SETTINGS_VERSION for this record -- that would needlessly
+// couple this record's format to the display-settings one's; each PL:S:<i>
+// record versions itself independently, same discipline PL:S:0 already
+// established relative to PL_PERSIST_SCHEMA_VERSION (the device/marker
+// schema).
+#define PL_PERSIST_INDEX_CUSHION_POLICY 1u
 
 // Number of PL:D:<i> device slots the store holds, i in [0, PL_PERSIST_DEVICE_SLOTS).
 // Widened from a single slot (index 0 only) to 8 by bead pico-link-4vb.6

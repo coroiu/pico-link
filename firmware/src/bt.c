@@ -774,6 +774,12 @@ typedef enum {
     // addr -- persist.c already has the pending record staged in its own
     // s_display_pending_mode/s_display_pending_timeout_s.
     PL_BT_PENDING_SET_DISPLAY_SETTINGS,
+    // Bead pico-link-8pp1.4 (S3): reuses this exact queue/heartbeat idiom
+    // for persist.c's PL:S:1 cushion-policy write -- same reentrancy
+    // reason as the other PL_BT_PENDING_* persist entries. Carries no
+    // addr -- persist.c already has the pending record staged in its own
+    // s_cushion_pending_policy.
+    PL_BT_PENDING_SET_CUSHION_POLICY,
 } pl_bt_pending_tag_t;
 
 typedef struct {
@@ -810,6 +816,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "SET_DEVICE_LDAC_QUALITY";
         case PL_BT_PENDING_SET_DISPLAY_SETTINGS:
             return "SET_DISPLAY_SETTINGS";
+        case PL_BT_PENDING_SET_CUSHION_POLICY:
+            return "SET_CUSHION_POLICY";
         default:
             return "?";
     }
@@ -897,6 +905,11 @@ static void pl_bt_pending_service(void) {
                 // PL_BT_PENDING_PERSIST_WRITE above.
                 pl_persist_execute_pending_display_settings_write();
                 break;
+            case PL_BT_PENDING_SET_CUSHION_POLICY:
+                // Bead pico-link-8pp1.4 (S3): same reentrancy contract as
+                // PL_BT_PENDING_PERSIST_WRITE above.
+                pl_persist_execute_pending_cushion_policy_write();
+                break;
         }
     }
 }
@@ -920,6 +933,11 @@ void pl_bt_enqueue_ldac_quality_write(void) {
 // Bead pico-link-qivj.5 (S11). See bt.h's doc comment.
 void pl_bt_enqueue_display_settings_write(void) {
     pl_bt_pending_push(PL_BT_PENDING_SET_DISPLAY_SETTINGS, NULL);
+}
+
+// Bead pico-link-8pp1.4 (S3). See bt.h's doc comment.
+void pl_bt_enqueue_cushion_policy_write(void) {
+    pl_bt_pending_push(PL_BT_PENDING_SET_CUSHION_POLICY, NULL);
 }
 
 // Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the
@@ -1161,6 +1179,19 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             uint16_t timeout_s = command.payload.display_settings.timeout_s;
             pl_log("BT: PL_CMD_SET_DISPLAY_SETTINGS mode=%u timeout_s=%u\r\n", (unsigned)mode, (unsigned)timeout_s);
             pl_persist_request_display_settings(mode, timeout_s);
+            break;
+        }
+
+        case PL_COMMAND_TAG_SET_CUSHION_POLICY: {
+            // Bead pico-link-8pp1.4 (S3), design `.planning/design/2026-09-
+            // 24-congestion-cushion.md` sec 4: UNLIKE PL_COMMAND_TAG_SET_
+            // DISPLAY_SETTINGS above, C both APPLIES this one live (core has
+            // no run loop of its own that touches a2dp.c -- see
+            // core/src/audio.rs's module doc) AND persists it.
+            uint8_t policy = command.payload.cushion_policy.policy;
+            pl_log("BT: PL_CMD_SET_CUSHION_POLICY policy=%u\r\n", (unsigned)policy);
+            pl_a2dp_set_cushion_policy(policy);
+            pl_persist_request_cushion_policy(policy);
             break;
         }
 

@@ -1,5 +1,6 @@
 use alloc::string::String;
 
+use crate::audio::CushionPolicy;
 use crate::power::DisplaySettings;
 use crate::render::Instant;
 
@@ -39,6 +40,9 @@ impl App {
             Event::DisplaySettingsLoaded { mode, timeout_s } => {
                 self.set_display_settings(DisplaySettings::from_wire(mode, timeout_s));
                 self.mark_model_changed();
+            }
+            Event::CushionPolicyLoaded { policy } => {
+                self.set_cushion_policy(CushionPolicy::from_wire(policy));
             }
         }
         self.stamp_pending_wizard_timestamp();

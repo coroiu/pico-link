@@ -2110,21 +2110,25 @@ static volatile uint32_t s_trim_dropped;
 static volatile uint32_t s_trim_hold_ms;
 static volatile uint32_t s_trim_hard_band_bytes = PL_PCM_TRIM_BAND_BYTES;
 
-#ifdef PL_DEBUG_REMOTE
-// Bead pico-link-8pp1.1: the CDC knob (debug_remote.c) calls this to
-// switch the policy live, no reflash -- design sec 5's measurement round
-// needs arms A1/B1/A2/B2 to share one build and one RF environment.
-// hard_band_ms is converted to bytes here (192 B/ms, same conversion this
-// file already uses inline at a2dp.c's STREAM_ESTABLISHED jitter_bytes
-// derivation) so decide() below never does unit conversion in its hot
-// path. Clamped to keep the hard band inside the ring's own headroom
-// (design sec 3: target 30ms + hard 70ms + ~64ms EMA ramp lag ~= 164ms <
-// the 32KB ring's 170ms capacity; anything above 70ms makes the
-// drop-newest overflow reachable before the hard trip) and the hold time to a sane upper
-// bound (a policy that never trips is a latent overflow, not a feature).
-// Thread-context caller only (debug_remote.c's poll, superloop) -- same
-// single-writer contract as s_debug_skip_media_ticks above.
-void pl_a2dp_debug_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms) {
+// Bead pico-link-8pp1.4: the ALWAYS-COMPILED setter/getter -- S1's
+// pl_a2dp_debug_set_trim_policy/pl_a2dp_debug_trim_policy below were
+// PL_DEBUG_REMOTE-only (the CDC knob), but S3's persisted cushion policy
+// (persist.c's boot load) and the SET_CUSHION_POLICY command handler
+// (bt.c) both need to apply this policy in a SHIPPING build, where
+// debug_remote.c is not even compiled in. hard_band_ms is converted to
+// bytes here (192 B/ms, same conversion this file already uses inline at
+// a2dp.c's STREAM_ESTABLISHED jitter_bytes derivation) so decide() below
+// never does unit conversion in its hot path. Clamped to keep the hard
+// band inside the ring's own headroom (design sec 3: target 30ms + hard
+// 70ms + ~64ms EMA ramp lag ~= 164ms < the 32KB ring's 170ms capacity;
+// anything above 70ms makes the drop-newest overflow reachable before the
+// hard trip) and the hold time to a sane upper bound (a policy that never
+// trips is a latent overflow, not a feature). Thread-context caller only
+// (persist.c's boot init, bt.c's pending-queue drain, debug_remote.c's
+// poll) -- same single-writer contract as s_debug_skip_media_ticks above:
+// whichever caller runs, it runs on the superloop/async_context, never an
+// IRQ.
+void pl_a2dp_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms) {
     if (hold_ms > 10000u) {
         hold_ms = 10000u;
     }
@@ -2135,12 +2139,52 @@ void pl_a2dp_debug_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms) {
     s_trim_hard_band_bytes = hard_band_ms * 192u;
 }
 
+// Reports the CURRENT policy back in the same units the setter takes.
+// Thread-context caller only, same contract as the setter above.
+void pl_a2dp_trim_policy(uint32_t *hold_ms, uint32_t *hard_band_ms) {
+    *hold_ms = s_trim_hold_ms;
+    *hard_band_ms = s_trim_hard_band_bytes / 192u;
+}
+
+// Bead pico-link-8pp1.4 (S3): maps `pico_link_core::audio::CushionPolicy`'s
+// wire byte (`0` = unset, `1` = Low, `2` = Stable; the reserved future
+// Super-stable `3` and any other value fall back to Low) onto the named
+// hold_ms/hard_band_ms pairs from design sec 3 and calls
+// pl_a2dp_set_trim_policy above -- the ONE place these two named policies'
+// numeric values live, so persist.c's boot load and bt.c's
+// PL_COMMAND_TAG_SET_CUSHION_POLICY handler both apply exactly the same
+// values the design specifies (debug_remote.c's "TRIM POLICY LOW"/"TRIM
+// POLICY STABLE" CDC commands predate this bead and keep their own
+// inline literals -- see pico-link-8pp1.1 -- but they are the same
+// numbers). Thread-context caller only, same contract as the setter
+// above.
+void pl_a2dp_set_cushion_policy(uint8_t policy_wire) {
+    switch (policy_wire) {
+        case 2:
+            pl_a2dp_set_trim_policy(3000u, 70u); // Stable
+            break;
+        default:
+            pl_a2dp_set_trim_policy(0u, 15u); // Low (also the fallback for 0/unset/3-reserved)
+            break;
+    }
+}
+
+#ifdef PL_DEBUG_REMOTE
+// Bead pico-link-8pp1.1: the CDC knob (debug_remote.c) calls this to
+// switch the policy live, no reflash -- design sec 5's measurement round
+// needs arms A1/B1/A2/B2 to share one build and one RF environment. Thin
+// wrapper over the always-compiled pl_a2dp_set_trim_policy above (bead
+// pico-link-8pp1.4) -- kept as a separate debug-prefixed name/doc site so
+// debug_remote.c's call sites and their history stay readable.
+void pl_a2dp_debug_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms) {
+    pl_a2dp_set_trim_policy(hold_ms, hard_band_ms);
+}
+
 // Reports the CURRENT policy back in the same units the setter takes, for
 // the CDC "TRIM POLICY GET" command -- thread-context caller only, same
 // contract as the setter above.
 void pl_a2dp_debug_trim_policy(uint32_t *hold_ms, uint32_t *hard_band_ms) {
-    *hold_ms = s_trim_hold_ms;
-    *hard_band_ms = s_trim_hard_band_bytes / 192u;
+    pl_a2dp_trim_policy(hold_ms, hard_band_ms);
 }
 #endif
 

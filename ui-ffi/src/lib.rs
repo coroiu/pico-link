@@ -1158,6 +1158,22 @@ pub struct PlDisplaySettingsPayload {
     pub timeout_s: u16,
 }
 
+/// [`PlEvent`]'s payload when `tag == PlEventTag::CushionPolicyLoaded`,
+/// and also [`PlCommand`]'s payload when `tag ==
+/// PlCommandTag::SetCushionPolicy` -- the same wire shape serves both
+/// directions (bead pico-link-8pp1.4), matching
+/// `pico_link_core::audio::CushionPolicy::to_wire`/`from_wire` exactly:
+/// `policy` (`0` = unset -> `Low`, `1` = `Low`, `2` = `Stable`; any other
+/// value, including the reserved `3`, falls back to `Low`). `core` decodes
+/// with `CushionPolicy::from_wire`, never a raw match here -- same
+/// "typed field would already be UB on a garbage discriminant" reasoning
+/// as every other payload struct in this union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlCushionPolicyPayload {
+    pub policy: u8,
+}
+
 /// [`PlEvent`]'s payload when `tag == PlEventTag::DeviceDiscovered`. `name`
 /// points to `name_len` bytes of UTF-8 text, not necessarily
 /// NUL-terminated; invalid UTF-8 is replaced lossily rather than rejected
@@ -1792,6 +1808,15 @@ pub enum PlEventTag {
     /// is unchanged by this tag's own addition. See
     /// [`PlDisplaySettingsPayload`]'s doc comment.
     DisplaySettingsLoaded = 18,
+    /// Bead pico-link-8pp1.4 (S3), design `.planning/design/2026-09-24-
+    /// congestion-cushion.md` sec 4: C's persisted global congestion-
+    /// cushion policy (`PL:S:1`) finished loading at boot (`main.c` pushes
+    /// this right after `pl_bt_init`, same context/timing as
+    /// `DisplaySettingsLoaded` above). Purely additive, same discipline as
+    /// every tag from `LevelsChanged` (13) on -- [`PL_EVENT_ABI_VERSION`]
+    /// is unchanged by this tag's own addition. See
+    /// [`PlCushionPolicyPayload`]'s doc comment.
+    CushionPolicyLoaded = 19,
 }
 
 impl core::convert::TryFrom<u32> for PlEventTag {
@@ -1821,6 +1846,7 @@ impl core::convert::TryFrom<u32> for PlEventTag {
             16 => Ok(PlEventTag::AudioFault),
             17 => Ok(PlEventTag::DiscoveryStateChanged),
             18 => Ok(PlEventTag::DisplaySettingsLoaded),
+            19 => Ok(PlEventTag::CushionPolicyLoaded),
             _ => Err(()),
         }
     }
@@ -1869,6 +1895,9 @@ pub union PlEventPayload {
     /// Bead pico-link-qivj.2. See [`PlDisplaySettingsPayload`]'s doc
     /// comment.
     pub display_settings: PlDisplaySettingsPayload,
+    /// Bead pico-link-8pp1.4. See [`PlCushionPolicyPayload`]'s doc
+    /// comment.
+    pub cushion_policy: PlCushionPolicyPayload,
 }
 
 /// ABI version [`PlEvent`] producers (C call sites) must set on every
@@ -2259,6 +2288,15 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
             let payload = unsafe { event.payload.display_settings };
             Event::DisplaySettingsLoaded { mode: payload.mode, timeout_s: payload.timeout_s }
         }
+        PlEventTag::CushionPolicyLoaded => {
+            // SAFETY: `tag` says this union currently holds
+            // `cushion_policy`. Reading it is sound regardless of its
+            // field value -- `core`'s own `CushionPolicy::from_wire`
+            // (called inside `App::handle_event`) falls back on any
+            // out-of-range value, same as `DisplaySettingsLoaded` above.
+            let payload = unsafe { event.payload.cushion_policy };
+            Event::CushionPolicyLoaded { policy: payload.policy }
+        }
     };
     ui.app.handle_event(core_event);
 }
@@ -2374,6 +2412,18 @@ pub enum PlCommandTag {
     /// [`PL_COMMAND_ABI_VERSION`], same reasoning as
     /// [`SetDeviceLdacQuality`](Self::SetDeviceLdacQuality)'s own addition.
     SetDisplaySettings = 9,
+    /// Bead pico-link-8pp1.4 (S3), design `.planning/design/2026-09-24-
+    /// congestion-cushion.md` sec 4: the global congestion-cushion policy
+    /// changed (a future Settings-picker pick, S4), for C to persist under
+    /// `PL:S:1` and apply live via `pl_a2dp_set_trim_policy`. Like
+    /// [`SetDisplaySettings`](Self::SetDisplaySettings), NOT drained from
+    /// `App`'s ordinary `commands` queue -- it comes from `App::take_
+    /// cushion_policy_to_save`, checked in [`pl_ui_poll_command`] the same
+    /// way (design D9). Purely additive to the tag enum -- no existing
+    /// payload shape changed -- so this does not bump
+    /// [`PL_COMMAND_ABI_VERSION`], same reasoning as
+    /// [`SetDisplaySettings`](Self::SetDisplaySettings)'s own addition.
+    SetCushionPolicy = 10,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::Connect`.
@@ -2452,6 +2502,8 @@ pub union PlCommandPayload {
     pub set_device_ldac_quality: PlSetDeviceLdacQualityPayload,
     /// See [`PlDisplaySettingsPayload`]'s doc comment. Bead pico-link-qivj.2.
     pub display_settings: PlDisplaySettingsPayload,
+    /// See [`PlCushionPolicyPayload`]'s doc comment. Bead pico-link-8pp1.4.
+    pub cushion_policy: PlCushionPolicyPayload,
 }
 
 /// ABI version [`PlCommand`] consumers (C call sites, i.e. `bt.c`'s poll
@@ -2594,6 +2646,16 @@ pub unsafe extern "C" fn pl_ui_poll_command(ui: *mut PlUi) -> PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::SetDisplaySettings,
             payload: PlCommandPayload { display_settings: PlDisplaySettingsPayload { mode, timeout_s } },
+        };
+    }
+    // Bead pico-link-8pp1.4 (S3): the cushion-policy save latch, same
+    // checked-first-ahead-of-the-ordinary-queue shape as
+    // `take_display_settings_to_save` above (design D9).
+    if let Some(policy) = ui.app.take_cushion_policy_to_save() {
+        return PlCommand {
+            version: PL_COMMAND_ABI_VERSION,
+            tag: PlCommandTag::SetCushionPolicy,
+            payload: PlCommandPayload { cushion_policy: PlCushionPolicyPayload { policy: policy.to_wire() } },
         };
     }
     match ui.app.poll_command() {
@@ -2862,11 +2924,11 @@ mod tests {
         let bogus_payload = PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: PlLinkState::Idle as u32 } };
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
-            // One past DisplaySettingsLoaded = 18, the highest legal
-            // PlEventTag as of bead pico-link-qivj.2 -- moved from 18 (one
-            // past the old highest, DiscoveryStateChanged = 17) when this
-            // bead added tag 18.
-            tag: 19,
+            // One past CushionPolicyLoaded = 19, the highest legal
+            // PlEventTag as of bead pico-link-8pp1.4 -- moved from 19 (one
+            // past the previous highest, DisplaySettingsLoaded = 18) when
+            // this bead added tag 19.
+            tag: 20,
             payload: bogus_payload,
         };
         unsafe {
@@ -3513,15 +3575,16 @@ mod tests {
             PlEventTag::AudioFault,
             PlEventTag::DiscoveryStateChanged,
             PlEventTag::DisplaySettingsLoaded,
+            PlEventTag::CushionPolicyLoaded,
         ];
         for tag in legal {
             assert!(PlEventTag::try_from(tag as u32).is_ok());
         }
-        // 19 -- one past DisplaySettingsLoaded = 18, the highest legal
-        // PlEventTag as of bead pico-link-qivj.2 (moved from 18, one past
-        // the old highest DiscoveryStateChanged = 17, when this bead added
-        // tag 18).
-        assert!(PlEventTag::try_from(19u32).is_err());
+        // 20 -- one past CushionPolicyLoaded = 19, the highest legal
+        // PlEventTag as of bead pico-link-8pp1.4 (moved from 19, one past
+        // the previous highest DisplaySettingsLoaded = 18, when this bead
+        // added tag 19).
+        assert!(PlEventTag::try_from(20u32).is_err());
         assert!(PlEventTag::try_from(u32::MAX).is_err());
     }
 
@@ -3988,6 +4051,44 @@ mod tests {
             pl_ui_tick(ui, idle_timeout_us + hold_us);
             assert!(pl_ui_display_power(ui) == PlDisplayPower::Off, "a repeat of an already-Live key must not have re-armed the hold");
 
+            pl_ui_destroy(ui);
+        }
+    }
+
+    // --- Bead pico-link-8pp1.4 (S3): the cushion-policy FFI seam ---
+
+    #[test]
+    fn pl_ui_push_event_cushion_policy_loaded_folds_into_the_model() {
+        let ui = new_ui();
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::CushionPolicyLoaded as u32,
+            payload: PlEventPayload { cushion_policy: PlCushionPolicyPayload { policy: 2 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "CushionPolicyLoaded is a legal tag");
+            assert_eq!((*ui).app.cushion_policy(), pico_link_core::CushionPolicy::Stable);
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_poll_command_surfaces_a_cushion_policy_save_ahead_of_the_ordinary_queue() {
+        // Design D9, same shape `take_display_settings_to_save` uses:
+        // checked FIRST by `pl_ui_poll_command`, ahead of `App`'s ordinary
+        // `commands` queue.
+        let ui = new_ui();
+        unsafe {
+            (*ui).app.request_cushion_policy(pico_link_core::CushionPolicy::Stable);
+            let cmd = pl_ui_poll_command(ui);
+            assert_eq!(cmd.tag as u32, PlCommandTag::SetCushionPolicy as u32);
+            let payload = cmd.payload.cushion_policy;
+            assert_eq!(payload.policy, 2, "Stable must encode to wire value 2");
+
+            // Drained -- a second poll must not resurface it.
+            let cmd2 = pl_ui_poll_command(ui);
+            assert_eq!(cmd2.tag as u32, PlCommandTag::None as u32);
             pl_ui_destroy(ui);
         }
     }

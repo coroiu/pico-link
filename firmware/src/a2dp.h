@@ -203,6 +203,30 @@ uint32_t pl_a2dp_link_lost_events(void);
 uint32_t pl_a2dp_stop_dwell(void);
 uint32_t pl_a2dp_credit_clamp_events(void);
 
+// Bead pico-link-8pp1.4: ALWAYS-COMPILED setter/getter for the resync
+// trim's hold/hard-band policy -- see a2dp.c's s_trim_hold_ms/
+// s_trim_hard_band_bytes doc comment for the single-writer discipline and
+// default-preserving clamp. hold_ms/hard_band_ms are both in milliseconds
+// (the setter converts hard_band_ms to bytes internally). Thread-context
+// caller only: persist.c's boot init (pl_persist_init, before the
+// superloop starts) and bt.c's PL_BT_PENDING_SET_CUSHION_POLICY drain
+// (async_context), plus (when PL_DEBUG_REMOTE is on) debug_remote.c's
+// poll -- never an IRQ.
+void pl_a2dp_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms);
+
+// Reads back the policy pl_a2dp_set_trim_policy last set (or the
+// compiled-in default, bit-identical to pre-8pp1.1 behaviour, if it was
+// never called) -- both units milliseconds, same as the setter. Thread-
+// context caller only, same contract as the setter above.
+void pl_a2dp_trim_policy(uint32_t *hold_ms, uint32_t *hard_band_ms);
+
+// Bead pico-link-8pp1.4 (S3): applies a `pico_link_core::audio::
+// CushionPolicy` wire byte (0=unset/1=Low/2=Stable, 3 reserved) as its
+// named hold_ms/hard_band_ms pair -- see a2dp.c's doc comment for the
+// single source of truth this centralizes. Thread-context caller only
+// (persist.c's boot init, bt.c's PL_BT_PENDING_SET_CUSHION_POLICY drain).
+void pl_a2dp_set_cushion_policy(uint8_t policy_wire);
+
 #ifdef PL_DEBUG_REMOTE
 // Bead pico-link-fhf, test A (injection). One-shot: the NEXT `ticks` calls
 // to the media timer handler skip pl_a2dp_fill()'s drain entirely, so the
@@ -216,19 +240,12 @@ uint32_t pl_a2dp_credit_clamp_events(void);
 // PL_DEBUG_REMOTE is set; entirely absent from a shipping build.
 void pl_a2dp_debug_skip_media_ticks(uint32_t ticks);
 
-// Bead pico-link-8pp1.1, design sec 5: switches the resync trim's hold/
-// hard-band policy live, no reflash -- see a2dp.c's s_trim_hold_ms/
-// s_trim_hard_band_bytes doc comment for the single-writer discipline and
-// default-preserving clamp. hold_ms/hard_band_ms are both in milliseconds
-// (the setter converts hard_band_ms to bytes internally). Thread-context
-// caller only (debug_remote.c's poll, superloop). Compiled only when
+// Bead pico-link-8pp1.1, design sec 5: the CDC "TRIM POLICY" knob -- thin
+// wrappers over the always-compiled pl_a2dp_set_trim_policy/
+// pl_a2dp_trim_policy above (bead pico-link-8pp1.4). Thread-context caller
+// only (debug_remote.c's poll, superloop). Compiled only when
 // PL_DEBUG_REMOTE is set.
 void pl_a2dp_debug_set_trim_policy(uint32_t hold_ms, uint32_t hard_band_ms);
-
-// Reads back the policy pl_a2dp_debug_set_trim_policy last set (or the
-// compiled-in default, bit-identical to pre-8pp1.1 behaviour, if it was
-// never called) -- both units milliseconds, same as the setter. Thread-
-// context caller only, same contract as the setter above.
 void pl_a2dp_debug_trim_policy(uint32_t *hold_ms, uint32_t *hard_band_ms);
 #endif
 
