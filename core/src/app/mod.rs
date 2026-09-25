@@ -18,6 +18,7 @@ use core::time::Duration;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::input::NavIntent;
+use crate::audio::CushionPolicy;
 use crate::power::DisplaySettings;
 use crate::render::home::build_home_screen;
 use crate::render::{FrameBuffer565, Instant, Navigator, RenderCtx};
@@ -45,7 +46,7 @@ pub(crate) use screens::devices::DEVICES_TITLE;
 pub(crate) use screens::ldac_quality::LDAC_QUALITY_ADAPTIVE;
 pub(crate) use screens::settings::build_settings_screen;
 pub(crate) use screens::why_page::build_why_page_screen;
-pub use ui_state::{DisplaySettingsState, HomeFace, WizardPhase};
+pub use ui_state::{CushionPolicyState, DisplaySettingsState, HomeFace, WizardPhase};
 
 /// Floor applied to [`Widget::redraw_after`]'s returned [`Duration`]
 /// before it is added to `ctx.now()` to produce [`App::next_redraw_at`]
@@ -147,6 +148,12 @@ pub struct App {
     /// reason (the Settings screen and its pickers are pushed
     /// `Action::PushView` closures with no path back to `App`).
     display_settings: Rc<RefCell<DisplaySettingsState>>,
+    /// The global congestion-cushion policy's shared mailbox -- bead
+    /// pico-link-8pp1.4 (S3). Same `Rc<RefCell<_>>` shape as
+    /// `display_settings` above, for a future Settings row/picker (S4).
+    /// See [`CushionPolicyState`]'s doc comment for why it carries only
+    /// one flag, not two.
+    cushion_policy: Rc<RefCell<CushionPolicyState>>,
 }
 
 impl App {
@@ -161,6 +168,7 @@ impl App {
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let home_face = Rc::new(RefCell::new(HomeFace::default()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
+        let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
         let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
         let navigator = Navigator::new(build_home_screen(&model, &home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings));
         Self {
@@ -174,6 +182,7 @@ impl App {
             wizard_phase,
             home_face,
             display_settings,
+            cushion_policy,
         }
     }
 
@@ -220,6 +229,46 @@ impl App {
     /// as [`App::take_display_settings_to_apply`].
     pub fn take_display_settings_to_save(&mut self) -> Option<DisplaySettings> {
         let mut state = self.display_settings.borrow_mut();
+        if state.save_pending {
+            state.save_pending = false;
+            Some(state.current)
+        } else {
+            None
+        }
+    }
+
+    /// The live global congestion-cushion policy -- bead pico-link-8pp1.4
+    /// (S3). For a future Settings row/picker (S4) to read.
+    #[must_use]
+    pub fn cushion_policy(&self) -> CushionPolicy {
+        self.cushion_policy.borrow().current
+    }
+
+    /// Seeds the live policy (from `Event::CushionPolicyLoaded`, C's
+    /// `PL:S:1` boot load) -- sets `current` but deliberately does NOT
+    /// mark it pending *save*: seeding is "here is what's already
+    /// stored/defaulted," not a user edit, same discipline
+    /// [`App::set_display_settings`] uses for its own seed.
+    pub fn set_cushion_policy(&mut self, policy: CushionPolicy) {
+        self.cushion_policy.borrow_mut().current = policy;
+    }
+
+    /// User-initiated pick (a future Settings picker, S4): sets `current`
+    /// AND marks it pending *save* -- unlike
+    /// [`App::set_display_settings`]/[`App::take_display_settings_to_apply`]'s
+    /// pair, there is no "apply" latch here (see [`CushionPolicyState`]'s
+    /// doc comment for why).
+    pub fn request_cushion_policy(&mut self, policy: CushionPolicy) {
+        let mut state = self.cushion_policy.borrow_mut();
+        state.current = policy;
+        state.save_pending = true;
+    }
+
+    /// Drains the "persist" latch -- `Some` at most once per user pick,
+    /// consumed by `ui-ffi`'s `pl_ui_poll_command` (design D9, same shape
+    /// [`App::take_display_settings_to_save`] uses).
+    pub fn take_cushion_policy_to_save(&mut self) -> Option<CushionPolicy> {
+        let mut state = self.cushion_policy.borrow_mut();
         if state.save_pending {
             state.save_pending = false;
             Some(state.current)

@@ -457,6 +457,27 @@ int main(void) {
         }
     }
 
+    // Bead pico-link-8pp1.4 (S3): push the PL:S:1 boot snapshot into core
+    // (for a future Settings row/picker, S4) AND apply it live to the
+    // resync trim -- UNLIKE the display-settings block above, core has no
+    // run loop of its own that touches a2dp.c, so C must apply this one
+    // itself (see core/src/audio.rs's module doc). No-op apply (a2dp.c
+    // keeps its compiled-in default, Low) if pl_persist_boot_cushion_
+    // policy() returns false -- see that function's doc comment for every
+    // reason it can.
+    {
+        uint8_t boot_cushion_policy;
+        if (pl_persist_boot_cushion_policy(&boot_cushion_policy)) {
+            pl_a2dp_set_cushion_policy(boot_cushion_policy);
+            struct PlEvent event = {
+                .version = PL_EVENT_ABI_VERSION,
+                .tag = PL_EVENT_TAG_CUSHION_POLICY_LOADED,
+                .payload = {.cushion_policy = {.policy = boot_cushion_policy}},
+            };
+            pl_ui_push_event(ui, event);
+        }
+    }
+
 #ifdef PL_ENCODER_ON_CORE1
     // Bead pico-link-nli.4 (G3, epic pico-link-nli): launch core1 into the
     // LDAC encoder loop, after cyw43/BTstack init per design sec 8 -- core1

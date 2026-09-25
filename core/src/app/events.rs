@@ -364,6 +364,13 @@ pub enum Event {
     /// [`DisplaySettings::from_wire`] (`core` owns the live value, unlike
     /// the LDAC-quality picker, where C owns the device record).
     DisplaySettingsLoaded { mode: u8, timeout_s: u16 },
+    /// C's flash-backed store finished loading the global congestion-
+    /// cushion policy (`PL:S:1`) at boot -- bead pico-link-8pp1.4 (S3),
+    /// design `.planning/design/2026-09-24-congestion-cushion.md` sec 4.
+    /// Wire value, not [`crate::audio::CushionPolicy`] itself: `core`
+    /// decodes with [`crate::audio::CushionPolicy::from_wire`], same
+    /// discipline as [`Self::DisplaySettingsLoaded`] above.
+    CushionPolicyLoaded { policy: u8 },
 }
 
 /// Phase 4's four named connect sub-steps: naming the current one tells

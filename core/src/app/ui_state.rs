@@ -1,3 +1,4 @@
+use crate::audio::CushionPolicy;
 use crate::power::DisplaySettings;
 use crate::render::Instant;
 
@@ -137,5 +138,22 @@ pub enum HomeFace {
 pub struct DisplaySettingsState {
     pub(in crate::app) current: DisplaySettings,
     pub(in crate::app) apply_pending: bool,
+    pub(in crate::app) save_pending: bool,
+}
+
+/// Bead pico-link-8pp1.4 (S3). The same `Rc<RefCell<_>>` mailbox shape as
+/// [`DisplaySettingsState`] above, for the same reason (a future Settings
+/// row/picker, S4, is an `Action::PushView` closure with no path back to a
+/// live `&mut App`) -- but with only ONE flag, not two: unlike the
+/// screensaver setting, `core` has nothing of its own to "apply" a cushion
+/// policy to (it neither implements nor runs the resync trim -- see
+/// `crate::audio`'s module doc). `save_pending` is set together with
+/// `current` on a user pick ([`App::request_cushion_policy`]), but NOT on
+/// [`App::set_cushion_policy`]'s initial seed from a loaded/default value
+/// (seeding must never re-save what was just loaded) -- same discipline as
+/// `DisplaySettingsState::apply_pending`/`save_pending` above.
+#[derive(Default)]
+pub struct CushionPolicyState {
+    pub(in crate::app) current: CushionPolicy,
     pub(in crate::app) save_pending: bool,
 }

@@ -119,6 +119,22 @@ typedef struct __attribute__((packed)) {
     uint16_t crc16;
 } pl_persist_display_settings_record_t;
 
+// Bead pico-link-8pp1.4 (S3): PL:S:1, the global congestion-cushion-policy
+// record -- design `.planning/design/2026-09-24-congestion-cushion.md`
+// sec 4. Own version byte, SEPARATE from PL_PERSIST_SETTINGS_VERSION (see
+// PL_PERSIST_INDEX_CUSHION_POLICY's doc comment in persist.h for why).
+// `policy` is the raw wire byte `pico_link_core::audio::CushionPolicy::
+// to_wire`/`from_wire` already define (0=unset, 1=Low, 2=Stable, 3
+// reserved for a possible future Super-stable mode) -- this module stores
+// and moves the byte, never interprets it (same discipline as
+// screensaver_mode above / ldac_quality in the device record).
+#define PL_PERSIST_CUSHION_POLICY_VERSION 1u
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint8_t policy;
+    uint16_t crc16;
+} pl_persist_cushion_policy_record_t;
+
 // CRC16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over every field of
 // pl_persist_device_record_t EXCEPT crc16 itself. A bit-loop, not a table --
 // records are tiny (50 bytes) and written at most once per ~10s, so table
@@ -239,6 +255,15 @@ static bool s_display_settings_loaded;
 static uint8_t s_display_settings_mode;
 static uint16_t s_display_settings_timeout_s;
 
+// Bead pico-link-8pp1.4 (S3): a FOURTH, independent staging slot -- the
+// global cushion policy (PL:S:1), same shape as s_display_pending/
+// s_display_settings_loaded above, just one field instead of two.
+static bool s_cushion_pending;
+static uint8_t s_cushion_pending_policy;
+static volatile bool s_cushion_write_enqueued;
+static bool s_cushion_policy_loaded;
+static uint8_t s_cushion_policy;
+
 // Unconditional (NOT #ifndef NDEBUG-gated) firmware/storage-region collision
 // check -- replaces btstack_flash_bank.c:53-58's assert, which pico-sdk's
 // forced-Release build (CMAKE_BUILD_TYPE unset -> NDEBUG defined) silently
@@ -323,6 +348,41 @@ void pl_persist_init(void) {
                     "persist: loaded display settings mode=%u timeout_s=%u\r\n", (unsigned)rec.screensaver_mode,
                     (unsigned)rec.screensaver_timeout_s
                 );
+            }
+        }
+    }
+
+    // --- Bead pico-link-8pp1.4 (S3), design `.planning/design/2026-09-24-
+    // congestion-cushion.md` sec 4: load PL:S:1 (cushion policy) HERE too --
+    // same "before the PL:M:0 marker check, unconditionally" placement as
+    // PL:S:0 above, and for the same reason (neither a first-boot nor a
+    // device-schema-mismatch early-return below may skip it). Self-
+    // versioned independently of both PL_PERSIST_SCHEMA_VERSION AND
+    // PL_PERSIST_SETTINGS_VERSION -- a bad length, wrong version or failed
+    // CRC just leaves s_cushion_policy_loaded false (pl_persist_boot_
+    // cushion_policy returns false, main.c falls back to the compiled-in
+    // default, Low) -- this record is never deleted here even when
+    // invalid, same reasoning as PL:S:0's own load.
+    {
+        pl_persist_cushion_policy_record_t rec;
+        int rec_len = s_tlv_impl->get_tag(
+            &s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, PL_PERSIST_INDEX_CUSHION_POLICY), (uint8_t *)&rec, sizeof(rec)
+        );
+        if (rec_len != (int)sizeof(rec)) {
+            pl_log("persist: no PL:S:1 cushion-policy record -- using default (Low)\r\n");
+        } else if (rec.version != PL_PERSIST_CUSHION_POLICY_VERSION) {
+            pl_log(
+                "persist: PL:S:1 version mismatch (got %u, expected %u) -- using default (Low)\r\n", rec.version,
+                PL_PERSIST_CUSHION_POLICY_VERSION
+            );
+        } else {
+            uint16_t crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_cushion_policy_record_t, crc16));
+            if (crc != rec.crc16) {
+                pl_log("persist: PL:S:1 CRC mismatch (got 0x%04x, computed 0x%04x) -- using default (Low)\r\n", rec.crc16, crc);
+            } else {
+                s_cushion_policy_loaded = true;
+                s_cushion_policy = rec.policy;
+                pl_log("persist: loaded cushion policy=%u\r\n", (unsigned)rec.policy);
             }
         }
     }
@@ -984,6 +1044,14 @@ void pl_persist_service(void) {
         s_display_write_enqueued = true;
         pl_bt_enqueue_display_settings_write();
     }
+    if (s_cushion_pending && !s_cushion_write_enqueued) {
+        // Bead pico-link-8pp1's design sec 4 / Andreas's 2026-09-24 ruling
+        // (D11 precedent): no streaming re-check here, matching the
+        // display-settings block above -- this is a user-initiated write
+        // that is allowed to skip audio rather than silently delay.
+        s_cushion_write_enqueued = true;
+        pl_bt_enqueue_cushion_policy_write();
+    }
 }
 
 // Bead pico-link-7jol.5. See persist.h's doc comment.
@@ -1078,6 +1146,51 @@ void pl_persist_execute_pending_display_settings_write(void) {
     s_display_settings_timeout_s = timeout_s;
     pl_log("persist: wrote display settings mode=%u timeout_s=%u\r\n", (unsigned)mode, (unsigned)timeout_s);
     s_display_write_enqueued = false;
+}
+
+// Bead pico-link-8pp1.4 (S3). See persist.h's doc comment.
+bool pl_persist_boot_cushion_policy(uint8_t *policy) {
+    if (!s_cushion_policy_loaded) {
+        return false;
+    }
+    *policy = s_cushion_policy;
+    return true;
+}
+
+// Bead pico-link-8pp1.4 (S3). See persist.h's doc comment.
+void pl_persist_request_cushion_policy(uint8_t policy) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    s_cushion_pending_policy = policy;
+    s_cushion_pending = true;
+    restore_interrupts(irq_state);
+}
+
+// Bead pico-link-8pp1.4 (S3). See persist.h's doc comment.
+void pl_persist_execute_pending_cushion_policy_write(void) {
+    if (!s_cushion_pending) {
+        s_cushion_write_enqueued = false;
+        return;
+    }
+
+    uint8_t policy;
+    uint32_t irq_state = save_and_disable_interrupts();
+    policy = s_cushion_pending_policy;
+    s_cushion_pending = false;
+    restore_interrupts(irq_state);
+
+    pl_persist_cushion_policy_record_t rec = {
+        .version = PL_PERSIST_CUSHION_POLICY_VERSION,
+        .policy = policy,
+        .crc16 = 0,
+    };
+    rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_cushion_policy_record_t, crc16));
+    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, PL_PERSIST_INDEX_CUSHION_POLICY), (const uint8_t *)&rec, sizeof(rec));
+    // Keep the live boot-snapshot mirror in sync too, same discipline as
+    // the display-settings write above.
+    s_cushion_policy_loaded = true;
+    s_cushion_policy = policy;
+    pl_log("persist: wrote cushion policy=%u\r\n", (unsigned)policy);
+    s_cushion_write_enqueued = false;
 }
 
 void pl_persist_request_urgent_flush(void) {

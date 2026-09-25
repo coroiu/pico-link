@@ -231,4 +231,12 @@ void pl_bt_enqueue_ldac_quality_write(void);
 // the superloop).
 void pl_bt_enqueue_display_settings_write(void);
 
+// Bead pico-link-8pp1.4 (S3): same idiom as pl_bt_enqueue_persist_write
+// above, for persist.c's PL:S:1 cushion-policy write -- see persist.h's
+// doc comment on pl_persist_request_cushion_policy/
+// pl_persist_execute_pending_cushion_policy_write for the full rationale.
+// Called from persist.c's pl_persist_service() (thread context, the
+// superloop).
+void pl_bt_enqueue_cushion_policy_write(void);
+
 #endif // PL_BT_H

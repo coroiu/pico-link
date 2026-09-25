@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 
+use crate::audio::CushionPolicy;
 use crate::render::{ListItem, VerticalList};
 
 use super::model::MAX_PAIRED_DEVICES;
@@ -936,4 +937,49 @@ fn pending_timestamp_backfill_fires_on_a_discovery_state_changed_event() {
         }
         other => panic!("expected WizardPhase::Scanning, got {other:?}"),
     }
+}
+
+// --- Bead pico-link-8pp1.4 (S3): the cushion-policy mailbox ---
+
+/// `App::new` defaults to `CushionPolicy::Low`, matching Andreas's
+/// 2026-09-24 ruling (default is Low until proven otherwise).
+#[test]
+fn cushion_policy_defaults_to_low() {
+    let app = App::new(240, 240);
+    assert_eq!(app.cushion_policy(), CushionPolicy::Low);
+}
+
+/// Seeding (boot load, `Event::CushionPolicyLoaded`) must set `current`
+/// but must NOT mark the save latch -- same discipline as
+/// `DisplaySettingsState::apply_pending`/`save_pending`'s "seeding never
+/// re-saves what was just loaded".
+#[test]
+fn cushion_policy_loaded_event_seeds_without_arming_the_save_latch() {
+    let mut app = App::new(240, 240);
+    app.handle_event(Event::CushionPolicyLoaded { policy: 2 });
+    assert_eq!(app.cushion_policy(), CushionPolicy::Stable);
+    assert_eq!(app.take_cushion_policy_to_save(), None, "a boot-load seed must never arm the save latch");
+}
+
+/// A wire value the enum doesn't understand (0 = unset, or the reserved
+/// future Super-stable `3`) falls back to `Low`, the same per-field
+/// fallback discipline `ScreensaverMode::from_wire` uses.
+#[test]
+fn cushion_policy_loaded_event_falls_back_to_low_on_an_unrecognized_wire_value() {
+    let mut app = App::new(240, 240);
+    app.set_cushion_policy(CushionPolicy::Stable);
+    app.handle_event(Event::CushionPolicyLoaded { policy: 3 });
+    assert_eq!(app.cushion_policy(), CushionPolicy::Low, "an unrecognized wire value must fall back to the default, Low");
+}
+
+/// A user-initiated pick (`request_cushion_policy`, what a future S4
+/// picker calls) sets `current` AND arms the save latch, drained exactly
+/// once.
+#[test]
+fn request_cushion_policy_arms_the_save_latch_exactly_once() {
+    let mut app = App::new(240, 240);
+    app.request_cushion_policy(CushionPolicy::Stable);
+    assert_eq!(app.cushion_policy(), CushionPolicy::Stable);
+    assert_eq!(app.take_cushion_policy_to_save(), Some(CushionPolicy::Stable));
+    assert_eq!(app.take_cushion_policy_to_save(), None, "the save latch must drain to None after being taken once");
 }

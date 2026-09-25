@@ -54,6 +54,7 @@
 extern crate alloc;
 
 pub mod app;
+pub mod audio;
 pub mod input;
 pub mod panel;
 pub mod platform;
@@ -65,6 +66,7 @@ pub use app::{
     App, BtModel, Command, ConnectFailureReason, ConnectStep, ConnectedCodec, DeviceEntry, Event, LinkState, PairedDevice,
     StoreStatus, VolumeSource, VolumeState, WizardPhase,
 };
+pub use audio::CushionPolicy;
 pub use input::NavIntent;
 pub use panel::{Button, Edge, PanelOrientation, PANEL};
 pub use power::{
