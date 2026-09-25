@@ -29,6 +29,7 @@ use embedded_graphics::draw_target::DrawTargetExt;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::{Point, Size};
 use embedded_graphics::primitives::Rectangle;
+use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::FontRenderer;
 
 use crate::input::NavIntent;
@@ -38,14 +39,32 @@ use super::framebuffer::FrameBuffer565;
 use super::list::{reconcile_top_index, ListItemKey};
 use super::menu::{draw_row, row_height, RowStyle, RowTrailing, RowValue};
 use super::paint_key::PaintKey;
-use super::theme::{font, palette};
+use super::theme::{font, icon, palette};
 use super::widget::{Action, FocusEvent, Verb, Widget};
 
 /// Seed for [`FieldList::paint_key`] -- only needs to differ from other
 /// widgets' own seeds.
 const FIELD_PAINT_KEY_SEED: u64 = 13;
 
-/// A field row's kind — TWO, not three, and collapsing Uma's `Info` and
+/// Gap (px) between a [`FieldKind::Value`] row's chevron and the value
+/// text it flanks — small enough to sit inside `draw_row`'s existing
+/// `LABEL_VALUE_GAP` reservation on the left, and inside
+/// `RowStyle::FIELD`'s `value_right_margin - caret_right_margin` gutter
+/// on the right (both already sized for an `icon_1x` glyph).
+const VALUE_CHEVRON_GAP: i32 = 2;
+
+/// A single line's rendered pixel width in `font` -- duplicated from
+/// `menu.rs`'s private `text_width` (same small-private-helper rationale
+/// that function's own doc comment gives; this module has no reason to
+/// depend on `menu.rs` beyond the `draw_row` primitive it already uses).
+#[allow(clippy::cast_possible_wrap)]
+fn value_text_width(font: &FontRenderer, text: &str) -> i32 {
+    font.get_rendered_dimensions_aligned(text, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
+        .unwrap_or(None)
+        .map_or(0, |bbox| bbox.size.width as i32)
+}
+
+/// A field row's kind. `Action`/`Readonly` collapsing Uma's `Info` and
 /// `Disabled` kinds into one variant IS the finding the field-list ruling
 /// makes (§4.1): both are focusable, dim, never grow a caret, `A` is a
 /// no-op, and the trailing value is drawn regardless of focus. They
@@ -54,9 +73,16 @@ const FIELD_PAINT_KEY_SEED: u64 = 13;
 /// so encoding them as one variant is what makes it structurally
 /// impossible for them to drift apart later.
 ///
+/// `Value` is a third, structurally distinct kind (Fern DESIGN,
+/// `.planning/design/2026-09-25-value-row-and-on-exit-hook.md` §2): a
+/// bright, focusable row whose Left/Right steps a value in place, rather
+/// than a caret pushing a deeper screen. It is not folded into `Action`
+/// because activation (`A`) must stay inert on it (§2's activation rule),
+/// and not into `Readonly` because its label is bright, not dim.
+///
 /// Extension point: if a disabled row ever needs its own distinct mark (a
 /// lock glyph, a strikethrough), it takes the **leading gutter**
-/// ([`FieldRow::with_leading_glyph`]), not a third kind.
+/// ([`FieldRow::with_leading_glyph`]), not a fourth kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
     /// Bright label, caret while focused, `A` fires the list's callback.
@@ -64,6 +90,34 @@ pub enum FieldKind {
     /// Dim label, NEVER a caret, `A` is a no-op — but fully focusable,
     /// and its value is drawn regardless of focus.
     Readonly,
+    /// Bright label like `Action`, but `A` is a no-op (like `Readonly`)
+    /// and Left/Right — not a caret — are this row's disclosure: they
+    /// step the value while this row is focused, via
+    /// [`FieldList::on_step`]. See [`StepBounds`] for the per-side
+    /// liveness this variant carries.
+    Value(StepBounds),
+}
+
+/// Whether a [`FieldKind::Value`] row's Left (`Prev`) and Right (`Next`)
+/// sides are currently live — computed by the screen builder from the
+/// model's own ladder, never by the widget (design §2: "clamp vs wrap is
+/// not a widget concept"). A clamped ladder reports `prev: false` at its
+/// low end; a wrapping ladder reports both `true` always. The widget only
+/// renders this (a dead side's chevron draws in [`palette::DIVIDER`]) and
+/// gates on it (a dead side's Left/Right is a no-op, no callback call).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepBounds {
+    pub prev: bool,
+    pub next: bool,
+}
+
+/// Which direction a [`FieldList::on_step`] callback was invoked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Left — steps the value down/back.
+    Prev,
+    /// Right — steps the value up/forward.
+    Next,
 }
 
 /// Which face a row's trailing value uses. A closed two-variant enum, not
@@ -143,6 +197,24 @@ impl FieldRow {
         Self::new(label, FieldKind::Readonly)
     }
 
+    /// A steppable row: bright label, chevrons flank the value while
+    /// focused (never a caret), `A` is a no-op, Left/Right step the value
+    /// via [`FieldList::on_step`] when `bounds` reports that side live.
+    /// Always carries a value from construction (unlike `action`/
+    /// `readonly`, which take theirs via [`Self::with_value`]) — a value
+    /// row with nothing to show is not a state this constructor can
+    /// represent. Callers must also call [`Self::with_key`] — the step
+    /// callback is keyed, never index-based (design §2).
+    ///
+    /// Named `value_row`, not `value` (the design's literal constructor
+    /// name) — [`Self::value`] is this type's already-shipped read
+    /// accessor for the built row's trailing text, used by every
+    /// screen's own row-content tests; the two cannot share a name.
+    #[must_use]
+    pub fn value_row(label: impl Into<String>, text: impl Into<String>, bounds: StepBounds) -> Self {
+        Self::new(label, FieldKind::Value(bounds)).with_value(text, palette::TEXT_PRIMARY)
+    }
+
     #[must_use]
     pub fn with_value(mut self, text: impl Into<String>, color: Rgb565) -> Self {
         self.value = Some(text.into());
@@ -202,7 +274,7 @@ impl FieldRow {
 
     fn resolved_label_color(&self) -> Rgb565 {
         self.label_color.unwrap_or(match self.kind {
-            FieldKind::Action => palette::TEXT_PRIMARY,
+            FieldKind::Action | FieldKind::Value(_) => palette::TEXT_PRIMARY,
             FieldKind::Readonly => palette::TEXT_SECONDARY,
         })
     }
@@ -236,12 +308,27 @@ pub struct FieldList {
     /// resolves that key back to a live value at *press time* -- the exact
     /// `VerticalList::on_activate_key` shape, mirrored here.
     on_activate_key: Option<OnActivateKey>,
+    /// Invoked with a [`FieldKind::Value`] row's key and [`Step`] direction
+    /// when Left/Right is pressed on that row's live side — see
+    /// [`Self::on_step`].
+    on_step: Option<OnStep>,
 }
+
+type OnStep = Box<dyn Fn(ListItemKey, Step) -> Action>;
 
 impl FieldList {
     #[must_use]
     pub fn new(rows: Vec<FieldRow>) -> Self {
-        Self { rows, selected: 0, top_index: Cell::new(0), focused: false, style: RowStyle::FIELD, on_activate_index: None, on_activate_key: None }
+        Self {
+            rows,
+            selected: 0,
+            top_index: Cell::new(0),
+            focused: false,
+            style: RowStyle::FIELD,
+            on_activate_index: None,
+            on_activate_key: None,
+            on_step: None,
+        }
     }
 
     /// Registers a callback invoked with the selected row's index when
@@ -266,6 +353,19 @@ impl FieldList {
     #[must_use]
     pub fn on_activate_key(mut self, callback: impl Fn(ListItemKey) -> Action + 'static) -> Self {
         self.on_activate_key = Some(Box::new(callback));
+        self
+    }
+
+    /// Registers a callback invoked with the selected row's key and the
+    /// pressed [`Step`] direction when Left/Right is pressed while a
+    /// [`FieldKind::Value`] row is focused **and that side's
+    /// [`StepBounds`] reports it live** — see [`Widget::on_intent`]'s
+    /// `Left`/`Right` arm for the full gate (design §2): a dead side, a
+    /// non-`Value` selected row, or no callback registered all fall
+    /// through to `Action::None` without ever calling this closure.
+    #[must_use]
+    pub fn on_step(mut self, callback: impl Fn(ListItemKey, Step) -> Action + 'static) -> Self {
+        self.on_step = Some(Box::new(callback));
         self
     }
 
@@ -352,6 +452,29 @@ impl FieldList {
         let next = (self.selected as i32 + delta).clamp(0, len - 1);
         self.selected = next as usize;
     }
+
+    /// Left/Right on the selected row -- see [`Self::on_step`]'s doc
+    /// comment for the full gate this implements. Not a `Widget` trait
+    /// method itself; `on_intent`'s `Left`/`Right` arms call this.
+    fn step(&self, direction: Step) -> Action {
+        let Some(row) = self.rows.get(self.selected) else {
+            return Action::None;
+        };
+        let FieldKind::Value(bounds) = row.kind else {
+            return Action::None;
+        };
+        let live = match direction {
+            Step::Prev => bounds.prev,
+            Step::Next => bounds.next,
+        };
+        if !live {
+            return Action::None;
+        }
+        match (row.key, &self.on_step) {
+            (Some(key), Some(callback)) => callback(key, direction),
+            _ => Action::None,
+        }
+    }
 }
 
 impl Widget for FieldList {
@@ -407,7 +530,7 @@ impl Widget for FieldList {
                     }
                     self.on_activate_index.as_ref().map_or(Action::None, |callback| callback(self.selected))
                 }
-                Some(FieldKind::Readonly) | None => Action::None,
+                Some(FieldKind::Readonly | FieldKind::Value(_)) | None => Action::None,
             },
         }
     }
@@ -423,7 +546,14 @@ impl Widget for FieldList {
             NavIntent::Down => self.move_selection(1),
             NavIntent::Up => self.move_selection(-1),
             NavIntent::JumpBy(n) => self.move_selection(i32::from(n)),
-            NavIntent::Select | NavIntent::Back | NavIntent::Left | NavIntent::Right | NavIntent::ShortcutX | NavIntent::ShortcutY => {}
+            // Left/Right step the focused Value row; on any other row
+            // (or with no side live / no callback) they are no-ops --
+            // design §1: this is the ONLY thing Left/Right do anywhere in
+            // this crate, and this widget must never fall back to
+            // treating an unconsumed Left as Back.
+            NavIntent::Left => return self.step(Step::Prev),
+            NavIntent::Right => return self.step(Step::Next),
+            NavIntent::Select | NavIntent::Back | NavIntent::ShortcutX | NavIntent::ShortcutY => {}
         }
         Action::None
     }
@@ -437,7 +567,7 @@ impl Widget for FieldList {
         let row = self.rows.get(self.selected)?;
         match row.kind {
             FieldKind::Action => Some(row.verb.unwrap_or(Verb::Open)),
-            FieldKind::Readonly => None,
+            FieldKind::Readonly | FieldKind::Value(_) => None,
         }
     }
 
@@ -468,12 +598,24 @@ impl Widget for FieldList {
             .fold(self.style.leading_gutter as u64)
             .fold(self.style.vertical_padding as u64)
             .fold(self.rows.len() as u64);
-        for row in &self.rows {
+        for (index, row) in self.rows.iter().enumerate() {
             key = key.fold_str(&row.label);
             key = key.fold(match row.kind {
                 FieldKind::Action => 0,
                 FieldKind::Readonly => 1,
+                FieldKind::Value(_) => 2,
             });
+            // The chevron liveness (`StepBounds`) is only ever DRAWN on
+            // the focused value row (see `Self::render`'s chevron block)
+            // -- folding it for every row regardless of focus would
+            // invalidate the cache on a sync that changes an unfocused
+            // row's bounds even though nothing about its pixels changed
+            // (the "must fold only what is drawn" rule).
+            if let FieldKind::Value(bounds) = row.kind {
+                if self.focused && index == self.selected {
+                    key = key.fold(u64::from(bounds.prev)).fold(u64::from(bounds.next));
+                }
+            }
             key = key.fold_color(row.resolved_label_color());
             key = key.fold_opt_str(row.value.as_deref());
             key = key.fold_color(row.value_color);
@@ -539,6 +681,51 @@ impl Widget for FieldList {
                 &trailing,
                 selected,
             )?;
+
+            // Value-row chevrons -- drawn on the FOCUSED value row only
+            // (design §2), flanking the value text; a dead side draws in
+            // `palette::DIVIDER` rather than being omitted, so the row's
+            // shape doesn't shift depending on which sides are live.
+            // Never drawn for an unfocused/unselected `Value` row (which
+            // renders identically to `Readonly`, just bright -- see
+            // `FieldRow::resolved_label_color`) or any non-`Value` row.
+            // Never a caret either -- `trailing.caret` above is gated on
+            // `FieldKind::Action` alone, so a `Value` row never reaches
+            // `draw_row`'s caret branch.
+            if let (true, FieldKind::Value(bounds)) = (selected, row.kind) {
+                let value_text = row.value.as_deref().unwrap_or_default();
+                let row_center_y = row_rect.top_left.y + row_rect.size.height as i32 / 2;
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                let value_right_edge = row_rect.top_left.x + row_rect.size.width as i32 - self.style.value_right_margin;
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                let caret_right_edge = row_rect.top_left.x + row_rect.size.width as i32 - self.style.caret_right_margin;
+                let value_left_edge = value_right_edge - value_text_width(&value_font_owned, value_text);
+
+                let chevron_font = font::icon_1x();
+                let mut prev_buf = [0_u8; 4];
+                let prev_str: &str = icon::CARET_LEFT.encode_utf8(&mut prev_buf);
+                let prev_color = if bounds.prev { palette::TEXT_PRIMARY } else { palette::DIVIDER };
+                let _ = chevron_font.render_aligned(
+                    prev_str,
+                    Point::new(value_left_edge - VALUE_CHEVRON_GAP, row_center_y),
+                    VerticalPosition::Center,
+                    HorizontalAlignment::Right,
+                    FontColor::Transparent(prev_color),
+                    &mut clipped,
+                );
+
+                let mut next_buf = [0_u8; 4];
+                let next_str: &str = icon::CARET_RIGHT.encode_utf8(&mut next_buf);
+                let next_color = if bounds.next { palette::TEXT_PRIMARY } else { palette::DIVIDER };
+                let _ = chevron_font.render_aligned(
+                    next_str,
+                    Point::new(caret_right_edge, row_center_y),
+                    VerticalPosition::Center,
+                    HorizontalAlignment::Right,
+                    FontColor::Transparent(next_color),
+                    &mut clipped,
+                );
+            }
         }
 
         Ok(())
@@ -825,5 +1012,98 @@ mod tests {
         // Both must render without panicking regardless of glyph
         // presence -- the gutter is reserved either way.
         let _ = (fb_with, fb_without);
+    }
+
+    // --- Value row (bead pico-link-ryw.9, design
+    // `.planning/design/2026-09-25-value-row-and-on-exit-hook.md` §2/§4) ---
+
+    #[test]
+    fn value_row_left_right_calls_on_step_with_key_and_direction() {
+        let key = ListItemKey::from_u64(7);
+        let calls: alloc::rc::Rc<core::cell::RefCell<Vec<(ListItemKey, Step)>>> = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let mut list = FieldList::new(vec![FieldRow::value_row("CUSHION", "3 dB", StepBounds { prev: true, next: true }).with_key(key)])
+            .on_step(move |k, step| {
+                calls_clone.borrow_mut().push((k, step));
+                Action::None
+            });
+        list.on_focus(FocusEvent::Gained);
+
+        list.on_intent(NavIntent::Left);
+        list.on_intent(NavIntent::Right);
+
+        assert_eq!(*calls.borrow(), vec![(key, Step::Prev), (key, Step::Next)]);
+    }
+
+    #[test]
+    fn value_row_dead_side_is_noop_and_skips_callback() {
+        let key = ListItemKey::from_u64(1);
+        let mut list = FieldList::new(vec![FieldRow::value_row("MIN", "0 dB", StepBounds { prev: false, next: true }).with_key(key)])
+            .on_step(|_, _| panic!("a dead side must never invoke the step callback"));
+        list.on_focus(FocusEvent::Gained);
+
+        let action = list.on_intent(NavIntent::Left);
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn left_right_on_action_and_readonly_rows_are_noops() {
+        let mut list = FieldList::new(vec![
+            FieldRow::action("CODEC").with_value("LDAC", palette::TEXT_PRIMARY),
+            FieldRow::readonly("SAMPLE RATE").with_value("48 kHz", palette::TEXT_SECONDARY),
+        ])
+        .on_step(|_, _| panic!("a non-Value row must never invoke the step callback"));
+        list.on_focus(FocusEvent::Gained);
+
+        assert!(matches!(list.on_intent(NavIntent::Left), Action::None));
+        assert!(matches!(list.on_intent(NavIntent::Right), Action::None));
+
+        list.on_intent(NavIntent::Down);
+        assert!(matches!(list.on_intent(NavIntent::Left), Action::None));
+        assert!(matches!(list.on_intent(NavIntent::Right), Action::None));
+    }
+
+    #[test]
+    fn value_row_activation_is_none() {
+        let mut list = FieldList::new(vec![FieldRow::value_row("CUSHION", "3 dB", StepBounds { prev: true, next: true })]);
+        list.on_focus(FocusEvent::Gained);
+        assert_eq!(list.activation(), None, "A must be dim and inert on a Value row");
+        let action = list.on_focus(FocusEvent::Activated);
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn chevrons_only_on_focused_value_row_and_dead_side_is_divider() {
+        let area = Rectangle::new(Point::new(0, 0), Size::new(220, 100));
+
+        let unfocused = FieldList::new(vec![FieldRow::value_row("CUSHION", "3 dB", StepBounds { prev: true, next: true })]);
+        let mut fb_unfocused = FrameBuffer565::new(220, 100);
+        unfocused.render(area, &test_ctx(), &mut fb_unfocused).unwrap();
+
+        let mut focused_both_live = FieldList::new(vec![FieldRow::value_row("CUSHION", "3 dB", StepBounds { prev: true, next: true })])
+            .with_focused(true)
+            .with_selected(0);
+        // `on_focus` needed for the `focused` flag used by `render`'s
+        // `selected` gate is set via `with_focused` above already, but
+        // exercise it via `on_focus` too, matching how the real navigator
+        // drives it.
+        focused_both_live.on_focus(FocusEvent::Gained);
+        let mut fb_focused = FrameBuffer565::new(220, 100);
+        focused_both_live.render(area, &test_ctx(), &mut fb_focused).unwrap();
+
+        let unfocused_pixels: Vec<_> = fb_unfocused.pixels().map(|p| p.1).collect();
+        let focused_pixels: Vec<_> = fb_focused.pixels().map(|p| p.1).collect();
+        assert_ne!(unfocused_pixels, focused_pixels, "focusing a Value row must draw the chevrons");
+
+        // A dead left side draws DIVIDER-colored ink somewhere it wasn't
+        // present when both sides were live.
+        let mut dead_left = FieldList::new(vec![FieldRow::value_row("MIN", "0 dB", StepBounds { prev: false, next: true })])
+            .with_focused(true)
+            .with_selected(0);
+        dead_left.on_focus(FocusEvent::Gained);
+        let mut fb_dead_left = FrameBuffer565::new(220, 100);
+        dead_left.render(area, &test_ctx(), &mut fb_dead_left).unwrap();
+        let dead_left_pixels: Vec<_> = fb_dead_left.pixels().map(|p| p.1).collect();
+        assert_ne!(dead_left_pixels, focused_pixels, "a dead side must render differently (DIVIDER, not TEXT_PRIMARY)");
     }
 }

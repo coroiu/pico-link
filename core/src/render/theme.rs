@@ -249,6 +249,12 @@ pub mod icon {
     /// respectively, with `0x6C` (camera-slr) and `0x71` (cart) as sane
     /// neighbors either side.
     pub const CARET_RIGHT: char = '\u{6F}';
+    /// A left-pointing solid caret/triangle — a
+    /// [`super::fields::FieldKind::Value`] row's "step down" chevron.
+    /// Same probe as [`CARET_RIGHT`] (`core/examples/caret_probe.rs`):
+    /// `0x6D..=0x71` rendered down/left/right/up-pointing carets at
+    /// `0x6D`/`0x6E`/`0x6F`/`0x70` respectively -- this is `0x6E`.
+    pub const CARET_LEFT: char = '\u{6E}';
     /// A Bluetooth glyph — e.g. a Home menu's "Pair device" row icon.
     /// Probed via a throwaway grid probe
     /// (`core/examples/icon_probe_home.rs`, deleted after use per the

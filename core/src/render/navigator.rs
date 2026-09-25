@@ -29,6 +29,12 @@ use crate::input::NavIntent;
 use crate::platform::OutputRequest;
 
 pub struct Navigator {
+    /// The screen stack. **After this bead (`pico-link-ryw.9`), no code in
+    /// this module may pop/truncate/reassign `stack` directly -- every
+    /// removal must route through [`Navigator::retire`]**, the one
+    /// private funnel that fires a retired [`Screen`]'s
+    /// [`Screen::with_on_exit`] hook exactly once. See `retire`'s own doc
+    /// comment for why.
     stack: Vec<Screen>,
     /// Requests emitted by widgets via `Action::Emit`, accumulated here
     /// (see `apply_action`) rather than acted on directly — `Navigator`
@@ -95,6 +101,33 @@ impl Navigator {
         self.stack.last_mut().expect("navigator stack must never be empty")
     }
 
+    /// The one private funnel every stack-removal op routes through --
+    /// takes `screen`'s on-exit closure ([`Screen::take_on_exit`]) and
+    /// calls it, AFTER `screen` is no longer anywhere on `self.stack`
+    /// (every call site below removes from `self.stack` first, then
+    /// passes the removed `Screen` here). "Exactly once" falls out of the
+    /// types rather than needing to be remembered at each call site:
+    /// `Option::take` can only ever yield the closure once, and `screen`
+    /// (moved into this method, dropped at its end) cannot be retired a
+    /// second time -- there is no second `Screen` to call this on.
+    ///
+    /// `pop_to_root`/`truncate_to` retire top-down (LIFO: the same order
+    /// the screens were pushed in, reversed) -- a loop of individual pops,
+    /// not `Vec::truncate` (which would drop the removed screens silently,
+    /// never calling this at all). `replace_root` retires the OLD root
+    /// after `mem::replace` swaps it out.
+    // `&mut self` is unused today (retiring a screen only needs the
+    // screen itself), kept deliberately: this is `Navigator`'s own
+    // funnel, every call site is already `self.retire(...)`, and a bare
+    // associated function would invite a future caller to bypass `self`
+    // and call it directly on a `Screen` removed some other way.
+    #[allow(clippy::unused_self)]
+    fn retire(&mut self, mut screen: Screen) {
+        if let Some(on_exit) = screen.take_on_exit() {
+            on_exit();
+        }
+    }
+
     /// How many screens are on the stack (>= 1; the root screen is never
     /// popped).
     #[must_use]
@@ -113,7 +146,9 @@ impl Navigator {
     /// pop happened.
     pub fn pop(&mut self) -> bool {
         if self.stack.len() > 1 {
-            self.stack.pop();
+            if let Some(screen) = self.stack.pop() {
+                self.retire(screen);
+            }
             self.force_full_damage = true;
             true
         } else {
@@ -131,8 +166,7 @@ impl Navigator {
     /// on Home, not require several manual `B` presses back through
     /// Devices). A no-op if the stack is already at depth 1.
     pub fn pop_to_root(&mut self) {
-        self.stack.truncate(1);
-        self.force_full_damage = true;
+        self.truncate_to(0);
     }
 
     /// The root screen's (`stack[0]`'s) own focused widget's selection
@@ -202,8 +236,14 @@ impl Navigator {
     /// A no-op if `index + 1 >= self.depth()` (nothing above it to drop).
     pub fn truncate_to(&mut self, index: usize) {
         let keep = index.saturating_add(1);
-        if keep < self.stack.len() {
-            self.stack.truncate(keep);
+        // Top-down (LIFO): pop-and-retire one screen at a time down to
+        // `keep`, never `Vec::truncate` -- that would drop every removed
+        // `Screen` silently, so their `on_exit` hooks would never fire
+        // (design §3: "NOT `Vec::truncate`, which drops silently").
+        while keep < self.stack.len() {
+            if let Some(screen) = self.stack.pop() {
+                self.retire(screen);
+            }
             self.force_full_damage = true;
         }
     }
@@ -225,7 +265,8 @@ impl Navigator {
     /// going through real navigation.
     pub fn replace_root(&mut self, mut screen: Screen) {
         screen.initialize_focus();
-        self.stack[0] = screen;
+        let old_root = core::mem::replace(&mut self.stack[0], screen);
+        self.retire(old_root);
         self.force_full_damage = true;
     }
 
@@ -621,5 +662,161 @@ mod tests {
         nav.push(list_screen("a", 1));
         nav.truncate_to(5);
         assert_eq!(nav.depth(), 2, "truncating past the current depth must not panic or change anything");
+    }
+
+    // --- on-exit hook (bead pico-link-ryw.9, design
+    // `.planning/design/2026-09-25-value-row-and-on-exit-hook.md` §3/§4) ---
+
+    use alloc::rc::Rc;
+    use core::cell::{Cell, RefCell};
+
+    /// A `list_screen` with an on-exit closure that increments `counter`.
+    fn counting_screen(title: &str, counter: &Rc<Cell<u32>>) -> Screen {
+        let counter = counter.clone();
+        list_screen(title, 1).with_on_exit(move || counter.set(counter.get() + 1))
+    }
+
+    /// A `list_screen` with an on-exit closure that appends `title` to
+    /// `log` -- for asserting retirement ORDER, not just count.
+    fn logging_screen(title: &'static str, log: &Rc<RefCell<Vec<&'static str>>>) -> Screen {
+        let log = log.clone();
+        list_screen(title, 1).with_on_exit(move || log.borrow_mut().push(title))
+    }
+
+    #[test]
+    fn on_exit_fires_once_on_back_pop() {
+        let counter = Rc::new(Cell::new(0));
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(counting_screen("detail", &counter));
+        assert_eq!(counter.get(), 0);
+
+        nav.dispatch(NavIntent::Back);
+        assert_eq!(counter.get(), 1);
+        nav.dispatch(NavIntent::Back); // root: no-op, must not double-fire
+        assert_eq!(counter.get(), 1);
+    }
+
+    #[test]
+    fn on_exit_fires_once_on_widget_popview_action() {
+        let counter = Rc::new(Cell::new(0));
+        let counter_clone = counter.clone();
+        let list = VerticalList::new(vec![ListItem::new("close")]).on_activate(Verb::Open, move |_| {
+            let _ = &counter_clone; // captured only to prove the closure below is the one that fires
+            Action::PopView
+        });
+        let detail = Screen::new("detail", vec![Box::new(list)]).with_on_exit({
+            let counter = counter.clone();
+            move || counter.set(counter.get() + 1)
+        });
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(detail);
+
+        nav.dispatch(NavIntent::Select);
+        assert_eq!(nav.depth(), 1);
+        assert_eq!(counter.get(), 1);
+    }
+
+    #[test]
+    fn on_exit_fires_once_on_b_b_escape() {
+        // B, B: first B pops a screen ABOVE the editor (does not fire the
+        // editor's own hook), second B pops the editor itself (fires it
+        // exactly once).
+        let counter = Rc::new(Cell::new(0));
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(counting_screen("editor", &counter));
+        nav.push(list_screen("confirm", 1));
+
+        nav.dispatch(NavIntent::Back);
+        assert_eq!(counter.get(), 0, "popping the screen above the editor must not fire the editor's hook");
+        assert_eq!(nav.current().title, "editor");
+
+        nav.dispatch(NavIntent::Back);
+        assert_eq!(counter.get(), 1, "the second B must fire the editor's hook exactly once");
+        assert_eq!(nav.current().title, "root");
+    }
+
+    #[test]
+    fn on_exit_fires_once_per_screen_on_pop_to_root_top_down() {
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(logging_screen("a", &log));
+        nav.push(logging_screen("b", &log));
+        assert_eq!(nav.depth(), 3);
+
+        nav.pop_to_root();
+        assert_eq!(nav.depth(), 1);
+        assert_eq!(*log.borrow(), vec!["b", "a"], "top-down: the screen pushed last retires first");
+    }
+
+    #[test]
+    fn on_exit_fires_only_above_index_on_truncate_to() {
+        let counter_a = Rc::new(Cell::new(0));
+        let counter_b = Rc::new(Cell::new(0));
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(counting_screen("a", &counter_a));
+        nav.push(counting_screen("b", &counter_b));
+        assert_eq!(nav.depth(), 3);
+
+        nav.truncate_to(1);
+        assert_eq!(nav.depth(), 2);
+        assert_eq!(counter_a.get(), 0, "screen at the kept index must not retire");
+        assert_eq!(counter_b.get(), 1, "screen above the kept index must retire");
+    }
+
+    #[test]
+    fn on_exit_fires_for_old_root_on_replace_root() {
+        let counter = Rc::new(Cell::new(0));
+        let mut nav = Navigator::new(counting_screen("root", &counter));
+        nav.replace_root(list_screen("new-root", 1));
+        assert_eq!(counter.get(), 1);
+        assert_eq!(nav.current().title, "new-root");
+    }
+
+    #[test]
+    fn on_exit_does_not_fire_when_a_screen_is_pushed_over_it() {
+        let counter = Rc::new(Cell::new(0));
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(counting_screen("editor", &counter));
+        nav.push(list_screen("confirm", 1));
+        assert_eq!(counter.get(), 0, "a push over the editor must not fire its on-exit hook");
+    }
+
+    #[test]
+    fn on_exit_does_not_fire_on_back_at_root() {
+        let counter = Rc::new(Cell::new(0));
+        let nav = Navigator::new(counting_screen("root", &counter));
+        // `pop` on a root-only stack is a documented no-op (`Navigator::
+        // pop`'s own doc comment); confirmed here via `depth`, not
+        // `dispatch`, since `dispatch(Back)` on a fresh root has nothing
+        // else to observe either way.
+        assert_eq!(nav.depth(), 1);
+        assert_eq!(counter.get(), 0);
+    }
+
+    #[test]
+    fn on_exit_not_fired_by_sync_or_render() {
+        let counter = Rc::new(Cell::new(0));
+        let mut nav = Navigator::new(counting_screen("root", &counter));
+        let mut fb = FrameBuffer565::new(240, 240);
+        for _ in 0..20 {
+            nav.sync_top(&test_ctx());
+            nav.render(&test_ctx(), &mut fb).unwrap();
+        }
+        assert_eq!(counter.get(), 0, "sync/render must never fire an on-exit hook -- only stack removal does");
+    }
+
+    #[test]
+    fn left_never_pops_the_stack() {
+        // Design §1: Left/Right forward to the focused widget only, and
+        // `Navigator::dispatch` must never gain a fallback that treats an
+        // unconsumed Left as Back.
+        let mut nav = Navigator::new(list_screen("root", 1));
+        nav.push(list_screen("detail", 3));
+        assert_eq!(nav.depth(), 2);
+
+        nav.dispatch(NavIntent::Left);
+        assert_eq!(nav.depth(), 2, "Left must never pop the stack, even when the focused widget ignores it");
+        nav.dispatch(NavIntent::Right);
+        assert_eq!(nav.depth(), 2, "Right must never pop the stack, even when the focused widget ignores it");
     }
 }
