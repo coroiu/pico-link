@@ -301,8 +301,13 @@ fn boost_may_distort(preset: &Preset) -> bool {
 /// The effect editor's live draft -- lives inside [`EffectEditorView`]
 /// itself (built once per push, never rebuilt while the editor stays on
 /// the navigator's stack, same as every other pushed screen in this
-/// crate), not in `App`: nothing here needs to survive past this screen's
-/// own lifetime on the stack.
+/// crate). `App::dsp_program` cannot read this directly (no path back
+/// into a screen buried in the `Navigator`'s stack), so every mutation is
+/// also mirrored into `App::editor_preview`, the `App`-owned mailbox
+/// bead `pico-link-ryw.7`'s review fix added for exactly this (see its
+/// doc comment) -- this struct itself still owns `band_index` and every
+/// other piece of on-screen-only state that mailbox has no reason to
+/// carry.
 struct EditorState {
     draft: Preset,
     band_index: usize,
@@ -446,6 +451,12 @@ struct EffectEditorView {
     presets: Rc<RefCell<PresetStore>>,
     commands: Rc<RefCell<VecDeque<Command>>>,
     editor_preset_id: Rc<RefCell<Option<u16>>>,
+    /// The `App`-owned live-preview mailbox -- bead `pico-link-ryw.7`
+    /// review fix, design sec 5.1. Mirrored from [`Self::state`] by
+    /// [`Self::sync_preview`] on every mutation; see
+    /// [`super::super::App`]'s `editor_preview` doc comment for the full
+    /// shape.
+    editor_preview: Rc<RefCell<Option<(Preset, bool)>>>,
     rows_key: PaintKey,
 }
 
@@ -465,6 +476,16 @@ impl EffectEditorView {
             .fold(band.map_or(0, |b| u64::from(b.gain_half_db as u16)))
             .fold(band.map_or(0, |b| u64::from(b.q_idx)))
             .fold_str(&state.draft.name)
+    }
+
+    /// Mirrors [`Self::state`]'s current draft/bypassed contents into
+    /// [`Self::editor_preview`] -- called after every mutation so
+    /// `App::dsp_program` (design sec 5.1 rules 1/2) sees the change
+    /// instantly, independent of [`Self::save_now`]'s `SavePreset` round
+    /// trip.
+    fn sync_preview(&self) {
+        let state = self.state.borrow();
+        *self.editor_preview.borrow_mut() = Some((state.draft.clone(), state.bypassed));
     }
 
     /// Queues exactly one `SavePreset` for the draft's current contents,
@@ -508,8 +529,11 @@ impl Widget for EffectEditorView {
     fn on_intent(&mut self, intent: NavIntent) -> Action {
         match intent {
             NavIntent::ShortcutX => {
-                let mut state = self.state.borrow_mut();
-                state.bypassed = !state.bypassed;
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.bypassed = !state.bypassed;
+                }
+                self.sync_preview();
                 Action::None
             }
             NavIntent::ShortcutY => {
@@ -527,6 +551,7 @@ impl Widget for EffectEditorView {
                     }
                 };
                 if changed {
+                    self.sync_preview();
                     self.save_now();
                 }
                 Action::None
@@ -548,6 +573,7 @@ impl Widget for EffectEditorView {
                     changed
                 };
                 if changed {
+                    self.sync_preview();
                     self.save_now();
                     Action::None
                 } else {
@@ -641,10 +667,15 @@ fn build_effect_editor_screen(
     presets: &Rc<RefCell<PresetStore>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
+    editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
 ) -> Screen {
     let state = Rc::new(RefCell::new(EditorState { draft: initial.clone(), band_index: 0, bypassed: false }));
     let rows = editor_rows(&state.borrow());
     let list = FieldList::new(rows);
+    // Seed the preview mailbox immediately on push -- design sec 5.1: the
+    // stream previews the draft (unbypassed) from the moment the editor
+    // opens, not from the first Left/Right press.
+    *editor_preview.borrow_mut() = Some((initial.clone(), false));
     let view = EffectEditorView {
         list,
         state: Rc::clone(&state),
@@ -652,11 +683,16 @@ fn build_effect_editor_screen(
         presets: Rc::clone(presets),
         commands: Rc::clone(commands),
         editor_preset_id: Rc::clone(editor_preset_id),
+        editor_preview: Rc::clone(editor_preview),
         rows_key: EffectEditorView::rows_key_of(&state.borrow()),
     };
     let editor_preset_id_for_exit = Rc::clone(editor_preset_id);
+    let editor_preview_for_exit = Rc::clone(editor_preview);
     Screen::new(initial.name.clone(), vec![Box::new(view)]).with_on_exit(move || {
         *editor_preset_id_for_exit.borrow_mut() = None;
+        // design sec 5.1 rule 3: leaving the editor reverts playback to
+        // the connected device's assignment.
+        *editor_preview_for_exit.borrow_mut() = None;
     })
 }
 
@@ -865,6 +901,7 @@ pub(crate) fn build_effects_list_screen(
     presets: &Rc<RefCell<PresetStore>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
+    editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
 ) -> Screen {
     let (rows, projection_key) = {
         let model_ref = model.borrow();
@@ -876,6 +913,7 @@ pub(crate) fn build_effects_list_screen(
     let presets_for_activate = Rc::clone(presets);
     let commands_for_activate = Rc::clone(commands);
     let editor_preset_id_for_activate = Rc::clone(editor_preset_id);
+    let editor_preview_for_activate = Rc::clone(editor_preview);
     let list = FieldList::new(rows).with_leading_gutter().on_activate_key(move |key| {
         if key == NEW_EFFECT_ROW_KEY {
             if presets_for_activate.borrow().len() >= MAX_EFFECTS {
@@ -891,7 +929,10 @@ pub(crate) fn build_effects_list_screen(
             let presets = Rc::clone(&presets_for_activate);
             let commands = Rc::clone(&commands_for_activate);
             let editor_preset_id = Rc::clone(&editor_preset_id_for_activate);
-            return Action::PushView(Box::new(move || build_effect_editor_screen(&preset, &model, &presets, &commands, &editor_preset_id)));
+            let editor_preview = Rc::clone(&editor_preview_for_activate);
+            return Action::PushView(Box::new(move || {
+                build_effect_editor_screen(&preset, &model, &presets, &commands, &editor_preset_id, &editor_preview)
+            }));
         }
         let id = key.as_u64();
         let Ok(id) = u16::try_from(id) else { return Action::None };
@@ -901,7 +942,8 @@ pub(crate) fn build_effects_list_screen(
         let presets = Rc::clone(&presets_for_activate);
         let commands = Rc::clone(&commands_for_activate);
         let editor_preset_id = Rc::clone(&editor_preset_id_for_activate);
-        Action::PushView(Box::new(move || build_effect_editor_screen(&preset, &model, &presets, &commands, &editor_preset_id)))
+        let editor_preview = Rc::clone(&editor_preview_for_activate);
+        Action::PushView(Box::new(move || build_effect_editor_screen(&preset, &model, &presets, &commands, &editor_preset_id, &editor_preview)))
     });
 
     let view = EffectsListView { list, model: Rc::clone(model), presets: Rc::clone(presets), commands: Rc::clone(commands), projection_key };

@@ -95,7 +95,7 @@ use crate::app::{
     BtModel, Command, CushionPolicyState, DeviceAddr, DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, ScreenId,
     VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
 };
-use crate::dsp::PresetStore;
+use crate::dsp::{Preset, PresetStore};
 use crate::input::NavIntent;
 use crate::platform::Instant;
 
@@ -153,9 +153,20 @@ pub(crate) fn build_home_screen(
     abr_floor: &Rc<RefCell<AbrFloorState>>,
     presets: &Rc<RefCell<PresetStore>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
+    editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
 ) -> Screen {
     let view = HomeView::new(
-        model, Rc::clone(home_face), commands, wizard_phase, now, display_settings, cushion_policy, abr_floor, presets, editor_preset_id,
+        model,
+        Rc::clone(home_face),
+        commands,
+        wizard_phase,
+        now,
+        display_settings,
+        cushion_policy,
+        abr_floor,
+        presets,
+        editor_preset_id,
+        editor_preview,
     );
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
@@ -367,6 +378,7 @@ impl HomeView {
         abr_floor: &Rc<RefCell<AbrFloorState>>,
         presets: &Rc<RefCell<PresetStore>>,
         editor_preset_id: &Rc<RefCell<Option<u16>>>,
+        editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
     ) -> Self {
         let (hero, link_state, discovering, connecting, connected_addr, fault_log) = {
             let snapshot = model.borrow();
@@ -393,6 +405,7 @@ impl HomeView {
         let presets_for_effects = Rc::clone(presets);
         let commands_for_effects = Rc::clone(commands);
         let editor_preset_id_for_effects = Rc::clone(editor_preset_id);
+        let editor_preview_for_effects = Rc::clone(editor_preview);
         let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Effects"), MenuItem::new("Settings")]).on_activate_index(
             // `Verb::Open`: both rows push a deeper screen and draw a
             // caret (design section 4's assignment table -- Home menu's A
@@ -418,7 +431,8 @@ impl HomeView {
                     let presets = Rc::clone(&presets_for_effects);
                     let commands = Rc::clone(&commands_for_effects);
                     let editor_preset_id = Rc::clone(&editor_preset_id_for_effects);
-                    Action::PushView(Box::new(move || build_effects_list_screen(&model, &presets, &commands, &editor_preset_id)))
+                    let editor_preview = Rc::clone(&editor_preview_for_effects);
+                    Action::PushView(Box::new(move || build_effects_list_screen(&model, &presets, &commands, &editor_preset_id, &editor_preview)))
                 }
                 MENU_ROW_SETTINGS => {
                     let display_settings = Rc::clone(&display_settings_for_settings_row);
@@ -827,9 +841,10 @@ mod tests {
         let abr_floor = Rc::new(RefCell::new(AbrFloorState::default()));
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
+        let editor_preview = Rc::new(RefCell::new(None));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id,
+            &editor_preset_id, &editor_preview,
         )
     }
 
@@ -847,9 +862,10 @@ mod tests {
         let abr_floor = Rc::new(RefCell::new(AbrFloorState::default()));
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
+        let editor_preview = Rc::new(RefCell::new(None));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id,
+            &editor_preset_id, &editor_preview,
         )
     }
 
@@ -981,9 +997,10 @@ mod tests {
         let abr_floor = Rc::new(RefCell::new(AbrFloorState::default()));
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
+        let editor_preview = Rc::new(RefCell::new(None));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id,
+            &editor_preset_id, &editor_preview,
         )
     }
 

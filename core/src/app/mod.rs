@@ -19,7 +19,7 @@ use embedded_graphics::primitives::Rectangle;
 
 use crate::input::NavIntent;
 use crate::audio::{AbrFloor, CushionPolicy};
-use crate::dsp::{Program, PresetStore};
+use crate::dsp::{Preset, Program, PresetStore};
 use crate::power::DisplaySettings;
 use crate::render::home::build_home_screen;
 use crate::render::{FrameBuffer565, Instant, Navigator, RenderCtx};
@@ -194,6 +194,26 @@ pub struct App {
     /// every boot-time `PresetLoaded` (C's own push sequence) has already
     /// landed by the time a user could possibly have opened the editor.
     editor_preset_id: Rc<RefCell<Option<u16>>>,
+    /// The DSP effects editor's live preview, while an editor screen is
+    /// open -- bead `pico-link-ryw.7` review fix, design sec 5.1. `None`
+    /// when no editor is open (rule 3: [`App::dsp_program`] resolves the
+    /// connected device's assignment, unchanged). `Some((draft, bypassed))`
+    /// while an editor is open: rule 1 (not bypassed) previews `draft`
+    /// instantly; rule 2 (bypassed, `X`) previews Off. Deliberately
+    /// separate from [`App::editor_preset_id`] (which names *where a save
+    /// goes*, not *what plays*) and from the draft this bead's
+    /// `EditorState` owns inside the pushed `EffectEditorView` itself --
+    /// `EditorState` cannot be read from here (no path back to a screen
+    /// buried in the `Navigator`'s stack), so the editor widget mirrors
+    /// its own draft into this `App`-owned mailbox on every change, the
+    /// same "second writer reaches into a live pushed screen via a shared
+    /// mailbox" shape `wizard_phase`/`home_face` already use -- except
+    /// here the pushed screen is the writer and `App` is the reader.
+    /// Updated independently of the `SavePreset` round trip: preview must
+    /// not wait on flash + the `PresetLoaded` echo (Andreas's 12:48
+    /// ruling: "applies to the stream instantly, independent of the
+    /// save").
+    editor_preview: Rc<RefCell<Option<(Preset, bool)>>>,
 }
 
 impl App {
@@ -213,6 +233,7 @@ impl App {
         let model: ModelHandle = Rc::new(RefCell::new(BtModel::default()));
         let presets = Rc::new(RefCell::new(PresetStore::new()));
         let editor_preset_id = Rc::new(RefCell::new(None));
+        let editor_preview = Rc::new(RefCell::new(None));
         let navigator = Navigator::new(build_home_screen(
             &model,
             &home_face,
@@ -224,6 +245,7 @@ impl App {
             &abr_floor,
             &presets,
             &editor_preset_id,
+            &editor_preview,
         ));
         Self {
             navigator,
@@ -240,6 +262,7 @@ impl App {
             abr_floor,
             presets,
             editor_preset_id,
+            editor_preview,
         }
     }
 
@@ -388,13 +411,21 @@ impl App {
     /// produce [`Program::off`] (Andreas's ruling: new/unassigned devices
     /// get Off) -- `core` never distinguishes "never assigned" from
     /// "assigned to a since-deleted preset," same as
-    /// [`crate::dsp::PresetStore::resolve`]'s own doc comment. A future
-    /// preset editor (`pico-link-ryw.7`) overriding this with the preset
-    /// currently being live-previewed is that bead's own addition -- this
-    /// bead's resolution is deliberately just the connected-device case,
-    /// since no editor exists yet to have a preview state to prefer.
+    /// [`crate::dsp::PresetStore::resolve`]'s own doc comment.
+    ///
+    /// design sec 5.1 overrides this whole resolution while a DSP effects
+    /// editor is open (bead `pico-link-ryw.7`, review fix): rule 1 (not
+    /// bypassed) previews [`App::editor_preview`]'s draft; rule 2
+    /// (bypassed) previews Off; only rule 3 (no editor open) falls through
+    /// to the connected-device resolution below. Checked first and
+    /// returned early -- the editor's preview always wins over the
+    /// connected device's stored assignment while open, independent of
+    /// whether the draft has been saved yet.
     #[must_use]
     pub fn dsp_program(&self, fs_hz: u32) -> Program {
+        if let Some((draft, bypassed)) = self.editor_preview.borrow().as_ref() {
+            return if *bypassed { Program::off(fs_hz) } else { Program::from_preset(draft, fs_hz) };
+        }
         let model = self.model.borrow();
         let presets = self.presets.borrow();
         let preset = model
