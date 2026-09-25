@@ -25,6 +25,7 @@
 #include "a2dp.h"
 #include "bt.h"
 #include "codec_ldac.h"
+#include "dsp.h"
 #include "media_keys.h"
 #include "pl_prio.h"
 #include "usb_audio.h"
@@ -528,6 +529,20 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                     } else {
                         pl_codec_ldac_debug_pin_rung((int32_t)n);
                         pl_log("debug-remote: LDAC RUNG %ld -> requested\r\n", n);
+                    }
+                } else if (strncmp(s_line, "DSPPROG", 7) == 0) {
+                    // Bead pico-link-ryw.1, design sec 1.4: the debug-only
+                    // canned DSP program loader (ryw.2's M0-M3 hardware
+                    // gate uses this before any UI exists). Dispatched
+                    // straight to dsp.c's pl_dsp_debug_load_program(),
+                    // same "direct dispatch, not through `out`" pattern as
+                    // ABR FLOOR/LDAC RUNG above.
+                    const char *arg = s_line + 7;
+                    long n = (*arg == ' ') ? strtol(arg + 1, NULL, 10) : -1;
+                    if (n < 0 || !pl_dsp_debug_load_program((int)n)) {
+                        pl_log("debug-remote: DSPPROG requires 0..3, got \"%s\"\r\n", s_line + 8);
+                    } else {
+                        pl_log("debug-remote: DSPPROG %ld -> loaded\r\n", n);
                     }
                 } else if (emitted < max) {
                     PlIntent intent;
