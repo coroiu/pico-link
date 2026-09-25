@@ -68,6 +68,20 @@ double-precision arithmetic**: `arm-none-eabi-nm -u` on the rebuilt
 for this reason (re-verify if this file changes again). See
 `pico-link-cz0.5.8`'s L0 bench re-run for the measured saving.
 
+## Adaptive-bitrate floor rail (bead pico-link-d42g, 2026-09-25)
+
+`src/ldacBT_internal.h`'s `LDACBT_LIMIT_ALTER_EQMID_PRIORITY` is a local
+patch, raised from `LDACBT_EQMID_MQ` to `LDACBT_EQMID_Q5`. Its only user is
+`ldacBT_get_altered_eqmid()` (`ldacBT_internal.c`), which is the sole path
+ABR uses to alter the live encoding rate — so this rail previously refused
+to step ABR below MQ (330 kbps) no matter what our firmware asked for. It
+now allows Q5 (198 kbps), matching the lowest rung our own adaptive ladder
+offers (`firmware/src/codec_ldac.h`'s `PL_LDAC_ADAPTIVE_LADDER_RUNGS`). This
+is a second, independent limit behind our own `codec_ldac.c` floor clamp —
+`ldacBT_set_eqmid()`/`ldacBT_assert_eqmid()` (used for user pins) are
+untouched and still refuse anything below MQ. See
+`.planning/design/2026-09-25-adaptive-floor.md` section 3.
+
 A `_32BIT_FIXED_POINT` build macro does exist (gates `mdct_fixp_ldac.c`,
 `sigana_fixp_ldac.c`, `quant_fixp_ldac.c`, etc. in `src/ldaclib.c`'s
 `#include` block) — upstream's own `Android.bp` documents it as "for devices
