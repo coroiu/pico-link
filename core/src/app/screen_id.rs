@@ -37,6 +37,14 @@ pub enum ScreenId {
     /// instead of a device page (there is no device address in scope
     /// here).
     SettingsPicker(SettingsPickerKind),
+    /// The DSP effects list -- a singleton, no payload, reached only from
+    /// Home's menu-face "Effects" row. Bead `pico-link-ryw.12.4`: this id
+    /// is what lets `App::import_preset` tell whether the effects list is
+    /// currently on top of the navigator's stack, for its import-focus-
+    /// follow (Uma's design, `ryw12-3-ux.md` sec 2: "Effects list on top:
+    /// ... move FOCUS to the new/updated row. Anywhere else: nothing on
+    /// screen").
+    EffectsList,
 }
 
 /// Which picker a [`ScreenId::Picker`] identifies -- distinguishes screens

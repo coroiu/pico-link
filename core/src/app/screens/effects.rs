@@ -19,8 +19,9 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::{Point, Size};
 use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{HorizontalAlignment, VerticalPosition};
+use u8g2_fonts::FontRenderer;
 
-use crate::dsp::preset::{q_from_index, Band, BandKind, CrossfeedLevel, Q_TABLE};
+use crate::dsp::preset::{nearest_q_index, q_milli_from_index, Band, BandKind, CrossfeedLevel, Preamp, Q_TABLE};
 use crate::dsp::{Program, Preset, PresetStore, MIN_BOOST_HEADROOM_DB};
 use crate::input::NavIntent;
 use crate::render::theme::{font, palette};
@@ -29,7 +30,7 @@ use crate::render::{
     RenderCtx, Screen, Step, StepBounds, Verb, Widget,
 };
 
-use super::super::{BtModel, Command, ModelHandle};
+use super::super::{BtModel, Command, ModelHandle, ScreenId};
 
 /// How many DSP effects the flash store can remember (`PL:P:0`..`PL:P:7`,
 /// design sec 2.2) -- the effects list gates "New effect" on this, the
@@ -67,8 +68,9 @@ const BAND_DEFAULT_FREQ_HZ: [u16; BAND_COUNT] = [100, 250, 1_000, 4_000, 8_000];
 /// design's own "0.7 shelves, 1.4 peaks" (design sec 4.2); the design's
 /// worked Q ladder (0.5/0.7/1.0/1.4/2.0/2.8/4.0/5.6) is an approximation
 /// of `Q_TABLE`, not a second incompatible one -- this module always
-/// displays `Q_TABLE`'s own shipped values, since that's what a
-/// [`Band::q_idx`] actually indexes into at DSP-program build time.
+/// displays `Q_TABLE`'s own shipped values, converted to [`Band::q_milli`]
+/// via [`q_milli_from_index`] before it ever reaches DSP-program build
+/// time.
 const BAND_DEFAULT_Q_IDX: [u8; BAND_COUNT] = [2, 4, 4, 4, 2];
 const DEFAULT_CROSSFEED: CrossfeedLevel = CrossfeedLevel::Medium;
 
@@ -82,8 +84,15 @@ const FREQ_LADDER_HZ: [u16; 31] = [
     8_000, 10_000, 12_500, 16_000, 20_000,
 ];
 
-const GAIN_MIN_HALF_DB: i8 = -24;
-const GAIN_MAX_HALF_DB: i8 = 24;
+/// Gain bounds/step, in centi-dB -- v2's exact storage unit (ryw.12 sec
+/// 2). `+/-1200 cdb` (`+/-12dB`) and a `100 cdb` (1dB) step reproduce
+/// v1's `+/-24` half-dB-unit bounds and 2-half-dB-unit step exactly
+/// (`24 * 50 == 1200`, `2 * 50 == 100`) -- the editor's step BEHAVIOUR is
+/// unchanged, only the field it steps is now the exact wire unit instead
+/// of a pre-quantised one.
+const GAIN_MIN_CDB: i16 = -1_200;
+const GAIN_MAX_CDB: i16 = 1_200;
+const GAIN_STEP_CDB: i16 = 100;
 
 /// The canned NAME cycle's 11 fixed candidates -- index 0 of the full
 /// 12-entry cycle is always the dynamic "Effect N" (see
@@ -92,7 +101,12 @@ const FIXED_NAME_CANDIDATES: [&str; 11] =
     ["Relaxed", "Long session", "Meetings", "Music", "Movies", "Podcasts", "Speech", "Warm", "Bright", "Bass", "Late night"];
 
 fn band_default(index: usize) -> Band {
-    Band { kind: BAND_DEFAULT_KIND[index], freq_hz: BAND_DEFAULT_FREQ_HZ[index], gain_half_db: 0, q_idx: BAND_DEFAULT_Q_IDX[index] }
+    Band {
+        kind: BAND_DEFAULT_KIND[index],
+        freq_half_hz: BAND_DEFAULT_FREQ_HZ[index].saturating_mul(2),
+        gain_cdb: 0,
+        q_milli: q_milli_from_index(BAND_DEFAULT_Q_IDX[index]),
+    }
 }
 
 fn default_bands() -> Vec<Band> {
@@ -134,8 +148,12 @@ fn band_label(index: usize, kind: BandKind) -> String {
 
 /// `100 Hz` below 1kHz, `1 kHz`/`1.25 kHz`/`12.5 kHz` above it -- trims a
 /// trailing `.0`/`0` rather than always showing two decimals (design sec
-/// 4.2's worked examples never show a trailing zero).
-fn format_freq(freq_hz: u16) -> String {
+/// 4.2's worked examples never show a trailing zero). Takes v2's
+/// `freq_half_hz`; every ladder entry this editor ever produces is a
+/// whole Hz (`* 2` from [`FREQ_LADDER_HZ`]), so the divide-by-2 below is
+/// exact.
+fn format_freq(freq_half_hz: u16) -> String {
+    let freq_hz = freq_half_hz / 2;
     if freq_hz < 1_000 {
         return format!("{freq_hz} Hz");
     }
@@ -155,10 +173,11 @@ fn format_freq(freq_hz: u16) -> String {
     }
 }
 
-/// `+3 dB` / `0 dB` / `-2 dB` -- steps are always whole dB (2 half-dB
-/// units), so integer division is exact.
-fn format_gain_db(gain_half_db: i8) -> String {
-    let db = i32::from(gain_half_db) / 2;
+/// `+3 dB` / `0 dB` / `-2 dB` -- the editor only ever steps `gain_cdb` in
+/// whole `GAIN_STEP_CDB` (100 = 1dB) increments, so integer division is
+/// exact.
+fn format_gain_db(gain_cdb: i16) -> String {
+    let db = i32::from(gain_cdb) / 100;
     if db == 0 {
         String::from("0 dB")
     } else {
@@ -166,8 +185,12 @@ fn format_gain_db(gain_half_db: i8) -> String {
     }
 }
 
-fn format_q(q_idx: u8) -> String {
-    let q = q_from_index(q_idx);
+/// Formats `q_milli` (v2's exact storage unit) the same as the old
+/// [`Q_TABLE`]-index display -- for every value the editor itself ever
+/// produces, `q_milli` IS `q_milli_from_index(idx)` for some table entry,
+/// so this renders identically to the old `format_q(q_idx)`.
+fn format_q(q_milli: u16) -> String {
+    let q = f32::from(q_milli) * 0.001;
     let text = format!("{q:.2}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
     String::from(trimmed)
@@ -204,40 +227,57 @@ fn freq_ladder_index(freq_hz: u16) -> usize {
     FREQ_LADDER_HZ.iter().position(|&f| f == freq_hz).unwrap_or(17) // 1kHz
 }
 
-fn step_freq(freq_hz: u16, dir: Step) -> u16 {
-    let idx = freq_ladder_index(freq_hz);
+/// Steps `freq_half_hz` (v2's exact storage unit) one [`FREQ_LADDER_HZ`]
+/// entry at a time -- identical stepping behaviour to the old
+/// `step_freq(freq_hz)`, just converting to/from half-Hz at the boundary
+/// (every ladder entry is a whole Hz, so `* 2` is exact).
+fn step_freq(freq_half_hz: u16, dir: Step) -> u16 {
+    let idx = freq_ladder_index(freq_half_hz / 2);
     let new = match dir {
         Step::Prev => idx.saturating_sub(1),
         Step::Next => (idx + 1).min(FREQ_LADDER_HZ.len() - 1),
     };
-    FREQ_LADDER_HZ[new]
+    FREQ_LADDER_HZ[new].saturating_mul(2)
 }
 
-fn freq_bounds(freq_hz: u16) -> StepBounds {
-    let idx = freq_ladder_index(freq_hz);
+fn freq_bounds(freq_half_hz: u16) -> StepBounds {
+    let idx = freq_ladder_index(freq_half_hz / 2);
     StepBounds { prev: idx > 0, next: idx < FREQ_LADDER_HZ.len() - 1 }
 }
 
-fn step_gain(gain_half_db: i8, dir: Step) -> i8 {
+/// Steps `gain_cdb` (v2's exact storage unit) by [`GAIN_STEP_CDB`] --
+/// identical stepping behaviour to the old `step_gain(gain_half_db)` (see
+/// [`GAIN_STEP_CDB`]'s doc comment for the exact unit match).
+fn step_gain(gain_cdb: i16, dir: Step) -> i16 {
     match dir {
-        Step::Prev => (gain_half_db - 2).max(GAIN_MIN_HALF_DB),
-        Step::Next => (gain_half_db + 2).min(GAIN_MAX_HALF_DB),
+        Step::Prev => (gain_cdb - GAIN_STEP_CDB).max(GAIN_MIN_CDB),
+        Step::Next => (gain_cdb + GAIN_STEP_CDB).min(GAIN_MAX_CDB),
     }
 }
 
-fn gain_bounds(gain_half_db: i8) -> StepBounds {
-    StepBounds { prev: gain_half_db > GAIN_MIN_HALF_DB, next: gain_half_db < GAIN_MAX_HALF_DB }
+fn gain_bounds(gain_cdb: i16) -> StepBounds {
+    StepBounds { prev: gain_cdb > GAIN_MIN_CDB, next: gain_cdb < GAIN_MAX_CDB }
 }
 
-fn step_q(q_idx: u8, dir: Step) -> u8 {
-    match dir {
-        Step::Prev => q_idx.saturating_sub(1),
-        Step::Next => (q_idx + 1).min(u8::try_from(Q_TABLE.len() - 1).unwrap_or(u8::MAX)),
-    }
+/// Steps `q_milli` (v2's exact storage unit) through [`Q_TABLE`]'s picker
+/// vocabulary -- snaps to the NEAREST table entry first (ryw.12 sec 2:
+/// "Q snaps to the nearest table entry on the first press"), then moves
+/// one entry in `dir`. For every `q_milli` the editor itself ever
+/// produces (always an exact `q_milli_from_index` value), the nearest
+/// entry IS its own index, so this steps identically to the old
+/// `step_q(q_idx)`.
+fn step_q(q_milli: u16, dir: Step) -> u16 {
+    let idx = nearest_q_index(q_milli);
+    let new_idx = match dir {
+        Step::Prev => idx.saturating_sub(1),
+        Step::Next => (idx + 1).min(u8::try_from(Q_TABLE.len() - 1).unwrap_or(u8::MAX)),
+    };
+    q_milli_from_index(new_idx)
 }
 
-fn q_bounds(q_idx: u8) -> StepBounds {
-    StepBounds { prev: q_idx > 0, next: (q_idx as usize) < Q_TABLE.len() - 1 }
+fn q_bounds(q_milli: u16) -> StepBounds {
+    let idx = nearest_q_index(q_milli);
+    StepBounds { prev: idx > 0, next: (idx as usize) < Q_TABLE.len() - 1 }
 }
 
 /// The dynamic first NAME candidate: `Effect N`, `N` the lowest number not
@@ -320,15 +360,194 @@ const ROW_FREQ: ListItemKey = ListItemKey::from_u64(3);
 const ROW_GAIN: ListItemKey = ListItemKey::from_u64(4);
 const ROW_Q: ListItemKey = ListItemKey::from_u64(5);
 const ROW_NAME: ListItemKey = ListItemKey::from_u64(6);
+/// The locked editor's read-only PREAMP row (bead `pico-link-ryw.12.4`,
+/// Uma's design sec 4). A key distinct from every [`ROW_*`] constant
+/// above so [`apply_step`]'s `else` branch -- and therefore `FieldList`'s
+/// own Left/Right handling for a non-[`FieldKind::Value`] row -- already
+/// makes it a structural no-op with no extra gating code (see this
+/// function's own doc comment).
+const ROW_PREAMP: ListItemKey = ListItemKey::from_u64(7);
+
+/// One locked band row's identity key -- `100 + index` keeps every band
+/// row's key distinct from [`ROW_CROSSFEED`]/[`ROW_PREAMP`]/every hand-
+/// made-editor `ROW_*` constant above, with room for up to
+/// [`crate::dsp::MAX_BANDS`] (10) rows.
+fn locked_band_row_key(index: usize) -> ListItemKey {
+    ListItemKey::from_u64(100 + index as u64)
+}
+
+/// `PK`/`LS`/`HS` -- the locked editor's compact band-kind abbreviation
+/// (Uma's design sec 4's worked rows: `"7 PK 2941 Hz ..."`), distinct
+/// from [`band_kind_word`]'s spelled-out hand-made-editor word (`"peak"`/
+/// `"low shelf"`/`"high shelf"`) because a locked row packs kind INTO the
+/// label alongside the 1-based index, with no room for the long form.
+fn band_kind_abbrev(kind: BandKind) -> &'static str {
+    match kind {
+        BandKind::Peak => "PK",
+        BandKind::LowShelf => "LS",
+        BandKind::HighShelf => "HS",
+    }
+}
+
+/// `"7 PK"` -- a locked band row's label (Uma's design sec 4).
+fn locked_band_label(index: usize, kind: BandKind) -> String {
+    format!("{} {}", index + 1, band_kind_abbrev(kind))
+}
+
+/// Renders `freq_half_hz` at v2's exact half-Hz precision: a whole Hz
+/// prints with no decimal, an odd half-Hz value (the only fractional case
+/// v2's unit can ever produce) prints with exactly one decimal -- Uma's
+/// design sec 4: "freq integer Hz or 1 dp for .5". No unit suffix here
+/// (unlike [`format_freq`]'s hand-made-editor `"100 Hz"`/`"1 kHz"`) --
+/// [`format_band_value`] appends `" Hz"` itself, conditionally, per the
+/// width-degrade ladder.
+fn format_band_freq_exact(freq_half_hz: u16) -> String {
+    if freq_half_hz % 2 == 0 {
+        format!("{}", freq_half_hz / 2)
+    } else {
+        format!("{:.1}", f32::from(freq_half_hz) * 0.5)
+    }
+}
+
+/// `"+3.30"`/`"-2.41"`/`"+0.00"` -- exact centi-dB gain at 2dp (Uma's
+/// design sec 4: "gain 2 dp"), always signed. No `" dB"` suffix here --
+/// see [`format_band_freq_exact`]'s doc comment for why the unit lives in
+/// [`format_band_value`] instead. `{:+.2}` always emits an ASCII `-` for
+/// a negative value (never U+2212), matching this module's other
+/// ASCII-only formatters (design sec 4: "ASCII hyphen, helv _tf has no
+/// U+2212").
+fn format_band_gain_exact(gain_cdb: i16) -> String {
+    format!("{:+.2}", f32::from(gain_cdb) * 0.01)
+}
+
+/// `"Q 5.90"` -- exact milli-Q at 2dp (Uma's design sec 4: "Q 2 dp"),
+/// with its own `"Q "` label baked in (unlike freq/gain, `Q` never
+/// degrades away -- it's the one field every degrade level in
+/// [`format_band_value`] keeps).
+fn format_band_q_exact(q_milli: u16) -> String {
+    format!("Q {:.2}", f32::from(q_milli) * 0.001)
+}
+
+/// `"-6.20 dB"` -- the locked editor's read-only PREAMP row value, at the
+/// same exact centi-dB precision [`format_band_gain_exact`] uses for a
+/// band's gain, but WITH the `" dB"` suffix (Uma's design sec 4's worked
+/// PREAMP row: `"PREAMP  -6.20 dB"` -- unlike a band row, PREAMP never
+/// degrades, so its unit is never conditional).
+fn format_preamp_exact(preamp_cdb: i16) -> String {
+    format!("{:+.2} dB", f32::from(preamp_cdb) * 0.01)
+}
+
+/// How far the locked editor's band-row VALUE text has to degrade to fit
+/// [`BAND_ROW_VALUE_BUDGET_PX`] -- Uma's design sec 4's ladder: "drop
+/// `dB` on band rows ... then drop `Hz`, then band values in
+/// `font::username`. Never ellipsise a number." Computed ONCE per
+/// [`locked_editor_rows`] call (not per row -- every band row shares one
+/// font/budget), from the worst-case string the design names: `"10 HS
+/// 19999.5 Hz -29.99 dB Q 65.00"`'s VALUE half, `"19999.5 Hz -29.99 dB Q
+/// 65.00"` (the widest legal v2 value at every field's extreme: max
+/// `freq_half_hz` `39690` half-Hz i.e. `19845.0`Hz rounds up to this
+/// probe's `19999.5`, `GAIN_DB_MAX` `30` minus a hair, `Q_MAX` `65`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BandRowDegrade {
+    /// `"19999.5 Hz -29.99 dB Q 65.00"` at [`font::value`].
+    Full,
+    /// `"19999.5 Hz -29.99 Q 65.00"` at [`font::value`] (dropped `dB`).
+    NoDb,
+    /// `"19999.5 -29.99 Q 65.00"` at [`font::value`] (dropped `Hz` too).
+    NoDbNoHz,
+    /// [`Self::NoDbNoHz`]'s text, but at [`ValueFont::Compact`]
+    /// ([`font::username`]) -- the last resort, when even the shortest
+    /// text doesn't fit at the normal face.
+    NoDbNoHzCompact,
+}
+
+/// The pixel budget a locked band row's VALUE text must fit inside, at
+/// [`font::value`] before any degrade -- Uma's design sec 4: "Ruby must
+/// measure worst case ... within ~182px."
+const BAND_ROW_VALUE_BUDGET_PX: i32 = 182;
+
+/// A single line's rendered pixel width in `font` -- same small private
+/// measuring helper `menu.rs`/`fields.rs` each keep their own copy of
+/// (see either's doc comment for why this isn't shared: each is a small
+/// leaf helper with no other reason to depend on a sibling view module).
+#[allow(clippy::cast_possible_wrap)]
+fn measure_text_width(font: &FontRenderer, text: &str) -> i32 {
+    font.get_rendered_dimensions_aligned(text, Point::zero(), VerticalPosition::Top, HorizontalAlignment::Left)
+        .unwrap_or(None)
+        .map_or(0, |bbox| bbox.size.width as i32)
+}
+
+fn band_row_degrade() -> BandRowDegrade {
+    let value_font = font::value();
+    let full = "19999.5 Hz -29.99 dB Q 65.00";
+    if measure_text_width(&value_font, full) <= BAND_ROW_VALUE_BUDGET_PX {
+        return BandRowDegrade::Full;
+    }
+    let no_db = "19999.5 Hz -29.99 Q 65.00";
+    if measure_text_width(&value_font, no_db) <= BAND_ROW_VALUE_BUDGET_PX {
+        return BandRowDegrade::NoDb;
+    }
+    let no_db_no_hz = "19999.5 -29.99 Q 65.00";
+    if measure_text_width(&value_font, no_db_no_hz) <= BAND_ROW_VALUE_BUDGET_PX {
+        return BandRowDegrade::NoDbNoHz;
+    }
+    BandRowDegrade::NoDbNoHzCompact
+}
+
+/// Formats one band's read-only value text per `degrade` -- never
+/// truncates/ellipsises a NUMBER (Uma's design sec 4's hard rule): every
+/// degrade level drops a UNIT SUFFIX (`" Hz"`, `" dB"`), never a digit.
+fn format_band_value(band: &Band, degrade: BandRowDegrade) -> String {
+    let freq = format_band_freq_exact(band.freq_half_hz);
+    let gain = format_band_gain_exact(band.gain_cdb);
+    let q = format_band_q_exact(band.q_milli);
+    match degrade {
+        BandRowDegrade::Full => format!("{freq} Hz {gain} dB {q}"),
+        BandRowDegrade::NoDb => format!("{freq} Hz {gain} {q}"),
+        BandRowDegrade::NoDbNoHz | BandRowDegrade::NoDbNoHzCompact => format!("{freq} {gain} {q}"),
+    }
+}
+
+/// The locked (imported) editor's row set (bead `pico-link-ryw.12.4`,
+/// Uma's design sec 4): CROSSFEED (still editable), a read-only PREAMP
+/// row, then one read-only row per band in FILE order. Deliberately NO
+/// NAME row -- design sec 4: "the canned cycle would destroy a
+/// computer-chosen name; rename = re-import."
+fn locked_editor_rows(state: &EditorState) -> Vec<FieldRow> {
+    let mut rows = vec![
+        FieldRow::value_row("CROSSFEED", crossfeed_word(state.draft.crossfeed), crossfeed_bounds(state.draft.crossfeed)).with_key(ROW_CROSSFEED),
+    ];
+
+    let preamp_cdb = match state.draft.preamp {
+        Preamp::Explicit(v) => v,
+        Preamp::Auto => 0, // structurally unreachable for a locked preset -- import always sets Explicit (ryw.12.2's `to_preset`).
+    };
+    rows.push(FieldRow::readonly("PREAMP").with_value(format_preamp_exact(preamp_cdb), palette::TEXT_SECONDARY).with_key(ROW_PREAMP));
+
+    let degrade = band_row_degrade();
+    for (i, band) in state.draft.bands.iter().enumerate() {
+        let mut row = FieldRow::readonly(locked_band_label(i, band.kind))
+            .with_value(format_band_value(band, degrade), palette::TEXT_SECONDARY)
+            .with_key(locked_band_row_key(i));
+        if degrade == BandRowDegrade::NoDbNoHzCompact {
+            row = row.with_compact_value();
+        }
+        rows.push(row);
+    }
+    rows
+}
 
 fn editor_rows(state: &EditorState) -> Vec<FieldRow> {
+    if state.draft.eq_locked {
+        return locked_editor_rows(state);
+    }
     let band = state.draft.bands.get(state.band_index).copied().unwrap_or_else(|| band_default(state.band_index.min(BAND_COUNT - 1)));
     vec![
         FieldRow::value_row("CROSSFEED", crossfeed_word(state.draft.crossfeed), crossfeed_bounds(state.draft.crossfeed)).with_key(ROW_CROSSFEED),
         FieldRow::value_row("BAND", band_label(state.band_index, band.kind), band_index_bounds(state.band_index)).with_key(ROW_BAND),
-        FieldRow::value_row("FREQ", format_freq(band.freq_hz), freq_bounds(band.freq_hz)).with_key(ROW_FREQ),
-        FieldRow::value_row("GAIN", format_gain_db(band.gain_half_db), gain_bounds(band.gain_half_db)).with_key(ROW_GAIN),
-        FieldRow::value_row("Q", format_q(band.q_idx), q_bounds(band.q_idx)).with_key(ROW_Q),
+        FieldRow::value_row("FREQ", format_freq(band.freq_half_hz), freq_bounds(band.freq_half_hz)).with_key(ROW_FREQ),
+        FieldRow::value_row("GAIN", format_gain_db(band.gain_cdb), gain_bounds(band.gain_cdb)).with_key(ROW_GAIN),
+        FieldRow::value_row("Q", format_q(band.q_milli), q_bounds(band.q_milli)).with_key(ROW_Q),
         FieldRow::value_row("NAME", state.draft.name.clone(), StepBounds { prev: true, next: true }).with_key(ROW_NAME),
     ]
 }
@@ -352,27 +571,27 @@ fn apply_step(state: &mut EditorState, key: ListItemKey, dir: Step, other_names:
         false
     } else if key == ROW_FREQ {
         let Some(band) = state.draft.bands.get_mut(state.band_index) else { return false };
-        let new = step_freq(band.freq_hz, dir);
-        if new == band.freq_hz {
+        let new = step_freq(band.freq_half_hz, dir);
+        if new == band.freq_half_hz {
             return false;
         }
-        band.freq_hz = new;
+        band.freq_half_hz = new;
         true
     } else if key == ROW_GAIN {
         let Some(band) = state.draft.bands.get_mut(state.band_index) else { return false };
-        let new = step_gain(band.gain_half_db, dir);
-        if new == band.gain_half_db {
+        let new = step_gain(band.gain_cdb, dir);
+        if new == band.gain_cdb {
             return false;
         }
-        band.gain_half_db = new;
+        band.gain_cdb = new;
         true
     } else if key == ROW_Q {
         let Some(band) = state.draft.bands.get_mut(state.band_index) else { return false };
-        let new = step_q(band.q_idx, dir);
-        if new == band.q_idx {
+        let new = step_q(band.q_milli, dir);
+        if new == band.q_milli {
             return false;
         }
-        band.q_idx = new;
+        band.q_milli = new;
         true
     } else if key == ROW_NAME {
         let new_name = step_name(&state.draft.name, dir, other_names);
@@ -461,20 +680,41 @@ struct EffectEditorView {
 }
 
 impl EffectEditorView {
-    // `gain_half_db as u16` below is a bit-pattern fold for a paint-key
-    // hash, not a numeric conversion -- the sign doesn't matter, only
-    // that distinct `i8` values fold to distinct `u64`s (same reasoning
-    // `Band::to_wire`'s own `as u8` cast documents).
+    // `gain_cdb as u16` below is a bit-pattern fold for a paint-key hash,
+    // not a numeric conversion -- the sign doesn't matter, only that
+    // distinct `i16` values fold to distinct `u64`s (same reasoning
+    // `Band::pack_kind_gain`'s own cast documents).
     #[allow(clippy::cast_sign_loss)]
     fn rows_key_of(state: &EditorState) -> PaintKey {
-        let band = state.draft.bands.get(state.band_index).copied();
-        PaintKey::of(EDITOR_PAINT_KEY_SEED)
+        let mut key = PaintKey::of(EDITOR_PAINT_KEY_SEED)
             .fold(u64::from(state.draft.crossfeed.to_wire()))
-            .fold(state.band_index as u64)
+            .fold(u64::from(state.draft.eq_locked));
+        if state.draft.eq_locked {
+            // Bead `pico-link-ryw.12.4`: a locked editor shows EVERY band
+            // as its own row (no `band_index` cursor), so the paint key
+            // must fold the whole band list -- plus the PREAMP row's own
+            // value -- rather than just the one band the hand-made
+            // editor's cursor currently points at.
+            let preamp_cdb = match state.draft.preamp {
+                Preamp::Explicit(v) => v,
+                Preamp::Auto => 0,
+            };
+            key = key.fold(preamp_cdb as u16 as u64);
+            for band in &state.draft.bands {
+                key = key
+                    .fold(u64::from(band.kind.to_wire()))
+                    .fold(u64::from(band.freq_half_hz))
+                    .fold(u64::from(band.gain_cdb as u16))
+                    .fold(u64::from(band.q_milli));
+            }
+            return key;
+        }
+        let band = state.draft.bands.get(state.band_index).copied();
+        key.fold(state.band_index as u64)
             .fold(band.map_or(0, |b| u64::from(b.kind.to_wire())))
-            .fold(band.map_or(0, |b| u64::from(b.freq_hz)))
-            .fold(band.map_or(0, |b| u64::from(b.gain_half_db as u16)))
-            .fold(band.map_or(0, |b| u64::from(b.q_idx)))
+            .fold(band.map_or(0, |b| u64::from(b.freq_half_hz)))
+            .fold(band.map_or(0, |b| u64::from(b.gain_cdb as u16)))
+            .fold(band.map_or(0, |b| u64::from(b.q_milli)))
             .fold_str(&state.draft.name)
     }
 
@@ -537,6 +777,14 @@ impl Widget for EffectEditorView {
                 Action::None
             }
             NavIntent::ShortcutY => {
+                // Bead `pico-link-ryw.12.4`: Y is unlabelled/inert
+                // everywhere in the locked editor (Uma's design sec 4) --
+                // there is no per-band cursor to reset against, and a
+                // locked band has no "default" to reset TO in the first
+                // place.
+                if self.state.borrow().draft.eq_locked {
+                    return Action::None;
+                }
                 let changed = {
                     let mut state = self.state.borrow_mut();
                     let on_band_row = self.list.selected_key() != Some(ROW_CROSSFEED) && self.list.selected_key() != Some(ROW_NAME);
@@ -587,14 +835,20 @@ impl Widget for EffectEditorView {
     fn chrome_contribution(&self, _ctx: &RenderCtx) -> Option<ChromeContribution> {
         let state = self.state.borrow();
         let x_label = if state.bypassed { "on" } else { "off" };
-        let on_band_row = !matches!(self.list.selected_key(), Some(ROW_CROSSFEED | ROW_NAME) | None);
-        let y_live = on_band_row
-            && state
-                .draft
-                .bands
-                .get(state.band_index)
-                .is_some_and(|band| *band != band_default(state.band_index));
-        let y = if y_live { ButtonLabel::Live(String::from("reset")) } else { ButtonLabel::Inert };
+        // Bead `pico-link-ryw.12.4`: Y is unlabelled/inert everywhere in
+        // the locked editor -- see `on_intent`'s `ShortcutY` arm.
+        let y = if state.draft.eq_locked {
+            ButtonLabel::Inert
+        } else {
+            let on_band_row = !matches!(self.list.selected_key(), Some(ROW_CROSSFEED | ROW_NAME) | None);
+            let y_live = on_band_row
+                && state
+                    .draft
+                    .bands
+                    .get(state.band_index)
+                    .is_some_and(|band| *band != band_default(state.band_index));
+            if y_live { ButtonLabel::Live(String::from("reset")) } else { ButtonLabel::Inert }
+        };
         Some(ChromeContribution {
             title: Some(state.draft.name.clone()),
             x: Some(ButtonLabel::Live(String::from(x_label))),
@@ -700,7 +954,11 @@ fn build_effect_editor_screen(
 
 const NEW_EFFECT_ROW_KEY: ListItemKey = ListItemKey::from_bytes([0xFD; 8]);
 
-fn effect_row_key(id: u16) -> ListItemKey {
+/// `pub(in crate::app)`, not private -- bead `pico-link-ryw.12.4`'s
+/// `App::import_preset` (`app/mod.rs`) needs the exact same row identity
+/// a live import lands on to drive [`FieldList::focus_key`]'s import-
+/// focus-follow (Uma's design, `ryw12-3-ux.md` sec 2).
+pub(in crate::app) fn effect_row_key(id: u16) -> ListItemKey {
     ListItemKey::from_u64(u64::from(id))
 }
 
@@ -729,6 +987,9 @@ fn effects_list_rows(model: &BtModel, presets: &PresetStore) -> Vec<FieldRow> {
             if connected_preset_id == Some(id) {
                 row = row.with_leading_glyph(crate::render::theme::icon::CHECK);
             }
+            if preset.eq_locked {
+                row = row.with_lock();
+            }
             row
         })
         .collect();
@@ -747,7 +1008,7 @@ const EFFECTS_LIST_PROJECTION_SEED: u64 = 62;
 fn effects_list_projection_key(model: &BtModel, presets: &PresetStore) -> PaintKey {
     let mut key = PaintKey::of(EFFECTS_LIST_PROJECTION_SEED).fold(presets.len() as u64);
     for (id, preset) in presets.iter() {
-        key = key.fold(u64::from(id)).fold_str(&preset.name).fold(usage_count(model, id) as u64);
+        key = key.fold(u64::from(id)).fold_str(&preset.name).fold(usage_count(model, id) as u64).fold(u64::from(preset.eq_locked));
     }
     key = key.fold(model.connected_addr.and_then(|addr| model.paired.iter().find(|d| d.addr == addr)).map_or(0, |d| u64::from(d.preset_id) + 1));
     key
@@ -764,6 +1025,11 @@ struct EffectsListView {
     presets: Rc<RefCell<PresetStore>>,
     commands: Rc<RefCell<VecDeque<Command>>>,
     projection_key: PaintKey,
+    /// Bead `pico-link-ryw.12.4`'s import-focus-follow mailbox -- see
+    /// [`super::super::App`]'s `import_focus` doc comment. Consumed (and
+    /// cleared) here, in [`Widget::sync`], every frame this screen is on
+    /// top.
+    import_focus: Rc<RefCell<Option<ListItemKey>>>,
 }
 
 impl EffectsListView {
@@ -803,6 +1069,20 @@ impl Widget for EffectsListView {
             drop(model);
             self.list.set_rows(rows);
             self.projection_key = key;
+        } else {
+            drop(presets);
+            drop(model);
+        }
+        // Bead `pico-link-ryw.12.4`: import-focus-follow -- a one-shot
+        // jump, consumed (and cleared) whether or not the target row was
+        // actually found (e.g. this same frame's `set_rows` above hasn't
+        // run yet because the projection key happened not to change --
+        // structurally not possible for a genuinely new/updated row, since
+        // that always changes `effects_list_projection_key`, but cleared
+        // unconditionally regardless so a stale target can never leak
+        // into a later, unrelated import).
+        if let Some(target) = self.import_focus.borrow_mut().take() {
+            self.list.focus_key(target);
         }
     }
 
@@ -896,12 +1176,14 @@ fn build_delete_confirm_screen(id: u16, name: &str, usage: usize, commands: Rc<R
 /// Called once per push; the resulting [`EffectsListView`] re-reads
 /// `model`/`presets` live via [`Widget::sync`] every frame it stays on
 /// top, same as every other pushed list in this crate.
+#[allow(clippy::too_many_arguments)] // Mirrors every other screen builder in this crate threading the shared Rcs through -- see `build_home_screen`.
 pub(crate) fn build_effects_list_screen(
     model: &ModelHandle,
     presets: &Rc<RefCell<PresetStore>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
     editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
+    import_focus: &Rc<RefCell<Option<ListItemKey>>>,
 ) -> Screen {
     let (rows, projection_key) = {
         let model_ref = model.borrow();
@@ -946,8 +1228,15 @@ pub(crate) fn build_effects_list_screen(
         Action::PushView(Box::new(move || build_effect_editor_screen(&preset, &model, &presets, &commands, &editor_preset_id, &editor_preview)))
     });
 
-    let view = EffectsListView { list, model: Rc::clone(model), presets: Rc::clone(presets), commands: Rc::clone(commands), projection_key };
-    Screen::new(EFFECTS_LIST_TITLE, vec![Box::new(view)])
+    let view = EffectsListView {
+        list,
+        model: Rc::clone(model),
+        presets: Rc::clone(presets),
+        commands: Rc::clone(commands),
+        projection_key,
+        import_focus: Rc::clone(import_focus),
+    };
+    Screen::new(EFFECTS_LIST_TITLE, vec![Box::new(view)]).with_id(ScreenId::EffectsList)
 }
 
 #[cfg(test)]
@@ -963,24 +1252,24 @@ mod tests {
 
     #[test]
     fn format_freq_below_1khz_is_plain_hz() {
-        assert_eq!(format_freq(100), "100 Hz");
-        assert_eq!(format_freq(20), "20 Hz");
+        assert_eq!(format_freq(200), "100 Hz");
+        assert_eq!(format_freq(40), "20 Hz");
     }
 
     #[test]
     fn format_freq_at_and_above_1khz_uses_khz_and_trims_trailing_zeros() {
-        assert_eq!(format_freq(1_000), "1 kHz");
-        assert_eq!(format_freq(1_250), "1.25 kHz");
-        assert_eq!(format_freq(1_600), "1.6 kHz");
-        assert_eq!(format_freq(12_500), "12.5 kHz");
-        assert_eq!(format_freq(20_000), "20 kHz");
+        assert_eq!(format_freq(2_000), "1 kHz");
+        assert_eq!(format_freq(2_500), "1.25 kHz");
+        assert_eq!(format_freq(3_200), "1.6 kHz");
+        assert_eq!(format_freq(25_000), "12.5 kHz");
+        assert_eq!(format_freq(40_000), "20 kHz");
     }
 
     #[test]
     fn format_gain_db_shows_a_sign_except_at_zero() {
         assert_eq!(format_gain_db(0), "0 dB");
-        assert_eq!(format_gain_db(6), "+3 dB");
-        assert_eq!(format_gain_db(-4), "-2 dB");
+        assert_eq!(format_gain_db(300), "+3 dB");
+        assert_eq!(format_gain_db(-200), "-2 dB");
     }
 
     #[test]
@@ -1012,23 +1301,24 @@ mod tests {
 
     #[test]
     fn freq_ladder_steps_move_one_entry_at_a_time_and_clamps() {
-        assert_eq!(step_freq(1_000, Step::Next), 1_250);
-        assert_eq!(step_freq(1_000, Step::Prev), 800);
-        assert_eq!(step_freq(20, Step::Prev), 20);
-        assert_eq!(step_freq(20_000, Step::Next), 20_000);
+        assert_eq!(step_freq(2_000, Step::Next), 2_500);
+        assert_eq!(step_freq(2_000, Step::Prev), 1_600);
+        assert_eq!(step_freq(40, Step::Prev), 40);
+        assert_eq!(step_freq(40_000, Step::Next), 40_000);
     }
 
     #[test]
     fn gain_steps_by_one_db_and_clamps_at_plus_minus_12() {
-        assert_eq!(step_gain(0, Step::Next), 2);
-        assert_eq!(step_gain(24, Step::Next), 24);
-        assert_eq!(step_gain(-24, Step::Prev), -24);
+        assert_eq!(step_gain(0, Step::Next), GAIN_STEP_CDB);
+        assert_eq!(step_gain(GAIN_MAX_CDB, Step::Next), GAIN_MAX_CDB);
+        assert_eq!(step_gain(GAIN_MIN_CDB, Step::Prev), GAIN_MIN_CDB);
     }
 
     #[test]
     fn q_steps_across_the_shipped_q_table_and_clamps() {
-        assert_eq!(step_q(0, Step::Prev), 0);
-        assert_eq!(step_q(u8::try_from(Q_TABLE.len() - 1).unwrap(), Step::Next), u8::try_from(Q_TABLE.len() - 1).unwrap());
+        let last_idx = u8::try_from(Q_TABLE.len() - 1).unwrap();
+        assert_eq!(step_q(q_milli_from_index(0), Step::Prev), q_milli_from_index(0));
+        assert_eq!(step_q(q_milli_from_index(last_idx), Step::Next), q_milli_from_index(last_idx));
     }
 
     #[test]
@@ -1074,11 +1364,11 @@ mod tests {
     #[test]
     fn apply_step_on_freq_changes_the_selected_bands_frequency_only() {
         let mut state = EditorState { draft: new_effect_preset("Test"), band_index: 2, bypassed: false };
-        let before = state.draft.bands[0].freq_hz;
+        let before = state.draft.bands[0].freq_half_hz;
         let changed = apply_step(&mut state, ROW_FREQ, Step::Next, &[]);
         assert!(changed);
-        assert_eq!(state.draft.bands[0].freq_hz, before, "only the selected band (index 2) must change");
-        assert_ne!(state.draft.bands[2].freq_hz, BAND_DEFAULT_FREQ_HZ[2]);
+        assert_eq!(state.draft.bands[0].freq_half_hz, before, "only the selected band (index 2) must change");
+        assert_ne!(state.draft.bands[2].freq_half_hz, BAND_DEFAULT_FREQ_HZ[2] * 2);
     }
 
     #[test]
@@ -1102,7 +1392,7 @@ mod tests {
     fn reset_selected_band_only_changes_when_not_already_default() {
         let mut state = EditorState { draft: new_effect_preset("Test"), band_index: 0, bypassed: false };
         assert!(!reset_selected_band(&mut state), "a fresh effect's band is already at defaults");
-        state.draft.bands[0].gain_half_db = 6;
+        state.draft.bands[0].gain_cdb = 300;
         assert!(reset_selected_band(&mut state));
         assert_eq!(state.draft.bands[0], band_default(0));
     }
@@ -1118,7 +1408,7 @@ mod tests {
     fn boost_may_distort_is_true_when_every_band_is_boosted_to_the_max() {
         let mut preset = new_effect_preset("Loud");
         for band in &mut preset.bands {
-            band.gain_half_db = GAIN_MAX_HALF_DB;
+            band.gain_cdb = GAIN_MAX_CDB;
         }
         assert!(boost_may_distort(&preset), "5 bands all at +12dB must exceed the -12dB preamp clamp");
     }
@@ -1312,6 +1602,102 @@ mod tests {
         );
     }
 
+    // --- Bead pico-link-ryw.12.4: imported presets, focus-follow, locked
+    // editor ---
+
+    const XM3_TEXT: &str = "Preamp: -4.41 dB\n\
+        Filter 1:  ON  LS  Fc 40 Hz  Gain -1.76 dB  BW Oct 1.917\n\
+        Filter 2:  ON  PK  Fc 80 Hz  Gain -2 dB  BW Oct 1.485\n\
+        Filter 3:  ON  PK  Fc 540 Hz  Gain -1.4 dB  BW Oct 0.482\n\
+        Filter 4:  ON  PK  Fc 1220 Hz  Gain 3.3 dB  BW Oct 0.687\n\
+        Filter 5:  ON  PK  Fc 2941 Hz  Gain -2.4 dB  BW Oct 0.242\n\
+        Filter 6:  ON  PK  Fc 3438 Hz  Gain 1.7 dB  BW Oct 0.311\n\
+        Filter 7:  ON  PK  Fc 4544 Hz  Gain 6.5 dB  BW Oct 0.818\n\
+        Filter 8:  ON  PK  Fc 9250 Hz  Gain -4.7 dB  BW Oct 0.413\n\
+        Filter 9:  ON  PK  Fc 9822 Hz  Gain -0.1 dB  BW Oct 0.349\n\
+        Filter 10:  ON  HS  Fc 10000 Hz  Gain 5.9 dB  BW Oct 1.917";
+
+    #[test]
+    fn an_import_lands_a_padlocked_row_and_focus_follows_it_when_the_list_is_open() {
+        let mut app = App::new(240, 240);
+        app.handle_event(Event::PresetLoaded { id: 1, blob: new_effect_preset("Relaxed").to_wire().to_vec() });
+        open_effects(&mut app);
+        app.render(); // establish a clean baseline, same discipline `picker.rs`'s own live-projection test uses
+
+        let (id, outcome) = app.import_preset(XM3_TEXT, "XM3 Harman").expect("the XM3 text must import cleanly");
+        assert_eq!(outcome, crate::dsp::ImportOutcome::Created);
+
+        // The list is open, so focus must jump to the new row -- Uma's
+        // design sec 2.
+        app.render(); // EffectsListView::sync consumes the import_focus mailbox
+        let expected_index = 1; // row 0 is "Relaxed", row 1 is the new import (creation order)
+        assert_eq!(app.effects_list_selected_index_for_test(), Some(expected_index));
+
+        // And the row carries `eq_locked` (the padlock's data source).
+        assert!(app.presets_for_test().get(id).unwrap().eq_locked);
+    }
+
+    #[test]
+    fn an_import_does_not_move_focus_when_the_effects_list_is_not_open() {
+        let mut app = App::new(240, 240);
+        app.handle_event(Event::PresetLoaded { id: 1, blob: new_effect_preset("Relaxed").to_wire().to_vec() });
+        // Deliberately NOT opening the effects list (still at Home root).
+        let _ = app.import_preset(XM3_TEXT, "XM3 Harman").expect("import must still succeed");
+        open_effects(&mut app);
+        app.render();
+        // Uma's design sec 2: "Anywhere else: nothing on screen" -- no
+        // jump was armed, so the list opens at its ordinary default (row
+        // 0), not on the import.
+        assert_eq!(app.effects_list_selected_index_for_test(), Some(0));
+    }
+
+    #[test]
+    fn a_locked_editor_has_no_name_row_and_a_readonly_preamp_and_band_row_per_band() {
+        let mut app = App::new(240, 240);
+        let (id, _) = app.import_preset(XM3_TEXT, "XM3 Harman").unwrap();
+        open_effects(&mut app);
+        app.handle_input(vec![NavIntent::Select]); // the only row -- the imported effect
+        assert_eq!(app.current_screen_title(), "XM3 Harman");
+
+        let preset = app.presets_for_test().get(id).unwrap().clone();
+        let rows = editor_rows(&EditorState { draft: preset, band_index: 0, bypassed: false });
+
+        assert!(rows.iter().all(|r| r.label != "NAME"), "a locked editor must have no NAME row");
+        assert_eq!(rows[0].label, "CROSSFEED");
+        assert_eq!(rows[1].label, "PREAMP");
+        assert_eq!(rows[1].value(), Some("-4.41 dB"));
+        assert_eq!(rows.len(), 2 + 10, "CROSSFEED + PREAMP + one row per one of the 10 XM3 bands");
+        assert_eq!(rows[2].label, "1 LS");
+        assert_eq!(rows[11].label, "10 HS");
+    }
+
+    #[test]
+    fn locked_band_row_values_never_truncate_a_number_at_any_degrade_level() {
+        // The worst-case value string this bead's own width budget is
+        // measured against (Uma's design sec 4) -- every digit must
+        // survive every degrade level, only the unit suffixes may drop.
+        let band = Band { kind: BandKind::HighShelf, freq_half_hz: 39_999, gain_cdb: -2_999, q_milli: 65_000 };
+        for degrade in [BandRowDegrade::Full, BandRowDegrade::NoDb, BandRowDegrade::NoDbNoHz, BandRowDegrade::NoDbNoHzCompact] {
+            let text = format_band_value(&band, degrade);
+            assert!(text.contains("19999.5"), "freq digits must survive at {degrade:?}: {text}");
+            assert!(text.contains("-29.99"), "gain digits must survive at {degrade:?}: {text}");
+            assert!(text.contains("65.00"), "Q digits must survive at {degrade:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn band_row_degrade_measures_a_real_font_and_picks_a_fitting_level() {
+        // Bead `pico-link-ryw.12.4`: actually measuring the worst-case
+        // string against `helvR12` (Uma's design sec 4's own instruction:
+        // "Ruby must measure worst case ... within ~182px") shows even
+        // `NoDb` doesn't fit -- the panel needs `NoDbNoHz`. This is a
+        // regression net on the MEASUREMENT, not an assumption: if a
+        // future font/budget change moves the answer, this test documents
+        // what it moved to rather than silently drifting. Every digit
+        // still survives at every level -- see the test above.
+        assert_eq!(band_row_degrade(), BandRowDegrade::NoDbNoHz);
+    }
+
     // --- Headless screenshots, at zoom ---
 
     fn save_zoomed_png(app: &mut App, path: &std::path::Path) {
@@ -1359,5 +1745,63 @@ mod tests {
         save_zoomed_png(&mut app, &out_dir.join("03_delete_confirm.png"));
 
         println!("wrote effects screenshots to {}", out_dir.display());
+    }
+
+    /// Committed zoomed PNG fixtures for bead `pico-link-ryw.12.4`'s
+    /// imported-preset UI: the padlocked list row, both pages of the
+    /// locked (10-band) editor, and the padlocked device-page picker.
+    /// Written straight into the repo (`ryw12-screenshots/`, sibling to
+    /// `home-screenshots/`'s own committed-fixture convention) rather than
+    /// `std::env::temp_dir()` -- Tess/a reviewer inspects these AT ZOOM
+    /// per this project's rendering-change verification discipline; this
+    /// test does not (yet) self-check them against a fresh render the way
+    /// `home_screenshot_fixtures.rs` does (that harness is its own,
+    /// separate follow-up).
+    #[test]
+    fn ryw12_4_imported_preset_screenshots_at_zoom() {
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("ryw12-screenshots");
+        std::fs::create_dir_all(&out_dir).expect("failed to create output dir");
+
+        let mut app = App::new(240, 240);
+        app.handle_event(Event::PresetLoaded { id: 1, blob: new_effect_preset("Relaxed").to_wire().to_vec() });
+        let (id, _) = app.import_preset(XM3_TEXT, "XM3 Harman").expect("the XM3 text must import cleanly");
+
+        // 1. The list -- a hand-made row and an imported (padlocked) row.
+        open_effects(&mut app);
+        save_zoomed_png(&mut app, &out_dir.join("01_list_with_padlock.png"));
+
+        // 2. The locked editor, page 1 (CROSSFEED focused, bands 1-3ish
+        //    visible) -- select the imported row (it's the second/last
+        //    real row, "New effect" comes after it).
+        app.handle_input(vec![NavIntent::Down]); // focus the imported row
+        app.handle_input(vec![NavIntent::Select]);
+        assert_eq!(app.current_screen_title(), "XM3 Harman");
+        save_zoomed_png(&mut app, &out_dir.join("02_locked_editor_page1.png"));
+
+        // 3. The locked editor, page 2 (scrolled down to the later bands).
+        for _ in 0..8 {
+            app.handle_input(vec![NavIntent::Down]);
+        }
+        save_zoomed_png(&mut app, &out_dir.join("03_locked_editor_page2.png"));
+        app.handle_input(vec![NavIntent::Back]); // editor -> effects list
+        app.handle_input(vec![NavIntent::Back]); // effects list -> Home menu face
+        app.handle_input(vec![NavIntent::Back]); // Home menu face -> Home status face
+
+        // 4. The device-page effect picker -- a hand-made option and a
+        //    padlocked imported option.
+        let addr = [7; 6];
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let _ = app.poll_command();
+        app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: id }));
+        app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+        app.handle_input(vec![NavIntent::Up]); // the menu's selection persisted from earlier in this test (Effects) -- force it back to Bluetooth (index 0)
+        app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> Devices
+        app.handle_input(vec![NavIntent::Select]); // the connected device row -> device page
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // CODEC -> QUALITY -> EFFECT row
+        app.handle_input(vec![NavIntent::Select]); // -> picker
+        save_zoomed_png(&mut app, &out_dir.join("04_effect_picker_with_padlock.png"));
+
+        println!("wrote ryw.12.4 screenshots to {}", out_dir.display());
     }
 }

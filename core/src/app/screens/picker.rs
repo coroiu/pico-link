@@ -29,6 +29,12 @@ pub(crate) struct PickerOption {
     /// picked, structurally (the activation gate lives in [`FieldList`], not
     /// in `on_pick`).
     pub selectable: bool,
+    /// Bead `pico-link-ryw.12.4`: draws a padlock after this option's
+    /// label -- the device-page effect picker's own "imported effect"
+    /// marker (Uma's design, `ryw12-3-ux.md` sec 1: "picker rows carry
+    /// the same padlock after imported names"). `false` for every other
+    /// picker in this crate.
+    pub locked: bool,
 }
 
 /// Seed for [`projection_key_of`] -- only needs to differ from other
@@ -82,6 +88,9 @@ fn options_to_rows(options: &[PickerOption], checked: Option<ListItemKey>) -> Ve
             if checked_here {
                 row = row.with_leading_glyph(icon::CHECK);
             }
+            if option.locked {
+                row = row.with_lock();
+            }
             row.with_key(option.key)
         })
         .collect()
@@ -103,6 +112,7 @@ fn projection_key_of(options: &[PickerOption], checked: Option<ListItemKey>) -> 
             None => key.fold(0),
         };
         key = key.fold(u64::from(option.selectable));
+        key = key.fold(u64::from(option.locked));
     }
     // `checked` folded last, offset by 1 so "no checked row" (`None`) can
     // never collide with a real key whose `as_u64()` happens to be `0`.
@@ -249,9 +259,9 @@ mod tests {
 
     fn three_options() -> Vec<PickerOption> {
         vec![
-            PickerOption { key: ListItemKey::from_u64(1), label: String::from("Alpha"), note: Some((String::from("best"), palette::TEXT_SECONDARY)), selectable: true },
-            PickerOption { key: ListItemKey::from_u64(2), label: String::from("Beta"), note: None, selectable: true },
-            PickerOption { key: ListItemKey::from_u64(3), label: String::from("Gamma"), note: Some((String::from("not offered"), palette::TEXT_SECONDARY)), selectable: false },
+            PickerOption { key: ListItemKey::from_u64(1), label: String::from("Alpha"), note: Some((String::from("best"), palette::TEXT_SECONDARY)), selectable: true, locked: false },
+            PickerOption { key: ListItemKey::from_u64(2), label: String::from("Beta"), note: None, selectable: true, locked: false },
+            PickerOption { key: ListItemKey::from_u64(3), label: String::from("Gamma"), note: Some((String::from("not offered"), palette::TEXT_SECONDARY)), selectable: false, locked: false },
         ]
     }
 

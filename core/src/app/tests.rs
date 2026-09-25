@@ -1257,7 +1257,12 @@ fn leaving_the_editor_reverts_dsp_program_to_the_connected_devices_assignment() 
     // already loaded it, and connect a device already assigned to it.
     let assigned_id = 7u16;
     let mut assigned_preset = Preset::new("Assigned");
-    assigned_preset.push_band(Band { kind: BandKind::Peak, freq_hz: 1_000, gain_half_db: 12, q_idx: 4 });
+    assigned_preset.push_band(Band {
+        kind: BandKind::Peak,
+        freq_half_hz: 1_000 * 2,
+        gain_cdb: 12 * 50,
+        q_milli: crate::dsp::preset::q_milli_from_index(4),
+    });
     app.handle_event(Event::PresetLoaded { id: assigned_id, blob: assigned_preset.to_wire().to_vec() });
     let addr: DeviceAddr = [1, 2, 3, 4, 5, 6];
     app.model.borrow_mut().connected_addr = Some(addr);
@@ -1313,7 +1318,7 @@ fn debug_eq_override_wins_over_an_assigned_preset_and_an_open_editor() {
     // A connected device with a real assigned preset.
     let mut assigned_preset = Preset::new("Assigned");
     let assigned_id = 7;
-    assigned_preset.push_band(Band { kind: BandKind::Peak, freq_hz: 1_000, gain_half_db: 12, q_idx: 4 });
+    assigned_preset.push_band(Band { kind: BandKind::Peak, freq_half_hz: 2_000, gain_cdb: 600, q_milli: crate::dsp::preset::q_milli_from_index(4) });
     app.handle_event(Event::PresetLoaded { id: assigned_id, blob: assigned_preset.to_wire().to_vec() });
     let addr: DeviceAddr = [9, 9, 9, 9, 9, 9];
     app.model.borrow_mut().connected_addr = Some(addr);

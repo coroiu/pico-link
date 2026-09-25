@@ -161,7 +161,7 @@ pub fn rbj_high_shelf(freq_hz: f32, gain_db: f32, q: f32, fs_hz: f32) -> Biquad 
 #[must_use]
 pub fn band_to_biquad(band: Band, fs_hz: u32) -> Biquad {
     let nyquist = fs_hz_to_f32(fs_hz) / 2.0;
-    let freq = f32::from(band.freq_hz).clamp(10.0, nyquist - 1.0);
+    let freq = band.freq_hz().clamp(10.0, nyquist - 1.0);
     let gain_db = band.gain_db();
     let q = band.q();
     let fs = fs_hz_to_f32(fs_hz);
@@ -380,12 +380,21 @@ impl Program {
 
     /// Compiles `preset` at `fs_hz`: every [`Band`] to a [`Biquad`]
     /// (RBJ), the crossfeed strength to [`CrossfeedCoeffs`] (bs2b), and
-    /// the automatic preamp from the resulting biquad cascade's combined
-    /// magnitude response.
+    /// the preamp -- automatic (from the resulting biquad cascade's
+    /// combined magnitude response) for [`super::preset::Preamp::Auto`],
+    /// or the published value verbatim for
+    /// [`super::preset::Preamp::Explicit`] (ryw.12 sec 2: "imported
+    /// presets are Explicit ... `Program::from_preset` uses Explicit or
+    /// `auto_preamp_db` accordingly").
     #[must_use]
     pub fn from_preset(preset: &Preset, fs_hz: u32) -> Self {
+        use super::preset::Preamp;
+
         let biquads: Vec<Biquad> = preset.bands.iter().map(|band| band_to_biquad(*band, fs_hz)).collect();
-        let preamp_db = auto_preamp_db(&biquads, fs_hz);
+        let preamp_db = match preset.preamp {
+            Preamp::Auto => auto_preamp_db(&biquads, fs_hz),
+            Preamp::Explicit(cdb) => f32::from(cdb) * 0.01,
+        };
         let crossfeed = crossfeed_coeffs(preset.crossfeed, fs_hz);
 
         Self { fs_hz, preamp_linear: libm::powf(10.0, preamp_db / 20.0), biquads, crossfeed }

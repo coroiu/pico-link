@@ -119,6 +119,45 @@ const _: () = assert!(RowStyle::FIELD.caret_right_margin < RowStyle::FIELD.value
 /// column's left edge — see [`draw_row`]'s label-clipping step.
 const LABEL_VALUE_GAP: i32 = 8;
 
+/// Width (px) reserved for the padlock glyph a `locked` row draws right
+/// after its label -- bead `pico-link-ryw.12.4`, Uma's design (`ryw12-3-
+/// ux.md` sec 1): "the name ellipsises BEFORE the lock and trailing
+/// count; lock and count never clip". An `icon_1x` glyph (~8px) plus a
+/// small gap, mirroring [`CHECK_GUTTER_WIDTH`]'s own "glyph + gap"
+/// shape.
+const LOCK_GLYPH_RESERVE: i32 = 12;
+
+/// Ellipsis-truncates `label` (byte-boundary-safe) so it renders at or
+/// under `max_width` in `font`, appending `"..."` (three ASCII dots, not
+/// U+2026 -- `helv*_tf` fonts in this codebase are `_tf` "full" glyph
+/// sets over Latin-1, and this project's other ASCII-only formatting
+/// helpers, e.g. `effects.rs`'s number formatters, already avoid non-
+/// ASCII punctuation for the same font-coverage reason). Only called for
+/// a `locked` row, so this per-prefix measuring loop -- the exact
+/// "character-walking text hack" this module's clip-not-ellipsise
+/// default deliberately avoids for every OTHER row -- runs for at most
+/// the handful of locked rows a screen ever has (bead `pico-link-ryw.12`'s
+/// own `MAX_PRESETS` bound is 8), not the whole list.
+fn ellipsis_truncate(font: &FontRenderer, label: &str, max_width: i32) -> String {
+    if text_width(font, label) <= max_width {
+        return String::from(label);
+    }
+    let mut end = label.len();
+    loop {
+        if end == 0 {
+            return String::from("...");
+        }
+        end -= 1;
+        while end > 0 && !label.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = alloc::format!("{}...", &label[..end]);
+        if end == 0 || text_width(font, &candidate) <= max_width {
+            return candidate;
+        }
+    }
+}
+
 /// A row's right-aligned trailing value text — drawn REGARDLESS of
 /// `selected` (today's `Trailing::Label` semantics, unchanged and still
 /// the point: `menu.rs`'s original doc comment on that variant).
@@ -276,6 +315,7 @@ pub(crate) fn draw_row<D>(
     leading: Option<char>,
     trailing: &RowTrailing<'_>,
     selected: bool,
+    locked: bool,
 ) -> Result<(), Infallible>
 where
     D: DrawTarget<Color = Rgb565, Error = Infallible>,
@@ -325,18 +365,49 @@ where
         row_rect.top_left.x + row_rect.size.width as i32,
         |value| value_right_edge - text_width(value.font, value.text) - LABEL_VALUE_GAP,
     );
-    let label_clip_width = (label_clip_right - label_x).max(0) as u32;
-    let label_rect =
-        Rectangle::new(Point::new(label_x, row_rect.top_left.y), Size::new(label_clip_width, row_rect.size.height));
-    let mut label_target = target.clipped(&label_rect);
-    let _ = label_font.render_aligned(
-        label,
-        Point::new(label_x, row_center_y),
-        VerticalPosition::Center,
-        HorizontalAlignment::Left,
-        FontColor::Transparent(label_color),
-        &mut label_target,
-    );
+
+    if locked {
+        // Bead `pico-link-ryw.12.4`: a locked row's padlock and trailing
+        // value must NEVER clip (Uma's design, `ryw12-3-ux.md` sec 1) --
+        // the label is ellipsis-truncated to leave room for the padlock
+        // instead of being clipped like every other row's label.
+        let label_budget_right = label_clip_right - LOCK_GLYPH_RESERVE;
+        let truncated = ellipsis_truncate(label_font, label, (label_budget_right - label_x).max(0));
+        let _ = label_font.render_aligned(
+            truncated.as_str(),
+            Point::new(label_x, row_center_y),
+            VerticalPosition::Center,
+            HorizontalAlignment::Left,
+            FontColor::Transparent(label_color),
+            target,
+        );
+        let lock_x = label_x + text_width(label_font, &truncated) + 4;
+        let mut buf = [0_u8; 4];
+        let lock: &str = icon::LOCK.encode_utf8(&mut buf);
+        let _ = font::icon_1x().render_aligned(
+            lock,
+            Point::new(lock_x, row_center_y),
+            VerticalPosition::Center,
+            HorizontalAlignment::Left,
+            FontColor::Transparent(palette::TEXT_SECONDARY),
+            target,
+        );
+    } else {
+        let label_clip_width = (label_clip_right - label_x).max(0) as u32;
+        let label_rect = Rectangle::new(
+            Point::new(label_x, row_rect.top_left.y),
+            Size::new(label_clip_width, row_rect.size.height),
+        );
+        let mut label_target = target.clipped(&label_rect);
+        let _ = label_font.render_aligned(
+            label,
+            Point::new(label_x, row_center_y),
+            VerticalPosition::Center,
+            HorizontalAlignment::Left,
+            FontColor::Transparent(label_color),
+            &mut label_target,
+        );
+    }
 
     if let Some(value) = &trailing.value {
         let _ = value.font.render_aligned(
@@ -539,6 +610,7 @@ impl Widget for MenuList {
                 None,
                 &trailing,
                 selected,
+                false, // MenuList rows are never locked -- only FieldList's imported-effect rows are.
             )?;
         }
 
