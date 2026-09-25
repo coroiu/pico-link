@@ -397,9 +397,10 @@ fn a_rail_liveness_matches_activation_for_every_screen() {
                 "forget picker" => Some(Verb::Select),
                 "forget confirm" => Some(Verb::Select),
                 "device detail" => None,
-                // Settings' first row ("IDLE SCREEN") is a focusable
-                // `Action` row that pushes a picker, so `A` is live: a
-                // real destination behind a row means `A` must say so.
+                // Settings' first row ("BUFFER", bead `pico-link-8pp1.2`
+                // S4) is a focusable `Action` row that pushes a picker, so
+                // `A` is live: a real destination behind a row means `A`
+                // must say so.
                 "settings" => Some(Verb::Open),
                 "wizard: scanning" => Some(Verb::Pair),
                 "wizard: nothing found" => Some(Verb::Scan),

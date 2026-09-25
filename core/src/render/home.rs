@@ -91,8 +91,9 @@ use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
-    build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, DeviceAddr,
-    DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, ScreenId, VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
+    build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, BtModel, Command, CushionPolicyState,
+    DeviceAddr, DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, ScreenId, VolumeSource, WizardPhase,
+    LDAC_QUALITY_ADAPTIVE,
 };
 use crate::input::NavIntent;
 use crate::platform::Instant;
@@ -143,8 +144,9 @@ pub(crate) fn build_home_screen(
     wizard_phase: &Rc<RefCell<WizardPhase>>,
     now: Instant,
     display_settings: &Rc<RefCell<DisplaySettingsState>>,
+    cushion_policy: &Rc<RefCell<CushionPolicyState>>,
 ) -> Screen {
-    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, now, display_settings);
+    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, now, display_settings, cushion_policy);
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
@@ -326,6 +328,7 @@ impl HomeView {
         wizard_phase: &Rc<RefCell<WizardPhase>>,
         now: Instant,
         display_settings: &Rc<RefCell<DisplaySettingsState>>,
+        cushion_policy: &Rc<RefCell<CushionPolicyState>>,
     ) -> Self {
         let (hero, link_state, discovering, connected_addr, fault_log) = {
             let snapshot = model.borrow();
@@ -338,6 +341,7 @@ impl HomeView {
         let commands_for_bluetooth = Rc::clone(commands);
         let wizard_phase_for_bluetooth = Rc::clone(wizard_phase);
         let display_settings_for_settings_row = Rc::clone(display_settings);
+        let cushion_policy_for_settings_row = Rc::clone(cushion_policy);
         let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Settings")]).on_activate_index(
             // `Verb::Open`: both rows push a deeper screen and draw a
             // caret (design section 4's assignment table -- Home menu's A
@@ -359,7 +363,8 @@ impl HomeView {
                 }
                 MENU_ROW_SETTINGS => {
                     let display_settings = Rc::clone(&display_settings_for_settings_row);
-                    Action::PushView(Box::new(move || build_settings_screen(&display_settings)))
+                    let cushion_policy = Rc::clone(&cushion_policy_for_settings_row);
+                    Action::PushView(Box::new(move || build_settings_screen(&display_settings, &cushion_policy)))
                 }
                 _ => Action::None,
             },
@@ -754,7 +759,8 @@ mod tests {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings)
+        let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy)
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -767,7 +773,8 @@ mod tests {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings)
+        let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy)
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting
@@ -870,7 +877,8 @@ mod tests {
         let commands = Rc::new(RefCell::new(VecDeque::new()));
         let wizard_phase = Rc::new(RefCell::new(WizardPhase::default()));
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings)
+        let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
+        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy)
     }
 
     #[test]
