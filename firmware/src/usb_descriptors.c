@@ -69,9 +69,12 @@ static const tusb_desc_device_t usbd_desc_device = {
     .idVendor = USBD_VID,
     .idProduct = USBD_PID,
     // Bumped 0x0100 -> 0x0101 for the HID interface addition (bead
-    // pico-link-47z.1). PID deliberately NOT bumped -- see
+    // pico-link-47z.1), then 0x0101 -> 0x0102 for the Pico Link Config
+    // vendor interface (bead pico-link-ryw.12.5, design comment on
+    // pico-link-ryw.12: "bump bcdDevice ... so hosts drop cached
+    // descriptors"). PID deliberately NOT bumped -- see
     // .planning/design/2026-09-02-media-keys.md section 2.5.
-    .bcdDevice = 0x0101,
+    .bcdDevice = 0x0102,
     .iManufacturer = STRID_MANUFACTURER,
     .iProduct = STRID_PRODUCT,
     .iSerialNumber = STRID_SERIAL,
@@ -91,7 +94,8 @@ const uint8_t *tud_descriptor_device_cb(void) {
     + TUD_AUDIO_SPEAKER_STEREO_FB_DESC_LEN \
     + TUD_CDC_DESC_LEN \
     + TUD_RPI_RESET_DESC_LEN \
-    + TUD_HID_DESC_LEN)
+    + TUD_HID_DESC_LEN \
+    + TUD_PL_CONFIG_DESC_LEN)
 
 // HID consumer-control report descriptor -- single 16-bit usage field, no
 // report ID (TinyUSB's stock consumer-control template). Covers play/pause
@@ -145,9 +149,17 @@ static const uint8_t usbd_desc_cfg[] = {
     // already ends in a trailing comma, so no comma is added here.
     TUD_RPI_RESET_DESCRIPTOR(ITF_NUM_RESET, STRID_RESET)
 
-    // HID consumer-control (media keys) -- MUST stay last, after RESET.
+    // HID consumer-control (media keys) -- after RESET, before CONFIG.
     // Interface number, string index, protocol, report descriptor len, EP In addr, size, polling interval (ms).
-    TUD_HID_DESCRIPTOR(ITF_NUM_HID, STRID_HID, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID_IN, 8, 10)
+    // NOTE: TUD_HID_DESCRIPTOR's own expansion ends in a trailing comma
+    // (same as TUD_RPI_RESET_DESCRIPTOR above), so none is added here.
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, STRID_HID, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID_IN, 8, 10),
+
+    // Pico Link Config -- bead pico-link-ryw.12.5: zero-endpoint vendor
+    // interface for host->device preset import (control transfers only,
+    // see usb_config_itf.h). MUST stay last -- appended after every other
+    // interface, same append-only rule ITF_NUM_HID followed for RESET.
+    TUD_PL_CONFIG_DESCRIPTOR(ITF_NUM_CONFIG, STRID_CONFIG)
 };
 
 _Static_assert(sizeof(usbd_desc_cfg) == USBD_DESC_LEN,
@@ -171,6 +183,7 @@ static const char *const usbd_desc_str[STRID_COUNT] = {
     [STRID_CDC] = "Pico Link Console",
     [STRID_RESET] = "Reset",
     [STRID_HID] = "Pico Link Media Keys",
+    [STRID_CONFIG] = "Pico Link Config",
 };
 
 const uint16_t *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {

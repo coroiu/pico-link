@@ -61,6 +61,7 @@
 #include "pl_loop_prof.h"
 #include "st7789.h"
 #include "usb_audio.h"
+#include "usb_config_itf.h"
 #include "usb_pump.h"
 #include "volume.h"
 #include "watchdog_sup.h"
@@ -637,6 +638,11 @@ int main(void) {
         // Bead pico-link-p1r.
         pl_loop_prof_record(PL_LOOP_PHASE_DEBUG_REMOTE, time_us_64() - debug_remote_start_us);
 #endif
+        // Bead pico-link-ryw.12.5: drains at most one pending USB preset
+        // import per iteration. Thread-context only, unconditional --
+        // NOT gated on PL_DEBUG_REMOTE, unlike the block above: this
+        // transport exists in release builds. See usb_config_itf.h.
+        pl_config_itf_poll(ui);
         // T2 of the media-keys epic (pico-link-47z.2): drains
         // media_keys.c's own ring and runs its 600ms safety-release
         // check. NOT gated behind PL_DEBUG_REMOTE -- T3's AVRCP handler

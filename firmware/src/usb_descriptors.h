@@ -61,13 +61,20 @@
 // .planning/design/2026-09-02-media-keys.md section 2.4. Any new interface
 // (HID included) MUST be appended AFTER ITF_NUM_RESET, never inserted
 // before it.
+// ITF_NUM_CONFIG (bead pico-link-ryw.12.5, design comment on
+// pico-link-ryw.12): "Pico Link Config", a zero-endpoint vendor interface
+// for host->device preset import (see usb_config_itf.h). Appended AFTER
+// HID, same "append after RESET, never insert before it" rule that
+// governed HID's own placement -- ITF_NUM_RESET's frozen index is what
+// matters, not what comes after it.
 enum {
     ITF_NUM_AUDIO_CONTROL = 0,
     ITF_NUM_AUDIO_STREAMING,
     ITF_NUM_CDC,
     ITF_NUM_CDC_DATA,
     ITF_NUM_RESET,   // FROZEN at 4 -- see comment above.
-    ITF_NUM_HID,     // Consumer-control (media keys). Appended LAST, after RESET.
+    ITF_NUM_HID,     // Consumer-control (media keys). Appended after RESET.
+    ITF_NUM_CONFIG,  // Pico Link Config (preset import). Appended after HID.
     ITF_NUM_TOTAL
 };
 
@@ -80,6 +87,7 @@ enum {
     STRID_CDC,
     STRID_RESET,
     STRID_HID,
+    STRID_CONFIG,
     STRID_COUNT
 };
 
@@ -159,5 +167,19 @@ enum {
 #define TUD_RPI_RESET_DESC_LEN 9
 #define TUD_RPI_RESET_DESCRIPTOR(_itfnum, _stridx) \
     9, TUSB_DESC_INTERFACE, _itfnum, 0, 0, TUSB_CLASS_VENDOR_SPECIFIC, RESET_INTERFACE_SUBCLASS, RESET_INTERFACE_PROTOCOL, _stridx,
+
+// --- (3) Pico Link Config -- bead pico-link-ryw.12.5 ---
+// Same shape as TUD_RPI_RESET_DESCRIPTOR above (one plain interface
+// descriptor, zero endpoints, control-transfer only) but its own
+// subclass/protocol pair so it can never be mistaken for the reset
+// interface by a host that dispatches on those fields instead of the
+// interface number. See usb_config_itf.h for the class driver and wire
+// protocol this descriptor announces.
+#define PL_CONFIG_INTERFACE_SUBCLASS 0x01
+#define PL_CONFIG_INTERFACE_PROTOCOL 0x01
+
+#define TUD_PL_CONFIG_DESC_LEN 9
+#define TUD_PL_CONFIG_DESCRIPTOR(_itfnum, _stridx) \
+    9, TUSB_DESC_INTERFACE, _itfnum, 0, 0, TUSB_CLASS_VENDOR_SPECIFIC, PL_CONFIG_INTERFACE_SUBCLASS, PL_CONFIG_INTERFACE_PROTOCOL, _stridx,
 
 #endif // PICO_LINK_USB_DESCRIPTORS_H
