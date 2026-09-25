@@ -249,4 +249,12 @@ void pl_bt_enqueue_cushion_policy_write(void);
 bool pl_bt_scan_connectable(void);
 uint32_t pl_bt_scan_mode_changes(void);
 
+// Bead pico-link-pigd (follow-up to pico-link-oevr's Q2): count of inbound
+// classic connection requests refused by pl_bt_connection_filter because the
+// remote address is not a device we have paired -- see bt.c's doc comment
+// on pl_bt_connection_filter for the accept rule. For a2dp.c's periodic
+// debug report (pl_a2dp_report), same idiom as pl_bt_scan_mode_changes
+// above. Safe from any context -- reads a single counter.
+uint32_t pl_bt_rejected_inbound_count(void);
+
 #endif // PL_BT_H

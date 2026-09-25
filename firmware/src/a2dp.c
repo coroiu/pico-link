@@ -4554,9 +4554,14 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // directly instead of inferring it from blueutil probes alone.
     // connectable=1 discoverable=0 whenever no ACL is up; connectable=0
     // once one is.
+    // Bead pico-link-pigd: rejected_inbound counts HCI_EVENT_CONNECTION_REQUESTs
+    // declined by bt.c's pl_bt_connection_filter because the remote address
+    // has no stored pairing -- see that function's doc comment for the
+    // accept rule (persist.c record AND BTstack link key both present).
     pl_log(
-        "bt: scan_connectable=%d scan_discoverable=0 scan_mode_changes=%lu\r\n", (int)pl_bt_scan_connectable(),
-        (unsigned long)pl_bt_scan_mode_changes()
+        "bt: scan_connectable=%d scan_discoverable=0 scan_mode_changes=%lu rejected_inbound=%lu\r\n",
+        (int)pl_bt_scan_connectable(), (unsigned long)pl_bt_scan_mode_changes(),
+        (unsigned long)pl_bt_rejected_inbound_count()
     );
 }
 
