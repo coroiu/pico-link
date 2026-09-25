@@ -1,6 +1,6 @@
 use alloc::string::String;
 
-use crate::audio::CushionPolicy;
+use crate::audio::{AbrFloor, CushionPolicy};
 use crate::power::DisplaySettings;
 use crate::render::Instant;
 
@@ -43,6 +43,9 @@ impl App {
             }
             Event::CushionPolicyLoaded { policy } => {
                 self.set_cushion_policy(CushionPolicy::from_wire(policy));
+            }
+            Event::AbrFloorLoaded { floor } => {
+                self.set_abr_floor(AbrFloor::from_wire(floor));
             }
         }
         self.stamp_pending_wizard_timestamp();

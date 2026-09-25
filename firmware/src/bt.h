@@ -239,6 +239,14 @@ void pl_bt_enqueue_display_settings_write(void);
 // superloop).
 void pl_bt_enqueue_cushion_policy_write(void);
 
+// Bead pico-link-d42g.3 (F3): same idiom as pl_bt_enqueue_persist_write
+// above, for persist.c's PL:S:2 Adaptive-floor write -- see persist.h's
+// doc comment on pl_persist_request_abr_floor/
+// pl_persist_execute_pending_abr_floor_write for the full rationale.
+// Called from persist.c's pl_persist_service() (thread context, the
+// superloop).
+void pl_bt_enqueue_abr_floor_write(void);
+
 // Bead pico-link-oevr: current page-scan state and transition count, for
 // a2dp.c's periodic debug report (pl_a2dp_report) to print -- so a
 // hardware round reads scan state instead of inferring it. See bt.c's

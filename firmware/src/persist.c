@@ -135,6 +135,18 @@ typedef struct __attribute__((packed)) {
     uint16_t crc16;
 } pl_persist_cushion_policy_record_t;
 
+// Bead pico-link-d42g.3 (F3): PL:S:2, the global LDAC Adaptive-floor
+// record -- design `.planning/design/2026-09-25-adaptive-floor.md` sec 2.
+// Own version byte, SEPARATE from PL_PERSIST_SETTINGS_VERSION/
+// PL_PERSIST_CUSHION_POLICY_VERSION, same reasoning as PL:S:1 above.
+// `floor` is the raw wire byte `pico_link_core::audio::AbrFloor::
+// to_wire`/`from_wire` already define (0=unset->330, 1=330, 2=246, 3=198)
+// -- this module stores and moves the byte, never interprets it (same
+// discipline as `policy` above). Uses the shared
+// pl_persist_load_u8_setting/pl_persist_store_u8_setting helpers below
+// rather than its own bespoke read/write pair.
+#define PL_PERSIST_ABR_FLOOR_VERSION 1u
+
 // CRC16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over every field of
 // pl_persist_device_record_t EXCEPT crc16 itself. A bit-loop, not a table --
 // records are tiny (50 bytes) and written at most once per ~10s, so table
@@ -152,6 +164,59 @@ static uint16_t pl_persist_crc16(const uint8_t *data, size_t len) {
 
 static btstack_tlv_flash_bank_t s_tlv_context;
 static const btstack_tlv_t *s_tlv_impl;
+
+// Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-25-
+// adaptive-floor.md` sec 2: shared load/store helpers for the growing
+// family of one-byte PL:S:<i> settings records (PL:S:1 cushion policy,
+// PL:S:2 Adaptive floor) -- named as debt in that design ("this is the
+// third copy of the 1-byte settings-record boilerplate"). Same wire shape
+// as pl_persist_cushion_policy_record_t: {u8 version; u8 value; u16
+// crc16}. `name` is a short label for the pl_log lines only (e.g. "abr
+// floor") -- it is never written to flash. PL:S:0 (display settings) is
+// NOT moved onto this: its layout has an extra u16 field, so it isn't a
+// one-byte setting.
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint8_t value;
+    uint16_t crc16;
+} pl_persist_u8_setting_record_t;
+
+// Returns false, leaving `*out_value` untouched, on any of: absent record,
+// wrong length, wrong version, bad CRC -- same "no migration, just fall
+// back to the caller's default" contract every PL:S:<i> loader in this
+// file already follows (see pl_persist_init's PL:S:0/PL:S:1 blocks).
+static bool pl_persist_load_u8_setting(uint8_t index, uint8_t version, const char *name, uint8_t *out_value) {
+    pl_persist_u8_setting_record_t rec;
+    int rec_len = s_tlv_impl->get_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, index), (uint8_t *)&rec, sizeof(rec));
+    if (rec_len != (int)sizeof(rec)) {
+        pl_log("persist: no PL:S:%u %s record -- using default\r\n", (unsigned)index, name);
+        return false;
+    }
+    if (rec.version != version) {
+        pl_log(
+            "persist: PL:S:%u %s version mismatch (got %u, expected %u) -- using default\r\n", (unsigned)index, name,
+            (unsigned)rec.version, (unsigned)version
+        );
+        return false;
+    }
+    uint16_t crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_u8_setting_record_t, crc16));
+    if (crc != rec.crc16) {
+        pl_log(
+            "persist: PL:S:%u %s CRC mismatch (got 0x%04x, computed 0x%04x) -- using default\r\n", (unsigned)index, name, rec.crc16,
+            crc
+        );
+        return false;
+    }
+    *out_value = rec.value;
+    pl_log("persist: loaded PL:S:%u %s=%u\r\n", (unsigned)index, name, (unsigned)rec.value);
+    return true;
+}
+
+static void pl_persist_store_u8_setting(uint8_t index, uint8_t version, uint8_t value) {
+    pl_persist_u8_setting_record_t rec = {.version = version, .value = value, .crc16 = 0};
+    rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_u8_setting_record_t, crc16));
+    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, index), (const uint8_t *)&rec, sizeof(rec));
+}
 
 static pl_persist_status_t s_boot_status = PL_PERSIST_STATUS_FIRST_BOOT;
 
@@ -263,6 +328,15 @@ static uint8_t s_cushion_pending_policy;
 static volatile bool s_cushion_write_enqueued;
 static bool s_cushion_policy_loaded;
 static uint8_t s_cushion_policy;
+
+// Bead pico-link-d42g.3 (F3): a FIFTH, independent staging slot -- the
+// global LDAC Adaptive floor (PL:S:2), same shape as s_cushion_pending/
+// s_cushion_policy_loaded above.
+static bool s_abr_floor_pending;
+static uint8_t s_abr_floor_pending_floor;
+static volatile bool s_abr_floor_write_enqueued;
+static bool s_abr_floor_loaded;
+static uint8_t s_abr_floor;
 
 // Unconditional (NOT #ifndef NDEBUG-gated) firmware/storage-region collision
 // check -- replaces btstack_flash_bank.c:53-58's assert, which pico-sdk's
@@ -384,6 +458,23 @@ void pl_persist_init(void) {
                 s_cushion_policy = rec.policy;
                 pl_log("persist: loaded cushion policy=%u\r\n", (unsigned)rec.policy);
             }
+        }
+    }
+
+    // --- Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-25-
+    // adaptive-floor.md` sec 2: load PL:S:2 (Adaptive floor) HERE too --
+    // same "before the PL:M:0 marker check, unconditionally" placement as
+    // PL:S:0/PL:S:1 above, and for the same reason. Uses the shared
+    // pl_persist_load_u8_setting helper -- a bad length, wrong version or
+    // failed CRC just leaves s_abr_floor_loaded false
+    // (pl_persist_boot_abr_floor returns false, main.c falls back to the
+    // compiled-in default, 330 kbps); this record is never deleted here
+    // even when invalid, same reasoning as PL:S:0/PL:S:1's own load.
+    {
+        uint8_t floor;
+        if (pl_persist_load_u8_setting(PL_PERSIST_INDEX_ABR_FLOOR, PL_PERSIST_ABR_FLOOR_VERSION, "abr floor", &floor)) {
+            s_abr_floor_loaded = true;
+            s_abr_floor = floor;
         }
     }
 
@@ -1052,6 +1143,14 @@ void pl_persist_service(void) {
         s_cushion_write_enqueued = true;
         pl_bt_enqueue_cushion_policy_write();
     }
+    if (s_abr_floor_pending && !s_abr_floor_write_enqueued) {
+        // Bead pico-link-d42g.3's design sec 2/4 (D11 precedent, same as
+        // the cushion-policy block above): no streaming re-check here --
+        // this is a user-initiated write that is allowed to skip audio
+        // rather than silently delay.
+        s_abr_floor_write_enqueued = true;
+        pl_bt_enqueue_abr_floor_write();
+    }
 }
 
 // Bead pico-link-7jol.5. See persist.h's doc comment.
@@ -1191,6 +1290,45 @@ void pl_persist_execute_pending_cushion_policy_write(void) {
     s_cushion_policy = policy;
     pl_log("persist: wrote cushion policy=%u\r\n", (unsigned)policy);
     s_cushion_write_enqueued = false;
+}
+
+// Bead pico-link-d42g.3 (F3). See persist.h's doc comment.
+bool pl_persist_boot_abr_floor(uint8_t *floor) {
+    if (!s_abr_floor_loaded) {
+        return false;
+    }
+    *floor = s_abr_floor;
+    return true;
+}
+
+// Bead pico-link-d42g.3 (F3). See persist.h's doc comment.
+void pl_persist_request_abr_floor(uint8_t floor) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    s_abr_floor_pending_floor = floor;
+    s_abr_floor_pending = true;
+    restore_interrupts(irq_state);
+}
+
+// Bead pico-link-d42g.3 (F3). See persist.h's doc comment.
+void pl_persist_execute_pending_abr_floor_write(void) {
+    if (!s_abr_floor_pending) {
+        s_abr_floor_write_enqueued = false;
+        return;
+    }
+
+    uint8_t floor;
+    uint32_t irq_state = save_and_disable_interrupts();
+    floor = s_abr_floor_pending_floor;
+    s_abr_floor_pending = false;
+    restore_interrupts(irq_state);
+
+    pl_persist_store_u8_setting(PL_PERSIST_INDEX_ABR_FLOOR, PL_PERSIST_ABR_FLOOR_VERSION, floor);
+    // Keep the live boot-snapshot mirror in sync too, same discipline as
+    // the cushion-policy write above.
+    s_abr_floor_loaded = true;
+    s_abr_floor = floor;
+    pl_log("persist: wrote abr floor=%u\r\n", (unsigned)floor);
+    s_abr_floor_write_enqueued = false;
 }
 
 void pl_persist_request_urgent_flush(void) {

@@ -41,6 +41,7 @@
 #include "tusb.h"
 
 #include "a2dp.h"
+#include "codec_ldac.h"
 #include "bt.h"
 #ifdef PL_DEBUG_REMOTE
 #include "debug_remote.h"
@@ -473,6 +474,26 @@ int main(void) {
                 .version = PL_EVENT_ABI_VERSION,
                 .tag = PL_EVENT_TAG_CUSHION_POLICY_LOADED,
                 .payload = {.cushion_policy = {.policy = boot_cushion_policy}},
+            };
+            pl_ui_push_event(ui, event);
+        }
+    }
+
+    // Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-25-
+    // adaptive-floor.md` sec 2/4: push the PL:S:2 boot snapshot into core
+    // (for a future Settings row/picker, F4) AND apply it live to the LDAC
+    // encoder -- same "core has no run loop of its own" reasoning as the
+    // PL:S:1 block above. No-op apply (codec_ldac.c keeps its compiled-in
+    // default, rung 4 = 330 kbps) if pl_persist_boot_abr_floor() returns
+    // false -- see that function's doc comment for every reason it can.
+    {
+        uint8_t boot_abr_floor;
+        if (pl_persist_boot_abr_floor(&boot_abr_floor)) {
+            pl_codec_ldac_set_floor(boot_abr_floor);
+            struct PlEvent event = {
+                .version = PL_EVENT_ABI_VERSION,
+                .tag = PL_EVENT_TAG_ABR_FLOOR_LOADED,
+                .payload = {.abr_floor = {.floor = boot_abr_floor}},
             };
             pl_ui_push_event(ui, event);
         }

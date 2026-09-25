@@ -978,6 +978,12 @@ typedef enum {
     // addr -- persist.c already has the pending record staged in its own
     // s_cushion_pending_policy.
     PL_BT_PENDING_SET_CUSHION_POLICY,
+    // Bead pico-link-d42g.3 (F3): reuses this exact queue/heartbeat idiom
+    // for persist.c's PL:S:2 Adaptive-floor write -- same reentrancy
+    // reason as the other PL_BT_PENDING_* persist entries. Carries no
+    // addr -- persist.c already has the pending record staged in its own
+    // s_abr_floor_pending_floor.
+    PL_BT_PENDING_SET_ABR_FLOOR,
 } pl_bt_pending_tag_t;
 
 typedef struct {
@@ -1016,6 +1022,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "SET_DISPLAY_SETTINGS";
         case PL_BT_PENDING_SET_CUSHION_POLICY:
             return "SET_CUSHION_POLICY";
+        case PL_BT_PENDING_SET_ABR_FLOOR:
+            return "SET_ABR_FLOOR";
         default:
             return "?";
     }
@@ -1108,6 +1116,11 @@ static void pl_bt_pending_service(void) {
                 // PL_BT_PENDING_PERSIST_WRITE above.
                 pl_persist_execute_pending_cushion_policy_write();
                 break;
+            case PL_BT_PENDING_SET_ABR_FLOOR:
+                // Bead pico-link-d42g.3 (F3): same reentrancy contract as
+                // PL_BT_PENDING_PERSIST_WRITE above.
+                pl_persist_execute_pending_abr_floor_write();
+                break;
         }
     }
 }
@@ -1136,6 +1149,11 @@ void pl_bt_enqueue_display_settings_write(void) {
 // Bead pico-link-8pp1.4 (S3). See bt.h's doc comment.
 void pl_bt_enqueue_cushion_policy_write(void) {
     pl_bt_pending_push(PL_BT_PENDING_SET_CUSHION_POLICY, NULL);
+}
+
+// Bead pico-link-d42g.3 (F3). See bt.h's doc comment.
+void pl_bt_enqueue_abr_floor_write(void) {
+    pl_bt_pending_push(PL_BT_PENDING_SET_ABR_FLOOR, NULL);
 }
 
 // Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the
@@ -1409,6 +1427,18 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             pl_log("BT: PL_CMD_SET_CUSHION_POLICY policy=%u\r\n", (unsigned)policy);
             pl_a2dp_set_cushion_policy(policy);
             pl_persist_request_cushion_policy(policy);
+            break;
+        }
+
+        case PL_COMMAND_TAG_SET_ABR_FLOOR: {
+            // Bead pico-link-d42g.3 (F3), design `.planning/design/2026-09-
+            // 25-adaptive-floor.md` sec 4: same "apply live AND persist"
+            // shape as PL_COMMAND_TAG_SET_CUSHION_POLICY above -- core has
+            // no run loop of its own that touches codec_ldac.c.
+            uint8_t floor = command.payload.abr_floor.floor;
+            pl_log("BT: PL_CMD_SET_ABR_FLOOR floor=%u\r\n", (unsigned)floor);
+            pl_codec_ldac_set_floor(floor);
+            pl_persist_request_abr_floor(floor);
             break;
         }
 
