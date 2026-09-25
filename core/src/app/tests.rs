@@ -1305,3 +1305,115 @@ fn dsp_program_is_a_stable_read_between_edits() {
     assert_eq!(first_read, second_read, "repeated dsp_program calls with no new input must return an equal program");
     assert_eq!(second_read, third_read, "repeated dsp_program calls with no new input must return an equal program");
 }
+
+/// Bead `pico-link-ryw.11`: feeds a small Equalizer APO session through
+/// `App`'s debug EQ commands and checks the override it produces wins
+/// over BOTH an assigned preset and an open (non-bypassed) editor
+/// preview -- `dsp_program`'s doc comment says the debug override is
+/// checked "AHEAD of everything else."
+#[test]
+fn debug_eq_override_wins_over_an_assigned_preset_and_an_open_editor() {
+    let mut app = App::new(240, 240);
+
+    // A connected device with a real assigned preset.
+    let mut assigned_preset = Preset::new("Assigned");
+    let assigned_id = 7;
+    assigned_preset.push_band(Band { kind: BandKind::Peak, freq_hz: 1_000, gain_half_db: 12, q_idx: 4 });
+    app.handle_event(Event::PresetLoaded { id: assigned_id, blob: assigned_preset.to_wire().to_vec() });
+    let addr: DeviceAddr = [9, 9, 9, 9, 9, 9];
+    app.model.borrow_mut().connected_addr = Some(addr);
+    app.model.borrow_mut().paired.push(PairedDevice {
+        addr,
+        name: alloc::string::String::from("Cans"),
+        mru_seq: 1,
+        ldac_quality: 0,
+        preset_id: assigned_id,
+    });
+    let assigned_program = Program::from_preset(&assigned_preset, TEST_DSP_FS_HZ);
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), assigned_program, "sanity: the assignment resolves before any override");
+
+    // Load a debug override.
+    app.debug_eq_begin();
+    app.debug_eq_line("Preamp: -3 dB").unwrap();
+    app.debug_eq_line("Filter 1: ON PK Fc 500 Hz Gain 2 dB Q 1").unwrap();
+    app.debug_eq_end().unwrap();
+
+    let overridden = app.dsp_program(TEST_DSP_FS_HZ);
+    assert_ne!(overridden, assigned_program, "the debug override must win over the connected device's assigned preset");
+
+    // It must ALSO win over an open, non-bypassed editor preview.
+    open_new_effect_editor(&mut app);
+    app.handle_input(vec![NavIntent::Right]); // CROSSFEED step -> draft changes, still not bypassed
+    assert_eq!(
+        app.dsp_program(TEST_DSP_FS_HZ),
+        overridden,
+        "the debug override must win over an open editor's live preview too"
+    );
+    app.handle_input(vec![NavIntent::Back]); // leave the editor
+
+    // `EQ OFF` clears it, reverting to the connected device's assignment.
+    app.debug_eq_off();
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), assigned_program, "EQ OFF must revert to the normal resolution");
+}
+
+/// Bead `pico-link-ryw.11`, orchestrator steer 2026-09-25: the override
+/// is `App`-owned state, not tied to any Bluetooth connection -- it must
+/// survive the connected device disconnecting and a different (or the
+/// same) device reconnecting, and only clear on `EQ OFF` (or a reboot,
+/// which this test can't exercise since `App` doesn't persist across
+/// process boundaries -- a fresh `App::new` never has an override to
+/// begin with).
+#[test]
+fn debug_eq_override_survives_disconnect_and_reconnect() {
+    let mut app = App::new(240, 240);
+
+    app.debug_eq_begin();
+    app.debug_eq_line("Preamp: -1 dB").unwrap();
+    app.debug_eq_line("Filter 1: ON LS Fc 100 Hz Gain 1 dB BW Oct 1").unwrap();
+    app.debug_eq_end().unwrap();
+    let overridden = app.dsp_program(TEST_DSP_FS_HZ);
+    assert_ne!(overridden, Program::off(TEST_DSP_FS_HZ), "sanity: the override is a real, non-bypass program");
+
+    let addr: DeviceAddr = [1, 1, 1, 1, 1, 1];
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), overridden, "connecting a device must not disturb the debug override");
+
+    app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), overridden, "disconnecting must not disturb the debug override");
+
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), overridden, "reconnecting must not disturb the debug override");
+
+    app.debug_eq_off();
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), Program::off(TEST_DSP_FS_HZ), "EQ OFF still clears it after a reconnect");
+}
+
+/// Malformed input mid-session must not clobber whatever override was
+/// already active from a PREVIOUS successful `EQ END`.
+#[test]
+fn a_failed_eq_end_leaves_the_previous_override_in_place() {
+    let mut app = App::new(240, 240);
+
+    app.debug_eq_begin();
+    app.debug_eq_line("Preamp: -2 dB").unwrap();
+    app.debug_eq_line("Filter 1: ON PK Fc 300 Hz Gain 1 dB Q 1").unwrap();
+    app.debug_eq_end().unwrap();
+    let first = app.dsp_program(TEST_DSP_FS_HZ);
+
+    // A second session with no Preamp: line -- END must fail.
+    app.debug_eq_begin();
+    app.debug_eq_line("Filter 1: ON PK Fc 400 Hz Gain 1 dB Q 1").unwrap();
+    let err = app.debug_eq_end().unwrap_err();
+    assert_eq!(err, DebugEqCommandError::Finish(crate::dsp::EqApoError::MissingPreamp));
+
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), first, "a failed EQ END must not clear or replace the previous override");
+}
+
+#[test]
+fn eq_commands_without_a_begin_report_not_in_session() {
+    let mut app = App::new(240, 240);
+    assert_eq!(app.debug_eq_line("Preamp: 0 dB").unwrap_err(), DebugEqCommandError::NotInSession);
+    assert_eq!(app.debug_eq_end().unwrap_err(), DebugEqCommandError::NotInSession);
+}

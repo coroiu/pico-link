@@ -3162,6 +3162,159 @@ pub unsafe extern "C" fn pl_ui_take_dsp_program(ui: *mut PlUi, out: *mut PlDspPr
     true
 }
 
+// --- Bead pico-link-ryw.11: debug-only EQ import over the PL_DEBUG_REMOTE
+// CDC console ---
+//
+// `firmware/src/debug_remote.c`'s `EQ BEGIN`/`EQ <line>`/`EQ END`/`EQ OFF`
+// commands strip their own `"EQ "` prefix and hand the rest of the line to
+// `pl_ui_debug_eq_command` below -- `"BEGIN"`/`"END"`/`"OFF"` dispatch to
+// `App`'s session state directly; anything else is treated as one
+// Equalizer APO text line and fed to the in-progress session. This whole
+// FFI surface is compiled unconditionally (same as every other `pl_ui_*`
+// function) -- it is `debug_remote.c` that is `PL_DEBUG_REMOTE`-gated at
+// the build level (see that file's own module doc / `firmware/CMakeLists.txt`),
+// so a release build simply never calls these.
+
+/// `pl_ui_debug_eq_command`'s result: `code` is `0` on success, negative on
+/// failure (see the match arms in [`debug_eq_command_error_result`] for
+/// the mapping); `line` is the 1-based line number within the CURRENT
+/// session a parse failure occurred at (`0` if not applicable -- a
+/// [`pico_link_core::app::DebugEqCommandError::NotInSession`] or a
+/// `finish`/`EQ END` failure, which is session-wide, not one line's
+/// fault).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlEqCommandResult {
+    pub code: i32,
+    pub line: u32,
+}
+
+impl PlEqCommandResult {
+    const OK: Self = Self { code: 0, line: 0 };
+    const NULL_OR_INVALID_UTF8: Self = Self { code: -1, line: 0 };
+}
+
+fn eq_apo_error_code(e: pico_link_core::dsp::EqApoError) -> i32 {
+    use pico_link_core::dsp::EqApoError::{
+        DuplicatePreamp, InvalidNumber, MalformedLine, MissingPreamp, NoBands, TooManyBands, UnknownKind,
+    };
+    match e {
+        MalformedLine => -2,
+        InvalidNumber => -3,
+        UnknownKind => -4,
+        TooManyBands => -5,
+        MissingPreamp => -6,
+        NoBands => -7,
+        DuplicatePreamp => -8,
+    }
+}
+
+fn debug_eq_command_error_result(e: pico_link_core::app::DebugEqCommandError) -> PlEqCommandResult {
+    use pico_link_core::app::DebugEqCommandError::{Finish, Line, NotInSession};
+    match e {
+        NotInSession => PlEqCommandResult { code: -9, line: 0 },
+        Line(line_err) => {
+            // `EqApoLineError::line` is a `usize` line count within one
+            // session -- always tiny (bounded by how many lines a CDC
+            // console command stream could plausibly send), never
+            // anywhere near `u32::MAX`.
+            #[allow(clippy::cast_possible_truncation)]
+            let line = line_err.line as u32;
+            PlEqCommandResult { code: eq_apo_error_code(line_err.error), line }
+        }
+        Finish(error) => PlEqCommandResult { code: eq_apo_error_code(error), line: 0 },
+    }
+}
+
+/// Dispatches one debug EQ console command against `ui`'s [`App`]:
+/// `text` (`text_len` bytes, need not be NUL-terminated) is `"BEGIN"`,
+/// `"END"`, `"OFF"`, or one Equalizer APO text line (a `Preamp:` or
+/// `Filter N:` line) -- see [`pico_link_core::app::App::debug_eq_begin`]/
+/// [`debug_eq_line`](pico_link_core::app::App::debug_eq_line)/
+/// [`debug_eq_end`](pico_link_core::app::App::debug_eq_end)/
+/// [`debug_eq_off`](pico_link_core::app::App::debug_eq_off) for the state
+/// machine this drives. Leading/trailing whitespace in `text` is
+/// tolerated (mirrors [`pico_link_core::dsp::EqApoSession::feed_line`]'s
+/// own trim).
+///
+/// Returns [`PlEqCommandResult::NULL_OR_INVALID_UTF8`] (`code == -1`) if
+/// `ui`/`text` is null or `text` isn't valid UTF-8, without touching
+/// `ui`'s state -- same "never write/mutate past an unvalidated pointer"
+/// contract [`pl_ui_take_dsp_program`]'s null check documents for its own
+/// out-param.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `text`, if non-null, must point to at least `text_len`
+/// valid, readable bytes for the duration of this call (borrowed only,
+/// not retained past it).
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_debug_eq_command(ui: *mut PlUi, text: *const u8, text_len: usize) -> PlEqCommandResult {
+    if ui.is_null() || text.is_null() {
+        return PlEqCommandResult::NULL_OR_INVALID_UTF8;
+    }
+    // SAFETY: caller contract above -- `ui` is a live `pl_ui_create` pointer,
+    // `text` points to `text_len` valid bytes for this call's duration.
+    let ui = unsafe { &mut *ui };
+    let bytes = unsafe { core::slice::from_raw_parts(text, text_len) };
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return PlEqCommandResult::NULL_OR_INVALID_UTF8;
+    };
+    let text = text.trim();
+
+    let result = match text {
+        "BEGIN" => {
+            ui.app.debug_eq_begin();
+            Ok(())
+        }
+        "END" => ui.app.debug_eq_end(),
+        "OFF" => {
+            ui.app.debug_eq_off();
+            Ok(())
+        }
+        line => ui.app.debug_eq_line(line),
+    };
+
+    match result {
+        Ok(()) => PlEqCommandResult::OK,
+        Err(e) => debug_eq_command_error_result(e),
+    }
+}
+
+/// Reads the currently active debug EQ override's band count and explicit
+/// preamp, for a status log line (`debug_remote.c` logs this right after
+/// a successful `EQ END`, and on an `EQ STATUS` query). Returns `false`
+/// (and leaves `*out_band_count`/`*out_preamp_db` untouched) if `ui` is
+/// null or no override is currently active -- see
+/// [`pico_link_core::app::App::debug_eq_override_info`].
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `out_band_count`/`out_preamp_db`, if non-null, must each
+/// point to valid, writable storage of their respective type.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_debug_eq_status(ui: *mut PlUi, out_band_count: *mut u8, out_preamp_db: *mut f32) -> bool {
+    if ui.is_null() {
+        return false;
+    }
+    // SAFETY: caller contract above.
+    let ui = unsafe { &mut *ui };
+    let Some((band_count, preamp_db)) = ui.app.debug_eq_override_info() else {
+        return false;
+    };
+    if !out_band_count.is_null() {
+        // SAFETY: caller contract above.
+        unsafe { *out_band_count = band_count };
+    }
+    if !out_preamp_db.is_null() {
+        // SAFETY: caller contract above.
+        unsafe { *out_preamp_db = preamp_db };
+    }
+    true
+}
+
 // --- Tests: pico-link-ptu, checked tag conversion ---
 //
 // Host-only (`#[cfg(test)]`, run via `cargo test -p ui-ffi` -- this crate is
@@ -4945,6 +5098,86 @@ mod tests {
                 !pl_ui_take_dsp_program(ui, &mut unchanged),
                 "no new edit since the last take -- must report no change, not a fresh program every call"
             );
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Bead pico-link-ryw.11: the full `BEGIN`/line/line/`END` sequence
+    /// through the real FFI entry point, checking `pl_ui_debug_eq_status`
+    /// reports the resulting band count/preamp and `pl_ui_take_dsp_program`
+    /// picks up a non-Off program.
+    #[test]
+    fn pl_ui_debug_eq_command_full_session_activates_an_override() {
+        let ui = new_ui();
+        unsafe {
+            let send = |s: &str| pl_ui_debug_eq_command(ui, s.as_ptr(), s.len());
+
+            assert_eq!(send("BEGIN").code, 0);
+            assert_eq!(send("Preamp: -4.41 dB").code, 0);
+            assert_eq!(send("Filter 1:  ON  LS  Fc 40 Hz  Gain -1.76 dB  BW Oct 1.917").code, 0);
+            assert_eq!(send("Filter 2:  ON  PK  Fc 80 Hz  Gain -2 dB  BW Oct 1.485").code, 0);
+            let end = send("END");
+            assert_eq!(end.code, 0);
+
+            let mut band_count = 0u8;
+            let mut preamp_db = 0f32;
+            assert!(pl_ui_debug_eq_status(ui, &mut band_count, &mut preamp_db));
+            assert_eq!(band_count, 2);
+            assert!((preamp_db - (-4.41)).abs() < 1e-4);
+
+            let mut program = zeroed_dsp_program();
+            assert!(pl_ui_take_dsp_program(ui, &mut program));
+            assert_eq!(program.n_biquads, 2);
+
+            assert_eq!(send("OFF").code, 0);
+            let mut after_off_band_count = 0u8;
+            let mut after_off_preamp_db = 0f32;
+            assert!(!pl_ui_debug_eq_status(ui, &mut after_off_band_count, &mut after_off_preamp_db));
+
+            let mut program_after_off = zeroed_dsp_program();
+            assert!(pl_ui_take_dsp_program(ui, &mut program_after_off), "EQ OFF must itself change the live program back");
+            assert_eq!(program_after_off.n_biquads, 0, "EQ OFF must revert to Off with no connected device");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// A malformed line reports the right error code AND the 1-based line
+    /// number within the session, not just a generic failure.
+    #[test]
+    fn pl_ui_debug_eq_command_malformed_line_reports_code_and_line_number() {
+        let ui = new_ui();
+        unsafe {
+            let send = |s: &str| pl_ui_debug_eq_command(ui, s.as_ptr(), s.len());
+
+            assert_eq!(send("BEGIN").code, 0);
+            assert_eq!(send("Preamp: -1 dB").code, 0); // line 1 of this session
+            let result = send("Filter 1: ON XX Fc 100 Hz Gain 1 dB Q 1"); // line 2 -- bad kind token
+            assert_eq!(result.code, -4, "UnknownKind must map to code -4");
+            assert_eq!(result.line, 2);
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// A line command with no preceding `BEGIN` reports `NotInSession`
+    /// (`code == -9`), and null/invalid-UTF8 input reports `-1` without
+    /// touching session state.
+    #[test]
+    fn pl_ui_debug_eq_command_not_in_session_and_null_args() {
+        let ui = new_ui();
+        unsafe {
+            let result = pl_ui_debug_eq_command(ui, "Preamp: -1 dB".as_ptr(), "Preamp: -1 dB".len());
+            assert_eq!(result.code, -9);
+
+            let result = pl_ui_debug_eq_command(core::ptr::null_mut(), core::ptr::null(), 0);
+            assert_eq!(result.code, -1);
+
+            let result = pl_ui_debug_eq_command(ui, core::ptr::null(), 0);
+            assert_eq!(result.code, -1);
+
+            assert!(!pl_ui_debug_eq_status(core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut()));
 
             pl_ui_destroy(ui);
         }
