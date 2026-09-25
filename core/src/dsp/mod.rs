@@ -22,6 +22,7 @@
 
 pub mod coeffs;
 pub mod eqapo;
+pub mod import;
 pub mod preset;
 pub mod store;
 
@@ -33,5 +34,6 @@ pub use coeffs::{
     MAX_BOOST_HEADROOM_DB, MIN_BOOST_HEADROOM_DB,
 };
 pub use eqapo::{bw_oct_to_q, EqApoError, EqApoLineError, EqApoOverride, EqApoSession, ParsedDocument, ParsedFilter};
+pub use import::{import as import_preset, ImportError, ImportOutcome, MAX_PRESETS};
 pub use preset::{Band, BandKind, CrossfeedLevel, Preset, BLOB_LEN, MAX_BANDS, MAX_NAME_BYTES};
 pub use store::PresetStore;
