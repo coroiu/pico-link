@@ -761,9 +761,23 @@ typedef struct {
     // for the "clean minute" veto (design sec 2.3). Reset whenever
     // STREAM_STARTED, STREAM_ESTABLISHED, or a quality change fires (sec
     // 5.2) -- there is no carried-over controller state, ever.
+    //
+    // Bead pico-link-jphl: qfull_snapshot alone made the up-step a one-way
+    // door -- it was only ever refreshed when a step fired, so ONE
+    // queue-full after the last step blocked every future up-step until a
+    // down-step happened (which itself needs q_ema >= Q_HI). up_clean_since_us
+    // decouples this from step timing: it is the wall-clock start of the
+    // current run of ticks with no NEW queue-full, and is restarted (to
+    // "now") on EVERY tick where stop_queue_full has moved since the
+    // snapshot -- not just at a step. The up-step then reads UP_DWELL off
+    // this clock instead of abr_last_step_us, so a link that goes clean
+    // again keeps counting down to an up-step instead of being vetoed
+    // forever. Down-step's SETTLE gate is untouched -- it still reads
+    // abr_last_step_us exclusively.
     int32_t abr_q_ema;
     uint64_t abr_last_step_us;
     uint32_t abr_qfull_snapshot;
+    uint64_t abr_up_clean_since_us;
 
     // Bead pico-link-quzf: the resync trim's DECIDE/COMPLETE-side sequence
     // cursor -- core0-private, written ONLY by pl_a2dp_resync_complete()
@@ -2723,6 +2737,16 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
         uint32_t tx_count_now = pl_a2dp_tx_count();
         s_ctx.abr_q_ema += (((int32_t)tx_count_now * 256) - s_ctx.abr_q_ema) >> 4;
 
+        // Bead pico-link-jphl: any NEW queue-full since the snapshot
+        // restarts the up-dwell clean-window clock, independent of
+        // whether a step is about to fire this tick. This is what makes
+        // the up-step reachable again after a queue-full that isn't
+        // immediately followed by a down-step.
+        if (s_ctx.stop_queue_full != s_ctx.abr_qfull_snapshot) {
+            s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
+            s_ctx.abr_up_clean_since_us = pbv_now_us;
+        }
+
         int32_t applied_rung = pl_codec_ldac_applied_rung();
         bool past_settle = (pbv_now_us - s_ctx.abr_last_step_us) > PL_LDAC_ABR_SETTLE_US;
 
@@ -2737,17 +2761,21 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
             // that no longer exists.
             s_ctx.abr_q_ema = (int32_t)tx_count_now * 256;
             s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
+            s_ctx.abr_up_clean_since_us = pbv_now_us;
         } else if (s_ctx.abr_q_ema <= PL_LDAC_ABR_Q_LO && applied_rung > 0 &&
-                   (pbv_now_us - s_ctx.abr_last_step_us) > PL_LDAC_ABR_UP_DWELL_US &&
-                   s_ctx.stop_queue_full == s_ctx.abr_qfull_snapshot) {
+                   (pbv_now_us - s_ctx.abr_up_clean_since_us) > PL_LDAC_ABR_UP_DWELL_US) {
             // Step up (toward quality): design sec 3.2 -- gated on a
             // provably clean dwell window (sec 2.3's veto: the rail
             // tripwire must not have fired even once across the ENTIRE
-            // up-dwell, not just "recently").
+            // up-dwell, not just "recently"). pico-link-jphl: that window
+            // is now measured from the last queue-full (abr_up_clean_
+            // since_us), not from the last step -- see that field's doc
+            // comment.
             pl_codec_ldac_request_rung(applied_rung - 1);
             s_ctx.abr_last_step_us = pbv_now_us;
             s_ctx.abr_q_ema = (int32_t)tx_count_now * 256;
             s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
+            s_ctx.abr_up_clean_since_us = pbv_now_us;
         }
     }
     // NO pl_log anywhere in this block -- same IRQ-context contract as the
@@ -3724,6 +3752,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.abr_q_ema = 0;
             s_ctx.abr_last_step_us = 0;
             s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
+            s_ctx.abr_up_clean_since_us = 0;
             // Bead pico-link-pbv round 2 (C2-3): round 1's trim-to-target
             // here is DELETED -- it discarded exactly the cushion that
             // keeps one late tick from reaching zero (PRIMING now waits
