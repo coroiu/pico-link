@@ -31,7 +31,16 @@
 #include <stdio.h>
 
 // --- Copied from codec_ldac.h / codec_ldac.c ---
-#define PL_LDAC_ADAPTIVE_LADDER_RUNGS 5
+// Bead pico-link-d42g: 5 -> 9, the physical ladder (design sec 3). The
+// runtime Adaptive floor (how far down the decide phase and the apply
+// clamp are actually allowed to go) is a SEPARATE model field,
+// model_abr_t::floor_rung, default PL_LDAC_FLOOR_RUNG_DEFAULT below --
+// mirrors codec_ldac.c's s_ldac_floor_rung / pl_codec_ldac_floor_rung.
+#define PL_LDAC_ADAPTIVE_LADDER_RUNGS 9
+// Bead pico-link-d42g: codec_ldac.c's s_ldac_floor_rung default (330kbps,
+// rung 4) -- identical to the pre-d42g physical ceiling, so every test
+// below that never touches floor_rung sees unchanged behaviour.
+#define PL_LDAC_FLOOR_RUNG_DEFAULT 4
 
 // --- Copied from a2dp.c's ABR constants ---
 #define PL_LDAC_ABR_Q_HI (4 * 256)
@@ -59,6 +68,11 @@ typedef struct {
     uint64_t up_clean_since_us;
     int32_t applied_rung;
     int32_t target_rung;
+    // Bead pico-link-d42g (design sec 4): mirrors codec_ldac.c's
+    // s_ldac_floor_rung -- the configured Adaptive cap, separate from the
+    // physical PL_LDAC_ADAPTIVE_LADDER_RUNGS ceiling above.
+    int32_t floor_rung;
+    uint32_t floor_hits;
     // Test-only failure injection for the APPLY phase. 0 == success,
     // nonzero == ldacBT_alter_eqmid_priority failed. Code review,
     // 2026-09-07: the real function's every reachable failure path
@@ -83,6 +97,8 @@ static void model_abr_reset(model_abr_t *c, uint32_t stop_queue_full_now) {
     c->up_clean_since_us = 0;
     c->applied_rung = 0;
     c->target_rung = 0;
+    c->floor_rung = PL_LDAC_FLOOR_RUNG_DEFAULT;
+    c->floor_hits = 0;
     c->inject_apply_status = 0;
     c->steps_down = 0;
     c->steps_up = 0;
@@ -107,12 +123,22 @@ static void model_decide(model_abr_t *c, uint32_t tx_count_now, uint64_t now_us,
 
     bool past_settle = (now_us - c->last_step_us) > PL_LDAC_ABR_SETTLE_US;
 
-    if (c->q_ema >= PL_LDAC_ABR_Q_HI && past_settle && c->applied_rung < PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) {
+    if (c->q_ema >= PL_LDAC_ABR_Q_HI && past_settle && c->applied_rung < c->floor_rung) {
+        // Bead pico-link-d42g: the cap is now the configured floor, not
+        // the physical ladder ceiling (design sec 4). The physical rail
+        // stays enforced independently in model_apply's at_rail check.
         c->target_rung = c->applied_rung + 1;
         c->last_step_us = now_us;
         c->q_ema = (int32_t)tx_count_now * 256;
         c->qfull_snapshot = stop_queue_full_now;
         c->up_clean_since_us = now_us;
+    } else if (c->q_ema >= PL_LDAC_ABR_Q_HI && past_settle && c->applied_rung >= c->floor_rung) {
+        // Bead pico-link-d42g: congested AND already at (or past) the
+        // floor -- this bead's own trigger observable. Rate-limited to
+        // once per SETTLE like a real step; NO q_ema reseed (design sec
+        // 4: there was no step, so the EMA isn't stale).
+        c->floor_hits++;
+        c->last_step_us = now_us;
     } else if (c->q_ema <= PL_LDAC_ABR_Q_LO && c->applied_rung > 0 &&
                (now_us - c->up_clean_since_us) > PL_LDAC_ABR_UP_DWELL_US) {
         c->target_rung = c->applied_rung - 1;
@@ -135,6 +161,14 @@ static void model_decide(model_abr_t *c, uint32_t tx_count_now, uint64_t now_us,
 // return (0 == success).
 static void model_apply(model_abr_t *c) {
     int32_t target = c->target_rung;
+    // Bead pico-link-d42g (design sec 4): THE single enforcement point --
+    // re-derived from floor_rung on every call, race-safe against any
+    // write order between model_decide (writes target_rung) and a
+    // hypothetical concurrent floor change (writes floor_rung), exactly
+    // like codec_ldac.c's real apply_pending_tuning.
+    if (target > c->floor_rung) {
+        target = c->floor_rung;
+    }
     if (target == c->applied_rung) {
         return;
     }
@@ -379,13 +413,23 @@ int main(void) {
         );
     }
 
-    // --- (e) never advances the rung counter past a rail, and a rail hit
-    // while the walk is at the boundary is counted, not silently ignored
-    // or mistaken for a fault. ---
+    // --- (e) never advances the rung counter past the PHYSICAL rail, and
+    // a rail hit while the walk is at the boundary is counted, not
+    // silently ignored or mistaken for a fault. Bead pico-link-d42g: this
+    // isolates the physical-rail check from the new configured floor by
+    // setting floor_rung to the rail itself -- a real Adaptive stream
+    // could never reach rung 8 with the default floor (rung 4), but the
+    // apply phase's at_rail safety net must hold regardless of what the
+    // floor is configured to. ---
     {
         model_abr_t c;
         model_abr_reset(&c, 0);
-        c.applied_rung = PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1; // already at the floor (MQ)
+        // A floor this deep is never valid in the real system (the wire
+        // mapping only ever produces rung 4/6/8) -- set intentionally
+        // beyond the physical rail so the floor clamp itself never fires,
+        // isolating model_apply's independent at_rail safety net.
+        c.floor_rung = PL_LDAC_ADAPTIVE_LADDER_RUNGS + 100;
+        c.applied_rung = PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1; // already at the physical rail (Q5)
         c.target_rung = PL_LDAC_ADAPTIVE_LADDER_RUNGS;      // would-be request past the ceiling
         // model_apply's own at_rail check catches this before ever calling
         // the (stubbed) library, regardless of target -- request_rung's
@@ -396,7 +440,57 @@ int main(void) {
         assert(c.applied_rung == PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1);
         assert(c.rail_hits == 1);
         assert(c.steps_down == 0);
-        printf("ok:   apply phase refuses to advance past the floor rail, counts it instead\n");
+        printf("ok:   apply phase refuses to advance past the physical rail, counts it instead\n");
+    }
+
+    // --- (e-1) the configured floor caps the down-step BEFORE the
+    // physical rail is ever reached, and floor_hits (not rail_hits) counts
+    // the "congested, already at the floor" case -- this bead's own
+    // trigger observable (design sec 4). ---
+    {
+        model_abr_t c;
+        model_abr_reset(&c, 0);
+        c.floor_rung = 6; // 246kbps
+        uint64_t now = 10ULL * PL_LDAC_ABR_SETTLE_US;
+        // Drive sustained congestion long enough to step down to the
+        // floor (6 steps, each gated >= 1 SETTLE apart) and then keep
+        // pressing past SETTLE so at least one floor_hit fires too.
+        for (int i = 0; i < 800; i++) {
+            now += 10000;
+            model_decide(&c, 7, now, 0); // pinned congested
+            model_apply(&c);
+        }
+        assert(c.applied_rung == 6); // stopped AT the configured floor
+        assert(c.steps_down == 6);   // walked one rung at a time from 0
+        assert(c.rail_hits == 0);    // never reached the physical rail (8)
+        assert(c.floor_hits > 0);    // congestion kept firing at the floor
+        printf("ok:   configured floor (6) caps the down-step before the physical rail (8), "
+               "floor_hits fires instead of rail_hits\n");
+    }
+
+    // --- (e-2) raising the floor mid-stream (a user picking a HIGHER
+    // minimum, e.g. 330kbps after having been at 198kbps) walks the
+    // applied rung back UP to the new floor via model_apply's clamp
+    // alone -- even with target_rung left untouched at the old, deeper
+    // value, proving the apply-phase clamp is the single point that is
+    // actually race-safe (design sec 4's mid-stream behaviour table). ---
+    {
+        model_abr_t c;
+        model_abr_reset(&c, 0);
+        c.applied_rung = 8;
+        c.target_rung = 8; // converged at the old, deeper floor (198kbps)
+        c.floor_rung = 4;  // user raises the floor back to 330kbps
+        // target_rung is deliberately left at 8 -- the clamp inside
+        // model_apply must pull the EFFECTIVE target in on every call
+        // regardless, exactly like codec_ldac.c's real single enforcement
+        // point.
+        for (int i = 0; i < 4; i++) {
+            model_apply(&c);
+        }
+        assert(c.applied_rung == 4);
+        assert(c.steps_up == 4);
+        printf("ok:   raising the floor mid-stream walks the applied rung back up to it, one step "
+               "per apply() call, even with target_rung left stale\n");
     }
 
     // --- (f) requested vs applied stay distinct until the walk catches

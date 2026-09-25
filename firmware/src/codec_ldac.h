@@ -49,12 +49,20 @@ typedef struct {
 // which a file-scope array in codec_ldac.c does by construction.
 extern const uint8_t pl_codec_ldac_negotiated_info[8];
 
-// The ladder's rung count (design sec 0.1: 5 rungs -- HQ, two unnameable
-// internal rungs, SQ... wait see that section's table for the real order:
-// 990/660/492/396/330 kbps). Exposed so a2dp.c's controller (the DECIDE
+// The ladder's rung count -- the PHYSICAL ladder libldac's own EQMID table
+// offers at 48kHz (design sec 0.1, bead pico-link-d42g's Q5 rail): HQ(0)
+// 990, SQ(1) 660, Q0(2) 492, Q1(3) 396, MQ(4) 330, Q2(5) 282, Q3(6) 246,
+// Q4(7) 216, Q5(8) 198 kbps. Exposed so a2dp.c's controller (the DECIDE
 // phase) can bound its own rung arithmetic without duplicating the
 // literal -- codec_ldac.c is still the only place that walks the ladder.
-#define PL_LDAC_ADAPTIVE_LADDER_RUNGS 5
+// Rungs 0..4 are unchanged from before bead pico-link-d42g (pins,
+// pl_ldac_quality_to_rung and the init seed still land only on 0/1/4);
+// rungs 5..8 exist only for Adaptive (and the LDAC RUNG debug pin) to
+// reach. The runtime FLOOR -- how far down Adaptive is currently allowed
+// to step -- is a SEPARATE value, see pl_codec_ldac_set_floor/
+// pl_codec_ldac_floor_rung below; this constant is the hard physical
+// rail, never the user-facing minimum.
+#define PL_LDAC_ADAPTIVE_LADDER_RUNGS 9
 
 // --- Bead pico-link-7jol.3: the LDAC ABR ladder and the pinned-quality
 // setting. See .planning/design/2026-09-07-ldac-abr-control-loop.md,
@@ -119,6 +127,39 @@ uint32_t pl_codec_ldac_abr_apply_fail(void);
 // wherever the ladder currently sits (no jump) so a2dp.c's decide loop
 // picks up from there on its next cycle.
 void pl_codec_ldac_pin_now(uint8_t ldac_quality_1based);
+
+// Bead pico-link-d42g (design .planning/design/2026-09-25-adaptive-floor.md
+// sec 4): the global, persisted cap on how far down the ladder Adaptive is
+// allowed to step (toward robustness). `floor_wire` is persist.h's stored
+// ABR-floor byte, NOT a rung -- 0 (unset) and 1 both mean 330kbps, 2 =
+// 246kbps, 3 = 198kbps, anything else = 330kbps (same "wire enum
+// independent of the ladder" convention as pl_codec_ldac_set_quality's
+// ldac_quality byte). Callable from any context -- only touches this
+// file's own volatile ladder state, same class as pl_codec_ldac_pin_now.
+// Applies live: if Adaptive and the current target already exceeds the
+// new floor, the target is pulled in immediately (grants an up-walk on
+// the very next apply, no reconnect). The SINGLE enforcement point that
+// also covers races against the decide phase's own writes is
+// pl_codec_ldac_apply_pending_tuning's clamp (codec_ldac.c) -- this
+// function's own immediate pull-in is a convenience, not the safety net.
+void pl_codec_ldac_set_floor(uint8_t floor_wire);
+
+// The rung Adaptive is currently capped at (default rung 4 == 330kbps, so
+// behaviour is identical to every stream before this bead until a floor is
+// explicitly set). a2dp.c's decide phase reads this to cap its own
+// down-step request and to detect "at the floor and still congested"
+// (abr_floor_hits), exactly the way PL_LDAC_ADAPTIVE_LADDER_RUNGS bounds
+// the physical ladder.
+int32_t pl_codec_ldac_floor_rung(void);
+
+// PL_DEBUG_REMOTE-only debug pin: forces the live encoder to a SPECIFIC
+// rung 0..PL_LDAC_ADAPTIVE_LADDER_RUNGS-1, bypassing the persisted
+// ldac_quality mapping entirely (pl_codec_ldac_pin_now only ever reaches
+// rungs 0/1/4). Lets a by-ear test reach 246/198 kbps directly without
+// having to manufacture real queue congestion. No-op if no LDAC encoder is
+// live, same defensive contract as pl_codec_ldac_pin_now. Clamped
+// internally to the valid rung range.
+void pl_codec_ldac_debug_pin_rung(int32_t rung);
 
 // The live encoder's current effective bitrate, in kbps, or 0 if no LDAC
 // encoder is live. Updated only from encoder context (init(), and

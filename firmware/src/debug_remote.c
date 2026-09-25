@@ -24,6 +24,7 @@
 
 #include "a2dp.h"
 #include "bt.h"
+#include "codec_ldac.h"
 #include "media_keys.h"
 #include "pl_prio.h"
 #include "usb_audio.h"
@@ -488,6 +489,45 @@ size_t pl_debug_remote_poll(PlIntent *out, size_t max) {
                             "debug-remote: TRIM POLICY %ld %ld -> hold_ms=%lu hard_band_ms=%lu (clamped)\r\n", hold_ms,
                             hard_band_ms, (unsigned long)applied_hold_ms, (unsigned long)applied_hard_band_ms
                         );
+                    }
+                } else if (strncmp(s_line, "ABR FLOOR", 9) == 0) {
+                    // Bead pico-link-d42g (design .planning/design/
+                    // 2026-09-25-adaptive-floor.md sec 4): drives the SAME
+                    // wire encoding SET_ABR_FLOOR/PL:S:2 use (0/unset and
+                    // 1 both mean 330kbps, 2 = 246kbps, 3 = 198kbps, other
+                    // = 330kbps) straight into codec_ldac.c's live floor --
+                    // no persistence, no FFI round-trip, so F2's by-ear
+                    // round can retune mid-stream without a reflash.
+                    const char *arg = s_line + 9;
+                    long n = (*arg == ' ') ? strtol(arg + 1, NULL, 10) : -1;
+                    if (n < 0 || n > 3) {
+                        pl_log("debug-remote: ABR FLOOR requires 0..3, got \"%s\"\r\n", s_line + 10);
+                    } else {
+                        pl_codec_ldac_set_floor((uint8_t)n);
+                        pl_log(
+                            "debug-remote: ABR FLOOR %ld -> floor_rung=%ld\r\n", n, (long)pl_codec_ldac_floor_rung()
+                        );
+                    }
+                } else if (strncmp(s_line, "LDAC RUNG", 9) == 0) {
+                    // Bead pico-link-d42g, design sec "Debug": a debug PIN
+                    // to any rung 0..8 (not just the three named EQMIDs
+                    // pl_codec_ldac_pin_now's persisted-quality path
+                    // reaches) -- lets the by-ear round hear 246/198
+                    // directly, without having to manufacture real queue
+                    // congestion to walk ABR down there. Goes through the
+                    // same live-apply path as a manual quality pin:
+                    // s_ldac_adaptive false, target = n, walked one step
+                    // per fill() call.
+                    const char *arg = s_line + 9;
+                    long n = (*arg == ' ') ? strtol(arg + 1, NULL, 10) : -1;
+                    if (n < 0 || n > PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) {
+                        pl_log(
+                            "debug-remote: LDAC RUNG requires 0..%d, got \"%s\"\r\n", PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1,
+                            s_line + 10
+                        );
+                    } else {
+                        pl_codec_ldac_debug_pin_rung((int32_t)n);
+                        pl_log("debug-remote: LDAC RUNG %ld -> requested\r\n", n);
                     }
                 } else if (emitted < max) {
                     PlIntent intent;

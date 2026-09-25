@@ -30,13 +30,20 @@ extern "C" {
 /* Function declaration */
 #define DECLFUNC static
 
-/* Limit for alter EQMID process */
-#define LDACBT_LIMIT_ALTER_EQMID_PRIORITY LDACBT_EQMID_MQ
-
-
 #include "ldaclib.h"
 #include "ldacBT.h"
 #include "ldacBT_ex.h"
+
+/* Limit for alter EQMID process.
+ *
+ * Local patch (bead pico-link-d42g, 2026-09-25): raised from LDACBT_EQMID_MQ
+ * to LDACBT_EQMID_Q5 so ldacBT_get_altered_eqmid() (the only user, in
+ * ldacBT_internal.c) can step ABR all the way down to Q5. This is the
+ * library's own independent rail behind our codec_ldac.c floor clamp;
+ * ldacBT_set_eqmid()/ldacBT_assert_eqmid() are untouched and still refuse
+ * HQ/SQ/MQ-only pins. Moved below the ldacBT_ex.h include so
+ * LDACBT_EQMID_Q5 is defined at the use site. */
+#define LDACBT_LIMIT_ALTER_EQMID_PRIORITY LDACBT_EQMID_Q5
 
 /* macro value */
 /* The size of LDAC transport header. Unit:Byte. */

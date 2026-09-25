@@ -808,6 +808,13 @@ typedef struct {
     uint64_t abr_last_step_us;
     uint32_t abr_qfull_snapshot;
     uint64_t abr_up_clean_since_us;
+    // Bead pico-link-d42g (design sec 4): a LIFETIME counter (never reset
+    // by init(), same convention as codec_ldac.c's s_ldac_abr_rail_hits --
+    // this is the decide-side equivalent: "sitting at the configured floor
+    // and STILL congested", which is exactly this bead's own trigger for
+    // needing a floor at all). Rate-limited to once per SETTLE window by
+    // reusing abr_last_step_us, same as a real step.
+    uint32_t abr_floor_hits;
 
     // Bead pico-link-quzf: the resync trim's DECIDE/COMPLETE-side sequence
     // cursor -- core0-private, written ONLY by pl_a2dp_resync_complete()
@@ -2838,8 +2845,12 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
         int32_t applied_rung = pl_codec_ldac_applied_rung();
         bool past_settle = (pbv_now_us - s_ctx.abr_last_step_us) > PL_LDAC_ABR_SETTLE_US;
 
-        if (s_ctx.abr_q_ema >= PL_LDAC_ABR_Q_HI && past_settle && applied_rung < PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) {
-            // Step down (toward robustness): design sec 3.2.
+        if (s_ctx.abr_q_ema >= PL_LDAC_ABR_Q_HI && past_settle && applied_rung < pl_codec_ldac_floor_rung()) {
+            // Step down (toward robustness): design sec 3.2. Bead
+            // pico-link-d42g: the cap moved from the physical ladder rail
+            // (PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) to the configured
+            // Adaptive floor -- codec_ldac.c's apply-phase clamp is the
+            // second, independent enforcement point (design sec 4).
             pl_codec_ldac_request_rung(applied_rung + 1);
             s_ctx.abr_last_step_us = pbv_now_us;
             // Reseed LAST, from the post-decision reading -- fhf's
@@ -2850,6 +2861,15 @@ static void pl_a2dp_media_timer_handler(btstack_timer_source_t *ts) {
             s_ctx.abr_q_ema = (int32_t)tx_count_now * 256;
             s_ctx.abr_qfull_snapshot = s_ctx.stop_queue_full;
             s_ctx.abr_up_clean_since_us = pbv_now_us;
+        } else if (s_ctx.abr_q_ema >= PL_LDAC_ABR_Q_HI && past_settle && applied_rung >= pl_codec_ldac_floor_rung()) {
+            // Bead pico-link-d42g (design sec 4): congested AND already at
+            // (or somehow past) the configured floor -- this counter
+            // directly measures this bead's own trigger condition. Rate-
+            // limited to once per SETTLE, exactly like a real step, and
+            // with NO q_ema reseed (design sec 4: "no q_ema reseed") --
+            // there was no step, so the EMA is not stale.
+            s_ctx.abr_floor_hits++;
+            s_ctx.abr_last_step_us = pbv_now_us;
         } else if (s_ctx.abr_q_ema <= PL_LDAC_ABR_Q_LO && applied_rung > 0 &&
                    (pbv_now_us - s_ctx.abr_up_clean_since_us) > PL_LDAC_ABR_UP_DWELL_US) {
             // Step up (toward quality): design sec 3.2 -- gated on a
@@ -4442,14 +4462,22 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // (s_ctx.frame.nominal_bitrate_bps) is the static negotiated value,
     // not live; this field is the one to read when measuring ABR/pinned
     // rungs by ear against the console.
+    // Bead pico-link-d42g (design sec 4): abr_floor_rung is the configured
+    // cap (pl_codec_ldac_floor_rung, default 4/330kbps); abr_floor_hits is
+    // this bead's own trigger observable -- "sitting at the floor and
+    // still congested" -- distinct from abr_rail_hits (the PHYSICAL ladder
+    // rail, rung 8, which the floor now sits in front of for every value
+    // below 198kbps).
     pl_log(
         "a2dp: abr_adaptive=%d quality_requested=%ld quality_applied=%ld abr_steps_down=%lu abr_steps_up=%lu "
-        "abr_rail_hits=%lu abr_apply_fail=%lu abr_q_ema=%ld.%02ld live_kbps=%lu\r\n",
+        "abr_rail_hits=%lu abr_apply_fail=%lu abr_q_ema=%ld.%02ld live_kbps=%lu abr_floor_rung=%ld "
+        "abr_floor_hits=%lu\r\n",
         (int)pl_codec_ldac_is_adaptive(), (long)pl_codec_ldac_requested_rung(), (long)pl_codec_ldac_applied_rung(),
         (unsigned long)pl_codec_ldac_abr_steps_down(), (unsigned long)pl_codec_ldac_abr_steps_up(),
         (unsigned long)pl_codec_ldac_abr_rail_hits(), (unsigned long)pl_codec_ldac_abr_apply_fail(),
         (long)(s_ctx.abr_q_ema >> 8), (long)(((s_ctx.abr_q_ema & 0xFF) * 100) >> 8),
-        (unsigned long)pl_codec_ldac_current_kbps()
+        (unsigned long)pl_codec_ldac_current_kbps(), (long)pl_codec_ldac_floor_rung(),
+        (unsigned long)s_ctx.abr_floor_hits
     );
     // Bead pico-link-pbv round 2 (C2-2), retuned by pico-link-85v: stop-
     // reason breakdown for pl_a2dp_fill's loop. stop_dwell must read 0 in

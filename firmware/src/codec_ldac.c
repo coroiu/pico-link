@@ -89,6 +89,15 @@ _Static_assert(sizeof(pl_codec_ldac_negotiated_info) == 8, "LDAC negotiated medi
 // this bead's completion comment).
 #define PL_LDAC_INIT_MTU 679
 
+// Bead pico-link-d42g (design sec 0/3): libldac's own per-packet transport
+// header size, subtracted from PL_LDAC_INIT_MTU to get the real payload
+// budget (ldacBT_api.c's tx.tx_size = mtu - pkt_hdr_sz) that
+// nfrm_in_pkt = tx_size / frmlen_tx packs frames into -- same convention
+// as PL_LDAC_INIT_MTU just above: restated locally, cited by name and
+// value, not re-included from the internal header (firmware/vendor/
+// libldac/src/ldacBT_internal.h:61, LDACBT_TX_HEADER_SIZE, currently 18).
+#define PL_LDAC_TX_HEADER_SIZE 18
+
 // The encoder instance -- statically allocated, never malloc'd as a
 // pl_ldac_encoder_t (design sec 5); the libldac HANDLE_LDAC_BT it owns IS
 // heap-allocated, but exactly once, lazily, the first time init() ever
@@ -152,6 +161,15 @@ static uint32_t s_ldac_abr_steps_down = 0;
 static uint32_t s_ldac_abr_steps_up = 0;
 static uint32_t s_ldac_abr_rail_hits = 0;
 static uint32_t s_ldac_abr_apply_fail = 0;
+
+// Bead pico-link-d42g (design sec 4): the global Adaptive floor, in rungs.
+// Default rung 4 (330kbps, same as today's physical rail before this
+// bead) means behaviour is IDENTICAL until a floor is explicitly set --
+// pl_codec_ldac_set_floor is the only writer, from any context (same
+// cross-context class as s_ldac_adaptive/s_ldac_target_rung). NOT reset
+// by init() -- this is a global, persisted-across-reconnects setting
+// (design sec 1/2), unlike the per-stream controller state above it.
+static volatile int32_t s_ldac_floor_rung = 4;
 
 // Andreas's ruling 2026-09-07 (design sec 5): a manual quality pick PINS
 // the EQMID; the controller is only ever constructed for ldac_quality ==
@@ -236,6 +254,25 @@ static void pl_codec_ldac_apply_pending_tuning(void *state) {
         return;
     }
     int32_t target = s_ldac_target_rung; // single volatile read
+    // Bead pico-link-d42g (design sec 4): THE single enforcement point for
+    // the Adaptive floor. Clamp here even though pl_codec_ldac_set_floor
+    // already tries to pull the target in on its own write -- this
+    // function is the sole reader AND writer of every other piece of
+    // ladder state (this file's own module doc above), so re-deriving the
+    // clamp from s_ldac_floor_rung right here, on every apply call, is
+    // race-safe in ANY write order between the decide phase (writes
+    // s_ldac_target_rung) and pl_codec_ldac_set_floor (writes
+    // s_ldac_floor_rung, possibly from a different context): whichever
+    // wrote last, the encoder never applies a rung past the floor, and
+    // walks back up (fewer steps down than requested, or steps up) if it
+    // is already beyond it. Non-Adaptive streams are untouched (a pin's
+    // target is exempt by design -- floors only cap Adaptive).
+    if (s_ldac_adaptive) {
+        int32_t floor_rung = s_ldac_floor_rung;
+        if (target > floor_rung) {
+            target = floor_rung;
+        }
+    }
     if (target == s_ldac_applied_rung) {
         return;
     }
@@ -321,6 +358,59 @@ static int32_t pl_ldac_quality_to_rung(uint8_t ldac_quality_1based) {
         default:
             return 0;
     }
+}
+
+// Bead pico-link-d42g (design sec 2/4): maps the PERSISTED wire byte
+// (persist.h's abr_floor -- 0 unset, 1/2/3 = 330/246/198 kbps) to the
+// ladder rung it caps at. Kept beside pl_ldac_quality_to_rung so the two
+// "wire byte -> rung" mappings in this file can never drift independently
+// (same "one function" discipline design sec 5.4 already applies to the
+// quality mapping). Design sec 0: 330=rung4, 246=rung6, 198=rung8.
+static int32_t pl_ldac_floor_wire_to_rung(uint8_t floor_wire) {
+    switch (floor_wire) {
+        case 2: // 246 kbps
+            return 6;
+        case 3: // 198 kbps
+            return 8;
+        case 0: // unset -- same default as wire value 1
+        case 1: // 330 kbps
+        default:
+            return 4;
+    }
+}
+
+void pl_codec_ldac_set_floor(uint8_t floor_wire) {
+    int32_t rung = pl_ldac_floor_wire_to_rung(floor_wire);
+    s_ldac_floor_rung = rung;
+    // Bead pico-link-d42g: grants permission immediately -- if the current
+    // target already sits past the new (tighter) floor, pull it in right
+    // now rather than waiting for the next decide-phase write. This is a
+    // convenience only; pl_codec_ldac_apply_pending_tuning's own clamp is
+    // the single point that is actually race-safe against a concurrent
+    // decide-phase write (design sec 4).
+    if (s_ldac_adaptive && s_ldac_target_rung > rung) {
+        s_ldac_target_rung = rung;
+    }
+}
+
+int32_t pl_codec_ldac_floor_rung(void) { return s_ldac_floor_rung; }
+
+// Bead pico-link-d42g, PL_DEBUG_REMOTE-only "LDAC RUNG n" command: same
+// live-apply mechanics as pl_codec_ldac_pin_now's fixed-quality branch
+// (adaptive = false, one-time target write, walked by
+// pl_codec_ldac_apply_pending_tuning), but takes a raw rung directly so
+// the by-ear round can reach 246/198 kbps without real queue congestion.
+void pl_codec_ldac_debug_pin_rung(int32_t rung) {
+    if (s_ldac_encoder.handle == NULL) {
+        return; // no live LDAC stream to apply to right now
+    }
+    if (rung < 0) {
+        rung = 0;
+    } else if (rung > PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1) {
+        rung = PL_LDAC_ADAPTIVE_LADDER_RUNGS - 1;
+    }
+    s_ldac_adaptive = false;
+    s_ldac_target_rung = rung;
 }
 
 void pl_codec_ldac_pin_now(uint8_t ldac_quality_1based) {
@@ -529,19 +619,35 @@ static bool pl_codec_ldac_init(
         // MQ's bitrate is a fixed ladder fact (design sec 0.1's table),
         // not something to ask the library for mid-negotiation (no handle
         // is at MQ yet to ask).
-        uint32_t worst_case_kbps = s_ldac_adaptive ? 330u : (uint32_t)kbps;
+        // Bead pico-link-d42g (design sec 0/3): the OLD formula
+        // (679/(kbps/3+3)) double-counted LDAC's own 3-byte per-frame
+        // transport header AND used the raw MTU (679) instead of
+        // libldac's real payload budget, tx_size = mtu -
+        // LDACBT_TX_HEADER_SIZE (18) -- ldacBT_api.c's own
+        // nfrm_in_pkt = tx_size / frmlen_tx maths. The two formulas agree
+        // from HQ to MQ only by coincidence and diverge below it (Q3: 7
+        // vs the library's real 8; Q5: 9 vs 10) -- ASK THE LIBRARY'S OWN
+        // MATHS (pico-link-qx8's doctrine), never restate a table.
+        // Sized for Q5 (198 kbps), not a fixed 330u -- the connect-time
+        // priming cushion this hint feeds (a2dp.c's STREAM_ESTABLISHED
+        // handler, sec 4.3) is never recomputed mid-stream, so sizing for
+        // the worst case every Adaptive stream can now reach is what
+        // makes a LIVE floor change never need a re-prime. Pinned streams
+        // still size for their own fixed bitrate (floor==ceiling there).
+        uint32_t worst_case_kbps = s_ldac_adaptive ? 198u : (uint32_t)kbps;
         uint32_t bytes_per_frame = (worst_case_kbps * 1000u) / 3000u;
-        uint32_t frmlen_tx = bytes_per_frame + 3u;
-        uint32_t raw_frames_per_packet = frmlen_tx > 0 ? (uint32_t)PL_LDAC_INIT_MTU / frmlen_tx : 0u;
+        uint32_t raw_frames_per_packet =
+            bytes_per_frame > 0 ? (uint32_t)(PL_LDAC_INIT_MTU - PL_LDAC_TX_HEADER_SIZE) / bytes_per_frame
+                                 : (uint32_t)(PL_LDAC_INIT_MTU - PL_LDAC_TX_HEADER_SIZE);
         uint32_t clamped_frames_per_packet = raw_frames_per_packet < 2u   ? 2u
                                               : raw_frames_per_packet > 15u ? 15u
                                                                             : raw_frames_per_packet;
         out_frame->self_packetising_frames_per_packet = (uint16_t)clamped_frames_per_packet;
         pl_log(
             "ldac: self_packetising_frames_per_packet=%lu (worst_case_kbps=%lu bytes_per_frame=%lu "
-            "frmlen_tx=%lu mtu=%d adaptive=%d)\r\n",
+            "tx_size=%d mtu=%d adaptive=%d)\r\n",
             (unsigned long)clamped_frames_per_packet, (unsigned long)worst_case_kbps, (unsigned long)bytes_per_frame,
-            (unsigned long)frmlen_tx, PL_LDAC_INIT_MTU, (int)s_ldac_adaptive
+            PL_LDAC_INIT_MTU - PL_LDAC_TX_HEADER_SIZE, PL_LDAC_INIT_MTU, (int)s_ldac_adaptive
         );
     }
 
