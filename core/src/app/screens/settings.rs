@@ -208,12 +208,14 @@ fn screensaver_mode_options(current: DisplaySettings) -> (Vec<PickerOption>, Opt
             label: String::from(ScreensaverMode::Dim.label()),
             note: Some((String::from("stays readable"), palette::TEXT_SECONDARY)),
             selectable: true,
+            locked: false,
         },
         PickerOption {
             key: ListItemKey::from_u64(u64::from(ScreensaverMode::Off.to_wire())),
             label: String::from(ScreensaverMode::Off.label()),
             note: Some((String::from("saves power"), palette::TEXT_SECONDARY)),
             selectable: true,
+            locked: false,
         },
     ];
     let checked = Some(ListItemKey::from_u64(u64::from(current.mode.to_wire())));
@@ -226,7 +228,7 @@ fn screensaver_mode_options(current: DisplaySettings) -> (Vec<PickerOption>, Opt
 fn screensaver_timeout_options(current: DisplaySettings) -> (Vec<PickerOption>, Option<ListItemKey>) {
     let options: Vec<PickerOption> = ScreensaverTimeout::ALL
         .iter()
-        .map(|timeout| PickerOption { key: ListItemKey::from_u64(u64::from(timeout.as_secs())), label: String::from(timeout.label()), note: None, selectable: true })
+        .map(|timeout| PickerOption { key: ListItemKey::from_u64(u64::from(timeout.as_secs())), label: String::from(timeout.label()), note: None, selectable: true, locked: false })
         .collect();
     let checked = Some(ListItemKey::from_u64(u64::from(current.timeout.as_secs())));
     (options, checked)
@@ -246,12 +248,14 @@ fn cushion_options(current: CushionPolicy) -> (Vec<PickerOption>, Option<ListIte
             label: String::from(CushionPolicy::Low.label()),
             note: Some((String::from("for calls"), palette::TEXT_SECONDARY)),
             selectable: true,
+            locked: false,
         },
         PickerOption {
             key: ListItemKey::from_u64(u64::from(CushionPolicy::Stable.to_wire())),
             label: String::from(CushionPolicy::Stable.label()),
             note: Some((String::from("fewer skips"), palette::TEXT_SECONDARY)),
             selectable: true,
+            locked: false,
         },
     ];
     let checked = Some(ListItemKey::from_u64(u64::from(current.to_wire())));
@@ -270,6 +274,7 @@ fn abr_floor_options(current: AbrFloor) -> (Vec<PickerOption>, Option<ListItemKe
             label: String::from(floor.label()),
             note: Some((String::from(note), palette::TEXT_SECONDARY)),
             selectable: true,
+            locked: false,
         })
         .collect();
     let checked = Some(ListItemKey::from_u64(u64::from(current.to_wire())));

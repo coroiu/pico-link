@@ -290,6 +290,31 @@ pub mod icon {
     /// `icon_probe_znb12.png`.
     pub const HEADPHONES: char = '\u{B6}';
 
+    /// A closed-padlock glyph — bead `pico-link-ryw.12.4`: marks an
+    /// IMPORTED (locked) DSP effect in the effects list and the device
+    /// page's effect picker (Uma's design, `ryw12-3-ux.md` sec 1: "Marker
+    /// = small padlock glyph ... right after the name").
+    ///
+    /// A live `api.github.com`/`app.unpkg.com` query of
+    /// `iconic/open-iconic`'s `svg/` directory at the time this constant
+    /// was probed reported no `lock*.svg` file, but that was the query
+    /// TOOL truncating/hallucinating over the 223-entry response (caught
+    /// by a cross-check: it also claimed alphabetical position 51 was
+    /// `button-pause.svg`, when this module's own [`CHECK`] constant
+    /// already proves position 51 is `check.svg`). The reliable source
+    /// is `open-iconic.css`'s `content: '\eXXX'` codepoint table, which
+    /// does list `lock-locked`/`lock-unlocked` at suffixes `0x8a`/`0x8b`.
+    /// Cross-checked against this module's own already-shipped, eye-
+    /// confirmed [`HEADPHONES`] (css suffix `0x76` -> `0x40 + 0x76 ==
+    /// 0xB6`, exactly [`HEADPHONES`]'s value) before trusting the same
+    /// `codepoint = 0x40 + css_suffix` conversion for `lock-locked`'s
+    /// `0x8a` -> `0x40 + 0x8a == 0xCA`. Not yet independently confirmed
+    /// by eye in a rendered probe PNG the way [`HEADPHONES`]/the znb.12
+    /// batch were (no `icon_probe_ryw12.rs` was run) -- flagged for a
+    /// screenshot check in Tess's verification pass, not just a formula
+    /// derivation.
+    pub const LOCK: char = '\u{CA}';
+
     /// A checkmark glyph — e.g. the pairing wizard's success outcome.
     /// `check.svg` is alphabetical index 51 -> codepoint
     /// `0x40 + 51 = 0x73`. Confirmed by eye: a clean single checkmark

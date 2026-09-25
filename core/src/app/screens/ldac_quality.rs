@@ -90,6 +90,7 @@ fn ldac_quality_options(model: &BtModel, addr: DeviceAddr) -> (Vec<PickerOption>
             label: format!("{} kbps", rates[i]),
             note: Some((String::from(NOTES[i]), palette::TEXT_SECONDARY)),
             selectable: true,
+            locked: false,
         })
         .collect();
     // Adaptive's trailing note is live while streaming ("660 now",
@@ -103,6 +104,7 @@ fn ldac_quality_options(model: &BtModel, addr: DeviceAddr) -> (Vec<PickerOption>
         label: String::from("Adaptive"),
         note: Some((adaptive_note, palette::TEXT_SECONDARY)),
         selectable: true,
+        locked: false,
     });
 
     let checked = Some(ldac_quality_checked_key(device.ldac_quality));

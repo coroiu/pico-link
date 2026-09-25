@@ -118,6 +118,24 @@ impl App {
         self.navigator.scroll_top_at(1)
     }
 
+    /// Test-only: read-only access to the live DSP effects preset store --
+    /// bead `pico-link-ryw.12.4`'s import tests need to assert on
+    /// `Preset::eq_locked`/the imported preset's exact contents, which
+    /// nothing else on `App`'s public surface exposes directly.
+    #[cfg(test)]
+    pub(crate) fn presets_for_test(&self) -> Ref<'_, crate::dsp::PresetStore> {
+        self.presets.borrow()
+    }
+
+    /// Test-only: the DSP effects list's own selection index, if it's
+    /// currently on the navigator stack at index 1 (`Home(1)/Effects(2)`,
+    /// 0-indexed here) -- bead `pico-link-ryw.12.4`'s import-focus-follow
+    /// regression net, same shape as [`App::devices_selected_index_for_test`].
+    #[cfg(test)]
+    pub(crate) fn effects_list_selected_index_for_test(&self) -> Option<usize> {
+        self.navigator.selected_index_at(1)
+    }
+
     /// Test-only: the wizard scan list's own selection index, if the
     /// wizard is currently on the navigator stack at index 2 (Home(1)/
     /// Devices(2)/Wizard(3), 0-indexed here) -- the wizard's counterpart to

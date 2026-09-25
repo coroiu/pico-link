@@ -287,9 +287,19 @@ fn build_effect_picker_screen(
     let projection = move || {
         let model = model_for_projection.borrow();
         let presets = presets_for_projection.borrow();
-        let mut options = vec![PickerOption { key: EFFECT_PICKER_OFF_KEY, label: String::from("Off"), note: None, selectable: true }];
+        let mut options =
+            vec![PickerOption { key: EFFECT_PICKER_OFF_KEY, label: String::from("Off"), note: None, selectable: true, locked: false }];
         for (id, preset) in presets.iter() {
-            options.push(PickerOption { key: ListItemKey::from_u64(u64::from(id)), label: preset.name.clone(), note: None, selectable: true });
+            options.push(PickerOption {
+                key: ListItemKey::from_u64(u64::from(id)),
+                label: preset.name.clone(),
+                note: None,
+                selectable: true,
+                // Bead `pico-link-ryw.12.4`: the picker carries the same
+                // padlock as the effects list for an imported effect
+                // (Uma's design, `ryw12-3-ux.md` sec 1/5).
+                locked: preset.eq_locked,
+            });
         }
         let current_id = model.paired.iter().find(|d| d.addr == addr).map_or(NO_PRESET_ID, |d| d.preset_id);
         let checked = if presets.resolve(current_id).is_some() { ListItemKey::from_u64(u64::from(current_id)) } else { EFFECT_PICKER_OFF_KEY };
