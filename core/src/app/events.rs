@@ -213,6 +213,16 @@ pub enum Event {
     /// [`BtModel::discovering`] and none of the four connected-model fields
     /// [`App::set_link_state`] clears: an inquiry does not disconnect A2DP.
     DiscoveryStateChanged { scanning: bool },
+    /// A connect attempt has begun -- the THIRD, independent axis
+    /// [`LinkState`]'s doc comment describes (bead `pico-link-0cq2`). On
+    /// the wire this is the former `PL_LINK_STATE_CONNECTING` (value `2`),
+    /// decoded by `ui-ffi` into this variant instead of
+    /// `LinkStateChanged` -- no C ABI change, no wire byte change. Folded
+    /// by [`App::set_connecting`], which deliberately touches only
+    /// [`BtModel::connecting`] and none of the connected-model fields
+    /// [`App::set_link_state`] clears: an attempt targeting a second
+    /// device must not disturb an already-established link to a first.
+    ConnectAttemptStarted,
     DeviceDiscovered(DeviceEntry),
     DevicesCleared,
     ConnectFailed { addr: [u8; 6], reason: ConnectFailureReason },

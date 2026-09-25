@@ -198,16 +198,101 @@ fn an_unrelated_event_does_not_snap_a_scrolled_devices_list_back_to_the_top() {
 }
 
 
+// --- Bead pico-link-0cq2: `connecting` as a third, independent axis from
+// `link_state`, so a failed connect ATTEMPT at a second device no longer
+// wipes an already-established link to a first (the "NO LINK while the
+// old link is still up" bug). ---
+
+/// Test 1: THE REGRESSION ITSELF -- device A is connected and streaming;
+/// a connect attempt at device B begins and fails. A's connected model
+/// (link, addr, codec, `out_level`, `ldac_live_kbps`) must survive untouched,
+/// `connecting` must end false, and the failure/wizard must record B.
 #[test]
-fn connect_failed_event_updates_the_model_and_returns_the_link_to_idle() {
+fn failed_switch_keeps_established_link() {
     let mut app = App::new(240, 240);
-    app.set_link_state(LinkState::Connecting);
+    let addr_a = [1; 6];
+    let addr_b = [2; 6];
+
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    app.poll_command();
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_a, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+    app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
+    app.handle_event(Event::LdacBitrateChanged { kbps: 660 });
+
+    app.handle_event(Event::ConnectAttemptStarted);
+    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::RadioError });
+
+    assert_eq!(app.model().link_state, LinkState::Connected, "A's link must survive a failed attempt at B");
+    assert_eq!(app.model().connected_addr, Some(addr_a));
+    assert!(app.model().connected_codec.is_some(), "A's codec must survive");
+    assert!(app.model().out_level.is_some(), "A's out_level must survive");
+    assert_eq!(app.model().ldac_live_kbps, Some(660), "A's live bitrate must survive");
+    assert!(!app.model().connecting, "the attempt is over");
+    assert_eq!(app.model().last_connect_failure, Some((addr_b, ConnectFailureReason::RadioError)));
+    assert_eq!(app.wizard_phase_for_test(), WizardPhase::Failed { addr: addr_b, reason: ConnectFailureReason::RadioError });
+}
+
+/// Test 2: a connect attempt beginning, on its own, must not touch
+/// `link_state`/`connected_addr` -- and the Home glyph must read Live
+/// throughout (`Connected` always wins over `connecting`, same rule as
+/// `discovering`).
+#[test]
+fn attempt_does_not_touch_link() {
+    let mut app = App::new(240, 240);
+    let addr_a = [1; 6];
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    app.poll_command();
+
+    app.handle_event(Event::ConnectAttemptStarted);
+
+    assert_eq!(app.model().link_state, LinkState::Connected);
+    assert_eq!(app.model().connected_addr, Some(addr_a));
+    assert!(app.model().connecting);
+}
+
+/// Test 3: the (currently unreachable in firmware, but core-representable)
+/// switch-succeeds path -- A drops mid-attempt at B, then B's connect
+/// succeeds. `connecting` stays true across A's drop (the attempt is still
+/// live) and only clears once B's own outcome lands.
+#[test]
+fn switch_success_follows_new_device() {
+    let mut app = App::new(240, 240);
+    let addr_a = [1; 6];
+    let addr_b = [2; 6];
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    app.poll_command();
+
+    app.handle_event(Event::ConnectAttemptStarted);
+    app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+    assert_eq!(app.model().connected_addr, None, "A's link dropping must still clear A's connected fields");
+    assert!(app.model().connecting, "the attempt at B is still in flight, unaffected by A's drop");
+
+    app.handle_event(Event::ConnectSucceeded { addr: addr_b, degraded: false });
+    app.poll_command();
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_b, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+
+    assert_eq!(app.model().connected_addr, Some(addr_b));
+    assert!(!app.model().connecting);
+}
+
+/// Test 4: a connect attempt failing from a fully idle starting point
+/// (no prior link at all) behaves exactly as before -- stays Idle,
+/// `connecting` ends false.
+#[test]
+fn failure_from_idle_stays_idle() {
+    let mut app = App::new(240, 240);
     let addr = [9, 9, 9, 9, 9, 9];
 
+    app.handle_event(Event::ConnectAttemptStarted);
     app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink });
 
     assert_eq!(app.model().last_connect_failure, Some((addr, ConnectFailureReason::NoA2dpSink)));
     assert_eq!(app.model().link_state, LinkState::Idle);
+    assert!(!app.model().connecting);
 }
 
 #[test]

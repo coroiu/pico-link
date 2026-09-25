@@ -25,7 +25,7 @@
 use std::path::Path;
 
 use embedded_graphics::prelude::RgbColor;
-use pico_link_core::{App, ConnectedCodec, DeviceEntry, Event, LinkState, PairedDevice, VolumeSource};
+use pico_link_core::{App, ConnectFailureReason, ConnectedCodec, DeviceEntry, Event, LinkState, PairedDevice, VolumeSource};
 
 pub const ZOOM: u32 = 3;
 
@@ -34,7 +34,7 @@ pub const ZOOM: u32 = 3;
 /// the repo root. `05`-`08` are VT6 (bead pico-link-4v2.6, design
 /// `.planning/design/2026-09-07-volume-on-display.md`): the title-bar
 /// volume element and its exceptional-state banners.
-pub const FIXTURE_NAMES: [&str; 8] = [
+pub const FIXTURE_NAMES: [&str; 9] = [
     "01_no_link",
     "02_connected_ldac",
     "03_disconnected_after_ldac",
@@ -43,6 +43,7 @@ pub const FIXTURE_NAMES: [&str; 8] = [
     "06_volume_zero_banner",
     "07_muted_banner_host",
     "08_muted_with_out_level_still_swinging",
+    "09_failed_switch_keeps_established_link",
 ];
 
 pub fn save_zoomed_png(app: &mut App, out_dir: &Path, name: &str) {
@@ -172,4 +173,22 @@ pub fn generate(out_dir: &Path) {
     app.tick(1);
     app.handle_event(Event::LevelsChanged { peak_l: 90, peak_r: 45, rms_l: 26, rms_r: 40 });
     save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[7]);
+
+    // --- Bead pico-link-0cq2 (T6): device A is connected and streaming,
+    // then a connect ATTEMPT at device B begins and fails -- the hero must
+    // keep showing A's codec/name, never fall back to `NO LINK`. This is
+    // the exact regression: `record_connect_failure` used to force
+    // `link_state` to `Idle` unconditionally, wiping A's connected model
+    // out from under a link the radio never touched. ---
+    let mut app = App::new(240, 240);
+    let addr_a = [0xAA; 6];
+    let addr_b = [0xBB; 6];
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr: addr_a, name: String::from("Sony WH-1000XM5"), mru_seq: 1, ldac_quality: 0 }));
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    app.poll_command();
+    app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_a, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
+    app.handle_event(Event::ConnectAttemptStarted);
+    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::RadioError });
+    save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[8]);
 }

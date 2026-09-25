@@ -334,7 +334,23 @@ typedef struct {
     uint16_t a2dp_cid;
     uint8_t local_seid;
     uint8_t remote_seid;
-    bd_addr_t connect_addr; // for ConnectFailed's addr payload
+    // Bead pico-link-0cq2: split into the ATTEMPT (`pending_addr`) and the
+    // COMMITTED session (`connect_addr`) -- they used to be one field,
+    // written at the start of every establish_stream call, which meant a
+    // failed attempt at device B (while A's session was still live)
+    // clobbered `connect_addr` to B even though A's radio session was
+    // untouched: a later live LDAC-quality apply on A silently landed on
+    // B's `pl_a2dp_is_connected_ldac` check instead, and a codec
+    // renegotiation read B's address for what was actually A's stream.
+    // `pending_addr` is written by `pl_a2dp_establish_stream_now` and read
+    // by pre-signaling failure/retry paths; `connect_addr` is committed
+    // from it only at A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED
+    // success and is what every post-signaling path (codec
+    // configuration/renegotiation, AVRCP, live quality apply,
+    // post-signaling failure pushes) reads -- exactly the established
+    // session, never a still-in-flight attempt.
+    bd_addr_t pending_addr; // the in-flight connect attempt's target
+    bd_addr_t connect_addr; // the COMMITTED session's address, for ConnectFailed/CodecChanged's addr payload
 
     pl_codec_t *codec; // NULL until A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION
     pl_codec_format_t format;
@@ -3089,7 +3105,11 @@ static uint32_t pl_a2dp_failure_reason_for_status(uint8_t status) {
 static void pl_a2dp_establish_stream_now(const uint8_t *addr) {
     bd_addr_t local_addr;
     memcpy(local_addr, addr, 6);
-    memcpy(s_ctx.connect_addr, addr, 6);
+    // Bead pico-link-0cq2: writes `pending_addr` (the ATTEMPT), not
+    // `connect_addr` (the COMMITTED session) -- see `pl_a2dp_ctx_t`'s doc
+    // comment on both fields for why. `connect_addr` is committed from
+    // this only on a real SIGNALING_CONNECTION_ESTABLISHED success.
+    memcpy(s_ctx.pending_addr, addr, 6);
 
     // Bead pico-link-cz0.6 (M5 persistence), design point 4: "forced flush
     // ... BEFORE arming a stream" -- this is that call site. Runs in the
@@ -3128,7 +3148,10 @@ static void pl_a2dp_reconnect_retry_handler(btstack_timer_source_t *ts) {
     (void)ts;
     s_ctx.reconnect_retry_armed = false;
     pl_log("a2dp: 0x0b retry firing, reissuing establish_stream (single bounded retry)\r\n");
-    pl_a2dp_establish_stream_now(s_ctx.connect_addr);
+    // Bead pico-link-0cq2: reissues against the ATTEMPT's own address --
+    // `connect_addr` may by now hold a different, already-COMMITTED
+    // session's address (see `pl_a2dp_ctx_t`'s doc comment).
+    pl_a2dp_establish_stream_now(s_ctx.pending_addr);
 }
 
 // Bead pico-link-648: arms the one bounded retry. Marks
@@ -3212,12 +3235,18 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     pl_a2dp_reconnect_retry_arm(status);
                     break;
                 }
-                pl_bt_push_connect_failed(s_ctx.connect_addr, pl_a2dp_failure_reason_for_status(status));
+                // Bead pico-link-0cq2: reports failure against the
+                // ATTEMPT's own address, and -- critically -- does NOT
+                // touch `s_ctx.connect_addr`: at this point signaling
+                // never succeeded, so any already-COMMITTED session
+                // (e.g. device A, mid-stream) is untouched and must stay
+                // addressable as itself.
+                pl_bt_push_connect_failed(s_ctx.pending_addr, pl_a2dp_failure_reason_for_status(status));
                 break;
             }
             // A real success cancels any retry that might still be armed
             // (shouldn't happen -- the retry path re-issues on the same
-            // connect_addr -- but a fresh connect() racing a stale timer
+            // pending_addr -- but a fresh connect() racing a stale timer
             // is exactly the "cannot fire into a live session" case this
             // bead's acceptance criteria calls out).
             pl_a2dp_reconnect_retry_cancel();
@@ -3225,6 +3254,14 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // whatever the previous session left armed/pushed -- same
             // reasoning as the reconnect-retry cancel just above.
             pl_a2dp_wizard_dismiss_timer_cancel();
+            // Bead pico-link-0cq2: signaling just succeeded -- commit the
+            // attempt to being the session. Every path below this point
+            // (codec configuration/renegotiation, AVRCP connect, live
+            // quality apply, post-signaling failure pushes) reads
+            // `connect_addr`, which from here on is this newly-established
+            // session's address, exactly the same as it always was for a
+            // single-device connect.
+            memcpy(s_ctx.connect_addr, s_ctx.pending_addr, 6);
             s_ctx.connect_succeeded_pushed = false;
             s_ctx.a2dp_cid = cid;
             // Fresh discovery pass starting -- clear any capability bits

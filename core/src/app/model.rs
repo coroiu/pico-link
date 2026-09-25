@@ -39,22 +39,32 @@ pub(crate) fn truncate_device_name(name: &str) -> String {
 /// The Bluetooth link's coarse lifecycle state, as reported by C over
 /// [`App::set_link_state`] (`pl_ui_set_link_state` in the FFI surface).
 /// Platform-free: `core` has no idea BTstack exists, it only knows these
-/// three labels.
+/// two labels.
 ///
-/// Describes **exactly one thing**: the A2DP connection lifecycle of
-/// [`BtModel::connected_addr`]. Whether the radio is currently running a
-/// GAP inquiry is a second, independent axis -- [`BtModel::discovering`] --
-/// and is deliberately **not representable** as a `LinkState`: this enum
-/// used to carry a `Scanning` variant, and because an inquiry does not
-/// disconnect A2DP, that variant was a lie every time it reached
-/// [`App::set_link_state`], which wiped the connected model out from under
-/// a link that was still up. Removing the variant makes that unreachable
-/// through the type rather than merely undocumented.
+/// Describes **exactly one thing**: whether [`BtModel::connected_addr`]'s
+/// A2DP link is up. Whether the radio is currently running a GAP inquiry
+/// is a second, independent axis -- [`BtModel::discovering`] -- and is
+/// deliberately **not representable** as a `LinkState`: this enum used to
+/// carry a `Scanning` variant, and because an inquiry does not disconnect
+/// A2DP, that variant was a lie every time it reached [`App::set_link_
+/// state`], which wiped the connected model out from under a link that was
+/// still up. Removing the variant makes that unreachable through the type
+/// rather than merely undocumented.
+///
+/// `Connecting` was removed for the same reason (bead `pico-link-0cq2`,
+/// design `.planning/design/` comment on that bead): a connect *attempt*
+/// is not the established link -- folding `LinkStateChanged(Connecting)`
+/// through [`App::set_link_state`] cleared `connected_addr`/
+/// `connected_codec`/`out_level`/`ldac_live_kbps` for whatever link was
+/// already up the moment a second device's connect attempt started, which
+/// is exactly the "NO LINK while the old link is still up" bug. The
+/// attempt is now its own independent axis, [`BtModel::connecting`],
+/// folded from [`crate::app::Event::ConnectAttemptStarted`] and touching
+/// only that one field -- same shape as `discovering` beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LinkState {
     #[default]
     Idle,
-    Connecting,
     Connected,
 }
 
@@ -145,6 +155,16 @@ pub struct BtModel {
     /// states and no producer for a third. Written only by
     /// [`App::set_discovering`].
     pub discovering: bool,
+    /// Whether a connect attempt is currently in flight -- a THIRD,
+    /// independent axis from `link_state` and `discovering` (bead
+    /// `pico-link-0cq2`): an attempt targeting device B must not disturb
+    /// whatever link to device A is already up, so it is folded from
+    /// [`crate::app::Event::ConnectAttemptStarted`] rather than through
+    /// [`LinkState`] the way it used to be (see that type's doc comment).
+    /// `bool`, not the attempt's address -- the wire event carries no addr,
+    /// and the wizard's own phase already holds the target. Written only
+    /// by [`App::set_connecting`].
+    pub connecting: bool,
     /// Inquiry-scan results. **Wizard-only reader** -- named distinctly
     /// from `paired` so "the Devices screen reads scan results" is a
     /// compile error, not a habit. Mutated only by

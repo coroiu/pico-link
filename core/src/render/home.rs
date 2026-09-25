@@ -186,6 +186,14 @@ struct HomeView {
     /// `.planning/design/2026-09-08-link-state-vs-discovery-axis.md`
     /// section 5).
     discovering: bool,
+    /// Whether a connect attempt is currently in flight -- the THIRD,
+    /// independent input `chrome_contribution` resolves alongside
+    /// `link_state`/`discovering` into one [`LinkGlyph`] (bead
+    /// `pico-link-0cq2`: an attempt at a second device must not demote an
+    /// already-`Connected` glyph for a first that's still up, any more
+    /// than a scan does -- same "`Connected` always wins" rule as
+    /// `discovering`).
+    connecting: bool,
     /// The connected device's address, if any -- read by `ShortcutY` to
     /// decide whether to push the device page or the explicit "no device"
     /// message (bead `pico-link-hr30`).
@@ -332,9 +340,16 @@ impl HomeView {
         cushion_policy: &Rc<RefCell<CushionPolicyState>>,
         abr_floor: &Rc<RefCell<AbrFloorState>>,
     ) -> Self {
-        let (hero, link_state, discovering, connected_addr, fault_log) = {
+        let (hero, link_state, discovering, connecting, connected_addr, fault_log) = {
             let snapshot = model.borrow();
-            (Self::project_hero(&snapshot), snapshot.link_state, snapshot.discovering, snapshot.connected_addr, snapshot.fault_log)
+            (
+                Self::project_hero(&snapshot),
+                snapshot.link_state,
+                snapshot.discovering,
+                snapshot.connecting,
+                snapshot.connected_addr,
+                snapshot.fault_log,
+            )
         };
 
         let model_for_shortcut_y = Rc::clone(model);
@@ -386,6 +401,7 @@ impl HomeView {
             menu,
             link_state,
             discovering,
+            connecting,
             connected_addr,
             model: model_for_shortcut_y,
             commands: commands_for_shortcut_y,
@@ -404,10 +420,10 @@ impl HomeView {
     /// as it did before the scan started (design section 1.1: the whole
     /// point is that the glyph must never demote on a scan).
     fn resolved_link_glyph(&self) -> LinkGlyph {
-        match (self.link_state, self.discovering) {
-            (LinkState::Connected, _) => LinkGlyph::Live,
-            (LinkState::Connecting, _) | (_, true) => LinkGlyph::Busy,
-            (LinkState::Idle, false) => LinkGlyph::Idle,
+        match (self.link_state, self.connecting, self.discovering) {
+            (LinkState::Connected, _, _) => LinkGlyph::Live,
+            (_, true, _) | (_, _, true) => LinkGlyph::Busy,
+            (LinkState::Idle, false, false) => LinkGlyph::Idle,
         }
     }
 }
@@ -438,6 +454,7 @@ impl Widget for HomeView {
         let model = self.model.borrow();
         self.link_state = model.link_state;
         self.discovering = model.discovering;
+        self.connecting = model.connecting;
         self.connected_addr = model.connected_addr;
         self.fault_log = model.fault_log;
         self.hero = Self::project_hero(&model);
@@ -834,6 +851,30 @@ mod tests {
         assert_eq!(view.face(), HomeFace::Menu);
         let screen = pushed_screen(view.on_intent(NavIntent::ShortcutY));
         assert_eq!(screen.id(), None, "the disconnected case must push the same 'no device' screen on the menu face too");
+    }
+
+    /// Bead `pico-link-0cq2`, test T2: a connect ATTEMPT while already
+    /// `Connected` must resolve to `LinkGlyph::Live`, not `Busy` -- same
+    /// "`Connected` always wins" rule `discovering` already had (design
+    /// section 1.1), now extended to the third axis.
+    #[test]
+    fn attempt_while_connected_keeps_the_live_glyph() {
+        let addr = [9; 6];
+        let mut view = connected_home_view(addr);
+        // `connected_home_view` doesn't set `link_state`/`connecting`
+        // directly -- drive them the same way `App::sync` would, via a
+        // fresh `sync` off the underlying model.
+        {
+            let mut model = view.model.borrow_mut();
+            model.link_state = LinkState::Connected;
+            model.connecting = true;
+        }
+        view.sync(&test_ctx());
+        assert_eq!(
+            view.chrome_contribution(&test_ctx()).and_then(|c| c.link),
+            Some(LinkGlyph::Live),
+            "a connect attempt at a second device must not demote an already-Live glyph"
+        );
     }
 
     #[test]
