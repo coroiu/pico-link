@@ -1679,6 +1679,7 @@ mod tests {
         let RecordingSetup { mut platform, storage_sets, .. } = recording_platform(vec![
             vec![NavIntent::Select],
             vec![NavIntent::Down],
+            vec![NavIntent::Down],
             vec![NavIntent::Select],
             vec![NavIntent::Down],
             vec![NavIntent::Down],

@@ -4866,4 +4866,44 @@ mod tests {
             pl_ui_destroy(ui);
         }
     }
+
+    /// Bead `pico-link-ryw.7` review fix, design sec 5.1: proves the live
+    /// preview at the actual FFI boundary C calls
+    /// (`pl_ui_take_dsp_program`), not just `App::dsp_program` directly --
+    /// with no connected device and no editor open the program is Off;
+    /// navigating Home -> Effects -> New effect (empty store, so the sole
+    /// row) pushes the editor AND must itself flip the live program to
+    /// the fresh draft's 5 default bands, with no `SavePreset`/
+    /// `PresetLoaded` round trip in between. A second, edit-free take
+    /// must report no change (coalesced, not re-sent every frame).
+    #[test]
+    fn pl_ui_take_dsp_program_previews_the_open_editors_draft() {
+        let ui = new_ui();
+        unsafe {
+            let mut before = zeroed_dsp_program();
+            assert!(pl_ui_take_dsp_program(ui, &mut before));
+            assert_eq!(before.n_biquads, 0, "no connected device and no editor open must resolve Off");
+
+            let open_new_effect_editor = [
+                PlIntent { tag: PlIntentTag::Select as u32, jump_by: 0 }, // Home status -> menu face
+                PlIntent { tag: PlIntentTag::Down as u32, jump_by: 0 },   // -> Effects row
+                PlIntent { tag: PlIntentTag::Select as u32, jump_by: 0 }, // -> Effects list
+                PlIntent { tag: PlIntentTag::Select as u32, jump_by: 0 }, // -> "New effect" -> editor
+            ];
+            pl_ui_input(ui, open_new_effect_editor.as_ptr(), open_new_effect_editor.len());
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+
+            let mut opened = zeroed_dsp_program();
+            assert!(pl_ui_take_dsp_program(ui, &mut opened), "opening the editor must itself change the live program");
+            assert_eq!(opened.n_biquads, 5, "the new effect's default 5-band draft must preview immediately, before any SavePreset echo");
+
+            let mut unchanged = zeroed_dsp_program();
+            assert!(
+                !pl_ui_take_dsp_program(ui, &mut unchanged),
+                "no new edit since the last take -- must report no change, not a fresh program every call"
+            );
+
+            pl_ui_destroy(ui);
+        }
+    }
 }

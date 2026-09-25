@@ -106,13 +106,25 @@ intent table and the rail edge together, never separately.
 | Input | Meaning on every screen |
 |---|---|
 | Up / Down | Move focus. Never activates. |
-| Right | Identical to A. |
-| Left | Identical to B. |
+| Left / Right | Adjust on a focused Value row; otherwise no-op. |
 | Centre | Identical to A. |
 | **A** | Activate the focused thing / confirm. |
 | **B** | Back, cancel, dismiss. Aborts in-flight operations. |
 | **X** | Primary contextual action - **always labelled, or inert.** |
 | **Y** | Secondary contextual action - **always labelled, or inert.** |
+
+**AMENDMENT (2026-09-25, bead pico-link-ryw.7):** the original table's
+"Right: identical to A" / "Left: identical to B" was never built --
+`navigator.rs`'s dispatch forwards Left/Right to the focused widget, and
+every widget ignored them until `pico-link-ryw.9`'s Value row and the DSP
+effects editor (`pico-link-ryw.7`) gave them a real meaning. Retired
+globally, not just for the editor: Left/Right are the Value row's own
+adjust gesture wherever one exists, and stay a no-op everywhere else --
+see `.planning/design/2026-09-25-value-row-and-on-exit-hook.md` (Fern,
+the `FieldKind::Value` design) and `2026-09-25-dsp-effects-ux.md` sec 2
+(the editor is the first real caller). If Left stayed Back on a Value
+row, the natural "decrease" press would become "leave the screen" -- the
+one hazard this retirement exists to avoid.
 
 1. **A is never irreversible.** Destructive actions are labelled rows behind a
    `ConfirmView` focused on Cancel.
@@ -410,8 +422,20 @@ Four items: auto-connect on plug-in; screen (brightness, dim/blank timeout);
 device info; forget all / factory reset (via `ConfirmView`).
 
 Absent deliberately: **codec** (per-device, on the device page), **volume** (on
-Home's d-pad), **EQ** (does not exist), **sample rate** (host-owned). Exposing
-any of these would be lying about what we control.
+Home's d-pad), **sample rate** (host-owned). Exposing any of these would be
+lying about what we control.
+
+**AMENDMENT (2026-09-25, bead pico-link-ryw.7): EQ now exists, but not
+here.** DSP effects (crossfeed + parametric EQ) shipped as their own
+Home menu row, **not** a Settings entry -- see
+`.planning/design/2026-09-25-dsp-effects-ux.md` sec 1's navigation
+rationale: nesting the effect editor under Settings would put it at
+depth 3, which breaks the `B, B` escape guarantee this design's global
+input contract depends on (sec 4, rule 3). Effects are also global
+(assigned per device, not owned by one), so a device page is the wrong
+home for them either. This list's "absent deliberately" framing still
+holds for Settings specifically; it no longer describes the product as a
+whole.
 
 > **A setting with no persistence behind it does not appear.** A toggle that
 > forgets is worse than no toggle.

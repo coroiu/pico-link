@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 
 use crate::audio::{AbrFloor, CushionPolicy};
+use crate::dsp::{Band, BandKind, Preset, Program};
 use crate::render::{ListItem, VerticalList};
 
 use super::model::MAX_PAIRED_DEVICES;
@@ -1110,4 +1111,103 @@ fn request_abr_floor_arms_the_save_latch_exactly_once() {
     assert_eq!(app.abr_floor(), AbrFloor::Kbps246);
     assert_eq!(app.take_abr_floor_to_save(), Some(AbrFloor::Kbps246));
     assert_eq!(app.take_abr_floor_to_save(), None, "the save latch must drain to None after being taken once");
+}
+
+// --- DSP effects editor: live preview (bead pico-link-ryw.7 review fix,
+// design sec 5.1) ---
+
+/// Matches `screens::effects::DSP_FS_HZ` (private to that module) -- the
+/// one sample rate this build's DSP chain compiles at.
+const TEST_DSP_FS_HZ: u32 = 48_000;
+
+/// Design sec 5.1 rule 1: while the editor is open and not bypassed, the
+/// stream plays the editor's current draft instantly -- whether or not
+/// that effect is assigned to the connected device (there is none here),
+/// and without waiting for the `SavePreset`/`PresetLoaded` round trip
+/// (`assert_no_commands_queued` is deliberately NOT called: a queued,
+/// undrained `SavePreset` must not stop `dsp_program` from already
+/// reflecting the edit).
+#[test]
+fn editing_an_unassigned_effect_changes_dsp_program_immediately() {
+    let mut app = App::new(240, 240);
+    open_new_effect_editor(&mut app);
+
+    let before = app.dsp_program(TEST_DSP_FS_HZ);
+    // CROSSFEED is the editor's first row/default selection; stepping it
+    // right changes the draft's saved shape (`apply_step`'s `ROW_CROSSFEED`
+    // arm), which `EffectEditorView::on_intent` mirrors into
+    // `App::editor_preview` before it ever queues the `SavePreset`.
+    app.handle_input(vec![NavIntent::Right]);
+    let after = app.dsp_program(TEST_DSP_FS_HZ);
+
+    assert_ne!(before, after, "a Left/Right edit on an unassigned draft must change dsp_program immediately, not after a save round trip");
+}
+
+/// Design sec 5.1 rule 2: `X` (bypass) previews Off, regardless of the
+/// draft's own contents.
+#[test]
+fn bypassing_the_open_editor_previews_off() {
+    let mut app = App::new(240, 240);
+    open_new_effect_editor(&mut app);
+    app.handle_input(vec![NavIntent::Right]); // give the draft a non-default shape first
+    assert_ne!(app.dsp_program(TEST_DSP_FS_HZ), Program::off(TEST_DSP_FS_HZ), "sanity: the un-bypassed draft must not already be Off");
+
+    app.handle_input(vec![NavIntent::ShortcutX]); // bypass
+
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), Program::off(TEST_DSP_FS_HZ), "X (bypass) must preview Off");
+}
+
+/// Design sec 5.1 rule 3: leaving the editor (by any route -- `B` here)
+/// reverts playback to the connected device's assignment, even while a
+/// DIFFERENT draft was being previewed a moment before.
+#[test]
+fn leaving_the_editor_reverts_dsp_program_to_the_connected_devices_assignment() {
+    let mut app = App::new(240, 240);
+
+    // Seed a stored preset (id 7) with a real band, as if C's boot push
+    // already loaded it, and connect a device already assigned to it.
+    let assigned_id = 7u16;
+    let mut assigned_preset = Preset::new("Assigned");
+    assigned_preset.push_band(Band { kind: BandKind::Peak, freq_hz: 1_000, gain_half_db: 12, q_idx: 4 });
+    app.handle_event(Event::PresetLoaded { id: assigned_id, blob: assigned_preset.to_wire().to_vec() });
+    let addr: DeviceAddr = [1, 2, 3, 4, 5, 6];
+    app.model.borrow_mut().connected_addr = Some(addr);
+    app.model.borrow_mut().paired.push(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: assigned_id });
+
+    let assigned_program = Program::from_preset(&assigned_preset, TEST_DSP_FS_HZ);
+    assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), assigned_program, "before any editor opens, rule 3 must resolve the connected device's assignment");
+
+    // Open the effects list and edit a brand-new, still-unassigned effect.
+    open_new_effect_editor(&mut app);
+    app.handle_input(vec![NavIntent::Right]); // CROSSFEED step -> draft changes
+    let preview = app.dsp_program(TEST_DSP_FS_HZ);
+    assert_ne!(preview, assigned_program, "while editing a different, unassigned draft, the preview must not be the connected device's still-assigned preset");
+
+    app.handle_input(vec![NavIntent::Back]); // leave the editor
+
+    assert_eq!(
+        app.dsp_program(TEST_DSP_FS_HZ),
+        assigned_program,
+        "leaving the editor by any route must revert dsp_program to the connected device's assignment"
+    );
+}
+
+/// `ui-ffi`'s pull loop (`pl_ui_take_dsp_program`) calls `App::dsp_program`
+/// every superloop iteration and change-gates on the result
+/// (`PlUi::last_dsp_program`). It must therefore be a pure read of
+/// current state, not something that advances or mutates on every call --
+/// each Left/Right step must yield exactly one new program, not a new one
+/// per subsequent call/frame with no further input.
+#[test]
+fn dsp_program_is_a_stable_read_between_edits() {
+    let mut app = App::new(240, 240);
+    open_new_effect_editor(&mut app);
+    app.handle_input(vec![NavIntent::Right]);
+
+    let first_read = app.dsp_program(TEST_DSP_FS_HZ);
+    let second_read = app.dsp_program(TEST_DSP_FS_HZ);
+    let third_read = app.dsp_program(TEST_DSP_FS_HZ);
+
+    assert_eq!(first_read, second_read, "repeated dsp_program calls with no new input must return an equal program");
+    assert_eq!(second_read, third_read, "repeated dsp_program calls with no new input must return an equal program");
 }

@@ -28,6 +28,26 @@ pub(in crate::app) fn open_wizard(app: &mut App) {
     app.handle_input(vec![NavIntent::Select]); // "Pair new headphones" row -> pushes the wizard
 }
 
+/// Home(1) -> Effects list(2): `MENU_ROW_EFFECTS` (`render::home`) is index
+/// 1, one `Down` past the menu face's default Bluetooth selection -- see
+/// [`open_devices`]'s doc comment for the first `Select`.
+pub(in crate::app) fn open_effects_list(app: &mut App) {
+    app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
+    app.handle_input(vec![NavIntent::Down]); // move selection onto the Effects row
+    app.handle_input(vec![NavIntent::Select]); // Effects row -> pushes the effects list
+}
+
+/// [`open_effects_list`] -> editor(3): with an empty [`crate::dsp::
+/// PresetStore`] the effects list's sole row is "New effect"
+/// (`effects.rs`'s `effects_list_rows`), so one more `Select` activates
+/// it -- which, per Andreas's save-immediately ruling, also queues one
+/// `Command::SavePreset { preset_id: 0, .. }` before the editor is even
+/// built.
+pub(in crate::app) fn open_new_effect_editor(app: &mut App) {
+    open_effects_list(app);
+    app.handle_input(vec![NavIntent::Select]); // "New effect" row -> auto-saves, pushes the editor
+}
+
 /// The Devices screen reads `BtModel::paired` (not `BtModel::discovered`,
 /// the wizard's own scan list -- see that field's doc comment), mutated
 /// only by [`Event::PairedDeviceUpserted`]/[`Event::PairedDeviceForgotten`].
