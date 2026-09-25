@@ -20,7 +20,7 @@ use embedded_graphics::prelude::{Point, Size};
 use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{HorizontalAlignment, VerticalPosition};
 
-use crate::dsp::preset::{q_from_index, Band, BandKind, CrossfeedLevel, Q_TABLE};
+use crate::dsp::preset::{nearest_q_index, q_milli_from_index, Band, BandKind, CrossfeedLevel, Q_TABLE};
 use crate::dsp::{Program, Preset, PresetStore, MIN_BOOST_HEADROOM_DB};
 use crate::input::NavIntent;
 use crate::render::theme::{font, palette};
@@ -67,8 +67,9 @@ const BAND_DEFAULT_FREQ_HZ: [u16; BAND_COUNT] = [100, 250, 1_000, 4_000, 8_000];
 /// design's own "0.7 shelves, 1.4 peaks" (design sec 4.2); the design's
 /// worked Q ladder (0.5/0.7/1.0/1.4/2.0/2.8/4.0/5.6) is an approximation
 /// of `Q_TABLE`, not a second incompatible one -- this module always
-/// displays `Q_TABLE`'s own shipped values, since that's what a
-/// [`Band::q_idx`] actually indexes into at DSP-program build time.
+/// displays `Q_TABLE`'s own shipped values, converted to [`Band::q_milli`]
+/// via [`q_milli_from_index`] before it ever reaches DSP-program build
+/// time.
 const BAND_DEFAULT_Q_IDX: [u8; BAND_COUNT] = [2, 4, 4, 4, 2];
 const DEFAULT_CROSSFEED: CrossfeedLevel = CrossfeedLevel::Medium;
 
@@ -82,8 +83,15 @@ const FREQ_LADDER_HZ: [u16; 31] = [
     8_000, 10_000, 12_500, 16_000, 20_000,
 ];
 
-const GAIN_MIN_HALF_DB: i8 = -24;
-const GAIN_MAX_HALF_DB: i8 = 24;
+/// Gain bounds/step, in centi-dB -- v2's exact storage unit (ryw.12 sec
+/// 2). `+/-1200 cdb` (`+/-12dB`) and a `100 cdb` (1dB) step reproduce
+/// v1's `+/-24` half-dB-unit bounds and 2-half-dB-unit step exactly
+/// (`24 * 50 == 1200`, `2 * 50 == 100`) -- the editor's step BEHAVIOUR is
+/// unchanged, only the field it steps is now the exact wire unit instead
+/// of a pre-quantised one.
+const GAIN_MIN_CDB: i16 = -1_200;
+const GAIN_MAX_CDB: i16 = 1_200;
+const GAIN_STEP_CDB: i16 = 100;
 
 /// The canned NAME cycle's 11 fixed candidates -- index 0 of the full
 /// 12-entry cycle is always the dynamic "Effect N" (see
@@ -92,7 +100,12 @@ const FIXED_NAME_CANDIDATES: [&str; 11] =
     ["Relaxed", "Long session", "Meetings", "Music", "Movies", "Podcasts", "Speech", "Warm", "Bright", "Bass", "Late night"];
 
 fn band_default(index: usize) -> Band {
-    Band { kind: BAND_DEFAULT_KIND[index], freq_hz: BAND_DEFAULT_FREQ_HZ[index], gain_half_db: 0, q_idx: BAND_DEFAULT_Q_IDX[index] }
+    Band {
+        kind: BAND_DEFAULT_KIND[index],
+        freq_half_hz: BAND_DEFAULT_FREQ_HZ[index].saturating_mul(2),
+        gain_cdb: 0,
+        q_milli: q_milli_from_index(BAND_DEFAULT_Q_IDX[index]),
+    }
 }
 
 fn default_bands() -> Vec<Band> {
@@ -134,8 +147,12 @@ fn band_label(index: usize, kind: BandKind) -> String {
 
 /// `100 Hz` below 1kHz, `1 kHz`/`1.25 kHz`/`12.5 kHz` above it -- trims a
 /// trailing `.0`/`0` rather than always showing two decimals (design sec
-/// 4.2's worked examples never show a trailing zero).
-fn format_freq(freq_hz: u16) -> String {
+/// 4.2's worked examples never show a trailing zero). Takes v2's
+/// `freq_half_hz`; every ladder entry this editor ever produces is a
+/// whole Hz (`* 2` from [`FREQ_LADDER_HZ`]), so the divide-by-2 below is
+/// exact.
+fn format_freq(freq_half_hz: u16) -> String {
+    let freq_hz = freq_half_hz / 2;
     if freq_hz < 1_000 {
         return format!("{freq_hz} Hz");
     }
@@ -155,10 +172,11 @@ fn format_freq(freq_hz: u16) -> String {
     }
 }
 
-/// `+3 dB` / `0 dB` / `-2 dB` -- steps are always whole dB (2 half-dB
-/// units), so integer division is exact.
-fn format_gain_db(gain_half_db: i8) -> String {
-    let db = i32::from(gain_half_db) / 2;
+/// `+3 dB` / `0 dB` / `-2 dB` -- the editor only ever steps `gain_cdb` in
+/// whole `GAIN_STEP_CDB` (100 = 1dB) increments, so integer division is
+/// exact.
+fn format_gain_db(gain_cdb: i16) -> String {
+    let db = i32::from(gain_cdb) / 100;
     if db == 0 {
         String::from("0 dB")
     } else {
@@ -166,8 +184,12 @@ fn format_gain_db(gain_half_db: i8) -> String {
     }
 }
 
-fn format_q(q_idx: u8) -> String {
-    let q = q_from_index(q_idx);
+/// Formats `q_milli` (v2's exact storage unit) the same as the old
+/// [`Q_TABLE`]-index display -- for every value the editor itself ever
+/// produces, `q_milli` IS `q_milli_from_index(idx)` for some table entry,
+/// so this renders identically to the old `format_q(q_idx)`.
+fn format_q(q_milli: u16) -> String {
+    let q = f32::from(q_milli) * 0.001;
     let text = format!("{q:.2}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
     String::from(trimmed)
@@ -204,40 +226,57 @@ fn freq_ladder_index(freq_hz: u16) -> usize {
     FREQ_LADDER_HZ.iter().position(|&f| f == freq_hz).unwrap_or(17) // 1kHz
 }
 
-fn step_freq(freq_hz: u16, dir: Step) -> u16 {
-    let idx = freq_ladder_index(freq_hz);
+/// Steps `freq_half_hz` (v2's exact storage unit) one [`FREQ_LADDER_HZ`]
+/// entry at a time -- identical stepping behaviour to the old
+/// `step_freq(freq_hz)`, just converting to/from half-Hz at the boundary
+/// (every ladder entry is a whole Hz, so `* 2` is exact).
+fn step_freq(freq_half_hz: u16, dir: Step) -> u16 {
+    let idx = freq_ladder_index(freq_half_hz / 2);
     let new = match dir {
         Step::Prev => idx.saturating_sub(1),
         Step::Next => (idx + 1).min(FREQ_LADDER_HZ.len() - 1),
     };
-    FREQ_LADDER_HZ[new]
+    FREQ_LADDER_HZ[new].saturating_mul(2)
 }
 
-fn freq_bounds(freq_hz: u16) -> StepBounds {
-    let idx = freq_ladder_index(freq_hz);
+fn freq_bounds(freq_half_hz: u16) -> StepBounds {
+    let idx = freq_ladder_index(freq_half_hz / 2);
     StepBounds { prev: idx > 0, next: idx < FREQ_LADDER_HZ.len() - 1 }
 }
 
-fn step_gain(gain_half_db: i8, dir: Step) -> i8 {
+/// Steps `gain_cdb` (v2's exact storage unit) by [`GAIN_STEP_CDB`] --
+/// identical stepping behaviour to the old `step_gain(gain_half_db)` (see
+/// [`GAIN_STEP_CDB`]'s doc comment for the exact unit match).
+fn step_gain(gain_cdb: i16, dir: Step) -> i16 {
     match dir {
-        Step::Prev => (gain_half_db - 2).max(GAIN_MIN_HALF_DB),
-        Step::Next => (gain_half_db + 2).min(GAIN_MAX_HALF_DB),
+        Step::Prev => (gain_cdb - GAIN_STEP_CDB).max(GAIN_MIN_CDB),
+        Step::Next => (gain_cdb + GAIN_STEP_CDB).min(GAIN_MAX_CDB),
     }
 }
 
-fn gain_bounds(gain_half_db: i8) -> StepBounds {
-    StepBounds { prev: gain_half_db > GAIN_MIN_HALF_DB, next: gain_half_db < GAIN_MAX_HALF_DB }
+fn gain_bounds(gain_cdb: i16) -> StepBounds {
+    StepBounds { prev: gain_cdb > GAIN_MIN_CDB, next: gain_cdb < GAIN_MAX_CDB }
 }
 
-fn step_q(q_idx: u8, dir: Step) -> u8 {
-    match dir {
-        Step::Prev => q_idx.saturating_sub(1),
-        Step::Next => (q_idx + 1).min(u8::try_from(Q_TABLE.len() - 1).unwrap_or(u8::MAX)),
-    }
+/// Steps `q_milli` (v2's exact storage unit) through [`Q_TABLE`]'s picker
+/// vocabulary -- snaps to the NEAREST table entry first (ryw.12 sec 2:
+/// "Q snaps to the nearest table entry on the first press"), then moves
+/// one entry in `dir`. For every `q_milli` the editor itself ever
+/// produces (always an exact `q_milli_from_index` value), the nearest
+/// entry IS its own index, so this steps identically to the old
+/// `step_q(q_idx)`.
+fn step_q(q_milli: u16, dir: Step) -> u16 {
+    let idx = nearest_q_index(q_milli);
+    let new_idx = match dir {
+        Step::Prev => idx.saturating_sub(1),
+        Step::Next => (idx + 1).min(u8::try_from(Q_TABLE.len() - 1).unwrap_or(u8::MAX)),
+    };
+    q_milli_from_index(new_idx)
 }
 
-fn q_bounds(q_idx: u8) -> StepBounds {
-    StepBounds { prev: q_idx > 0, next: (q_idx as usize) < Q_TABLE.len() - 1 }
+fn q_bounds(q_milli: u16) -> StepBounds {
+    let idx = nearest_q_index(q_milli);
+    StepBounds { prev: idx > 0, next: (idx as usize) < Q_TABLE.len() - 1 }
 }
 
 /// The dynamic first NAME candidate: `Effect N`, `N` the lowest number not
@@ -326,9 +365,9 @@ fn editor_rows(state: &EditorState) -> Vec<FieldRow> {
     vec![
         FieldRow::value_row("CROSSFEED", crossfeed_word(state.draft.crossfeed), crossfeed_bounds(state.draft.crossfeed)).with_key(ROW_CROSSFEED),
         FieldRow::value_row("BAND", band_label(state.band_index, band.kind), band_index_bounds(state.band_index)).with_key(ROW_BAND),
-        FieldRow::value_row("FREQ", format_freq(band.freq_hz), freq_bounds(band.freq_hz)).with_key(ROW_FREQ),
-        FieldRow::value_row("GAIN", format_gain_db(band.gain_half_db), gain_bounds(band.gain_half_db)).with_key(ROW_GAIN),
-        FieldRow::value_row("Q", format_q(band.q_idx), q_bounds(band.q_idx)).with_key(ROW_Q),
+        FieldRow::value_row("FREQ", format_freq(band.freq_half_hz), freq_bounds(band.freq_half_hz)).with_key(ROW_FREQ),
+        FieldRow::value_row("GAIN", format_gain_db(band.gain_cdb), gain_bounds(band.gain_cdb)).with_key(ROW_GAIN),
+        FieldRow::value_row("Q", format_q(band.q_milli), q_bounds(band.q_milli)).with_key(ROW_Q),
         FieldRow::value_row("NAME", state.draft.name.clone(), StepBounds { prev: true, next: true }).with_key(ROW_NAME),
     ]
 }
@@ -352,27 +391,27 @@ fn apply_step(state: &mut EditorState, key: ListItemKey, dir: Step, other_names:
         false
     } else if key == ROW_FREQ {
         let Some(band) = state.draft.bands.get_mut(state.band_index) else { return false };
-        let new = step_freq(band.freq_hz, dir);
-        if new == band.freq_hz {
+        let new = step_freq(band.freq_half_hz, dir);
+        if new == band.freq_half_hz {
             return false;
         }
-        band.freq_hz = new;
+        band.freq_half_hz = new;
         true
     } else if key == ROW_GAIN {
         let Some(band) = state.draft.bands.get_mut(state.band_index) else { return false };
-        let new = step_gain(band.gain_half_db, dir);
-        if new == band.gain_half_db {
+        let new = step_gain(band.gain_cdb, dir);
+        if new == band.gain_cdb {
             return false;
         }
-        band.gain_half_db = new;
+        band.gain_cdb = new;
         true
     } else if key == ROW_Q {
         let Some(band) = state.draft.bands.get_mut(state.band_index) else { return false };
-        let new = step_q(band.q_idx, dir);
-        if new == band.q_idx {
+        let new = step_q(band.q_milli, dir);
+        if new == band.q_milli {
             return false;
         }
-        band.q_idx = new;
+        band.q_milli = new;
         true
     } else if key == ROW_NAME {
         let new_name = step_name(&state.draft.name, dir, other_names);
@@ -461,10 +500,10 @@ struct EffectEditorView {
 }
 
 impl EffectEditorView {
-    // `gain_half_db as u16` below is a bit-pattern fold for a paint-key
-    // hash, not a numeric conversion -- the sign doesn't matter, only
-    // that distinct `i8` values fold to distinct `u64`s (same reasoning
-    // `Band::to_wire`'s own `as u8` cast documents).
+    // `gain_cdb as u16` below is a bit-pattern fold for a paint-key hash,
+    // not a numeric conversion -- the sign doesn't matter, only that
+    // distinct `i16` values fold to distinct `u64`s (same reasoning
+    // `Band::pack_kind_gain`'s own cast documents).
     #[allow(clippy::cast_sign_loss)]
     fn rows_key_of(state: &EditorState) -> PaintKey {
         let band = state.draft.bands.get(state.band_index).copied();
@@ -472,9 +511,9 @@ impl EffectEditorView {
             .fold(u64::from(state.draft.crossfeed.to_wire()))
             .fold(state.band_index as u64)
             .fold(band.map_or(0, |b| u64::from(b.kind.to_wire())))
-            .fold(band.map_or(0, |b| u64::from(b.freq_hz)))
-            .fold(band.map_or(0, |b| u64::from(b.gain_half_db as u16)))
-            .fold(band.map_or(0, |b| u64::from(b.q_idx)))
+            .fold(band.map_or(0, |b| u64::from(b.freq_half_hz)))
+            .fold(band.map_or(0, |b| u64::from(b.gain_cdb as u16)))
+            .fold(band.map_or(0, |b| u64::from(b.q_milli)))
             .fold_str(&state.draft.name)
     }
 
@@ -963,24 +1002,24 @@ mod tests {
 
     #[test]
     fn format_freq_below_1khz_is_plain_hz() {
-        assert_eq!(format_freq(100), "100 Hz");
-        assert_eq!(format_freq(20), "20 Hz");
+        assert_eq!(format_freq(200), "100 Hz");
+        assert_eq!(format_freq(40), "20 Hz");
     }
 
     #[test]
     fn format_freq_at_and_above_1khz_uses_khz_and_trims_trailing_zeros() {
-        assert_eq!(format_freq(1_000), "1 kHz");
-        assert_eq!(format_freq(1_250), "1.25 kHz");
-        assert_eq!(format_freq(1_600), "1.6 kHz");
-        assert_eq!(format_freq(12_500), "12.5 kHz");
-        assert_eq!(format_freq(20_000), "20 kHz");
+        assert_eq!(format_freq(2_000), "1 kHz");
+        assert_eq!(format_freq(2_500), "1.25 kHz");
+        assert_eq!(format_freq(3_200), "1.6 kHz");
+        assert_eq!(format_freq(25_000), "12.5 kHz");
+        assert_eq!(format_freq(40_000), "20 kHz");
     }
 
     #[test]
     fn format_gain_db_shows_a_sign_except_at_zero() {
         assert_eq!(format_gain_db(0), "0 dB");
-        assert_eq!(format_gain_db(6), "+3 dB");
-        assert_eq!(format_gain_db(-4), "-2 dB");
+        assert_eq!(format_gain_db(300), "+3 dB");
+        assert_eq!(format_gain_db(-200), "-2 dB");
     }
 
     #[test]
@@ -1012,23 +1051,24 @@ mod tests {
 
     #[test]
     fn freq_ladder_steps_move_one_entry_at_a_time_and_clamps() {
-        assert_eq!(step_freq(1_000, Step::Next), 1_250);
-        assert_eq!(step_freq(1_000, Step::Prev), 800);
-        assert_eq!(step_freq(20, Step::Prev), 20);
-        assert_eq!(step_freq(20_000, Step::Next), 20_000);
+        assert_eq!(step_freq(2_000, Step::Next), 2_500);
+        assert_eq!(step_freq(2_000, Step::Prev), 1_600);
+        assert_eq!(step_freq(40, Step::Prev), 40);
+        assert_eq!(step_freq(40_000, Step::Next), 40_000);
     }
 
     #[test]
     fn gain_steps_by_one_db_and_clamps_at_plus_minus_12() {
-        assert_eq!(step_gain(0, Step::Next), 2);
-        assert_eq!(step_gain(24, Step::Next), 24);
-        assert_eq!(step_gain(-24, Step::Prev), -24);
+        assert_eq!(step_gain(0, Step::Next), GAIN_STEP_CDB);
+        assert_eq!(step_gain(GAIN_MAX_CDB, Step::Next), GAIN_MAX_CDB);
+        assert_eq!(step_gain(GAIN_MIN_CDB, Step::Prev), GAIN_MIN_CDB);
     }
 
     #[test]
     fn q_steps_across_the_shipped_q_table_and_clamps() {
-        assert_eq!(step_q(0, Step::Prev), 0);
-        assert_eq!(step_q(u8::try_from(Q_TABLE.len() - 1).unwrap(), Step::Next), u8::try_from(Q_TABLE.len() - 1).unwrap());
+        let last_idx = u8::try_from(Q_TABLE.len() - 1).unwrap();
+        assert_eq!(step_q(q_milli_from_index(0), Step::Prev), q_milli_from_index(0));
+        assert_eq!(step_q(q_milli_from_index(last_idx), Step::Next), q_milli_from_index(last_idx));
     }
 
     #[test]
@@ -1074,11 +1114,11 @@ mod tests {
     #[test]
     fn apply_step_on_freq_changes_the_selected_bands_frequency_only() {
         let mut state = EditorState { draft: new_effect_preset("Test"), band_index: 2, bypassed: false };
-        let before = state.draft.bands[0].freq_hz;
+        let before = state.draft.bands[0].freq_half_hz;
         let changed = apply_step(&mut state, ROW_FREQ, Step::Next, &[]);
         assert!(changed);
-        assert_eq!(state.draft.bands[0].freq_hz, before, "only the selected band (index 2) must change");
-        assert_ne!(state.draft.bands[2].freq_hz, BAND_DEFAULT_FREQ_HZ[2]);
+        assert_eq!(state.draft.bands[0].freq_half_hz, before, "only the selected band (index 2) must change");
+        assert_ne!(state.draft.bands[2].freq_half_hz, BAND_DEFAULT_FREQ_HZ[2] * 2);
     }
 
     #[test]
@@ -1102,7 +1142,7 @@ mod tests {
     fn reset_selected_band_only_changes_when_not_already_default() {
         let mut state = EditorState { draft: new_effect_preset("Test"), band_index: 0, bypassed: false };
         assert!(!reset_selected_band(&mut state), "a fresh effect's band is already at defaults");
-        state.draft.bands[0].gain_half_db = 6;
+        state.draft.bands[0].gain_cdb = 300;
         assert!(reset_selected_band(&mut state));
         assert_eq!(state.draft.bands[0], band_default(0));
     }
@@ -1118,7 +1158,7 @@ mod tests {
     fn boost_may_distort_is_true_when_every_band_is_boosted_to_the_max() {
         let mut preset = new_effect_preset("Loud");
         for band in &mut preset.bands {
-            band.gain_half_db = GAIN_MAX_HALF_DB;
+            band.gain_cdb = GAIN_MAX_CDB;
         }
         assert!(boost_may_distort(&preset), "5 bands all at +12dB must exceed the -12dB preamp clamp");
     }
