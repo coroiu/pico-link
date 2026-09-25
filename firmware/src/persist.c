@@ -55,12 +55,15 @@ typedef struct __attribute__((packed)) {
 } pl_persist_marker_t;
 
 // ~52 bytes -- design point 4's "a 52-byte record write is up to 3
-// blackouts of ~3ms" figure. `preset_id` is a REFERENCE into a future
+// blackouts of ~3ms" figure. `preset_id` is a REFERENCE into the PL:P
 // global preset store (design point 2, Andreas's pico-link-ryw constraint:
-// "if I forget a device then the EQ will not be lost") -- 0 means "no
-// preset assigned", not implemented on the read/write side yet (that store
-// doesn't exist this bead), but the field's presence now is what avoids a
-// format migration later.
+// "if I forget a device then the EQ will not be lost"; bead pico-link-ryw.6
+// wires the read/write side -- see PL_PERSIST_DEVICE_FIELD_PRESET_ID in
+// persist.h) -- 0 (PL_PERSIST_PRESET_ID_NONE) means "no preset assigned",
+// and so does any id the PL:P store no longer holds (a dangling reference
+// after a delete, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 2.4) -- `core` resolves both cases as Off, this module
+// never does.
 //
 // `codec_id` and `ldac_quality` (design findings 1.1/1.2,
 // .planning/design/2026-09-02-device-page-seam.md, bead pico-link-ay0.1),
@@ -146,6 +149,26 @@ typedef struct __attribute__((packed)) {
 // pl_persist_load_u8_setting/pl_persist_store_u8_setting helpers below
 // rather than its own bespoke read/write pair.
 #define PL_PERSIST_ABR_FLOOR_VERSION 1u
+
+// Bead pico-link-ryw.6, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 2.2: PL:P:<slot>, one DSP-preset record. `blob` is entirely
+// OPAQUE to C -- Rust owns the wire format (to_wire/from_wire, its own
+// per-field-fallback version byte inside the blob itself); this module
+// only ever stores and moves the `blob_len`-byte prefix, exactly the same
+// "C never parses" discipline `pl_persist_display_settings_record_t`'s
+// `screensaver_mode` etc. apply to a single byte, just extended to a whole
+// buffer. `preset_id` is never 0 in a valid record (0 is
+// PL_PERSIST_PRESET_ID_NONE, reserved) and is never reused across the
+// store's lifetime (design sec 2.2's monotonic id allocator, s_next_preset_id
+// below).
+#define PL_PERSIST_PRESET_VERSION 1u
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint16_t preset_id;
+    uint8_t blob_len;
+    uint8_t blob[PL_PERSIST_PRESET_BLOB_LEN];
+    uint16_t crc16;
+} pl_persist_preset_record_t;
 
 // CRC16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over every field of
 // pl_persist_device_record_t EXCEPT crc16 itself. A bit-loop, not a table --
@@ -249,10 +272,15 @@ typedef struct {
     uint32_t mru_seq;
     // Design findings 1.1/1.2: codec_id is codec_table.h's PL_CODEC_ID_*
     // (0 = Automatic), ldac_quality is 1-based (0 = unset; NOT a raw
-    // LDACBT_EQMID_* value -- see pl_persist_write_device_settings's doc
-    // comment in persist.h).
+    // LDACBT_EQMID_* value -- see persist.h's doc comment on
+    // pl_persist_request_device_settings).
     uint8_t codec_id;
     uint8_t ldac_quality;
+    // Bead pico-link-ryw.6: the PL:P preset id this device references (0 =
+    // PL_PERSIST_PRESET_ID_NONE = Off). Same "kept live by every write,
+    // never just a boot-time snapshot" discipline as codec_id/ldac_quality
+    // above.
+    uint16_t preset_id;
 } pl_persist_slot_t;
 static pl_persist_slot_t s_slots[PL_PERSIST_DEVICE_SLOTS];
 
@@ -262,6 +290,29 @@ static pl_persist_slot_t s_slots[PL_PERSIST_DEVICE_SLOTS];
 // now the max mru_seq loaded across ALL PL_PERSIST_DEVICE_SLOTS slots, plus
 // one (design section 6) -- not just slot 0's.
 static uint32_t s_next_mru_seq = 1;
+
+// Bead pico-link-ryw.6, design sec 2.2: the LIVE in-RAM mirror of every
+// occupied PL:P preset slot -- same role as s_slots above, just for
+// presets. Populated by pl_persist_init()'s preset load loop and kept live
+// by pl_persist_execute_pending_save_preset_write/pl_persist_execute_
+// pending_delete_preset_write, in the same async_context call that
+// performs the flash write/delete itself.
+typedef struct {
+    bool occupied;
+    uint16_t id;
+    uint8_t blob_len;
+    uint8_t blob[PL_PERSIST_PRESET_BLOB_LEN];
+} pl_persist_preset_slot_t;
+static pl_persist_preset_slot_t s_preset_slots[PL_PERSIST_PRESET_SLOTS];
+
+// Next preset id to allocate -- seeded from the max id loaded at boot, plus
+// one (same discipline as s_next_mru_seq above). Design sec 2.2: "ids are
+// monotonic and never reused... at boot, next_id = max(stored) + 1". 0
+// (PL_PERSIST_PRESET_ID_NONE) is reserved and never allocated, so this
+// always starts at least at 1.
+static uint16_t s_next_preset_id = 1;
+
+static pl_persist_status_t s_preset_boot_status = PL_PERSIST_STATUS_FIRST_BOOT;
 
 // Staged-save state (design point 4's "staged, gated, flushed" split).
 static bool s_pending;
@@ -294,14 +345,40 @@ static volatile bool s_urgent;
 // pending queue and potentially crowding out a real scan/connect request.
 static volatile bool s_write_enqueued;
 
-// Bead pico-link-7jol.5: a SECOND, independent staging slot for per-device
-// SETTINGS writes (today, only ldac_quality) -- see persist.h's doc
-// comment on pl_persist_request_ldac_quality for why this is not folded
-// into s_pending/s_pending_addr above.
-static bool s_settings_pending;
-static uint8_t s_settings_pending_addr[6];
-static uint8_t s_settings_pending_ldac_quality;
-static volatile bool s_settings_write_enqueued;
+// Bead pico-link-7jol.5, generalized by pico-link-ryw.6: a SECOND,
+// independent staging slot for per-device SETTINGS writes (codec_id,
+// ldac_quality, preset_id) -- see persist.h's doc comment on
+// pl_persist_request_device_settings for why this is not folded into
+// s_pending/s_pending_addr above, and for the field-mask coalescing
+// contract. `s_device_settings_pending_mask` is an OR of every field a
+// not-yet-drained call has staged for the CURRENT `s_device_settings_
+// pending_addr` -- a call for a different address resets it (see
+// pl_persist_request_device_settings's body).
+static bool s_device_settings_pending;
+static uint8_t s_device_settings_pending_addr[6];
+static uint8_t s_device_settings_pending_mask;
+static uint8_t s_device_settings_pending_codec_id;
+static uint8_t s_device_settings_pending_ldac_quality;
+static uint16_t s_device_settings_pending_preset_id;
+static volatile bool s_device_settings_write_enqueued;
+
+// Bead pico-link-ryw.6, design sec 2.2/2.5: a staging slot for a PL:P
+// preset SAVE -- independent of every slot above (a preset save is neither
+// a pairing write nor a per-device settings write). `preset_id ==
+// PL_PERSIST_PRESET_ID_NONE` (0) staged here means "allocate a fresh id"
+// -- see pl_persist_request_save_preset's doc comment.
+static bool s_preset_save_pending;
+static uint16_t s_preset_save_pending_id;
+static uint8_t s_preset_save_pending_blob_len;
+static uint8_t s_preset_save_pending_blob[PL_PERSIST_PRESET_BLOB_LEN];
+static volatile bool s_preset_save_write_enqueued;
+
+// Bead pico-link-ryw.6, design sec 2.4: a staging slot for a PL:P preset
+// DELETE -- independent of the save slot above (a delete carries only an
+// id, no blob).
+static bool s_preset_delete_pending;
+static uint16_t s_preset_delete_pending_id;
+static volatile bool s_preset_delete_write_enqueued;
 
 // Bead pico-link-qivj.5 (S11): a THIRD, independent staging slot -- global
 // display settings (screensaver mode + idle timeout), not per-device, so it
@@ -496,8 +573,15 @@ void pl_persist_init(void) {
         for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
             s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, i));
         }
+        // Bead pico-link-ryw.6: presets are "our own records" too (this
+        // header's module doc) -- wiped alongside devices on a schema
+        // mismatch, same as every PL:D tag above.
+        for (uint8_t i = 0; i < PL_PERSIST_PRESET_SLOTS; i++) {
+            s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, i));
+        }
         s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_MARKER, 0));
         s_boot_status = PL_PERSIST_STATUS_VERSION_MISMATCH;
+        s_preset_boot_status = PL_PERSIST_STATUS_VERSION_MISMATCH;
         return;
     }
 
@@ -541,15 +625,16 @@ void pl_persist_init(void) {
         sl->mru_seq = rec.mru_seq;
         sl->codec_id = rec.codec_id;
         sl->ldac_quality = rec.ldac_quality;
+        sl->preset_id = rec.preset_id;
         any_loaded = true;
         if (rec.mru_seq > max_mru_seq) {
             max_mru_seq = rec.mru_seq;
         }
         pl_log(
             "persist: loaded device slot=%u %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u, codec_id=%u, "
-            "ldac_quality=%u)\r\n",
+            "ldac_quality=%u, preset_id=%u)\r\n",
             slot, rec.addr[0], rec.addr[1], rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len,
-            rec.codec_id, rec.ldac_quality
+            rec.codec_id, rec.ldac_quality, rec.preset_id
         );
     }
 
@@ -557,6 +642,70 @@ void pl_persist_init(void) {
     s_boot_status = any_corrupt ? PL_PERSIST_STATUS_RECORD_CORRUPT : PL_PERSIST_STATUS_LOADED;
     if (!any_loaded) {
         pl_log("persist: marker present but no device records -- valid store, no device yet\r\n");
+    }
+
+    // --- Preset records: same per-record-isolation loop shape as the
+    // device loop above (design sec 2.2's "load every valid PL:P record
+    // before the marker check" is satisfied trivially here -- this runs
+    // AFTER the marker check has already confirmed PL_PERSIST_SCHEMA_VERSION
+    // matches, same as the device loop it mirrors).
+    bool any_preset_loaded = false;
+    bool any_preset_corrupt = false;
+    uint16_t max_preset_id = 0;
+    for (uint8_t slot = 0; slot < PL_PERSIST_PRESET_SLOTS; slot++) {
+        pl_persist_preset_record_t rec;
+        int rec_len = s_tlv_impl->get_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, slot), (uint8_t *)&rec, sizeof(rec));
+        if (rec_len != (int)sizeof(rec)) {
+            // Slot never written -- not an error, just unoccupied.
+            continue;
+        }
+        if (rec.version != PL_PERSIST_PRESET_VERSION) {
+            pl_log(
+                "persist: preset record version mismatch in slot %u (got %u, expected %u) -- dropping this record "
+                "only\r\n",
+                slot, rec.version, PL_PERSIST_PRESET_VERSION
+            );
+            s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, slot));
+            any_preset_corrupt = true;
+            continue;
+        }
+        uint16_t crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_preset_record_t, crc16));
+        if (crc != rec.crc16) {
+            pl_log(
+                "persist: preset record CRC mismatch in slot %u (got 0x%04x, computed 0x%04x) -- dropping this "
+                "record only\r\n",
+                slot, rec.crc16, crc
+            );
+            s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, slot));
+            any_preset_corrupt = true;
+            continue;
+        }
+        if (rec.preset_id == PL_PERSIST_PRESET_ID_NONE) {
+            // Should never happen (only pl_persist_execute_pending_save_
+            // preset_write ever writes this tag, and it never allocates
+            // id 0) -- treat as corrupt rather than trusting a sentinel
+            // value as a real id.
+            pl_log("persist: preset record in slot %u has id=0 (reserved) -- dropping this record only\r\n", slot);
+            s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, slot));
+            any_preset_corrupt = true;
+            continue;
+        }
+
+        pl_persist_preset_slot_t *psl = &s_preset_slots[slot];
+        psl->occupied = true;
+        psl->id = rec.preset_id;
+        psl->blob_len = rec.blob_len > (uint8_t)sizeof(psl->blob) ? (uint8_t)sizeof(psl->blob) : rec.blob_len;
+        memcpy(psl->blob, rec.blob, sizeof(psl->blob));
+        any_preset_loaded = true;
+        if (rec.preset_id > max_preset_id) {
+            max_preset_id = rec.preset_id;
+        }
+        pl_log("persist: loaded preset slot=%u id=%u blob_len=%u\r\n", slot, rec.preset_id, rec.blob_len);
+    }
+    s_next_preset_id = (uint16_t)(max_preset_id + 1);
+    s_preset_boot_status = any_preset_corrupt ? PL_PERSIST_STATUS_RECORD_CORRUPT : PL_PERSIST_STATUS_LOADED;
+    if (!any_preset_loaded) {
+        pl_log("persist: marker present but no preset records -- valid store, no presets yet\r\n");
     }
 }
 
@@ -580,7 +729,7 @@ uint8_t pl_persist_boot_device_count(void) {
     return count;
 }
 
-void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq, uint8_t *out_ldac_quality) {
+void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_name[32], uint8_t *out_name_len, uint32_t *out_mru_seq, uint8_t *out_ldac_quality, uint16_t *out_preset_id) {
     uint8_t seen = 0;
     for (uint8_t i = 0; i < PL_PERSIST_DEVICE_SLOTS; i++) {
         if (!s_slots[i].occupied) {
@@ -592,6 +741,7 @@ void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_n
             *out_name_len = s_slots[i].name_len;
             *out_mru_seq = s_slots[i].mru_seq;
             *out_ldac_quality = s_slots[i].ldac_quality;
+            *out_preset_id = s_slots[i].preset_id;
             return;
         }
         seen++;
@@ -601,6 +751,45 @@ void pl_persist_boot_device_at(uint8_t index, uint8_t out_addr[6], uint8_t out_n
     *out_name_len = 0;
     *out_mru_seq = 0;
     *out_ldac_quality = 0;
+    *out_preset_id = 0;
+}
+
+// Bead pico-link-ryw.6, design sec 2.2: same "computed live from the slot
+// mirror, called once at boot before any write can run" contract as
+// pl_persist_boot_device_count above, just for the preset store.
+uint8_t pl_persist_boot_preset_count(void) {
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < PL_PERSIST_PRESET_SLOTS; i++) {
+        if (s_preset_slots[i].occupied) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Bead pico-link-ryw.6, design sec 2.2: same "seen == index" walk as
+// pl_persist_boot_device_at above.
+void pl_persist_boot_preset_at(uint8_t index, uint16_t *out_id, uint8_t *out_blob_len, uint8_t out_blob[PL_PERSIST_PRESET_BLOB_LEN]) {
+    uint8_t seen = 0;
+    for (uint8_t i = 0; i < PL_PERSIST_PRESET_SLOTS; i++) {
+        if (!s_preset_slots[i].occupied) {
+            continue;
+        }
+        if (seen == index) {
+            *out_id = s_preset_slots[i].id;
+            *out_blob_len = s_preset_slots[i].blob_len;
+            memcpy(out_blob, s_preset_slots[i].blob, PL_PERSIST_PRESET_BLOB_LEN);
+            return;
+        }
+        seen++;
+    }
+    *out_id = 0;
+    *out_blob_len = 0;
+    memset(out_blob, 0, PL_PERSIST_PRESET_BLOB_LEN);
+}
+
+pl_persist_status_t pl_persist_preset_boot_status(void) {
+    return s_preset_boot_status;
 }
 
 // Code-review finding (bd-pico-link-cz0.6, 2026-09-01, CONFIRMED): this
@@ -693,37 +882,42 @@ static int pl_persist_find_free_slot(void) {
 }
 
 // Design finding 1.3 (.planning/design/2026-09-02-device-page-seam.md sec
-// 1.3, bead pico-link-ay0.1): what a particular RMW call carries and how it
-// should behave, so pl_persist_do_write (pairing/reconnect writes) and
-// pl_persist_write_device_settings (a codec pin) share ONE
-// read-modify-write core (pl_persist_rmw below) instead of forking the RMW
-// logic -- two independently written RMW paths over the same on-flash
-// struct is exactly how a CRC-checked store starts producing "corruption"
-// nobody can reproduce.
+// 1.3, bead pico-link-ay0.1), generalized by bead pico-link-ryw.6 from a
+// single `set_codec_settings` bool to a real field mask (design
+// `.planning/design/2026-09-25-dsp-effects-stage.md` sec 2.3): what a
+// particular RMW call carries and how it should behave, so
+// pl_persist_do_write (pairing/reconnect writes) and the field-masked
+// device-settings write below (codec pin / LDAC quality pick / preset
+// assignment) share ONE read-modify-write core (pl_persist_rmw below)
+// instead of forking the RMW logic -- two independently written RMW paths
+// over the same on-flash struct is exactly how a CRC-checked store starts
+// producing "corruption" nobody can reproduce.
 typedef struct {
     // NULL (or non-NULL with name_len == 0) => leave rec.name/rec.name_len
     // exactly as already on record (or zeroed, for a brand-new slot) -- the
     // same RMW convention pl_persist_do_write always used.
     const uint8_t *name;
     uint8_t name_len;
-    // true => overwrite rec.codec_id/rec.ldac_quality with the values
-    // below. false => leave them exactly as already on record. A pairing
-    // write (pl_persist_do_write) never sets this -- codec/quality are Tier
-    // 2 settings, not pairing facts.
-    bool set_codec_settings;
+    // An OR of PL_PERSIST_DEVICE_FIELD_* (persist.h) -- only the masked-in
+    // fields of codec_id/ldac_quality/preset_id below overwrite the
+    // existing record; every other field rides through untouched. A
+    // pairing write (pl_persist_do_write) always passes 0 here -- Tier 2
+    // settings are never pairing facts.
+    uint8_t field_mask;
     uint8_t codec_id;
     uint8_t ldac_quality;
-    // Design finding 1.3: a settings write ("I pinned a codec") is NOT "I
-    // used this device" -- only a pairing/reconnect write bumps mru_seq.
-    // Bumping on a settings write would make a pinned-but-unconnected
-    // device the boot auto-reconnect target
+    uint16_t preset_id;
+    // Design finding 1.3: a settings write ("I pinned a codec", "I assigned
+    // a preset") is NOT "I used this device" -- only a pairing/reconnect
+    // write bumps mru_seq. Bumping on a settings write would make a
+    // pinned-but-unconnected device the boot auto-reconnect target
     // (core::paired.iter().max_by_key(|d| d.mru_seq)).
     bool bump_mru;
     // true (pl_persist_do_write): the original find-existing-slot else
     // first-free-slot else refuse policy (design section 6, NO eviction).
-    // false (pl_persist_write_device_settings): never claim a fresh slot --
-    // refuse (return false from pl_persist_rmw, writing nothing) if no
-    // existing slot holds the target address.
+    // false (the field-masked device-settings write): never claim a fresh
+    // slot -- refuse (return false from pl_persist_rmw, writing nothing) if
+    // no existing slot holds the target address.
     bool allow_create_slot;
 } pl_persist_rmw_fields_t;
 
@@ -801,12 +995,19 @@ static bool pl_persist_rmw(const uint8_t addr[6], const pl_persist_rmw_fields_t 
     // else: leave rec.name/rec.name_len exactly as read (or zeroed, for a
     // brand new slot) -- this call has no name to contribute.
 
-    if (fields->set_codec_settings) {
+    if (fields->field_mask & PL_PERSIST_DEVICE_FIELD_CODEC_ID) {
         rec.codec_id = fields->codec_id;
+    }
+    if (fields->field_mask & PL_PERSIST_DEVICE_FIELD_LDAC_QUALITY) {
         rec.ldac_quality = fields->ldac_quality;
     }
-    // else: leave rec.codec_id/rec.ldac_quality exactly as read -- a
-    // pairing write must not clobber a previously pinned preference.
+    if (fields->field_mask & PL_PERSIST_DEVICE_FIELD_PRESET_ID) {
+        rec.preset_id = fields->preset_id;
+    }
+    // Every field NOT in fields->field_mask rides through exactly as read
+    // -- a pairing write (field_mask == 0) must not clobber a previously
+    // pinned preference or preset assignment, and an AssignPreset write
+    // must not clobber a previously pinned codec/quality, etc.
 
     if (fields->bump_mru) {
         rec.mru_seq = s_next_mru_seq++;
@@ -814,8 +1015,8 @@ static bool pl_persist_rmw(const uint8_t addr[6], const pl_persist_rmw_fields_t 
     // else: leave rec.mru_seq exactly as read -- design finding 1.3, a
     // settings write is not a use.
 
-    // volume/flags/preset_id: untouched -- no caller populates them yet
-    // (Tier 2, design section 2 point 5). Rides through RMW unchanged.
+    // volume/flags: untouched -- no caller populates them yet (Tier 2,
+    // design section 2 point 5). Rides through RMW unchanged.
     rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_device_record_t, crc16));
 
     s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_DEVICE, (uint8_t)slot), (const uint8_t *)&rec, sizeof(rec));
@@ -833,21 +1034,23 @@ static bool pl_persist_rmw(const uint8_t addr[6], const pl_persist_rmw_fields_t 
     sl->mru_seq = rec.mru_seq;
     sl->codec_id = rec.codec_id;
     sl->ldac_quality = rec.ldac_quality;
+    sl->preset_id = rec.preset_id;
 
     s_last_write_us = time_us_64();
     s_have_last_write = true;
     pl_log(
         "persist: wrote device record slot=%d %02x:%02x:%02x:%02x:%02x:%02x (mru_seq=%lu, name_len=%u, codec_id=%u, "
-        "ldac_quality=%u)\r\n",
+        "ldac_quality=%u, preset_id=%u)\r\n",
         slot, rec.addr[0], rec.addr[1], rec.addr[2], rec.addr[3], rec.addr[4], rec.addr[5], (unsigned long)rec.mru_seq, rec.name_len,
-        rec.codec_id, rec.ldac_quality
+        rec.codec_id, rec.ldac_quality, rec.preset_id
     );
-    // Bead pico-link-4vb.7 (T3): echo the write that actually landed --
-    // design section 3's single-writer rule ("no echo means no row") means
-    // this is the ONLY place PlEventTag::PairedDeviceUpserted is pushed for
-    // a save (pl_persist_do_write and pl_persist_write_device_settings both
+    // Bead pico-link-4vb.7 (T3), widened by pico-link-ryw.6: echo the write
+    // that actually landed -- design section 3's single-writer rule ("no
+    // echo means no row") means this is the ONLY place
+    // PlEventTag::PairedDeviceUpserted is pushed for a save
+    // (pl_persist_do_write and the field-masked device-settings write both
     // funnel through this one function).
-    pl_bt_push_paired_device_upserted(rec.addr, rec.name, rec.name_len, rec.mru_seq, rec.ldac_quality);
+    pl_bt_push_paired_device_upserted(rec.addr, rec.name, rec.name_len, rec.mru_seq, rec.ldac_quality, rec.preset_id);
     *out_result = PL_PERSIST_WRITE_OK;
     return true;
 }
@@ -868,9 +1071,10 @@ static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], cons
     pl_persist_rmw_fields_t fields = {
         .name = name,
         .name_len = name_len,
-        .set_codec_settings = false,
+        .field_mask = 0,
         .codec_id = 0,
         .ldac_quality = 0,
+        .preset_id = 0,
         .bump_mru = true,
         .allow_create_slot = true,
     };
@@ -883,13 +1087,19 @@ static pl_persist_write_result_t pl_persist_do_write(const uint8_t addr[6], cons
     return result;
 }
 
-bool pl_persist_write_device_settings(const uint8_t addr[6], uint8_t codec_id, uint8_t ldac_quality) {
+// Bead pico-link-ryw.6: the field-masked write itself, `static` now --
+// nothing outside persist.c ever calls this directly; every caller goes
+// through pl_persist_request_device_settings/pl_persist_execute_pending_
+// device_settings_write below. See persist.h's doc comment on
+// pl_persist_request_device_settings for the full contract.
+static bool pl_persist_write_device_settings(const uint8_t addr[6], uint8_t field_mask, uint8_t codec_id, uint8_t ldac_quality, uint16_t preset_id) {
     pl_persist_rmw_fields_t fields = {
         .name = NULL,
         .name_len = 0,
-        .set_codec_settings = true,
+        .field_mask = field_mask,
         .codec_id = codec_id,
         .ldac_quality = ldac_quality,
+        .preset_id = preset_id,
         .bump_mru = false,
         .allow_create_slot = false,
     };
@@ -1082,10 +1292,10 @@ bool pl_persist_forget_device(const uint8_t addr[6]) {
 }
 
 void pl_persist_service(void) {
-    // Bead pico-link-7jol.5: services BOTH staging slots on the same
-    // "not streaming" gate -- they are otherwise fully independent (no
-    // shared settle timer, no shared enqueued flag), see
-    // s_settings_pending's doc comment for why they're not merged.
+    // Bead pico-link-7jol.5, extended by pico-link-ryw.6: services every
+    // staging slot below independently -- they share no settle timer and
+    // no enqueued flag, see s_device_settings_pending's doc comment for why
+    // they're not merged.
     if (s_pending && !s_write_enqueued && !(pl_usb_audio_streaming() || pl_a2dp_streaming())) {
         bool due;
         if (s_urgent) {
@@ -1107,7 +1317,7 @@ void pl_persist_service(void) {
             pl_bt_enqueue_persist_write();
         }
     }
-    if (s_settings_pending && !s_settings_write_enqueued) {
+    if (s_device_settings_pending && !s_device_settings_write_enqueued) {
         // No settle/rate-limit window -- a manual pick is already the
         // debounced event (design sec 5: "applies live", the user pressed
         // A once); nothing to coalesce a burst of.
@@ -1115,17 +1325,36 @@ void pl_persist_service(void) {
         // Bead pico-link-xcmx, Andreas's ruling: unlike the general
         // pairing/link-key write above, this write is NOT gated behind
         // "not streaming". This is a user-initiated write -- the user just
-        // pressed A on the quality picker -- and the checkmark's
-        // check-follows-echo contract (design sec 5.1) means the echo, and
-        // therefore the UI feedback, never arrives at all while gated,
-        // since the one moment a user is guaranteed to be streaming is the
-        // moment they're auditioning a quality by ear. Andreas: "just
-        // write. It's fine if audio skips when I'm actively interacting
-        // with the device." Background/periodic persistence (the write
-        // above, and pl_persist_execute_pending_write) keeps the streaming
-        // gate.
-        s_settings_write_enqueued = true;
-        pl_bt_enqueue_ldac_quality_write();
+        // pressed A on the quality picker, or a d-pad step in the
+        // preset-assignment row -- and the checkmark's check-follows-echo
+        // contract (design sec 5.1) means the echo, and therefore the UI
+        // feedback, never arrives at all while gated, since the one moment
+        // a user is guaranteed to be streaming is the moment they're
+        // auditioning a pick by ear. Andreas: "just write. It's fine if
+        // audio skips when I'm actively interacting with the device."
+        // Background/periodic persistence (the write above, and
+        // pl_persist_execute_pending_write) keeps the streaming gate.
+        s_device_settings_write_enqueued = true;
+        pl_bt_enqueue_device_settings_write();
+    }
+    if (s_preset_save_pending && !s_preset_save_write_enqueued) {
+        // Bead pico-link-ryw.6, design sec 2.5 / Andreas's ryw.6 ruling:
+        // "save immediately on every value change" -- same "no streaming
+        // gate, user-initiated" treatment as the block above. A burst of
+        // edits before the heartbeat drains this coalesces to the LATEST
+        // staged blob (pl_persist_request_save_preset already applied that
+        // coalescing) -- this flag only ever allows ONE
+        // PL_BT_PENDING_SAVE_PRESET entry in flight at a time, so the
+        // pending-action queue (capacity 8) can never fill from this alone
+        // no matter how fast the d-pad repeats.
+        s_preset_save_write_enqueued = true;
+        pl_bt_enqueue_save_preset_write();
+    }
+    if (s_preset_delete_pending && !s_preset_delete_write_enqueued) {
+        // Design sec 2.4/2.5: same "user-initiated, no streaming gate"
+        // treatment.
+        s_preset_delete_write_enqueued = true;
+        pl_bt_enqueue_delete_preset_write();
     }
     if (s_display_pending && !s_display_write_enqueued) {
         // Bead pico-link-qivj.5 (S11), design D11 (Andreas's xcmx ruling,
@@ -1153,42 +1382,219 @@ void pl_persist_service(void) {
     }
 }
 
-// Bead pico-link-7jol.5. See persist.h's doc comment.
-void pl_persist_request_ldac_quality(const uint8_t addr[6], uint8_t ldac_quality) {
+// Bead pico-link-ryw.6. See persist.h's doc comment on
+// pl_persist_request_device_settings for the full field-mask/coalescing
+// contract.
+void pl_persist_request_device_settings(const uint8_t addr[6], uint8_t field_mask, uint8_t codec_id, uint8_t ldac_quality, uint16_t preset_id) {
     uint32_t irq_state = save_and_disable_interrupts();
-    memcpy(s_settings_pending_addr, addr, 6);
-    s_settings_pending_ldac_quality = ldac_quality;
-    s_settings_pending = true;
+    if (s_device_settings_pending && memcmp(s_device_settings_pending_addr, addr, 6) != 0) {
+        // A not-yet-drained request for a DIFFERENT address is staged --
+        // this call supersedes it entirely (same "freshest wins" policy
+        // pl_persist_request_save_device already has for the pairing
+        // slot), rather than mixing field masks/values across two devices.
+        s_device_settings_pending_mask = 0;
+    }
+    memcpy(s_device_settings_pending_addr, addr, 6);
+    if (field_mask & PL_PERSIST_DEVICE_FIELD_CODEC_ID) {
+        s_device_settings_pending_codec_id = codec_id;
+    }
+    if (field_mask & PL_PERSIST_DEVICE_FIELD_LDAC_QUALITY) {
+        s_device_settings_pending_ldac_quality = ldac_quality;
+    }
+    if (field_mask & PL_PERSIST_DEVICE_FIELD_PRESET_ID) {
+        s_device_settings_pending_preset_id = preset_id;
+    }
+    // OR in, don't overwrite: a field this call didn't touch but an
+    // earlier, not-yet-drained call (for the SAME address) already staged
+    // stays staged -- see this function's doc comment in persist.h.
+    s_device_settings_pending_mask |= field_mask;
+    s_device_settings_pending = true;
     restore_interrupts(irq_state);
 }
 
-// Bead pico-link-7jol.5. See persist.h's doc comment.
-void pl_persist_execute_pending_ldac_quality_write(void) {
-    if (!s_settings_pending) {
-        s_settings_write_enqueued = false;
+// Bead pico-link-ryw.6. See persist.h's doc comment.
+void pl_persist_execute_pending_device_settings_write(void) {
+    if (!s_device_settings_pending) {
+        s_device_settings_write_enqueued = false;
         return;
     }
-    // Bead pico-link-xcmx: no streaming re-check here, matching the
+    // Bead pico-link-xcmx / ryw.6: no streaming re-check here, matching the
     // enqueue side above -- this is the user-initiated write Andreas ruled
     // should just go through, streaming or not.
 
     uint8_t addr[6];
+    uint8_t field_mask;
+    uint8_t codec_id;
     uint8_t ldac_quality;
+    uint16_t preset_id;
     uint32_t irq_state = save_and_disable_interrupts();
-    memcpy(addr, s_settings_pending_addr, 6);
-    ldac_quality = s_settings_pending_ldac_quality;
-    s_settings_pending = false;
+    memcpy(addr, s_device_settings_pending_addr, 6);
+    field_mask = s_device_settings_pending_mask;
+    codec_id = s_device_settings_pending_codec_id;
+    ldac_quality = s_device_settings_pending_ldac_quality;
+    preset_id = s_device_settings_pending_preset_id;
+    s_device_settings_pending = false;
+    s_device_settings_pending_mask = 0;
     restore_interrupts(irq_state);
 
-    // Read-then-write, both from this same async_context call, so this
-    // can never race a concurrent write to the same slot's codec_id --
-    // reads the device's EXISTING codec_id first so this write never
-    // clobbers it (this bead's UI only ever changes ldac_quality).
-    uint8_t existing_codec_id = 0;
-    uint8_t existing_ldac_quality_unused = 0;
-    pl_persist_get_device_settings(addr, &existing_codec_id, &existing_ldac_quality_unused);
-    pl_persist_write_device_settings(addr, existing_codec_id, ldac_quality);
-    s_settings_write_enqueued = false;
+    // pl_persist_rmw (via pl_persist_write_device_settings) starts from the
+    // EXISTING record and only applies field_mask's bits -- no pre-read
+    // needed here to avoid clobbering an unmasked field, unlike the old
+    // ldac_quality-only pair this replaces.
+    pl_persist_write_device_settings(addr, field_mask, codec_id, ldac_quality, preset_id);
+    s_device_settings_write_enqueued = false;
+}
+
+// Bead pico-link-ryw.6, design sec 2.2. Finds which PL:P slot currently
+// holds `id`, if any -- returns the slot index or -1. Consults the in-RAM
+// s_preset_slots mirror, not flash, same discipline as
+// pl_persist_find_slot_for_addr.
+static int pl_persist_find_preset_slot_for_id(uint16_t id) {
+    for (uint8_t i = 0; i < PL_PERSIST_PRESET_SLOTS; i++) {
+        if (s_preset_slots[i].occupied && s_preset_slots[i].id == id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Bead pico-link-ryw.6, design sec 2.2. Finds the first unoccupied PL:P
+// slot, or -1 if every slot is in use -- same "no eviction" policy as
+// pl_persist_find_free_slot.
+static int pl_persist_find_free_preset_slot(void) {
+    for (uint8_t i = 0; i < PL_PERSIST_PRESET_SLOTS; i++) {
+        if (!s_preset_slots[i].occupied) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Bead pico-link-ryw.6. See persist.h's doc comment.
+void pl_persist_request_save_preset(uint16_t preset_id, uint8_t blob_len, const uint8_t *blob) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    s_preset_save_pending_id = preset_id;
+    uint8_t copy_len = blob_len > (uint8_t)sizeof(s_preset_save_pending_blob) ? (uint8_t)sizeof(s_preset_save_pending_blob) : blob_len;
+    memcpy(s_preset_save_pending_blob, blob, copy_len);
+    if (copy_len < (uint8_t)sizeof(s_preset_save_pending_blob)) {
+        memset(s_preset_save_pending_blob + copy_len, 0, sizeof(s_preset_save_pending_blob) - copy_len);
+    }
+    s_preset_save_pending_blob_len = copy_len;
+    s_preset_save_pending = true;
+    restore_interrupts(irq_state);
+}
+
+// Bead pico-link-ryw.6. See persist.h's doc comment.
+void pl_persist_execute_pending_save_preset_write(void) {
+    if (!s_preset_save_pending) {
+        s_preset_save_write_enqueued = false;
+        return;
+    }
+
+    uint16_t requested_id;
+    uint8_t blob_len;
+    uint8_t blob[PL_PERSIST_PRESET_BLOB_LEN];
+    uint32_t irq_state = save_and_disable_interrupts();
+    requested_id = s_preset_save_pending_id;
+    blob_len = s_preset_save_pending_blob_len;
+    memcpy(blob, s_preset_save_pending_blob, sizeof(blob));
+    s_preset_save_pending = false;
+    restore_interrupts(irq_state);
+
+    int slot;
+    uint16_t id_to_write;
+    if (requested_id == PL_PERSIST_PRESET_ID_NONE) {
+        // Fresh allocation -- design sec 2.2: ids are monotonic and never
+        // reused.
+        slot = pl_persist_find_free_preset_slot();
+        if (slot < 0) {
+            pl_log(
+                "persist: preset store full (%u/%u slots used) -- refusing to allocate a new preset, no "
+                "eviction\r\n",
+                (unsigned)PL_PERSIST_PRESET_SLOTS, (unsigned)PL_PERSIST_PRESET_SLOTS
+            );
+            s_preset_save_write_enqueued = false;
+            return;
+        }
+        id_to_write = s_next_preset_id++;
+    } else {
+        // Overwrite in place -- design sec 2.2: an id always names an
+        // EXISTING slot once allocated; a caller-supplied id that no slot
+        // holds is refused rather than silently claiming a fresh slot under
+        // it (that would let a stale/racing id alias a different preset's
+        // slot).
+        slot = pl_persist_find_preset_slot_for_id(requested_id);
+        if (slot < 0) {
+            pl_log("persist: save_preset id=%u but no slot holds it -- refusing\r\n", (unsigned)requested_id);
+            s_preset_save_write_enqueued = false;
+            return;
+        }
+        id_to_write = requested_id;
+    }
+
+    pl_persist_preset_record_t rec = {
+        .version = PL_PERSIST_PRESET_VERSION,
+        .preset_id = id_to_write,
+        .blob_len = blob_len,
+        .crc16 = 0,
+    };
+    memcpy(rec.blob, blob, sizeof(rec.blob));
+    rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_preset_record_t, crc16));
+    s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, (uint8_t)slot), (const uint8_t *)&rec, sizeof(rec));
+
+    pl_persist_preset_slot_t *psl = &s_preset_slots[(uint8_t)slot];
+    psl->occupied = true;
+    psl->id = id_to_write;
+    psl->blob_len = blob_len;
+    memcpy(psl->blob, blob, sizeof(psl->blob));
+
+    pl_log("persist: wrote preset slot=%d id=%u blob_len=%u\r\n", slot, id_to_write, blob_len);
+    // Design sec 2.2/3.2: the SavePreset echo -- carries whichever id was
+    // actually used (the one supplied, or the freshly allocated one), same
+    // single-writer-echo rule as every other write in this file.
+    pl_bt_push_preset_loaded(id_to_write, blob_len, blob);
+    s_preset_save_write_enqueued = false;
+}
+
+// Bead pico-link-ryw.6. See persist.h's doc comment.
+void pl_persist_request_delete_preset(uint16_t preset_id) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    s_preset_delete_pending_id = preset_id;
+    s_preset_delete_pending = true;
+    restore_interrupts(irq_state);
+}
+
+// Bead pico-link-ryw.6. See persist.h's doc comment.
+void pl_persist_execute_pending_delete_preset_write(void) {
+    if (!s_preset_delete_pending) {
+        s_preset_delete_write_enqueued = false;
+        return;
+    }
+
+    uint16_t id;
+    uint32_t irq_state = save_and_disable_interrupts();
+    id = s_preset_delete_pending_id;
+    s_preset_delete_pending = false;
+    restore_interrupts(irq_state);
+
+    int slot = pl_persist_find_preset_slot_for_id(id);
+    if (slot < 0) {
+        pl_log("persist: delete_preset id=%u but no slot holds it -- no-op\r\n", (unsigned)id);
+        s_preset_delete_write_enqueued = false;
+        return;
+    }
+
+    // Design sec 2.4: deletes ONLY the PL:P tag -- never rewrites any PL:D
+    // device record, so a device still referencing `id` keeps a dangling
+    // reference that `core` resolves as Off. This is deliberately cheap
+    // (avoids up to PL_PERSIST_DEVICE_SLOTS extra writes) and never
+    // garbage-collects anything.
+    s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, (uint8_t)slot));
+    memset(&s_preset_slots[(uint8_t)slot], 0, sizeof(s_preset_slots[(uint8_t)slot]));
+
+    pl_log("persist: deleted preset slot=%d id=%u\r\n", slot, (unsigned)id);
+    pl_bt_push_preset_deleted(id);
+    s_preset_delete_write_enqueued = false;
 }
 
 // Bead pico-link-qivj.5 (S11). See persist.h's doc comment.

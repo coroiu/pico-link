@@ -164,9 +164,12 @@ void pl_bt_get_connect_target_name(const uint8_t addr[6], uint8_t out_name[32], 
 // persisted 1-based quality pick, 0 = unset -- callers must pass whatever
 // persist.c's slot mirror actually holds for this record (see
 // pl_persist_get_device_settings/pl_persist_boot_device_at), never a
-// literal 0. Safe from IRQ or thread context -- routes through
-// pl_bt_ring_push, same as every other push helper in this header.
-void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq, uint8_t ldac_quality);
+// literal 0. `preset_id` (bead pico-link-ryw.6, ABI 5->6) is the PL:P id
+// this device references, 0 (or an id the preset store no longer holds)
+// meaning Off -- resolved by `core`, never by this module. Safe from IRQ or
+// thread context -- routes through pl_bt_ring_push, same as every other
+// push helper in this header.
+void pl_bt_push_paired_device_upserted(const uint8_t addr[6], const uint8_t name[32], uint8_t name_len, uint32_t mru_seq, uint8_t ldac_quality, uint16_t preset_id);
 
 // Bead pico-link-4vb.7 (T3), design section 5.1: pushes
 // PlEventTag::PairedDeviceForgotten. Called from persist.c's
@@ -179,6 +182,35 @@ void pl_bt_push_paired_device_forgotten(const uint8_t addr[6]);
 // (S18 -- never silently evict, so the UI must hear about a refused
 // write).
 void pl_bt_push_paired_store_full(void);
+
+// Bead pico-link-ryw.6, design `.planning/design/2026-09-25-dsp-effects-
+// stage.md` sec 2.2/3.2: pushes PlEventTag::PresetLoaded -- either at boot
+// (bt.c's own boot sequence, one push per surviving PL:P record) or as the
+// PL_COMMAND_TAG_SAVE_PRESET echo (persist.c's
+// pl_persist_execute_pending_save_preset_write, the single place a preset
+// write actually lands). `id` is never 0 (PL_PERSIST_PRESET_ID_NONE is
+// reserved). `blob` is copied by value into the pushed PlEvent's own fixed
+// buffer, same convention as pl_bt_push_codec_changed's `name` -- only the
+// first `blob_len` bytes are meaningful. `blob` is a plain pointer, not a
+// PL_PERSIST_PRESET_BLOB_LEN-sized array -- persist.h's constant is not
+// visible from every translation unit that includes this header (e.g.
+// volume.c, debug_remote.c), same "name as a pointer, copied by value
+// inside" convention pl_bt_push_codec_changed's `name` param uses; the
+// destination array size comes from pico_link_ui.h's PlPresetLoadedPayload
+// (already visible here via the include above), not persist.h.
+void pl_bt_push_preset_loaded(uint16_t id, uint8_t blob_len, const uint8_t *blob);
+
+// Bead pico-link-ryw.6, design sec 2.4/3.2: pushes
+// PlEventTag::PresetDeleted -- the PL_COMMAND_TAG_DELETE_PRESET echo, a
+// real deletion persist.c's flash store performed (no echo for a
+// no-op delete of an id no slot holds).
+void pl_bt_push_preset_deleted(uint16_t id);
+
+// Bead pico-link-ryw.6, design sec 2.2: pushes
+// PlEventTag::PresetStoreLoaded -- the terminator of bt.c's boot-time
+// `count` x pl_bt_push_preset_loaded push sequence, same shape
+// pl_bt_push_store_loaded is for PairedDeviceUpserted's boot sequence.
+void pl_bt_push_preset_store_loaded(uint32_t status, uint16_t count);
 
 #ifdef PL_DEBUG_REMOTE
 // Bead pico-link-g48: debug-only direct connect to a host-supplied
@@ -215,13 +247,28 @@ void pl_bt_debug_disconnect(void);
 // ("Reentrancy") for the full rationale.
 void pl_bt_enqueue_persist_write(void);
 
-// Bead pico-link-7jol.5: same idiom as pl_bt_enqueue_persist_write above,
-// for persist.c's LDAC-quality settings write instead of a pairing write
-// -- see persist.h's doc comment on pl_persist_request_ldac_quality/
-// pl_persist_execute_pending_ldac_quality_write for the full rationale.
-// Called from persist.c's pl_persist_service() (thread context, the
-// superloop).
-void pl_bt_enqueue_ldac_quality_write(void);
+// Bead pico-link-7jol.5, generalized by pico-link-ryw.6: same idiom as
+// pl_bt_enqueue_persist_write above, for persist.c's field-masked
+// device-settings write (codec_id/ldac_quality/preset_id) instead of a
+// pairing write -- see persist.h's doc comment on
+// pl_persist_request_device_settings/pl_persist_execute_pending_device_
+// settings_write for the full rationale. Called from persist.c's
+// pl_persist_service() (thread context, the superloop).
+void pl_bt_enqueue_device_settings_write(void);
+
+// Bead pico-link-ryw.6: same idiom as pl_bt_enqueue_persist_write above,
+// for persist.c's PL:P preset-save write -- see persist.h's doc comment on
+// pl_persist_request_save_preset/pl_persist_execute_pending_save_preset_
+// write for the full rationale. Called from persist.c's
+// pl_persist_service() (thread context, the superloop).
+void pl_bt_enqueue_save_preset_write(void);
+
+// Bead pico-link-ryw.6: same idiom as pl_bt_enqueue_persist_write above,
+// for persist.c's PL:P preset-delete write -- see persist.h's doc comment
+// on pl_persist_request_delete_preset/pl_persist_execute_pending_delete_
+// preset_write for the full rationale. Called from persist.c's
+// pl_persist_service() (thread context, the superloop).
+void pl_bt_enqueue_delete_preset_write(void);
 
 // Bead pico-link-qivj.5 (S11): same idiom as pl_bt_enqueue_persist_write
 // above, for persist.c's PL:S:0 display-settings write -- see persist.h's
