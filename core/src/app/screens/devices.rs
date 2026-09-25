@@ -19,6 +19,8 @@ use crate::render::{
     Verb, VerticalList, Widget,
 };
 
+use crate::dsp::PresetStore;
+
 use super::device_page::build_device_page_screen;
 use super::super::model::MAX_PAIRED_DEVICES;
 use super::super::{truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, ModelHandle, PairedDevice, ScreenId, WizardPhase};
@@ -83,6 +85,7 @@ pub(crate) fn build_devices_screen(
     prev_key: Option<ListItemKey>,
     prev_index: usize,
     prev_scroll_top: Option<usize>,
+    presets: &Rc<RefCell<PresetStore>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     wizard_phase: &Rc<RefCell<WizardPhase>>,
 ) -> Screen {
@@ -92,6 +95,7 @@ pub(crate) fn build_devices_screen(
     };
 
     let model_for_activate = Rc::clone(model);
+    let presets_for_activate = Rc::clone(presets);
     let commands_for_activate = Rc::clone(commands);
     let wizard_phase_for_activate = Rc::clone(wizard_phase);
     let list = VerticalList::new(items)
@@ -147,6 +151,7 @@ pub(crate) fn build_devices_screen(
                 let addr = device.addr;
                 let fallback_title = paired_device_label(&device);
                 let model = Rc::clone(&model_for_activate);
+                let presets = Rc::clone(&presets_for_activate);
                 let commands = Rc::clone(&commands_for_activate);
                 return Action::PushView(Box::new(move || {
                     // The connected device we just resolved cannot have
@@ -154,7 +159,7 @@ pub(crate) fn build_devices_screen(
                     // on the very same press -- structurally unreachable,
                     // but a same-titled empty screen is a harmless
                     // fallback rather than a panic if it ever is.
-                    build_device_page_screen(&model, addr, &commands).unwrap_or_else(|| Screen::new(fallback_title, vec![]))
+                    build_device_page_screen(&model, addr, &presets, &commands).unwrap_or_else(|| Screen::new(fallback_title, vec![]))
                 }));
             }
             // A on any other paired row: switch to it, reusing the

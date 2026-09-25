@@ -91,10 +91,11 @@ use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
 use crate::app::{
-    build_device_page_screen, build_devices_screen, build_settings_screen, build_why_page_screen, AbrFloorState, BtModel, Command,
-    CushionPolicyState, DeviceAddr, DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, ScreenId, VolumeSource,
-    WizardPhase, LDAC_QUALITY_ADAPTIVE,
+    build_device_page_screen, build_devices_screen, build_effects_list_screen, build_settings_screen, build_why_page_screen, AbrFloorState,
+    BtModel, Command, CushionPolicyState, DeviceAddr, DisplaySettingsState, FaultKey, FaultLog, HomeFace, LinkState, ModelHandle, ScreenId,
+    VolumeSource, WizardPhase, LDAC_QUALITY_ADAPTIVE,
 };
+use crate::dsp::PresetStore;
 use crate::input::NavIntent;
 use crate::platform::Instant;
 
@@ -125,7 +126,11 @@ pub const HOME_TITLE: &str = "Pico Link";
 /// Settings", no "Home" row -- B already does that, and a row meaning "go
 /// back" is wasted on a 240px screen).
 const MENU_ROW_BLUETOOTH: usize = 0;
-const MENU_ROW_SETTINGS: usize = 1;
+/// Bead `pico-link-ryw.7`: the third Home menu row, opening the DSP
+/// effects list (design sec 0: "The Home menu face gets a third row,
+/// Effects (Bluetooth / Effects / Settings)").
+const MENU_ROW_EFFECTS: usize = 1;
+const MENU_ROW_SETTINGS: usize = 2;
 
 /// Builds the Home screen exactly once -- `pico-link-bgnd`'s only caller is
 /// `App::new`; Home is never rebuilt again for the app's lifetime.
@@ -146,8 +151,12 @@ pub(crate) fn build_home_screen(
     display_settings: &Rc<RefCell<DisplaySettingsState>>,
     cushion_policy: &Rc<RefCell<CushionPolicyState>>,
     abr_floor: &Rc<RefCell<AbrFloorState>>,
+    presets: &Rc<RefCell<PresetStore>>,
+    editor_preset_id: &Rc<RefCell<Option<u16>>>,
 ) -> Screen {
-    let view = HomeView::new(model, Rc::clone(home_face), commands, wizard_phase, now, display_settings, cushion_policy, abr_floor);
+    let view = HomeView::new(
+        model, Rc::clone(home_face), commands, wizard_phase, now, display_settings, cushion_policy, abr_floor, presets, editor_preset_id,
+    );
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
     // this replaced, which rendered B live on the status face too even
@@ -222,6 +231,10 @@ struct HomeView {
     /// Never more than one frame stale, the same tolerance every other
     /// field on this struct has.
     now: Instant,
+    /// The live DSP effects preset store -- bead `pico-link-ryw.7`, for the
+    /// menu face's `Effects` row (`build_effects_list_screen`) and the FX
+    /// line's own [`Self::project_hero`] read.
+    presets: Rc<RefCell<PresetStore>>,
 }
 
 impl HomeView {
@@ -231,7 +244,7 @@ impl HomeView {
     /// has no interaction state of its own worth updating in place, so
     /// rebuilding it fresh each sync is simpler than a setter and no more
     /// expensive than the rebuild-on-every-event path it replaces).
-    fn project_hero(model: &BtModel) -> HeroStatusView {
+    fn project_hero(model: &BtModel, presets: &PresetStore) -> HeroStatusView {
         // `NO LINK` whenever there is no live codec (design section 15's
         // "absent, never frozen or faked" rule -- this covers Idle/
         // Scanning/Connecting alike, not just a bare disconnect),
@@ -261,7 +274,7 @@ impl HomeView {
                 VolumeSource::Sink | VolumeSource::Device => HeroVolumeSource::Other,
             },
         });
-        match &model.connected_codec {
+        let hero = match &model.connected_codec {
             Some(codec) => {
                 // Bead pico-link-4vb.4 (T4): reads `paired` (the remembered
                 // list), not the old `discovered` scan list -- the whole
@@ -317,7 +330,20 @@ impl HomeView {
                 .with_out_level(out_level)
             }
             None => HeroStatusView::new("", CodecStatus::NoLink),
-        }
+        };
+        // FX line (design sec 8): "FX <name>" in the stat-strip slot
+        // (`HeroStatusView::with_stat_line`, previously unused by any live
+        // caller), absent when nothing is connected or the device's
+        // effect is Off (the default for every new device) --
+        // `resolve_effect_name` already collapses "never assigned" and
+        // "assigned to a since-deleted preset" to the same `"Off"` word,
+        // so this only needs one check, not two.
+        let fx_line = model.connected_addr.and_then(|addr| model.paired.iter().find(|d| d.addr == addr)).and_then(|device| {
+            let name = crate::app::resolve_effect_name(presets, device.preset_id);
+            (name != "Off").then(|| alloc::format!("FX {name}"))
+        });
+        let hero = if let Some(line) = fx_line { hero.with_stat_line(line) } else { hero };
+        hero
         .with_volume(hero_volume)
         // The Home fault strip (design `.planning/design/2026-09-07-home-
         // fault-strip.md`, bead `pico-link-9eq2.3.3`) -- a straight field
@@ -339,11 +365,13 @@ impl HomeView {
         display_settings: &Rc<RefCell<DisplaySettingsState>>,
         cushion_policy: &Rc<RefCell<CushionPolicyState>>,
         abr_floor: &Rc<RefCell<AbrFloorState>>,
+        presets: &Rc<RefCell<PresetStore>>,
+        editor_preset_id: &Rc<RefCell<Option<u16>>>,
     ) -> Self {
         let (hero, link_state, discovering, connecting, connected_addr, fault_log) = {
             let snapshot = model.borrow();
             (
-                Self::project_hero(&snapshot),
+                Self::project_hero(&snapshot, &presets.borrow()),
                 snapshot.link_state,
                 snapshot.discovering,
                 snapshot.connecting,
@@ -357,10 +385,15 @@ impl HomeView {
         let model_for_bluetooth = Rc::clone(model);
         let commands_for_bluetooth = Rc::clone(commands);
         let wizard_phase_for_bluetooth = Rc::clone(wizard_phase);
+        let presets_for_bluetooth = Rc::clone(presets);
         let display_settings_for_settings_row = Rc::clone(display_settings);
         let cushion_policy_for_settings_row = Rc::clone(cushion_policy);
         let abr_floor_for_settings_row = Rc::clone(abr_floor);
-        let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Settings")]).on_activate_index(
+        let model_for_effects = Rc::clone(model);
+        let presets_for_effects = Rc::clone(presets);
+        let commands_for_effects = Rc::clone(commands);
+        let editor_preset_id_for_effects = Rc::clone(editor_preset_id);
+        let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Effects"), MenuItem::new("Settings")]).on_activate_index(
             // `Verb::Open`: both rows push a deeper screen and draw a
             // caret (design section 4's assignment table -- Home menu's A
             // word changed from "select" to "open" as part of the rule 4
@@ -375,9 +408,17 @@ impl HomeView {
                     // `pico-link-bgnd` M1), so a value snapshot captured
                     // here would go stale forever after the first press.
                     let model = Rc::clone(&model_for_bluetooth);
+                    let presets = Rc::clone(&presets_for_bluetooth);
                     let commands = Rc::clone(&commands_for_bluetooth);
                     let wizard_phase = Rc::clone(&wizard_phase_for_bluetooth);
-                    Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, None, &commands, &wizard_phase)))
+                    Action::PushView(Box::new(move || build_devices_screen(&model, None, 0, None, &presets, &commands, &wizard_phase)))
+                }
+                MENU_ROW_EFFECTS => {
+                    let model = Rc::clone(&model_for_effects);
+                    let presets = Rc::clone(&presets_for_effects);
+                    let commands = Rc::clone(&commands_for_effects);
+                    let editor_preset_id = Rc::clone(&editor_preset_id_for_effects);
+                    Action::PushView(Box::new(move || build_effects_list_screen(&model, &presets, &commands, &editor_preset_id)))
                 }
                 MENU_ROW_SETTINGS => {
                     let display_settings = Rc::clone(&display_settings_for_settings_row);
@@ -407,6 +448,7 @@ impl HomeView {
             commands: commands_for_shortcut_y,
             fault_log,
             now,
+            presets: Rc::clone(presets),
         }
     }
 
@@ -457,7 +499,7 @@ impl Widget for HomeView {
         self.connecting = model.connecting;
         self.connected_addr = model.connected_addr;
         self.fault_log = model.fault_log;
-        self.hero = Self::project_hero(&model);
+        self.hero = Self::project_hero(&model, &self.presets.borrow());
         drop(model);
         self.menu.sync(ctx);
     }
@@ -536,6 +578,7 @@ impl Widget for HomeView {
             NavIntent::ShortcutY => {
                 if let Some(addr) = self.connected_addr {
                     let model = Rc::clone(&self.model);
+                    let presets = Rc::clone(&self.presets);
                     let commands = Rc::clone(&self.commands);
                     Action::PushView(Box::new(move || {
                         // The device we just read `connected_addr` for
@@ -546,7 +589,7 @@ impl Widget for HomeView {
                         // a panic if it ever is (same shape as
                         // `build_devices_screen`'s own `fallback_title`
                         // handling).
-                        build_device_page_screen(&model, addr, &commands).unwrap_or_else(|| Screen::new(NO_DEVICE_TITLE, vec![]))
+                        build_device_page_screen(&model, addr, &presets, &commands).unwrap_or_else(|| Screen::new(NO_DEVICE_TITLE, vec![]))
                     }))
                 } else {
                     Action::PushView(Box::new(|| {
@@ -782,7 +825,12 @@ mod tests {
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
         let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
         let abr_floor = Rc::new(RefCell::new(AbrFloorState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor)
+        let presets = Rc::new(RefCell::new(PresetStore::new()));
+        let editor_preset_id = Rc::new(RefCell::new(None));
+        HomeView::new(
+            &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
+            &editor_preset_id,
+        )
     }
 
     /// A [`HomeView`] whose model has a connected, paired device at
@@ -797,7 +845,12 @@ mod tests {
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
         let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
         let abr_floor = Rc::new(RefCell::new(AbrFloorState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor)
+        let presets = Rc::new(RefCell::new(PresetStore::new()));
+        let editor_preset_id = Rc::new(RefCell::new(None));
+        HomeView::new(
+            &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
+            &editor_preset_id,
+        )
     }
 
     /// Runs an [`Action::PushView`]'s builder and returns the resulting
@@ -926,7 +979,12 @@ mod tests {
         let display_settings = Rc::new(RefCell::new(DisplaySettingsState::default()));
         let cushion_policy = Rc::new(RefCell::new(CushionPolicyState::default()));
         let abr_floor = Rc::new(RefCell::new(AbrFloorState::default()));
-        HomeView::new(&model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor)
+        let presets = Rc::new(RefCell::new(PresetStore::new()));
+        let editor_preset_id = Rc::new(RefCell::new(None));
+        HomeView::new(
+            &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
+            &editor_preset_id,
+        )
     }
 
     #[test]
@@ -1015,5 +1073,95 @@ mod tests {
         view.on_focus(FocusEvent::Activated); // status -> menu
         assert_eq!(view.face(), HomeFace::Menu);
         assert!(view.handles_back(), "B must be live on the menu face -- it folds back to the status face");
+    }
+
+    // --- Effects row + FX line (bead pico-link-ryw.7) ---
+
+    #[test]
+    fn menu_face_has_three_rows_bluetooth_effects_settings_in_order() {
+        let mut app = crate::app::App::new(240, 240);
+        app.handle_input(vec![NavIntent::Select]); // status -> menu face
+        assert_eq!(app.current_screen_title(), HOME_TITLE);
+        app.handle_input(vec![NavIntent::Down]); // Effects
+        app.handle_input(vec![NavIntent::Select]); // open it
+        assert_eq!(app.current_screen_title(), "Effects", "Down once from Bluetooth must reach Effects");
+    }
+
+    #[test]
+    fn fx_line_rendering_does_not_panic_when_the_connected_devices_effect_is_off() {
+        // Text-presence pixel checks can't distinguish "FX Off" from "no
+        // FX line" (both are absent per design sec 8) -- the real
+        // assertion for FX-line *content* is `resolve_effect_name`'s own
+        // unit tests plus the zoomed screenshot below; this just proves
+        // an unassigned connected device renders cleanly.
+        let mut app = crate::app::App::new(240, 240);
+        let addr = [50; 6];
+        app.handle_event(crate::app::Event::ConnectSucceeded { addr, degraded: false });
+        app.poll_command();
+        app.handle_event(crate::app::Event::PairedDeviceUpserted(crate::app::PairedDevice {
+            addr,
+            name: String::from("Cans"),
+            mru_seq: 1,
+            ldac_quality: 0,
+            preset_id: 0,
+        }));
+        let _ = app.render();
+        assert_eq!(app.navigator_depth(), 1);
+    }
+
+    /// Headless zoomed screenshots of the two states this bead adds:
+    /// the menu face's new `Effects` row, and the status face's `FX
+    /// <name>` line once a connected device has an assigned effect.
+    #[test]
+    fn effects_row_and_fx_line_screenshots_at_zoom() {
+        use embedded_graphics::prelude::RgbColor;
+
+        fn save_zoomed_png(app: &mut crate::app::App, path: &std::path::Path) {
+            const ZOOM: u32 = 3;
+            let framebuffer = app.render();
+            let mut image = image::RgbImage::new(framebuffer.width(), framebuffer.height());
+            for pixel in framebuffer.pixels() {
+                let color = pixel.1;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+                image.put_pixel(
+                    pixel.0.x as u32,
+                    pixel.0.y as u32,
+                    image::Rgb([(color.r() << 3) | (color.r() >> 2), (color.g() << 2) | (color.g() >> 4), (color.b() << 3) | (color.b() >> 2)]),
+                );
+            }
+            let zoomed = image::imageops::resize(&image, framebuffer.width() * ZOOM, framebuffer.height() * ZOOM, image::imageops::FilterType::Nearest);
+            zoomed.save(path).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        }
+
+        let out_dir = std::env::temp_dir().join("pico-link-home-effects-screenshots");
+        std::fs::create_dir_all(&out_dir).expect("failed to create output dir");
+
+        // Menu face, Effects row visible.
+        let mut app = crate::app::App::new(240, 240);
+        app.handle_input(vec![NavIntent::Select]);
+        save_zoomed_png(&mut app, &out_dir.join("01_menu_face_effects_row.png"));
+
+        // Status face, connected device with an assigned effect -- the FX
+        // line.
+        let mut app = crate::app::App::new(240, 240);
+        let addr = [51; 6];
+        app.handle_event(crate::app::Event::ConnectSucceeded { addr, degraded: false });
+        app.poll_command();
+        app.handle_event(crate::app::Event::PairedDeviceUpserted(crate::app::PairedDevice {
+            addr,
+            name: String::from("Sony WH-1000XM5"),
+            mru_seq: 1,
+            ldac_quality: 0,
+            preset_id: 1,
+        }));
+        app.handle_event(crate::app::Event::CodecChanged(crate::app::ConnectedCodec {
+            addr,
+            word: String::from("LDAC"),
+            nominal_bitrate_bps: 990_000,
+        }));
+        app.handle_event(crate::app::Event::PresetLoaded { id: 1, blob: crate::dsp::Preset::new("Relaxed").to_wire().to_vec() });
+        save_zoomed_png(&mut app, &out_dir.join("02_status_face_fx_line.png"));
+
+        println!("wrote Home effects screenshots to {}", out_dir.display());
     }
 }

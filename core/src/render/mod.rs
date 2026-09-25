@@ -96,7 +96,7 @@ pub use confirm::ConfirmView;
 pub use ctx::RenderCtx;
 pub use framebuffer::FrameBuffer565;
 pub use crate::platform::Instant;
-pub use fields::{FieldKind, FieldList, FieldRow, ValueFont};
+pub use fields::{FieldKind, FieldList, FieldRow, Step, StepBounds, ValueFont};
 pub use hero::{BitrateStatus, CodecStatus, HeroStatusView, HeroVolume, HeroVolumeSource};
 pub use home::HOME_TITLE;
 pub use list::{ListItem, ListItemKey, VerticalList, ROW_HEIGHT};

@@ -1041,8 +1041,12 @@ impl Widget for HeroStatusView {
                 let stat_y = area.top_left.y + STAT_TOP;
                 let label_font = font::label();
                 let stat_max_width = (hero_body.size.width as i32 - LEFT_MARGIN - RIGHT_MARGIN).max(0) as u32;
-                let upper = stat_line.to_uppercase();
-                let stat_text = truncate_to_width(&label_font, &upper, stat_max_width);
+                // Bead pico-link-ryw.7: no longer forced uppercase --
+                // the FX line ("FX Relaxed", design sec 8) is
+                // deliberately mixed-case. This field is only ever set by
+                // that one live caller today; a future caller that wants
+                // caps can pass already-uppercased text.
+                let stat_text = truncate_to_width(&label_font, stat_line, stat_max_width);
                 let _ = label_font.render_aligned(
                     stat_text.as_str(),
                     Point::new(hero_body.top_left.x + LEFT_MARGIN, stat_y),

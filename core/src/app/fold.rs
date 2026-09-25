@@ -515,7 +515,14 @@ impl App {
     /// rather than dropping the whole load.
     fn on_preset_loaded(&mut self, id: u16, blob: &[u8]) {
         let preset = crate::dsp::preset::Preset::from_wire(blob);
-        self.presets.load(id, preset);
+        self.presets.borrow_mut().load(id, preset);
+        // The editor (if any) adopts the first echo it sees while its own
+        // id is still pending -- see `App::editor_preset_id`'s doc comment.
+        let mut editor_id = self.editor_preset_id.borrow_mut();
+        if *editor_id == Some(0) {
+            *editor_id = Some(id);
+        }
+        drop(editor_id);
         self.mark_model_changed();
     }
 
@@ -527,7 +534,7 @@ impl App {
     /// [`crate::dsp::PresetStore::resolve`]'s doc comment), so no
     /// up-to-8-device rewrite belongs here.
     fn on_preset_deleted(&mut self, id: u16) {
-        self.presets.delete(id);
+        self.presets.borrow_mut().delete(id);
         self.mark_model_changed();
     }
 

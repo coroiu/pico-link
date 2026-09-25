@@ -45,6 +45,8 @@ pub enum ScreenId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     LdacQuality,
+    /// The device page's `EFFECT` row's picker -- bead `pico-link-ryw.7`.
+    Effect,
 }
 
 /// Which picker a [`ScreenId::SettingsPicker`] identifies.

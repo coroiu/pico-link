@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(app.cushion_policy(), CushionPolicy::Low, "default must be Low");
 
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
-        app.handle_input(vec![NavIntent::Down]); // Settings row
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // Effects row, then Settings row
         app.handle_input(vec![NavIntent::Select]); // open Settings (BUFFER row focused, row 0)
         app.handle_input(vec![NavIntent::Select]); // open the Buffer picker
         app.handle_input(vec![NavIntent::Down]); // focus Stable
@@ -454,7 +454,7 @@ mod tests {
         app.handle_event(crate::app::Event::CushionPolicyLoaded { policy: 2 }); // Stable
 
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
-        app.handle_input(vec![NavIntent::Down]); // Settings row
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // Effects row, then Settings row
         app.handle_input(vec![NavIntent::Select]); // open Settings
 
         assert_eq!(app.current_screen_title(), SETTINGS_TITLE);
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(app.abr_floor(), AbrFloor::Kbps330, "default must be 330 kbps");
 
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
-        app.handle_input(vec![NavIntent::Down]); // Settings row
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // Effects row, then Settings row
         app.handle_input(vec![NavIntent::Select]); // open Settings (BUFFER row focused, row 0)
         app.handle_input(vec![NavIntent::Down]); // focus LDAC MIN (row 1)
         app.handle_input(vec![NavIntent::Select]); // open the LDAC MIN picker
@@ -500,7 +500,7 @@ mod tests {
         app.handle_event(crate::app::Event::AbrFloorLoaded { floor: 2 }); // 246 kbps
 
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
-        app.handle_input(vec![NavIntent::Down]); // Settings row
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down]); // Effects row, then Settings row
         app.handle_input(vec![NavIntent::Select]); // open Settings
 
         assert_eq!(app.current_screen_title(), SETTINGS_TITLE);
@@ -538,7 +538,7 @@ mod tests {
         }
 
         let mut app = App::new(240, 240);
-        app.handle_input(vec![NavIntent::Select, NavIntent::Down, NavIntent::Select]); // open Settings
+        app.handle_input(vec![NavIntent::Select, NavIntent::Down, NavIntent::Down, NavIntent::Select]); // open Settings
         dump(&mut app, "settings.png", &out_dir);
 
         app.handle_input(vec![NavIntent::Select]); // open the Buffer picker (row 0, BUFFER)
