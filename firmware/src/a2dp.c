@@ -4119,7 +4119,13 @@ void pl_a2dp_init(struct PlUi *ui) {
     sdp_register_service(s_sdp_device_id_buf);
 
     gap_set_local_name("Pico Link 00:00:00:00:00:00");
-    gap_discoverable_control(1);
+    // Bead pico-link-oevr: gap_discoverable_control(1) used to live here
+    // (copied from a2dp_source_demo.c, never turned off) -- deleted.
+    // bt.c's pl_bt_update_scan_mode is now the sole owner of
+    // connectable/discoverable scan state; a source has no reason to be
+    // inquiry-discoverable (Q3 of the bead's DESIGN comment), and this
+    // function runs before pl_bt_init's own explicit scan-mode call
+    // anyway, so this line would just be overwritten.
     // Audio/Video, Rendering -- matches a2dp_source_demo.c's own
     // gap_set_class_of_device(0x200408) exactly (design sec 9/bead spec).
     gap_set_class_of_device(0x200408);
@@ -4542,6 +4548,16 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
             (unsigned long)trim_hard_band_ms
         );
     }
+    // Bead pico-link-oevr, hardware verification: page-scan ownership now
+    // lives in bt.c (pl_bt_update_scan_mode) -- print its current state and
+    // transition count here so a hardware round can read scan state
+    // directly instead of inferring it from blueutil probes alone.
+    // connectable=1 discoverable=0 whenever no ACL is up; connectable=0
+    // once one is.
+    pl_log(
+        "bt: scan_connectable=%d scan_discoverable=0 scan_mode_changes=%lu\r\n", (int)pl_bt_scan_connectable(),
+        (unsigned long)pl_bt_scan_mode_changes()
+    );
 }
 
 // Bead pico-link-auh, section 1: see a2dp.h's doc comment on this

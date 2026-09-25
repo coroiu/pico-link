@@ -239,4 +239,14 @@ void pl_bt_enqueue_display_settings_write(void);
 // superloop).
 void pl_bt_enqueue_cushion_policy_write(void);
 
+// Bead pico-link-oevr: current page-scan state and transition count, for
+// a2dp.c's periodic debug report (pl_a2dp_report) to print -- so a
+// hardware round reads scan state instead of inferring it. See bt.c's
+// pl_bt_update_scan_mode doc comment for the ownership rule these reflect
+// (connectable = no ACL up, discoverable = always off). Safe from any
+// context -- recomputes from BTstack's own connection list / reads a
+// single counter.
+bool pl_bt_scan_connectable(void);
+uint32_t pl_bt_scan_mode_changes(void);
+
 #endif // PL_BT_H

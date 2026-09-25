@@ -130,4 +130,13 @@
 // sec 4.1, .planning/design/2026-08-30-ldac.md Q2/Q5.
 #define ENABLE_A2DP_EXPLICIT_CONFIG
 
+// Bead pico-link-oevr: without this, l2cap_register_service() calls
+// gap_connectable_control(1) unconditionally on every service registration
+// (l2cap.c:5023-5026), silently fighting bt.c's pl_bt_update_scan_mode --
+// the ONLY place in this tree allowed to set connectable/discoverable
+// scan state. With it defined, l2cap_init/register/unregister no longer
+// touch scan state at all; bt.c owns it explicitly, including the initial
+// connectable=1 at pl_bt_init (before any service registration runs).
+#define ENABLE_EXPLICIT_CONNECTABLE_MODE_CONTROL
+
 #endif // BTSTACK_CONFIG_H
