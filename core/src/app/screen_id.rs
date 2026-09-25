@@ -55,5 +55,8 @@ pub enum SettingsPickerKind {
     /// The BUFFER row's picker (bead `pico-link-8pp1.2`, S4) -- picks the
     /// global congestion-cushion policy ([`crate::audio::CushionPolicy`]).
     Cushion,
+    /// The LDAC MIN row's picker (bead `pico-link-d42g.4`, F4) -- picks the
+    /// global LDAC Adaptive floor ([`crate::audio::AbrFloor`]).
+    AbrFloor,
 }
 

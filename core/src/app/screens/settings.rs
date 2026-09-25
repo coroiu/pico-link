@@ -10,13 +10,13 @@ use core::time::Duration;
 use embedded_graphics::prelude::Size;
 use embedded_graphics::primitives::Rectangle;
 
-use crate::audio::CushionPolicy;
+use crate::audio::{AbrFloor, CushionPolicy};
 use crate::input::NavIntent;
 use crate::power::{DisplaySettings, ScreensaverMode, ScreensaverTimeout};
 use crate::render::theme::palette;
 use crate::render::{Action, FieldList, FieldRow, FocusEvent, FrameBuffer565, ListItemKey, PaintKey, RenderCtx, Screen, Verb, Widget};
 
-use super::super::{CushionPolicyState, DisplaySettingsState, ScreenId, SettingsPickerKind};
+use super::super::{AbrFloorState, CushionPolicyState, DisplaySettingsState, ScreenId, SettingsPickerKind};
 use super::picker::{build_picker_view_screen, PickerOption};
 
 /// The Settings screen's fixed title.
@@ -32,6 +32,18 @@ pub(crate) const SETTINGS_TITLE: &str = "Settings";
 const ROW_MODE_KEY: ListItemKey = ListItemKey::from_u64(0);
 const ROW_TIMEOUT_KEY: ListItemKey = ListItemKey::from_u64(1);
 const ROW_CUSHION_KEY: ListItemKey = ListItemKey::from_u64(2);
+/// Bead `pico-link-d42g.4` (F4) -- a fresh key, not renumbered into the
+/// gap left by the other three (see this const block's own doc comment on
+/// [`ROW_CUSHION_KEY`]: row order is `settings_rows`'s vec order, not this
+/// value).
+const ROW_ABR_FLOOR_KEY: ListItemKey = ListItemKey::from_u64(3);
+
+/// Bead `pico-link-d42g.4` (F4), Uma's 2026-09-25 UX design sec 3/6: the
+/// ABR floor options offered in the picker, **highest first**, each paired
+/// with its secondary-colour note. ONE const list so a failed by-ear rung
+/// (F2) can be dropped with a one-line change here -- nothing else in this
+/// module enumerates the offered set.
+const ABR_FLOOR_OPTIONS: &[(AbrFloor, &str)] = &[(AbrFloor::Kbps330, "default"), (AbrFloor::Kbps246, "untested"), (AbrFloor::Kbps198, "untested")];
 
 /// Seed for [`SettingsView::projection_key`] -- only needs to differ from
 /// other widgets'/views' own seeds.
@@ -39,20 +51,25 @@ const SETTINGS_PROJECTION_SEED: u64 = 61;
 
 /// Bead `pico-link-8pp1.2` (S4): BUFFER is the FIRST row (Uma's design,
 /// "audio is the product") -- the two display rows (`IDLE SCREEN`/
-/// `IDLE AFTER`) stay adjacent underneath it.
-fn settings_rows(current: DisplaySettings, cushion: CushionPolicy) -> Vec<FieldRow> {
+/// `IDLE AFTER`) stay adjacent underneath it. Bead `pico-link-d42g.4` (F4)
+/// adds `LDAC MIN` directly under `BUFFER` (Uma's 2026-09-25 UX design sec
+/// 6: "Settings row 2"), always visible -- Settings has no device whose
+/// `QUALITY` could gate it.
+fn settings_rows(current: DisplaySettings, cushion: CushionPolicy, abr_floor: AbrFloor) -> Vec<FieldRow> {
     vec![
         FieldRow::action("BUFFER").with_value(cushion.label(), palette::TEXT_PRIMARY).with_key(ROW_CUSHION_KEY),
+        FieldRow::action("LDAC MIN").with_value(abr_floor.label(), palette::TEXT_PRIMARY).with_key(ROW_ABR_FLOOR_KEY),
         FieldRow::action("IDLE SCREEN").with_value(current.mode.label(), palette::TEXT_PRIMARY).with_key(ROW_MODE_KEY),
         FieldRow::action("IDLE AFTER").with_value(current.timeout.label(), palette::TEXT_PRIMARY).with_key(ROW_TIMEOUT_KEY),
     ]
 }
 
-fn settings_projection_key(current: DisplaySettings, cushion: CushionPolicy) -> PaintKey {
+fn settings_projection_key(current: DisplaySettings, cushion: CushionPolicy, abr_floor: AbrFloor) -> PaintKey {
     PaintKey::of(SETTINGS_PROJECTION_SEED)
         .fold(u64::from(current.mode.to_wire()))
         .fold(u64::from(current.timeout.as_secs()))
         .fold(u64::from(cushion.to_wire()))
+        .fold(u64::from(abr_floor.to_wire()))
 }
 
 /// The Settings screen's two rows -- `IDLE SCREEN` (mode) and `IDLE AFTER`
@@ -62,18 +79,28 @@ fn settings_projection_key(current: DisplaySettings, cushion: CushionPolicy) -> 
 /// screen is on top, so a pick made in either picker (which shares this
 /// same `Rc<RefCell<DisplaySettingsState>>`) is reflected here with no
 /// rebuild.
-pub(crate) fn build_settings_screen(state: &Rc<RefCell<DisplaySettingsState>>, cushion_state: &Rc<RefCell<CushionPolicyState>>) -> Screen {
+pub(crate) fn build_settings_screen(
+    state: &Rc<RefCell<DisplaySettingsState>>,
+    cushion_state: &Rc<RefCell<CushionPolicyState>>,
+    abr_floor_state: &Rc<RefCell<AbrFloorState>>,
+) -> Screen {
     let (rows, projection_key) = {
         let current = state.borrow().current;
         let cushion = cushion_state.borrow().current;
-        (settings_rows(current, cushion), settings_projection_key(current, cushion))
+        let abr_floor = abr_floor_state.borrow().current;
+        (settings_rows(current, cushion, abr_floor), settings_projection_key(current, cushion, abr_floor))
     };
     let state_for_activate = Rc::clone(state);
     let cushion_state_for_activate = Rc::clone(cushion_state);
+    let abr_floor_state_for_activate = Rc::clone(abr_floor_state);
     let list = FieldList::new(rows).on_activate_key(move |key| {
         if key == ROW_CUSHION_KEY {
             let cushion_state = Rc::clone(&cushion_state_for_activate);
             return Action::PushView(Box::new(move || build_cushion_picker_screen(&cushion_state)));
+        }
+        if key == ROW_ABR_FLOOR_KEY {
+            let abr_floor_state = Rc::clone(&abr_floor_state_for_activate);
+            return Action::PushView(Box::new(move || build_abr_floor_picker_screen(&abr_floor_state)));
         }
         if key == ROW_MODE_KEY {
             let state = Rc::clone(&state_for_activate);
@@ -85,7 +112,8 @@ pub(crate) fn build_settings_screen(state: &Rc<RefCell<DisplaySettingsState>>, c
         }
         Action::None
     });
-    let view = SettingsView { list, state: Rc::clone(state), cushion_state: Rc::clone(cushion_state), projection_key };
+    let view =
+        SettingsView { list, state: Rc::clone(state), cushion_state: Rc::clone(cushion_state), abr_floor_state: Rc::clone(abr_floor_state), projection_key };
     Screen::new(SETTINGS_TITLE, vec![Box::new(view)]).with_id(ScreenId::Settings)
 }
 
@@ -99,6 +127,10 @@ struct SettingsView {
     /// Bead `pico-link-8pp1.2` (S4) -- the BUFFER row's live source, read
     /// alongside `state` on every [`Self::sync`] the same way.
     cushion_state: Rc<RefCell<CushionPolicyState>>,
+    /// Bead `pico-link-d42g.4` (F4) -- the LDAC MIN row's live source, read
+    /// alongside `state`/`cushion_state` on every [`Self::sync`] the same
+    /// way.
+    abr_floor_state: Rc<RefCell<AbrFloorState>>,
     /// The last [`settings_projection_key`] value -- see
     /// `DevicesListView::projection_key`'s doc comment for the full
     /// "allocation-saving skip, not a correctness dependency" rule this
@@ -125,9 +157,10 @@ impl Widget for SettingsView {
     fn sync(&mut self, _ctx: &RenderCtx) {
         let current = self.state.borrow().current;
         let cushion = self.cushion_state.borrow().current;
-        let key = settings_projection_key(current, cushion);
+        let abr_floor = self.abr_floor_state.borrow().current;
+        let key = settings_projection_key(current, cushion, abr_floor);
         if key != self.projection_key {
-            self.list.set_rows(settings_rows(current, cushion));
+            self.list.set_rows(settings_rows(current, cushion, abr_floor));
             self.projection_key = key;
         }
     }
@@ -225,6 +258,45 @@ fn cushion_options(current: CushionPolicy) -> (Vec<PickerOption>, Option<ListIte
     (options, checked)
 }
 
+/// The LDAC MIN row's picker options (bead `pico-link-d42g.4`, F4), built
+/// from the single [`ABR_FLOOR_OPTIONS`] list -- see [`screensaver_mode_
+/// options`]'s doc comment for the shared-by-construction-and-projection
+/// reasoning.
+fn abr_floor_options(current: AbrFloor) -> (Vec<PickerOption>, Option<ListItemKey>) {
+    let options = ABR_FLOOR_OPTIONS
+        .iter()
+        .map(|&(floor, note)| PickerOption {
+            key: ListItemKey::from_u64(u64::from(floor.to_wire())),
+            label: String::from(floor.label()),
+            note: Some((String::from(note), palette::TEXT_SECONDARY)),
+            selectable: true,
+        })
+        .collect();
+    let checked = Some(ListItemKey::from_u64(u64::from(current.to_wire())));
+    (options, checked)
+}
+
+/// The LDAC MIN row's picker (bead `pico-link-d42g.4`, F4) -- built via
+/// [`build_picker_view_screen`], same shape as [`build_cushion_picker_
+/// screen`] (a different mailbox, [`AbrFloorState`], not [`DisplaySettings
+/// State`]). Applies live and saves on pick (`Action::None`, stays open):
+/// `core` has nothing of its own to apply a floor to, C applies it live via
+/// `pl_codec_ldac_set_floor` (design `.planning/design/2026-09-25-
+/// adaptive-floor.md` sec 4).
+fn build_abr_floor_picker_screen(abr_floor_state: &Rc<RefCell<AbrFloorState>>) -> Screen {
+    let state_for_projection = Rc::clone(abr_floor_state);
+    let projection = move || abr_floor_options(state_for_projection.borrow().current);
+    let state_for_pick = Rc::clone(abr_floor_state);
+    let on_pick = move |key: ListItemKey| {
+        let floor = AbrFloor::from_wire(u8::try_from(key.as_u64()).unwrap_or(1));
+        let mut s = state_for_pick.borrow_mut();
+        s.current = floor;
+        s.save_pending = true;
+        Action::None
+    };
+    build_picker_view_screen(ScreenId::SettingsPicker(SettingsPickerKind::AbrFloor), "LDAC minimum", projection, on_pick)
+}
+
 /// The BUFFER row's picker (bead `pico-link-8pp1.2`, S4) -- built via
 /// [`build_picker_view_screen`] the same way the two [`build_settings_
 /// picker_screen`] pickers are, but kept separate from that function
@@ -259,14 +331,18 @@ fn build_cushion_picker_screen(cushion_state: &Rc<RefCell<CushionPolicyState>>) 
 ///
 /// # Panics
 ///
-/// Panics if `kind` is [`SettingsPickerKind::Cushion`] -- that variant is
-/// never routed here; [`build_settings_screen`] pushes
-/// [`build_cushion_picker_screen`] directly instead, since it needs a
+/// Panics if `kind` is [`SettingsPickerKind::Cushion`] or
+/// [`SettingsPickerKind::AbrFloor`] -- both are never routed here;
+/// [`build_settings_screen`] pushes [`build_cushion_picker_screen`]/
+/// [`build_abr_floor_picker_screen`] directly instead, since each needs a
 /// different mailbox type than this function takes.
 pub(crate) fn build_settings_picker_screen(kind: SettingsPickerKind, state: &Rc<RefCell<DisplaySettingsState>>) -> Screen {
     match kind {
         SettingsPickerKind::Cushion => {
             unreachable!("SettingsPickerKind::Cushion is built by build_cushion_picker_screen, never routed through build_settings_picker_screen")
+        }
+        SettingsPickerKind::AbrFloor => {
+            unreachable!("SettingsPickerKind::AbrFloor is built by build_abr_floor_picker_screen, never routed through build_settings_picker_screen")
         }
         SettingsPickerKind::ScreensaverMode => {
             let state_for_projection = Rc::clone(state);
@@ -304,22 +380,25 @@ mod tests {
     use embedded_graphics::prelude::RgbColor;
 
     use crate::app::App;
-    use crate::audio::CushionPolicy;
+    use crate::audio::{AbrFloor, CushionPolicy};
     use crate::input::NavIntent;
 
     use super::*;
 
-    /// [`settings_rows`]'s default (`CushionPolicy::Low`, `DisplaySettings::
-    /// default()`) puts BUFFER first, showing `Low latency` -- bead
-    /// `pico-link-8pp1.2` (S4), Uma's 2026-09-25 design part 1's row order
-    /// and default.
+    /// [`settings_rows`]'s default (`CushionPolicy::Low`, `AbrFloor::
+    /// Kbps330`, `DisplaySettings::default()`) puts BUFFER first with
+    /// `LDAC MIN` directly under it, showing `330 kbps` -- bead
+    /// `pico-link-d42g.4` (F4), Uma's 2026-09-25 UX design sec 6's row
+    /// position and default.
     #[test]
-    fn settings_rows_default_shows_buffer_first_with_low_latency() {
-        let rows = settings_rows(DisplaySettings::default(), CushionPolicy::Low);
+    fn settings_rows_default_shows_buffer_first_with_ldac_min_underneath() {
+        let rows = settings_rows(DisplaySettings::default(), CushionPolicy::Low, AbrFloor::Kbps330);
         assert_eq!(rows[0].label, "BUFFER");
         assert_eq!(rows[0].value(), Some("Low latency"));
-        assert_eq!(rows[1].label, "IDLE SCREEN");
-        assert_eq!(rows[2].label, "IDLE AFTER");
+        assert_eq!(rows[1].label, "LDAC MIN");
+        assert_eq!(rows[1].value(), Some("330 kbps"));
+        assert_eq!(rows[2].label, "IDLE SCREEN");
+        assert_eq!(rows[3].label, "IDLE AFTER");
     }
 
     /// The BUFFER row's value tracks whatever `CushionPolicy` it's built
@@ -327,8 +406,18 @@ mod tests {
     /// live pick (or a `CushionPolicyLoaded` boot seed) with no rebuild.
     #[test]
     fn settings_rows_reflects_a_stable_cushion_policy() {
-        let rows = settings_rows(DisplaySettings::default(), CushionPolicy::Stable);
+        let rows = settings_rows(DisplaySettings::default(), CushionPolicy::Stable, AbrFloor::Kbps330);
         assert_eq!(rows[0].value(), Some("Stable"));
+    }
+
+    /// The LDAC MIN row's value tracks whatever `AbrFloor` it's built with --
+    /// the same "reflects a live pick or boot seed with no rebuild" property
+    /// as the BUFFER row above, bead `pico-link-d42g.4` (F4).
+    #[test]
+    fn settings_rows_reflects_a_198_abr_floor() {
+        let rows = settings_rows(DisplaySettings::default(), CushionPolicy::Low, AbrFloor::Kbps198);
+        assert_eq!(rows[1].label, "LDAC MIN");
+        assert_eq!(rows[1].value(), Some("198 kbps"));
     }
 
     /// End-to-end through real input: Home menu -> Settings -> BUFFER row
@@ -373,6 +462,52 @@ mod tests {
         assert_eq!(app.take_cushion_policy_to_save(), None, "a boot-load seed must never arm the save latch");
     }
 
+    /// End-to-end through real input: Home menu -> Settings -> `Down` once
+    /// to LDAC MIN (row 1, under BUFFER) -> its picker -> `Down` twice to
+    /// `198 kbps` -> `Select`. Proves the pick reaches `App::take_abr_floor_
+    /// to_save` (what `ui-ffi`'s `pl_ui_poll_command` drains into
+    /// `PlCommandTag::SetAbrFloor`), and that the Settings row underneath
+    /// reflects it live with no pop/re-push -- bead `pico-link-d42g.4` (F4),
+    /// mirroring [`picking_stable_in_the_buffer_picker_reaches_take_
+    /// cushion_policy_to_save`] above.
+    #[test]
+    fn picking_198_in_the_abr_floor_picker_reaches_take_abr_floor_to_save() {
+        let mut app = App::new(240, 240);
+        assert_eq!(app.abr_floor(), AbrFloor::Kbps330, "default must be 330 kbps");
+
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+        app.handle_input(vec![NavIntent::Down]); // Settings row
+        app.handle_input(vec![NavIntent::Select]); // open Settings (BUFFER row focused, row 0)
+        app.handle_input(vec![NavIntent::Down]); // focus LDAC MIN (row 1)
+        app.handle_input(vec![NavIntent::Select]); // open the LDAC MIN picker
+        app.handle_input(vec![NavIntent::Down]); // focus 246 kbps
+        app.handle_input(vec![NavIntent::Down]); // focus 198 kbps
+        app.handle_input(vec![NavIntent::Select]); // pick it
+
+        assert_eq!(app.abr_floor(), AbrFloor::Kbps198, "the live floor must update immediately");
+        assert_eq!(app.take_abr_floor_to_save(), Some(AbrFloor::Kbps198), "the pick must arm the save latch exactly once");
+        assert_eq!(app.take_abr_floor_to_save(), None, "the save latch must drain to None after being taken once");
+    }
+
+    /// An `AbrFloorLoaded` boot seed (F3's `Event::AbrFloorLoaded`) must be
+    /// reflected on the LDAC MIN row with no user pick, and must not arm
+    /// the save latch -- mirrors [`a_cushion_policy_loaded_event_before_
+    /// settings_is_opened_shows_on_the_buffer_row`] above, bead
+    /// `pico-link-d42g.4` (F4).
+    #[test]
+    fn an_abr_floor_loaded_event_before_settings_is_opened_shows_on_the_ldac_min_row() {
+        let mut app = App::new(240, 240);
+        app.handle_event(crate::app::Event::AbrFloorLoaded { floor: 2 }); // 246 kbps
+
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+        app.handle_input(vec![NavIntent::Down]); // Settings row
+        app.handle_input(vec![NavIntent::Select]); // open Settings
+
+        assert_eq!(app.current_screen_title(), SETTINGS_TITLE);
+        assert_eq!(app.abr_floor(), AbrFloor::Kbps246);
+        assert_eq!(app.take_abr_floor_to_save(), None, "a boot-load seed must never arm the save latch");
+    }
+
     /// Headless PNG dump of the Settings screen (BUFFER row visible, on
     /// top) and the Buffer picker at zoom -- the same "dumped from here
     /// since this module's tests are the only place with `pub(crate)`
@@ -408,5 +543,10 @@ mod tests {
 
         app.handle_input(vec![NavIntent::Select]); // open the Buffer picker (row 0, BUFFER)
         dump(&mut app, "buffer_picker.png", &out_dir);
+
+        app.handle_input(vec![NavIntent::Back]); // close the Buffer picker back to Settings
+        app.handle_input(vec![NavIntent::Down]); // focus LDAC MIN (row 1)
+        app.handle_input(vec![NavIntent::Select]); // open the LDAC MIN picker
+        dump(&mut app, "abr_floor_picker.png", &out_dir);
     }
 }
