@@ -278,6 +278,14 @@ pub struct Screen {
     /// [`super::widget::LinkGlyph`] instead, resolved upstream in
     /// `home.rs`).
     id: Option<ScreenId>,
+    /// Fires exactly once, when this screen leaves the navigator stack by
+    /// any route -- see [`Self::with_on_exit`]'s doc comment for the full
+    /// contract. `Option<Box<dyn FnOnce()>>`, not `Drop`: a widget cannot
+    /// see stack removal at all, and `Drop` would fire on every teardown
+    /// (`pl_ui_destroy`, test cleanup, a `Vec` drop mid-truncate), not
+    /// just a navigator-driven exit -- see
+    /// [`super::navigator::Navigator::retire`]'s doc comment.
+    on_exit: Option<Box<dyn FnOnce()>>,
 }
 
 impl Screen {
@@ -290,7 +298,44 @@ impl Screen {
             focused_index: None,
             paint_cache: Vec::new(),
             id: None,
+            on_exit: None,
         }
+    }
+
+    /// Registers a closure to fire exactly once when this screen leaves
+    /// the navigator stack, by ANY route -- `B`, `B, B`, a stack reset
+    /// from a model-driven event, a test helper that pops/truncates/
+    /// replaces directly. See
+    /// [`super::navigator::Navigator::retire`], the single private funnel
+    /// every stack-removal op routes through, for how "exactly once" is
+    /// made structural rather than remembered: the closure is an
+    /// `Option<Box<dyn FnOnce()>>` taken via [`Option::take`], and a
+    /// retired `Screen` is consumed, not reused.
+    ///
+    /// The closure runs AFTER this screen has already left the stack (it
+    /// can never observe itself on top) and synchronously, inside the
+    /// `Navigator` op that removed it. It has no reference back to the
+    /// `Navigator` -- it cannot push or pop -- so it may only write into
+    /// caller-owned mailboxes/queues it captures by move. A caller must
+    /// not hold a borrow of anything this closure also touches across the
+    /// `Navigator` call that can trigger it.
+    ///
+    /// Pushing a screen ABOVE this one does not fire it -- only this
+    /// screen's own removal does. Not fired by
+    /// [`super::navigator::Navigator::new`]/`App` drop/`pl_ui_destroy` --
+    /// nothing leaves the stack on that route.
+    #[must_use]
+    pub fn with_on_exit(mut self, f: impl FnOnce() + 'static) -> Self {
+        self.on_exit = Some(Box::new(f));
+        self
+    }
+
+    /// Takes this screen's on-exit closure, if any -- `pub(super)` because
+    /// [`super::navigator::Navigator::retire`] is this method's only
+    /// caller; nothing outside the navigation stack machinery should ever
+    /// see a `Screen`'s hook directly.
+    pub(super) fn take_on_exit(&mut self) -> Option<Box<dyn FnOnce()>> {
+        self.on_exit.take()
     }
 
     /// Tags this screen with a [`ScreenId`] -- an identity/liveness marker
