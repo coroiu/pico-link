@@ -982,13 +982,19 @@ impl core::convert::TryFrom<u32> for PlLinkState {
     }
 }
 
-impl From<PlLinkState> for LinkState {
-    fn from(state: PlLinkState) -> Self {
-        match state {
-            PlLinkState::Idle => LinkState::Idle,
-            PlLinkState::Connecting => LinkState::Connecting,
-            PlLinkState::Connected => LinkState::Connected,
-        }
+/// Decodes a wire [`PlLinkState`] into the [`Event`] it means -- NOT a
+/// blanket `From<PlLinkState> for LinkState`, because since bead
+/// `pico-link-0cq2` the three wire values no longer map 1:1 onto
+/// `core::LinkState`'s two variants (see that type's doc comment):
+/// `PlLinkState::Connecting` (wire value `2`, the former
+/// `PL_LINK_STATE_CONNECTING`) now means [`Event::ConnectAttemptStarted`]
+/// instead of a `LinkStateChanged` payload -- no C ABI change, no wire byte
+/// change, only where in `core`'s event vocabulary that byte lands.
+fn decode_link_state_event(state: PlLinkState) -> Event {
+    match state {
+        PlLinkState::Idle => Event::LinkStateChanged(LinkState::Idle),
+        PlLinkState::Connecting => Event::ConnectAttemptStarted,
+        PlLinkState::Connected => Event::LinkStateChanged(LinkState::Connected),
     }
 }
 
@@ -2027,7 +2033,7 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                     return;
                 }
             };
-            Event::LinkStateChanged(state.into())
+            decode_link_state_event(state)
         }
         PlEventTag::DeviceDiscovered => {
             // SAFETY: `tag` says this union currently holds `device_discovered`.
@@ -3889,6 +3895,42 @@ mod tests {
             assert_eq!(pl_ui_malformed_tag_count(ui), 0);
             assert!((*ui).app.model().discovering);
             assert_eq!((*ui).app.model().link_state, LinkState::Idle, "DiscoveryStateChanged must never touch link_state");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Bead `pico-link-0cq2`, test T5: the wire's `PL_LINK_STATE_CONNECTING`
+    /// discriminant (`2`) must decode to [`Event::ConnectAttemptStarted`],
+    /// not a `LinkStateChanged` payload, while `0`/`3` still decode to
+    /// `LinkStateChanged(Idle)`/`LinkStateChanged(Connected)` -- see
+    /// `decode_link_state_event`'s doc comment. Proved end to end via
+    /// `BtModel`: an already-`Connected` link must stay `Connected` and
+    /// `connecting` must flip true/false around the attempt, with none of
+    /// this touching `link_state`.
+    #[test]
+    fn pl_ui_push_event_decodes_the_connecting_wire_value_as_a_connect_attempt_not_a_link_state() {
+        let ui = new_ui();
+        let connect = |state: PlLinkState| PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::LinkStateChanged as u32,
+            payload: PlEventPayload { link_state_changed: PlLinkStateChangedPayload { state: state as u32 } },
+        };
+        unsafe {
+            pl_ui_push_event(ui, connect(PlLinkState::Connected));
+            assert_eq!((*ui).app.model().link_state, LinkState::Connected);
+            assert!(!(*ui).app.model().connecting);
+
+            pl_ui_push_event(ui, connect(PlLinkState::Connecting));
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "wire value 2 is legal, not malformed");
+            assert_eq!(
+                (*ui).app.model().link_state,
+                LinkState::Connected,
+                "an attempt at a second device must not touch an already-established link_state"
+            );
+            assert!((*ui).app.model().connecting, "wire value 2 must set connecting, not link_state");
+
+            pl_ui_push_event(ui, connect(PlLinkState::Idle));
+            assert_eq!((*ui).app.model().link_state, LinkState::Idle);
             pl_ui_destroy(ui);
         }
     }

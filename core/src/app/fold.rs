@@ -19,6 +19,7 @@ impl App {
         match event {
             Event::LinkStateChanged(state) => self.set_link_state(state),
             Event::DiscoveryStateChanged { scanning } => self.set_discovering(scanning),
+            Event::ConnectAttemptStarted => self.set_connecting(true),
             Event::DeviceDiscovered(device) => {
                 self.add_device(device.addr, device.name, device.rssi, device.class_of_device);
             }
@@ -147,7 +148,14 @@ impl App {
     /// bypass, which never touches `WizardPhase` at all).
     fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
         self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
-        self.model.borrow_mut().connected_addr = Some(addr);
+        {
+            let mut model = self.model.borrow_mut();
+            model.connected_addr = Some(addr);
+            // The attempt is over -- see `BtModel::connecting`'s doc
+            // comment for why this is a terminal-outcome call site rather
+            // than folded generically in `set_link_state`.
+            model.connecting = false;
+        }
         *self.wizard_phase.borrow_mut() = WizardPhase::Succeeded { degraded };
         self.dirty = true;
     }
@@ -272,6 +280,18 @@ impl App {
                 // the exact same reason -- see `BtModel::ldac_live_kbps`'s
                 // doc comment.
                 model.ldac_live_kbps = None;
+                // Deliberately NOT `model.connecting = false` here --
+                // `connecting` is a third, independent axis (see
+                // `BtModel::connecting`'s doc comment). In the future
+                // device-switch flow the old link (A) drops mid-attempt
+                // (`LinkStateChanged(Idle)` for A) while the attempt at B
+                // continues; clearing `connecting` on every non-`Connected`
+                // link state would end the attempt's Busy glyph right when
+                // it's most true. Only a terminal attempt outcome --
+                // `Connected`, `ConnectSucceeded`, or `ConnectFailed` --
+                // clears it, each at its own call site.
+            } else {
+                model.connecting = false;
             }
         }
         self.mark_model_changed();
@@ -287,6 +307,17 @@ impl App {
         if !scanning {
             self.on_scan_ended_if_applicable();
         }
+        self.mark_model_changed();
+    }
+
+    /// Records whether a connect attempt is currently in flight. The
+    /// THIRD, independent axis (bead `pico-link-0cq2`) -- deliberately does
+    /// NOT touch [`BtModel::link_state`] or clear any connected-model
+    /// field: an attempt targeting a second device must not disturb a link
+    /// to a first that's already up. [`BtModel::connecting`] has exactly
+    /// one writer: this method.
+    pub fn set_connecting(&mut self, connecting: bool) {
+        self.model.borrow_mut().connecting = connecting;
         self.mark_model_changed();
     }
 
@@ -441,19 +472,20 @@ impl App {
     }
 
     /// Records a failed connect attempt with its [`ConnectFailureReason`]
-    /// and returns the link to [`LinkState::Idle`] -- the attempt is over
-    /// either way, retryable or not; a future screen deciding whether to
-    /// offer a retry reads `reason.retryable()` off
-    /// `BtModel::last_connect_failure`, not the link state.
+    /// and ends the attempt (`connecting -> false`) -- but, as of bead
+    /// `pico-link-0cq2`, deliberately does NOT touch [`BtModel::link_state`]
+    /// any more. It used to unconditionally force the link back to
+    /// [`LinkState::Idle`], which was the bug: a failed attempt at device B
+    /// while device A's link was already up wiped A's connected model out
+    /// from under it, even though the radio never touched A. `link_state`
+    /// is now written only by genuine firmware link reports
+    /// ([`App::set_link_state`], via [`Event::LinkStateChanged`]) -- a
+    /// future screen deciding whether to offer a retry reads
+    /// `reason.retryable()` off `BtModel::last_connect_failure`, not the
+    /// link state.
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
         self.model.borrow_mut().last_connect_failure = Some((addr, reason));
-        // `link_state` has exactly one writer: routed through
-        // `set_link_state` rather than assigning the field directly, so
-        // the "codec/addr/out_level cleared off `Connected`" invariant
-        // holds by construction. The `mark_model_changed()` call below is
-        // therefore redundant with the one inside `set_link_state`, but
-        // harmless -- `mark_model_changed` is idempotent.
-        self.set_link_state(LinkState::Idle);
+        self.set_connecting(false);
         // Phase 4/5 -> phase 6 (failure outcome). Unconditional (not
         // gated on the wizard currently being open/mid-connect): a stray
         // `ConnectFailed` with the wizard closed or already past this
