@@ -156,6 +156,7 @@ pub(crate) fn build_home_screen(
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
     editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
     import_focus: &Rc<RefCell<Option<ListItemKey>>>,
+    presets_ready: &Rc<RefCell<bool>>,
 ) -> Screen {
     let view = HomeView::new(
         model,
@@ -170,6 +171,7 @@ pub(crate) fn build_home_screen(
         editor_preset_id,
         editor_preview,
         import_focus,
+        presets_ready,
     );
     // B's liveness at depth 1 is now `HomeView::handles_back` (pico-link-
     // 4a2) -- dynamic per-face, unlike the old `Screen::handles_back(true)`
@@ -383,6 +385,7 @@ impl HomeView {
         editor_preset_id: &Rc<RefCell<Option<u16>>>,
         editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
         import_focus: &Rc<RefCell<Option<ListItemKey>>>,
+        presets_ready: &Rc<RefCell<bool>>,
     ) -> Self {
         let (hero, link_state, discovering, connecting, connected_addr, fault_log) = {
             let snapshot = model.borrow();
@@ -411,6 +414,7 @@ impl HomeView {
         let editor_preset_id_for_effects = Rc::clone(editor_preset_id);
         let editor_preview_for_effects = Rc::clone(editor_preview);
         let import_focus_for_effects = Rc::clone(import_focus);
+        let presets_ready_for_effects = Rc::clone(presets_ready);
         let menu = MenuList::new(vec![MenuItem::new("Bluetooth"), MenuItem::new("Effects"), MenuItem::new("Settings")]).on_activate_index(
             // `Verb::Open`: both rows push a deeper screen and draw a
             // caret (design section 4's assignment table -- Home menu's A
@@ -438,8 +442,9 @@ impl HomeView {
                     let editor_preset_id = Rc::clone(&editor_preset_id_for_effects);
                     let editor_preview = Rc::clone(&editor_preview_for_effects);
                     let import_focus = Rc::clone(&import_focus_for_effects);
+                    let presets_ready = Rc::clone(&presets_ready_for_effects);
                     Action::PushView(Box::new(move || {
-                        build_effects_list_screen(&model, &presets, &commands, &editor_preset_id, &editor_preview, &import_focus)
+                        build_effects_list_screen(&model, &presets, &commands, &editor_preset_id, &editor_preview, &import_focus, &presets_ready)
                     }))
                 }
                 MENU_ROW_SETTINGS => {
@@ -851,9 +856,10 @@ mod tests {
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
         let import_focus = Rc::new(RefCell::new(None));
+        let presets_ready = Rc::new(RefCell::new(true));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id, &editor_preview, &import_focus,
+            &editor_preset_id, &editor_preview, &import_focus, &presets_ready,
         )
     }
 
@@ -873,9 +879,10 @@ mod tests {
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
         let import_focus = Rc::new(RefCell::new(None));
+        let presets_ready = Rc::new(RefCell::new(true));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id, &editor_preview, &import_focus,
+            &editor_preset_id, &editor_preview, &import_focus, &presets_ready,
         )
     }
 
@@ -1009,9 +1016,10 @@ mod tests {
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
         let import_focus = Rc::new(RefCell::new(None));
+        let presets_ready = Rc::new(RefCell::new(true));
         HomeView::new(
             &model, home_face, &commands, &wizard_phase, Instant::from_micros(0), &display_settings, &cushion_policy, &abr_floor, &presets,
-            &editor_preset_id, &editor_preview, &import_focus,
+            &editor_preset_id, &editor_preview, &import_focus, &presets_ready,
         )
     }
 

@@ -579,51 +579,87 @@ void pl_persist_boot_preset_at(uint8_t index, uint16_t *out_id, uint8_t *out_blo
 // PL_PERSIST_KIND_PRESET's doc comment above).
 pl_persist_status_t pl_persist_preset_boot_status(void);
 
-// Bead pico-link-ryw.6, design sec 2.2/2.5: stages a preset save --
-// `preset_id == PL_PERSIST_PRESET_ID_NONE` (0) means "allocate a fresh,
-// never-before-used id" (ids are monotonic and never reused, design sec
-// 2.2: "a delete-then-create in the same slot gets a new id, and a stale
-// device reference dangles rather than aliasing another EQ"); a non-zero
-// id means "overwrite the existing preset with this id in place". Same
-// short-critical-section RAM-only staging idiom as
-// pl_persist_request_device_settings -- a burst of edits (Andreas's ryw.6
-// ruling: "save immediately on every value change") coalesces to the
-// LATEST blob, never queues unboundedly. `blob_len` bytes of `blob` are
-// staged; the rest is not read. Called from bt.c's
-// PL_COMMAND_TAG_SAVE_PRESET handler (thread context, the superloop).
+// Bead pico-link-ryw.14, Ada's preset-id-allocation contract: C's own
+// preset-id high-water mark -- the id C's flash allocator would hand out
+// next for a genuinely new preset (persist.c's s_next_preset_id, seeded at
+// boot from max(loaded id) + 1, same as before this bead; the difference is
+// that `core` is now the one consuming it, via
+// PlEventTag::PresetStoreLoaded's next_id field, rather than C allocating
+// silently on `preset_id == 0`). `core` must raise its own allocator to at
+// least this value before creating anything, or a fresh id could alias one
+// C already holds for a deleted-then-reused slot (finding 4 of Ada's design
+// comment: this counter is NOT itself persisted across reboot yet -- see
+// bead pico-link-ryw.15).
+uint16_t pl_persist_preset_next_id(void);
+
+// Bead pico-link-ryw.6, design sec 2.2/2.5, contract REWRITTEN by bead
+// pico-link-ryw.14 (Ada's preset-id-allocation contract): stages an UPSERT
+// of `preset_id` -- `core` is now the SOLE allocator of preset ids
+// ([`pico_link_core::dsp::PresetStore::create`] on the Rust side), so
+// `preset_id` is always real and nonzero; `PL_PERSIST_PRESET_ID_NONE` (0)
+// is refused (logged only, no echo -- `core` never sends it any more).
+// Stages into an ordered, per-id table (`PL_PERSIST_PRESET_STAGE_SLOTS`
+// entries) rather than one single-slot staging var: a request for an id
+// already staged replaces that entry'S op/blob in place (latest wins, same
+// "burst of edits coalesces to the latest" rule as before), a genuinely new
+// id is appended, preserving FIFO order -- this matters because `core`
+// allocates monotonically and its commands arrive FIFO, so distinct new
+// ids reach the executor's upsert rule (b) below in ascending order. If the
+// table is already full, the request is refused immediately (at stage
+// time, thread context) with its truth echo (see
+// pl_persist_execute_pending_save_preset_write's doc comment) rather than
+// queued. Called from bt.c's PL_COMMAND_TAG_SAVE_PRESET handler (thread
+// context, the superloop).
 void pl_persist_request_save_preset(uint16_t preset_id, uint8_t blob_len, const uint8_t *blob);
 
-// Performs the actual flash write for whatever save is currently staged by
-// pl_persist_request_save_preset -- same calling contract as
+// Performs the actual flash write for the OLDEST currently-staged preset
+// operation (save or delete -- both pl_persist_request_save_preset and
+// pl_persist_request_delete_preset feed the SAME ordered table; this
+// function and pl_persist_execute_pending_delete_preset_write are two
+// names for the one drain, kept as two so bt.c's existing two pending-
+// queue tags/call sites need no change). Same calling contract as
 // pl_persist_execute_pending_write (bt.c's pending-queue drain, async_
-// context ONLY). On an actual write (a fresh allocation, or overwriting an
-// existing id in place), pushes PlEventTag::PresetLoaded with whichever id
-// was actually used -- the SavePreset echo (design sec 2.2/3.2), same
-// single-writer-echo discipline as every other write in this file. If
-// `preset_id` was non-zero but no slot currently holds it, or a fresh
-// allocation finds every PL_PERSIST_PRESET_SLOTS slot occupied, the write
-// is refused and logged -- no echo, no row, same "no echo means no row"
-// rule pl_persist_do_write's doc comment states for devices.
+// context ONLY).
+//
+// For a save, applies Ada's upsert rules: (a) a slot already holds
+// `preset_id` -- overwrite it in place. (b) no slot holds it, and it's at
+// or past C's own high-water mark (pl_persist_preset_next_id) -- claim a
+// free slot and raise the mark past it. (c) no slot holds it, and it's
+// BELOW the high-water mark (a stale, already-deleted, or otherwise
+// invalid id) -- refuse. (e) rule (b) with no free slot -- refuse (store
+// full, no eviction).
+//
+// After EVERY attempt, successful or refused, pushes exactly one truth
+// echo for `preset_id`: PlEventTag::PresetLoaded (with whatever blob a
+// slot now actually holds -- the new one on success, the unchanged old one
+// on a same-id refusal) if a slot holds it afterward, else
+// PlEventTag::PresetDeleted (a refused creation, which never had a slot to
+// begin with -- `core` folds this exactly like a real deletion, dropping
+// the preset from its own store rather than leaking a phantom "saved but
+// not really" entry). Never silent -- unlike the pre-ryw.14 contract, a
+// refusal is now always observable to `core`.
 void pl_persist_execute_pending_save_preset_write(void);
 
-// Bead pico-link-ryw.6, design sec 2.4: stages a preset delete. Same
-// short-critical-section RAM-only staging idiom as
-// pl_persist_request_save_preset. Called from bt.c's
-// PL_COMMAND_TAG_DELETE_PRESET handler (thread context, the superloop).
+// Bead pico-link-ryw.6, design sec 2.4, contract updated by bead
+// pico-link-ryw.14: stages a preset delete into the SAME ordered per-id
+// table pl_persist_request_save_preset uses (see that function's doc
+// comment for the table's replace/append/full-refusal shape). Called from
+// bt.c's PL_COMMAND_TAG_DELETE_PRESET handler (thread context, the
+// superloop).
 void pl_persist_request_delete_preset(uint16_t preset_id);
 
-// Performs the actual flash delete for whatever request is currently
-// staged by pl_persist_request_delete_preset -- same calling contract as
-// pl_persist_execute_pending_write (bt.c's pending-queue drain, async_
-// context ONLY). Design sec 2.4: deletes ONLY the PL:P:<slot> tag -- never
-// rewrites any PL:D device record, so a device still referencing this id
-// keeps a dangling reference that `core` resolves as Off (never
-// garbage-collected back onto another preset -- design sec 2.4: "NEVER
-// garbage-collect a preset because its last device was forgotten" extends
-// symmetrically to "because the preset itself was deleted"). Pushes
-// PlEventTag::PresetDeleted on an actual deletion only -- a delete request
-// for an id no slot currently holds is a silent no-op (matches
-// pl_persist_forget_device's own "no slot holds it -- no-op" contract).
+// See pl_persist_execute_pending_save_preset_write's doc comment -- this is
+// the other of the two names for that one shared drain. Design sec 2.4:
+// deletes ONLY the PL:P:<slot> tag -- never rewrites any PL:D device
+// record, so a device still referencing this id keeps a dangling reference
+// that `core` resolves as Off (never garbage-collected back onto another
+// preset -- design sec 2.4: "NEVER garbage-collect a preset because its
+// last device was forgotten" extends symmetrically to "because the preset
+// itself was deleted"). Always pushes PlEventTag::PresetDeleted as its
+// truth echo, whether or not a slot actually held `preset_id` (a delete for
+// an id no slot holds is a no-op on flash, but is not silent to `core` any
+// more -- see pl_persist_execute_pending_save_preset_write's doc comment on
+// why refusals stopped being invisible).
 void pl_persist_execute_pending_delete_preset_write(void);
 
 #endif // PL_PERSIST_H

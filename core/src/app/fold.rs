@@ -50,7 +50,7 @@ impl App {
             }
             Event::PresetLoaded { id, blob } => self.on_preset_loaded(id, &blob),
             Event::PresetDeleted { id } => self.on_preset_deleted(id),
-            Event::PresetStoreLoaded { count, status } => self.on_preset_store_loaded(count, status),
+            Event::PresetStoreLoaded { count, status, next_id } => self.on_preset_store_loaded(count, status, next_id),
         }
         self.stamp_pending_wizard_timestamp();
     }
@@ -516,13 +516,12 @@ impl App {
     fn on_preset_loaded(&mut self, id: u16, blob: &[u8]) {
         let preset = crate::dsp::preset::Preset::from_wire(blob);
         self.presets.borrow_mut().load(id, preset);
-        // The editor (if any) adopts the first echo it sees while its own
-        // id is still pending -- see `App::editor_preset_id`'s doc comment.
-        let mut editor_id = self.editor_preset_id.borrow_mut();
-        if *editor_id == Some(0) {
-            *editor_id = Some(id);
-        }
-        drop(editor_id);
+        // Bead `pico-link-ryw.14` (Ada's preset-id-allocation contract):
+        // `core` allocates every preset id itself before queuing a
+        // `SavePreset`, so `editor_preset_id` is never `Some(0)`/pending any
+        // more -- this echo needs no adoption step, it's simply the truth
+        // echo confirming (or, on a refused save, correcting) what flash
+        // now holds for `id`.
         self.mark_model_changed();
     }
 
@@ -544,12 +543,22 @@ impl App {
     /// Unlike that method, there is no reconnect-style policy decision to
     /// make here -- every loaded preset already folded into
     /// [`App::presets`] via [`Self::on_preset_loaded`] by the time this
-    /// arrives, so this is purely a dirty-marking terminator. `count` and
-    /// `status` are not yet read by anything (no preset-store-health
-    /// screen exists, `pico-link-ryw.7`), same "not yet read" status
-    /// [`Event::StoreLoaded`]'s own `count` field once had.
-    fn on_preset_store_loaded(&mut self, count: u16, status: StoreStatus) {
+    /// arrives.
+    ///
+    /// Bead `pico-link-ryw.14` (Ada's preset-id-allocation contract): also
+    /// raises [`PresetStore`]'s allocator past C's own high-water mark
+    /// (`next_id`, the id C's flash allocator would hand out next) via
+    /// [`PresetStore::raise_next_id`], and flips [`App::presets_ready`] --
+    /// until this arrives, no creation path (New effect, import) is allowed
+    /// to allocate an id, because it could alias one C already holds. See
+    /// [`App::presets_ready`]'s doc comment. `count`/`status` themselves
+    /// are not yet read by anything else (no preset-store-health screen
+    /// exists), same "not yet read" status [`Event::StoreLoaded`]'s own
+    /// `count` field once had.
+    fn on_preset_store_loaded(&mut self, count: u16, status: StoreStatus, next_id: u16) {
         let _ = (count, status);
+        self.presets.borrow_mut().raise_next_id(next_id);
+        *self.presets_ready.borrow_mut() = true;
         self.mark_model_changed();
     }
 }

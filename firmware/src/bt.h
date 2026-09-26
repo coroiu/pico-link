@@ -210,7 +210,8 @@ void pl_bt_push_preset_deleted(uint16_t id);
 // PlEventTag::PresetStoreLoaded -- the terminator of bt.c's boot-time
 // `count` x pl_bt_push_preset_loaded push sequence, same shape
 // pl_bt_push_store_loaded is for PairedDeviceUpserted's boot sequence.
-void pl_bt_push_preset_store_loaded(uint32_t status, uint16_t count);
+// `next_id` added by bead pico-link-ryw.14 -- see bt.c's own doc comment.
+void pl_bt_push_preset_store_loaded(uint32_t status, uint16_t count, uint16_t next_id);
 
 #ifdef PL_DEBUG_REMOTE
 // Bead pico-link-g48: debug-only direct connect to a host-supplied

@@ -729,10 +729,14 @@ impl EffectEditorView {
     }
 
     /// Queues exactly one `SavePreset` for the draft's current contents,
-    /// against whatever id [`Self::editor_preset_id`] currently reports --
-    /// Andreas's ruling: every value change saves immediately.
+    /// against [`Self::editor_preset_id`]'s real, Rust-allocated id --
+    /// Andreas's ruling: every value change saves immediately. Ada's
+    /// preset-id-allocation contract (bead `pico-link-ryw.14`): the id is
+    /// final from the moment the editor opens (see `build_effect_editor_
+    /// screen`'s doc comment) -- there is no longer a `Some(0)`
+    /// "allocation pending" state to fall back from.
     fn save_now(&self) {
-        let preset_id = self.editor_preset_id.borrow().unwrap_or(0);
+        let preset_id = self.editor_preset_id.borrow().expect("an open editor always has a real, already-allocated id");
         let blob = self.state.borrow().draft.to_wire();
         self.commands.borrow_mut().push_back(Command::SavePreset { preset_id, blob: blob.to_vec() });
     }
@@ -810,7 +814,7 @@ impl Widget for EffectEditorView {
                 let changed = {
                     let other_names = {
                         let presets = self.presets.borrow();
-                        let excluding = self.editor_preset_id.borrow().unwrap_or(0);
+                        let excluding = self.editor_preset_id.borrow().expect("an open editor always has a real, already-allocated id");
                         other_effect_names(&presets, excluding)
                     };
                     let mut state = self.state.borrow_mut();
@@ -904,17 +908,20 @@ impl Widget for EffectEditorView {
     }
 }
 
-/// Builds the effect editor screen, either for an existing effect
-/// (`preset_id` real, `initial` its current stored contents) or a brand
-/// new one (`preset_id == 0`, `initial` already a fresh
-/// [`new_effect_preset`]). Called once per push; never rebuilt while it
-/// stays on the navigator's stack.
+/// Builds the effect editor screen, either for an existing effect or a
+/// brand new one (`initial` already a fresh [`new_effect_preset`]) --
+/// either way `editor_preset_id` already carries the real, final,
+/// Rust-allocated id by the time this is called (Ada's preset-id-
+/// allocation contract, bead `pico-link-ryw.14`: `core` owns id
+/// allocation, so there is no `preset_id == 0`/"allocation pending" state
+/// any more). Called once per push; never rebuilt while it stays on the
+/// navigator's stack.
 ///
 /// Andreas's ruling supersedes design sec 3.3/5.2's "nothing written
 /// until the editor is left": a brand-new effect is saved immediately on
-/// creation (one `SavePreset{preset_id: 0, ..}`), before this screen is
-/// even built, so it already exists in `presets` if the user immediately
-/// backs out.
+/// creation (one `SavePreset{preset_id: <real id>, ..}`), before this
+/// screen is even built, so it already exists in `presets` if the user
+/// immediately backs out.
 fn build_effect_editor_screen(
     initial: &Preset,
     model: &ModelHandle,
@@ -1184,6 +1191,7 @@ pub(crate) fn build_effects_list_screen(
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
     editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
     import_focus: &Rc<RefCell<Option<ListItemKey>>>,
+    presets_ready: &Rc<RefCell<bool>>,
 ) -> Screen {
     let (rows, projection_key) = {
         let model_ref = model.borrow();
@@ -1196,17 +1204,31 @@ pub(crate) fn build_effects_list_screen(
     let commands_for_activate = Rc::clone(commands);
     let editor_preset_id_for_activate = Rc::clone(editor_preset_id);
     let editor_preview_for_activate = Rc::clone(editor_preview);
+    let presets_ready_for_activate = Rc::clone(presets_ready);
     let list = FieldList::new(rows).with_leading_gutter().on_activate_key(move |key| {
         if key == NEW_EFFECT_ROW_KEY {
+            // Ada's preset-id-allocation contract (bead `pico-link-ryw.14`):
+            // `core` must not allocate an id until C's boot-time high-water
+            // mark has actually arrived (`Event::PresetStoreLoaded`) -- an
+            // id allocated before that could alias one C already holds. The
+            // row is simply inert until then, same "discoverable without
+            // any radio/flash work" gate `MAX_EFFECTS` above already uses.
+            if !*presets_ready_for_activate.borrow() {
+                return Action::None;
+            }
             if presets_for_activate.borrow().len() >= MAX_EFFECTS {
                 return Action::None;
             }
             let other_names = other_effect_names(&presets_for_activate.borrow(), 0);
             let preset = new_effect_preset(&effect_n_candidate(&other_names));
-            // Andreas's ruling: save immediately, even for a brand-new
-            // effect -- see `build_effect_editor_screen`'s doc comment.
-            commands_for_activate.borrow_mut().push_back(Command::SavePreset { preset_id: 0, blob: preset.to_wire().to_vec() });
-            *editor_preset_id_for_activate.borrow_mut() = Some(0);
+            // `core` allocates the real id itself now (Ada's contract) --
+            // no more `preset_id: 0`/`Some(0)` "allocation pending" dance.
+            // Andreas's ruling still holds: save immediately, even for a
+            // brand-new effect -- see `build_effect_editor_screen`'s doc
+            // comment.
+            let id = presets_for_activate.borrow_mut().create(preset.clone());
+            commands_for_activate.borrow_mut().push_back(Command::SavePreset { preset_id: id, blob: preset.to_wire().to_vec() });
+            *editor_preset_id_for_activate.borrow_mut() = Some(id);
             let model = Rc::clone(&model_for_activate);
             let presets = Rc::clone(&presets_for_activate);
             let commands = Rc::clone(&commands_for_activate);
@@ -1243,6 +1265,7 @@ pub(crate) fn build_effects_list_screen(
 mod tests {
     use embedded_graphics::prelude::RgbColor;
 
+    use crate::app::test_support::ready_presets;
     use crate::app::{App, ConnectedCodec, Event, PairedDevice};
     use crate::input::NavIntent;
 
@@ -1461,6 +1484,11 @@ mod tests {
     // --- End-to-end through App: Home -> Effects -> New effect ---
 
     fn open_effects(app: &mut App) {
+        // Bead `pico-link-ryw.14`: `App::presets_ready` defaults `false` on
+        // a real boot, so every test here that goes on to create/import a
+        // preset needs this pushed first -- see `ready_presets`'s doc
+        // comment.
+        ready_presets(app);
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
         app.handle_input(vec![NavIntent::Down]); // Effects row
         app.handle_input(vec![NavIntent::Select]); // open Effects list
@@ -1481,7 +1509,11 @@ mod tests {
 
         match app.poll_command() {
             Some(Command::SavePreset { preset_id, blob }) => {
-                assert_eq!(preset_id, 0, "a brand-new effect's first save must ask C to allocate");
+                // Bead `pico-link-ryw.14`, Ada's preset-id-allocation
+                // contract: `core` allocates the real id itself now, up
+                // front -- there is no more `preset_id: 0`/"ask C to
+                // allocate" convention.
+                assert_ne!(preset_id, 0, "a brand-new effect must get a real, Rust-allocated id immediately");
                 let preset = Preset::from_wire(&blob);
                 assert_eq!(preset.name, "Effect 1");
                 assert_eq!(preset.crossfeed, CrossfeedLevel::Medium);
@@ -1498,17 +1530,14 @@ mod tests {
         let mut app = App::new(240, 240);
         open_effects(&mut app);
         app.handle_input(vec![NavIntent::Select]); // New effect -> editor
-        let Some(Command::SavePreset { blob, .. }) = app.poll_command() else { panic!("expected the creation save") };
-
-        // C's echo, carrying the allocated id -- same round trip real
-        // hardware performs.
-        app.handle_event(Event::PresetLoaded { id: 1, blob });
+        let Some(Command::SavePreset { preset_id: created_id, .. }) = app.poll_command() else { panic!("expected the creation save") };
+        assert_ne!(created_id, 0, "bead pico-link-ryw.14: the id is real and Rust-allocated from the start");
 
         // CROSSFEED is focused first (design sec 4.2) -- one Right press.
         app.handle_input(vec![NavIntent::Right]);
         match app.poll_command() {
             Some(Command::SavePreset { preset_id, blob }) => {
-                assert_eq!(preset_id, 1, "once the id has echoed back, every further save must target it");
+                assert_eq!(preset_id, created_id, "every further save must target the same id the creation save used");
                 let preset = Preset::from_wire(&blob);
                 assert_eq!(preset.crossfeed, CrossfeedLevel::Strong, "Medium -> Strong");
             }
@@ -1640,6 +1669,7 @@ mod tests {
     #[test]
     fn an_import_does_not_move_focus_when_the_effects_list_is_not_open() {
         let mut app = App::new(240, 240);
+        ready_presets(&mut app);
         app.handle_event(Event::PresetLoaded { id: 1, blob: new_effect_preset("Relaxed").to_wire().to_vec() });
         // Deliberately NOT opening the effects list (still at Home root).
         let _ = app.import_preset(XM3_TEXT, "XM3 Harman").expect("import must still succeed");
@@ -1654,6 +1684,7 @@ mod tests {
     #[test]
     fn a_locked_editor_has_no_name_row_and_a_readonly_preamp_and_band_row_per_band() {
         let mut app = App::new(240, 240);
+        ready_presets(&mut app);
         let (id, _) = app.import_preset(XM3_TEXT, "XM3 Harman").unwrap();
         open_effects(&mut app);
         app.handle_input(vec![NavIntent::Select]); // the only row -- the imported effect
@@ -1763,6 +1794,7 @@ mod tests {
         std::fs::create_dir_all(&out_dir).expect("failed to create output dir");
 
         let mut app = App::new(240, 240);
+        ready_presets(&mut app);
         app.handle_event(Event::PresetLoaded { id: 1, blob: new_effect_preset("Relaxed").to_wire().to_vec() });
         let (id, _) = app.import_preset(XM3_TEXT, "XM3 Harman").expect("the XM3 text must import cleanly");
 

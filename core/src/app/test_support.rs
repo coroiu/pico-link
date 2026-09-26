@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use crate::input::NavIntent;
 
-use super::{App, ConnectedCodec, DeviceAddr, Event, LinkState, PairedDevice};
+use super::{App, ConnectedCodec, DeviceAddr, Event, LinkState, PairedDevice, StoreStatus};
 
 /// Home(1) -> Devices(2): reaching the Devices screen takes two
 /// `Select`s -- centre toggles Home to its menu face (Bluetooth
@@ -28,10 +28,30 @@ pub(in crate::app) fn open_wizard(app: &mut App) {
     app.handle_input(vec![NavIntent::Select]); // "Pair new headphones" row -> pushes the wizard
 }
 
+/// Bead `pico-link-ryw.14`, Ada's preset-id-allocation contract:
+/// `App::presets_ready` defaults `false` in real firmware (a real boot must
+/// not let anything allocate a preset id before C's own high-water mark has
+/// arrived, see that field's doc comment) -- so any test that creates a
+/// preset (New effect, import) needs this pushed first, same as C's own
+/// real boot sequence would push it. One shared helper rather than seeding
+/// every individual test: every call site that needs readiness routes
+/// through [`open_effects_list`] or this function directly.
+/// `next_id: 1` matches [`crate::dsp::PresetStore::new`]'s own starting
+/// value -- these tests want an ordinary "nothing loaded yet" boot, not the
+/// high-water-mark-specific scenario `pico-link-ryw.14`'s own "not ready"
+/// regression test constructs by hand.
+pub(in crate::app) fn ready_presets(app: &mut App) {
+    app.handle_event(Event::PresetStoreLoaded { count: 0, status: StoreStatus::FirstBoot, next_id: 1 });
+}
+
 /// Home(1) -> Effects list(2): `MENU_ROW_EFFECTS` (`render::home`) is index
 /// 1, one `Down` past the menu face's default Bluetooth selection -- see
-/// [`open_devices`]'s doc comment for the first `Select`.
+/// [`open_devices`]'s doc comment for the first `Select`. Also readies the
+/// preset store (see [`ready_presets`]) -- every caller of this helper goes
+/// on to either read the effects list or create/import a preset, both of
+/// which need it.
 pub(in crate::app) fn open_effects_list(app: &mut App) {
+    ready_presets(app);
     app.handle_input(vec![NavIntent::Select]); // Home status -> menu face (Bluetooth selected)
     app.handle_input(vec![NavIntent::Down]); // move selection onto the Effects row
     app.handle_input(vec![NavIntent::Select]); // Effects row -> pushes the effects list

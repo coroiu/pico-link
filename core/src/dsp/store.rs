@@ -70,6 +70,22 @@ impl PresetStore {
         self.next_id = self.next_id.max(id.saturating_add(1)).max(1);
     }
 
+    /// Raises `next_id` to at least `next_id` (never lowers it) -- bead
+    /// `pico-link-ryw.14`, Ada's preset-id-allocation contract. Seeded from
+    /// C's own boot-time high-water mark
+    /// ([`crate::app::Event::PresetStoreLoaded`]'s `next_id` field: the id
+    /// C's flash allocator would hand out next) so [`Self::create`] never
+    /// hands out an id C already used for a since-deleted preset (design:
+    /// "ids are monotonic and never reused" -- C's allocator and this
+    /// store's must therefore never disagree about how far the counter has
+    /// already advanced). A no-op if `next_id` is behind where this store
+    /// already is (e.g. this store already holds a higher loaded id than
+    /// C's own counter reports, which [`Self::load`] would have bumped past
+    /// it already).
+    pub fn raise_next_id(&mut self, next_id: u16) {
+        self.next_id = self.next_id.max(next_id).max(1);
+    }
+
     /// Allocates a fresh, never-before-used id and inserts `preset` under
     /// it. Returns the allocated id (design sec 3.2: `PresetLoaded` "is
     /// also the save echo and carries the allocated id").

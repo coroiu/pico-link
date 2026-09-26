@@ -362,23 +362,43 @@ static uint8_t s_device_settings_pending_ldac_quality;
 static uint16_t s_device_settings_pending_preset_id;
 static volatile bool s_device_settings_write_enqueued;
 
-// Bead pico-link-ryw.6, design sec 2.2/2.5: a staging slot for a PL:P
-// preset SAVE -- independent of every slot above (a preset save is neither
-// a pairing write nor a per-device settings write). `preset_id ==
-// PL_PERSIST_PRESET_ID_NONE` (0) staged here means "allocate a fresh id"
-// -- see pl_persist_request_save_preset's doc comment.
-static bool s_preset_save_pending;
-static uint16_t s_preset_save_pending_id;
-static uint8_t s_preset_save_pending_blob_len;
-static uint8_t s_preset_save_pending_blob[PL_PERSIST_PRESET_BLOB_LEN];
-static volatile bool s_preset_save_write_enqueued;
+// Bead pico-link-ryw.14, Ada's preset-id-allocation contract: an ORDERED,
+// per-id staging table for PL:P preset saves/deletes -- replaces the old
+// single-slot s_preset_save_pending_id/s_preset_delete_pending_id (which
+// silently lost whichever request wasn't staged when two different ids
+// landed before the drain, code-review finding on pico-link-ryw.14).
+// `core` is now the sole allocator of preset ids, so C's job on a save is
+// an UPSERT, not an allocate-or-overwrite decision -- see
+// pl_persist_request_save_preset's doc comment for the full contract.
+typedef enum {
+    PL_PERSIST_PRESET_OP_SAVE,
+    PL_PERSIST_PRESET_OP_DELETE,
+} pl_persist_preset_op_t;
 
-// Bead pico-link-ryw.6, design sec 2.4: a staging slot for a PL:P preset
-// DELETE -- independent of the save slot above (a delete carries only an
-// id, no blob).
-static bool s_preset_delete_pending;
-static uint16_t s_preset_delete_pending_id;
-static volatile bool s_preset_delete_write_enqueued;
+typedef struct {
+    uint16_t id;
+    pl_persist_preset_op_t op;
+    uint8_t blob_len; // meaningful for PL_PERSIST_PRESET_OP_SAVE only
+    uint8_t blob[PL_PERSIST_PRESET_BLOB_LEN];
+} pl_persist_preset_stage_entry_t;
+
+// `PL_PERSIST_PRESET_SLOTS * 2`: generous headroom over the flash slot
+// budget itself (design comment's own sizing) -- a burst of edits to
+// DIFFERENT presets between heartbeat drains is the only way this fills,
+// and each drain only ever removes at most one edit's worth of headroom
+// per preset actually being edited.
+#define PL_PERSIST_PRESET_STAGE_SLOTS (PL_PERSIST_PRESET_SLOTS * 2u)
+
+// Dense array: occupied entries live at indices [0, s_preset_stage_len),
+// in FIFO (insertion) order -- draining the head and shifting the rest
+// down by one is cheap at this size (at most 16 entries of ~86 bytes
+// each), and keeping FIFO order matters because `core` allocates
+// monotonically and its SavePreset commands arrive FIFO, so two distinct
+// new ids reach the executor's upsert rule (b) in ascending order (see
+// pl_persist_execute_pending_save_preset_write's doc comment).
+static pl_persist_preset_stage_entry_t s_preset_stage[PL_PERSIST_PRESET_STAGE_SLOTS];
+static uint8_t s_preset_stage_len;
+static volatile bool s_preset_op_write_enqueued;
 
 // Bead pico-link-qivj.5 (S11): a THIRD, independent staging slot -- global
 // display settings (screensaver mode + idle timeout), not per-device, so it
@@ -1337,24 +1357,18 @@ void pl_persist_service(void) {
         s_device_settings_write_enqueued = true;
         pl_bt_enqueue_device_settings_write();
     }
-    if (s_preset_save_pending && !s_preset_save_write_enqueued) {
+    if (s_preset_stage_len > 0 && !s_preset_op_write_enqueued) {
         // Bead pico-link-ryw.6, design sec 2.5 / Andreas's ryw.6 ruling:
         // "save immediately on every value change" -- same "no streaming
-        // gate, user-initiated" treatment as the block above. A burst of
-        // edits before the heartbeat drains this coalesces to the LATEST
-        // staged blob (pl_persist_request_save_preset already applied that
-        // coalescing) -- this flag only ever allows ONE
-        // PL_BT_PENDING_SAVE_PRESET entry in flight at a time, so the
-        // pending-action queue (capacity 8) can never fill from this alone
-        // no matter how fast the d-pad repeats.
-        s_preset_save_write_enqueued = true;
+        // gate, user-initiated" treatment as the block above. Bead
+        // pico-link-ryw.14: ONE shared flag/queue entry drains whichever
+        // operation (save or delete) is oldest in the ordered table, same
+        // "one entry in flight at a time" guard against flooding the
+        // pending-action queue (capacity 8) the pre-ryw.14 two-flag version
+        // had, now covering both operation kinds through a single flag
+        // since they share one table.
+        s_preset_op_write_enqueued = true;
         pl_bt_enqueue_save_preset_write();
-    }
-    if (s_preset_delete_pending && !s_preset_delete_write_enqueued) {
-        // Design sec 2.4/2.5: same "user-initiated, no streaming gate"
-        // treatment.
-        s_preset_delete_write_enqueued = true;
-        pl_bt_enqueue_delete_preset_write();
     }
     if (s_display_pending && !s_display_write_enqueued) {
         // Bead pico-link-qivj.5 (S11), design D11 (Andreas's xcmx ruling,
@@ -1470,131 +1484,194 @@ static int pl_persist_find_free_preset_slot(void) {
     return -1;
 }
 
-// Bead pico-link-ryw.6. See persist.h's doc comment.
-void pl_persist_request_save_preset(uint16_t preset_id, uint8_t blob_len, const uint8_t *blob) {
-    uint32_t irq_state = save_and_disable_interrupts();
-    s_preset_save_pending_id = preset_id;
-    uint8_t copy_len = blob_len > (uint8_t)sizeof(s_preset_save_pending_blob) ? (uint8_t)sizeof(s_preset_save_pending_blob) : blob_len;
-    memcpy(s_preset_save_pending_blob, blob, copy_len);
-    if (copy_len < (uint8_t)sizeof(s_preset_save_pending_blob)) {
-        memset(s_preset_save_pending_blob + copy_len, 0, sizeof(s_preset_save_pending_blob) - copy_len);
-    }
-    s_preset_save_pending_blob_len = copy_len;
-    s_preset_save_pending = true;
-    restore_interrupts(irq_state);
+// Bead pico-link-ryw.14. See persist.h's pl_persist_preset_next_id doc
+// comment.
+uint16_t pl_persist_preset_next_id(void) {
+    return s_next_preset_id;
 }
 
-// Bead pico-link-ryw.6. See persist.h's doc comment.
-void pl_persist_execute_pending_save_preset_write(void) {
-    if (!s_preset_save_pending) {
-        s_preset_save_write_enqueued = false;
+// Bead pico-link-ryw.14: pushes the truth echo for `id` -- PlEventTag::
+// PresetLoaded if a slot currently holds it (the new blob on a successful
+// upsert, the unchanged old one on a same-id refusal), else PlEventTag::
+// PresetDeleted (a refused creation never had a slot, or a real deletion
+// just removed one). Called after EVERY save/delete attempt, successful or
+// refused -- see pl_persist_execute_pending_save_preset_write's doc
+// comment.
+static void pl_persist_push_preset_truth_echo(uint16_t id) {
+    int slot = pl_persist_find_preset_slot_for_id(id);
+    if (slot >= 0) {
+        pl_bt_push_preset_loaded(id, s_preset_slots[(uint8_t)slot].blob_len, s_preset_slots[(uint8_t)slot].blob);
+    } else {
+        pl_bt_push_preset_deleted(id);
+    }
+}
+
+// Bead pico-link-ryw.14: stages `op` for `id` into the ordered per-id
+// table -- replace-in-place if `id` is already staged (latest wins, FIFO
+// position kept), else append if there's room. Returns false (nothing
+// staged) if the table is already full AND `id` wasn't already staged --
+// the caller pushes the truth echo itself in that case (see
+// pl_persist_request_save_preset/pl_persist_request_delete_preset).
+static bool pl_persist_stage_preset_op(uint16_t id, pl_persist_preset_op_t op, uint8_t blob_len, const uint8_t *blob) {
+    uint32_t irq_state = save_and_disable_interrupts();
+    for (uint8_t i = 0; i < s_preset_stage_len; i++) {
+        if (s_preset_stage[i].id == id) {
+            s_preset_stage[i].op = op;
+            s_preset_stage[i].blob_len = 0;
+            if (op == PL_PERSIST_PRESET_OP_SAVE) {
+                uint8_t copy_len = blob_len > (uint8_t)PL_PERSIST_PRESET_BLOB_LEN ? (uint8_t)PL_PERSIST_PRESET_BLOB_LEN : blob_len;
+                memcpy(s_preset_stage[i].blob, blob, copy_len);
+                if (copy_len < (uint8_t)PL_PERSIST_PRESET_BLOB_LEN) {
+                    memset(s_preset_stage[i].blob + copy_len, 0, PL_PERSIST_PRESET_BLOB_LEN - copy_len);
+                }
+                s_preset_stage[i].blob_len = copy_len;
+            }
+            restore_interrupts(irq_state);
+            return true;
+        }
+    }
+    if (s_preset_stage_len >= PL_PERSIST_PRESET_STAGE_SLOTS) {
+        restore_interrupts(irq_state);
+        return false;
+    }
+    pl_persist_preset_stage_entry_t *entry = &s_preset_stage[s_preset_stage_len];
+    entry->id = id;
+    entry->op = op;
+    entry->blob_len = 0;
+    if (op == PL_PERSIST_PRESET_OP_SAVE) {
+        uint8_t copy_len = blob_len > (uint8_t)PL_PERSIST_PRESET_BLOB_LEN ? (uint8_t)PL_PERSIST_PRESET_BLOB_LEN : blob_len;
+        memcpy(entry->blob, blob, copy_len);
+        if (copy_len < (uint8_t)PL_PERSIST_PRESET_BLOB_LEN) {
+            memset(entry->blob + copy_len, 0, PL_PERSIST_PRESET_BLOB_LEN - copy_len);
+        }
+        entry->blob_len = copy_len;
+    }
+    s_preset_stage_len++;
+    restore_interrupts(irq_state);
+    return true;
+}
+
+// Bead pico-link-ryw.6, contract rewritten by pico-link-ryw.14. See
+// persist.h's doc comment.
+void pl_persist_request_save_preset(uint16_t preset_id, uint8_t blob_len, const uint8_t *blob) {
+    if (preset_id == PL_PERSIST_PRESET_ID_NONE) {
+        // Rule (d): `core` never sends 0 any more -- refuse and log only,
+        // no echo (there is nothing meaningful to echo for the reserved
+        // sentinel id).
+        pl_log("persist: save_preset id=0 (reserved) -- refusing, core never sends this any more\r\n");
+        return;
+    }
+    if (!pl_persist_stage_preset_op(preset_id, PL_PERSIST_PRESET_OP_SAVE, blob_len, blob)) {
+        pl_log("persist: preset stage table full (%u entries) -- refusing id=%u\r\n", (unsigned)PL_PERSIST_PRESET_STAGE_SLOTS, (unsigned)preset_id);
+        pl_persist_push_preset_truth_echo(preset_id);
+    }
+}
+
+// Bead pico-link-ryw.6, contract rewritten by pico-link-ryw.14 -- drains
+// the oldest staged preset operation (save OR delete; both
+// pl_persist_request_save_preset and pl_persist_request_delete_preset feed
+// the same table). See persist.h's doc comment on
+// pl_persist_execute_pending_save_preset_write for the full upsert-rules/
+// truth-echo contract this implements.
+static void pl_persist_drain_preset_stage_head(void) {
+    if (s_preset_stage_len == 0) {
+        s_preset_op_write_enqueued = false;
         return;
     }
 
-    uint16_t requested_id;
-    uint8_t blob_len;
-    uint8_t blob[PL_PERSIST_PRESET_BLOB_LEN];
     uint32_t irq_state = save_and_disable_interrupts();
-    requested_id = s_preset_save_pending_id;
-    blob_len = s_preset_save_pending_blob_len;
-    memcpy(blob, s_preset_save_pending_blob, sizeof(blob));
-    s_preset_save_pending = false;
+    pl_persist_preset_stage_entry_t entry = s_preset_stage[0];
+    for (uint8_t i = 1; i < s_preset_stage_len; i++) {
+        s_preset_stage[i - 1] = s_preset_stage[i];
+    }
+    s_preset_stage_len--;
     restore_interrupts(irq_state);
 
-    int slot;
-    uint16_t id_to_write;
-    if (requested_id == PL_PERSIST_PRESET_ID_NONE) {
-        // Fresh allocation -- design sec 2.2: ids are monotonic and never
-        // reused.
+    if (entry.op == PL_PERSIST_PRESET_OP_DELETE) {
+        // Design sec 2.4: deletes ONLY the PL:P tag -- never rewrites any
+        // PL:D device record, so a device still referencing `entry.id`
+        // keeps a dangling reference that `core` resolves as Off.
+        int slot = pl_persist_find_preset_slot_for_id(entry.id);
+        if (slot >= 0) {
+            s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, (uint8_t)slot));
+            memset(&s_preset_slots[(uint8_t)slot], 0, sizeof(s_preset_slots[(uint8_t)slot]));
+            pl_log("persist: deleted preset slot=%d id=%u\r\n", slot, (unsigned)entry.id);
+        } else {
+            pl_log("persist: delete_preset id=%u but no slot holds it -- no-op\r\n", (unsigned)entry.id);
+        }
+        pl_persist_push_preset_truth_echo(entry.id);
+        s_preset_op_write_enqueued = false;
+        return;
+    }
+
+    // PL_PERSIST_PRESET_OP_SAVE -- Ada's upsert rules (a)-(e).
+    int slot = pl_persist_find_preset_slot_for_id(entry.id);
+    if (slot < 0) {
+        if (entry.id < s_next_preset_id) {
+            // Rule (c): `entry.id` was used before and deleted, or is
+            // otherwise stale -- refuse. The truth echo (PresetDeleted,
+            // since no slot holds it) tells `core` to drop it from its own
+            // store rather than believing a save that never happened.
+            pl_log("persist: save_preset id=%u is stale (< next_id=%u) -- refusing\r\n", (unsigned)entry.id, (unsigned)s_next_preset_id);
+            pl_persist_push_preset_truth_echo(entry.id);
+            s_preset_op_write_enqueued = false;
+            return;
+        }
         slot = pl_persist_find_free_preset_slot();
         if (slot < 0) {
+            // Rule (e): a genuinely new (at-or-past-high-water-mark) id,
+            // but every slot is occupied -- refuse, no eviction.
             pl_log(
-                "persist: preset store full (%u/%u slots used) -- refusing to allocate a new preset, no "
-                "eviction\r\n",
-                (unsigned)PL_PERSIST_PRESET_SLOTS, (unsigned)PL_PERSIST_PRESET_SLOTS
+                "persist: preset store full (%u/%u slots used) -- refusing id=%u, no eviction\r\n",
+                (unsigned)PL_PERSIST_PRESET_SLOTS, (unsigned)PL_PERSIST_PRESET_SLOTS, (unsigned)entry.id
             );
-            s_preset_save_write_enqueued = false;
+            pl_persist_push_preset_truth_echo(entry.id);
+            s_preset_op_write_enqueued = false;
             return;
         }
-        id_to_write = s_next_preset_id++;
-    } else {
-        // Overwrite in place -- design sec 2.2: an id always names an
-        // EXISTING slot once allocated; a caller-supplied id that no slot
-        // holds is refused rather than silently claiming a fresh slot under
-        // it (that would let a stale/racing id alias a different preset's
-        // slot).
-        slot = pl_persist_find_preset_slot_for_id(requested_id);
-        if (slot < 0) {
-            pl_log("persist: save_preset id=%u but no slot holds it -- refusing\r\n", (unsigned)requested_id);
-            s_preset_save_write_enqueued = false;
-            return;
-        }
-        id_to_write = requested_id;
+        // Rule (b): claim the free slot and raise the high-water mark past
+        // this id -- ids are monotonic and never reused (design sec 2.2).
+        s_next_preset_id = (uint16_t)(entry.id + 1u);
     }
+    // Rule (a) (an existing slot already held `entry.id`) falls straight
+    // through to the same write below -- an upsert writes identically
+    // either way, only which slot differs.
 
     pl_persist_preset_record_t rec = {
         .version = PL_PERSIST_PRESET_VERSION,
-        .preset_id = id_to_write,
-        .blob_len = blob_len,
+        .preset_id = entry.id,
+        .blob_len = entry.blob_len,
         .crc16 = 0,
     };
-    memcpy(rec.blob, blob, sizeof(rec.blob));
+    memcpy(rec.blob, entry.blob, sizeof(rec.blob));
     rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_preset_record_t, crc16));
     s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, (uint8_t)slot), (const uint8_t *)&rec, sizeof(rec));
 
     pl_persist_preset_slot_t *psl = &s_preset_slots[(uint8_t)slot];
     psl->occupied = true;
-    psl->id = id_to_write;
-    psl->blob_len = blob_len;
-    memcpy(psl->blob, blob, sizeof(psl->blob));
+    psl->id = entry.id;
+    psl->blob_len = entry.blob_len;
+    memcpy(psl->blob, entry.blob, sizeof(psl->blob));
 
-    pl_log("persist: wrote preset slot=%d id=%u blob_len=%u\r\n", slot, id_to_write, blob_len);
-    // Design sec 2.2/3.2: the SavePreset echo -- carries whichever id was
-    // actually used (the one supplied, or the freshly allocated one), same
-    // single-writer-echo rule as every other write in this file.
-    pl_bt_push_preset_loaded(id_to_write, blob_len, blob);
-    s_preset_save_write_enqueued = false;
+    pl_log("persist: wrote preset slot=%d id=%u blob_len=%u\r\n", slot, (unsigned)entry.id, (unsigned)entry.blob_len);
+    pl_persist_push_preset_truth_echo(entry.id);
+    s_preset_op_write_enqueued = false;
+}
+
+void pl_persist_execute_pending_save_preset_write(void) {
+    pl_persist_drain_preset_stage_head();
 }
 
 // Bead pico-link-ryw.6. See persist.h's doc comment.
 void pl_persist_request_delete_preset(uint16_t preset_id) {
-    uint32_t irq_state = save_and_disable_interrupts();
-    s_preset_delete_pending_id = preset_id;
-    s_preset_delete_pending = true;
-    restore_interrupts(irq_state);
+    if (!pl_persist_stage_preset_op(preset_id, PL_PERSIST_PRESET_OP_DELETE, 0, NULL)) {
+        pl_log("persist: preset stage table full (%u entries) -- refusing delete id=%u\r\n", (unsigned)PL_PERSIST_PRESET_STAGE_SLOTS, (unsigned)preset_id);
+        pl_persist_push_preset_truth_echo(preset_id);
+    }
 }
 
-// Bead pico-link-ryw.6. See persist.h's doc comment.
 void pl_persist_execute_pending_delete_preset_write(void) {
-    if (!s_preset_delete_pending) {
-        s_preset_delete_write_enqueued = false;
-        return;
-    }
-
-    uint16_t id;
-    uint32_t irq_state = save_and_disable_interrupts();
-    id = s_preset_delete_pending_id;
-    s_preset_delete_pending = false;
-    restore_interrupts(irq_state);
-
-    int slot = pl_persist_find_preset_slot_for_id(id);
-    if (slot < 0) {
-        pl_log("persist: delete_preset id=%u but no slot holds it -- no-op\r\n", (unsigned)id);
-        s_preset_delete_write_enqueued = false;
-        return;
-    }
-
-    // Design sec 2.4: deletes ONLY the PL:P tag -- never rewrites any PL:D
-    // device record, so a device still referencing `id` keeps a dangling
-    // reference that `core` resolves as Off. This is deliberately cheap
-    // (avoids up to PL_PERSIST_DEVICE_SLOTS extra writes) and never
-    // garbage-collects anything.
-    s_tlv_impl->delete_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_PRESET, (uint8_t)slot));
-    memset(&s_preset_slots[(uint8_t)slot], 0, sizeof(s_preset_slots[(uint8_t)slot]));
-
-    pl_log("persist: deleted preset slot=%d id=%u\r\n", slot, (unsigned)id);
-    pl_bt_push_preset_deleted(id);
-    s_preset_delete_write_enqueued = false;
+    pl_persist_drain_preset_stage_head();
 }
 
 // Bead pico-link-qivj.5 (S11). See persist.h's doc comment.

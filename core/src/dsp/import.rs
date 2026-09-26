@@ -95,6 +95,15 @@ pub enum ImportError {
     /// The name is new (not a same-name replace of an existing imported
     /// effect) and the store already holds [`MAX_PRESETS`] presets.
     StoreFull,
+    /// Bead `pico-link-ryw.14`, Ada's preset-id-allocation contract:
+    /// `core` cannot yet allocate a preset id because C's boot-time
+    /// high-water mark ([`crate::app::Event::PresetStoreLoaded`]'s
+    /// `next_id`) hasn't arrived yet -- an id allocated now could alias one
+    /// C already holds. `App::import_preset` returns this before calling
+    /// [`import`] at all (this module has no `PresetStore`-readiness state
+    /// of its own to check); [`import`]/[`place`] never produce it
+    /// themselves.
+    NotReady,
 }
 
 impl From<EqApoLineError> for ImportError {
