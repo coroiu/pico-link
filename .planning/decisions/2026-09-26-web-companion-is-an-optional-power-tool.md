@@ -25,8 +25,16 @@ because picotool already fails on this Mac and release builds lack remote reboot
 Its home page reuses the device's home layout, including the live moving level
 bars. This is a mirror of the visual language, not functional parity. Live bars
 need a small device-to-host telemetry stream (meter levels, link state), so that
-stream moves into F1. Whether the web renders through `core/` compiled to WASM
-(pixel-identical) or reimplements the layout natively is a design question for Fern.
+stream moves into F1.
+
+**Amendment 2 (same day, Andreas):** the whole companion is **web-native**. The
+home page reuses the device's *layout* (and live bars) at browser resolution; it
+is not a pixel clone. A wasm build of `core/` rendering the real 240x240
+framebuffer was designed and rejected: an LCD-constrained page cannot deliver
+the better EQ experience that is the companion's reason to exist, and a page
+mixing a scaled LCD with native controls is incoherent. The telemetry snapshot
+carries resolved values (kbps, names, FX) so the page reimplements layout, not
+logic; only the meter hold/decay is recomputed in JS.
 
 ## Alternatives
 - **Full functional mirror** — two equal front-ends; doubles every feature and dilutes the screen. (Rejected; the visual mirror above is different.)
