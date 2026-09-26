@@ -53,6 +53,7 @@ mod inspect;
 mod model;
 mod screen_id;
 mod screens;
+mod telemetry;
 mod ui_state;
 
 pub use events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus, VolumeSource, VolumeState};
