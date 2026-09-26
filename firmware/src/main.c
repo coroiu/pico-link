@@ -736,6 +736,17 @@ int main(void) {
         pl_dsp_service();
 #endif
 
+        // Bead pico-link-jyhk.4, ADA DESIGN comment on pico-link-jyhk.1
+        // section 3: "the snapshot carries this iteration's levels and
+        // bitrate" -- so this call sits right after pl_dsp_service above
+        // (which is itself right after the a2dp/ldac polls), before the
+        // display-power/dirty gate below. Internally gated (poll-recency
+        // + a min generation interval), so an unattached web page costs
+        // this one no-op check, nothing more.
+        uint64_t telemetry_start_us = time_us_64();
+        pl_config_itf_poll_telemetry(ui);
+        pl_loop_prof_record(PL_LOOP_PHASE_TELEMETRY, time_us_64() - telemetry_start_us);
+
         // Idle-screensaver seam (pico-link-i3e, extended by pico-link-
         // qivj.2 with a Dim level): a LEVEL, read once per iteration right
         // after pl_ui_tick and applied idempotently to the backlight PWM

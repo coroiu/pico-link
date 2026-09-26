@@ -68,6 +68,11 @@ typedef enum {
     PL_LOOP_PHASE_LOG_DRAIN,
     // pl_wdt_service + pl_wdt_report.
     PL_LOOP_PHASE_WDT_SERVICE,
+    // pl_config_itf_poll_telemetry (bead pico-link-jyhk.4). Expected ~0
+    // whenever no web page is attached (the whole call is one poll-
+    // recency check), and one pl_ui_telemetry encode's cost at most once
+    // every 20ms while a page is polling.
+    PL_LOOP_PHASE_TELEMETRY,
     // The pacing sleep_us() at the bottom of the loop (expected to be ~0
     // whenever the body already exceeds frame_budget_us).
     PL_LOOP_PHASE_SLEEP,

@@ -17,10 +17,12 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "tusb.h"
 
 #include "hardware/sync.h"
+#include "pico/time.h"
 
 #include "pico_link_ui.h"
 #include "usb_descriptors.h"
@@ -152,10 +154,99 @@ void pl_config_itf_poll(struct PlUi *ui) {
     s_import_pending = false;
 }
 
+// --- bead pico-link-jyhk.4: GET_TELEMETRY (0x03) / GET_INFO (0x04) ---
+// ADA DESIGN comment on pico-link-jyhk.1, sections 3-5.
+//
+// s_telemetry_buf/s_telemetry_len are published by
+// pl_config_itf_poll_telemetry (thread context, main.c's superloop) under
+// save_and_disable_interrupts and read directly by
+// configd_control_xfer_cb's GET_TELEMETRY SETUP handler (IRQ context) --
+// the same "writer excludes the IRQ, IRQ needs no lock" pattern as
+// s_status/set_status above. Both are zero-initialized by static storage
+// duration, which is exactly the pre-first-generation "not ready" state
+// (core's snap_seq field reads 0 until the first successful encode --
+// see App::telemetry_snapshot's doc comment): the reply is simply
+// however-many-bytes (possibly zero) have ever been published, with no
+// separate "reset to not-ready after further idle" step. That is a
+// deliberate simplification of design section 3 flow (c) -- once a page
+// has attached at least once, serving its last real (if stale) snapshot
+// rather than a synthesized not-ready header matches the design's own
+// "self-heals, not a delta log" philosophy (section 2) more closely than
+// inventing a second not-ready representation would.
+#define PL_TELEMETRY_POLL_RECENCY_US (1000ull * 1000ull) // 1s, design sec 3 flow (b)
+#define PL_TELEMETRY_GEN_INTERVAL_US (20ull * 1000ull)   // 20ms, design sec 3 flow (b)
+
+static uint8_t s_telemetry_buf[PL_CONFIG_TELEMETRY_BUF_LEN];
+static volatile uint16_t s_telemetry_len;
+// Stamped by the IRQ-context GET_TELEMETRY SETUP handler on every poll;
+// read by pl_config_itf_poll_telemetry (thread context) to gate
+// generation on "polled within the last second". A torn 64-bit read on
+// this 32-bit core can only misjudge staleness by at most one loop
+// iteration -- never a correctness hazard, same reasoning pl_prio.h/
+// pl_loop_prof.h already rely on for their own newest-snapshot counters.
+static volatile uint64_t s_telemetry_last_poll_us;
+// Which page the last SETUP asked for (only PL_TELEMETRY_PAGE_HOME exists
+// today, but this keeps a future page-1 poll driving generation of the
+// page actually requested, not always page 0).
+static volatile uint8_t s_telemetry_requested_page;
+// Thread-context only (both read and written exclusively from
+// pl_config_itf_poll_telemetry, which main.c calls from a single
+// superloop on core 0) -- no lock needed, same single-writer/single-reader
+// reasoning as pl_loop_prof.h's own module doc.
+static uint64_t s_telemetry_last_gen_us;
+
+// Copies `len` bytes (capped to the buffer) into s_telemetry_buf under a
+// short IRQ-disable critical section, then publishes the new length --
+// same set_status pattern as above (usb_config_itf.c:59-63 in the module's
+// original numbering), so configd_control_xfer_cb's SETUP handler (which
+// runs as the excluded IRQ) can never observe a torn buffer/length pair.
+static void publish_telemetry(const uint8_t *buf, size_t len) {
+    size_t copy_len = (len > PL_CONFIG_TELEMETRY_BUF_LEN) ? PL_CONFIG_TELEMETRY_BUF_LEN : len;
+    uint32_t irq_state = save_and_disable_interrupts();
+    memcpy(s_telemetry_buf, buf, copy_len);
+    s_telemetry_len = (uint16_t)copy_len;
+    restore_interrupts(irq_state);
+}
+
+void pl_config_itf_poll_telemetry(struct PlUi *ui) {
+    uint64_t now_us = time_us_64();
+
+    // Design sec 3 flow (b): "run only if the last poll was under 1s ago."
+    // No page attached (or it stopped polling) -- zero cost, no Rust call.
+    uint64_t last_poll_us = s_telemetry_last_poll_us;
+    if (last_poll_us == 0 || (now_us - last_poll_us) > PL_TELEMETRY_POLL_RECENCY_US) {
+        return;
+    }
+
+    // "...and at least 20ms have passed since the last generation."
+    if ((now_us - s_telemetry_last_gen_us) < PL_TELEMETRY_GEN_INTERVAL_US) {
+        return;
+    }
+    s_telemetry_last_gen_us = now_us;
+
+    uint8_t page = s_telemetry_requested_page;
+    uint8_t tmp[PL_CONFIG_TELEMETRY_BUF_LEN];
+    size_t written = pl_ui_telemetry(ui, page, tmp, sizeof(tmp));
+    if (written == 0) {
+        // Unsupported page, or (structurally impossible here, since
+        // sizeof(tmp) is PL_CONFIG_TELEMETRY_BUF_LEN) too small a buffer
+        // -- see pl_ui_telemetry's own doc comment: "0 means don't
+        // publish this poll." Leave whatever was previously published in
+        // place.
+        return;
+    }
+
+    publish_telemetry(tmp, written);
+}
+
 static void configd_init(void) {
     s_import_pending = false;
     s_import_len = 0;
     set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_IDLE });
+    s_telemetry_len = 0;
+    s_telemetry_last_poll_us = 0;
+    s_telemetry_last_gen_us = 0;
+    s_telemetry_requested_page = PL_TELEMETRY_PAGE_HOME;
 }
 
 static void configd_reset(uint8_t __unused rhport) {
@@ -226,6 +317,70 @@ static bool configd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_
             static pl_cfg_status_wire_t reply;
             reply = s_status;
             return tud_control_xfer(rhport, request, &reply, sizeof(reply));
+        }
+
+        if (request->bRequest == PL_CFG_REQ_GET_TELEMETRY &&
+            request->bmRequestType_bit.direction == TUSB_DIR_IN) {
+            uint8_t page = (uint8_t)(request->wValue & 0xFFu);
+            if (page != PL_TELEMETRY_PAGE_HOME) {
+                // Only page 0 exists today (design sec 4's versioning
+                // note: "F3 diagnostics becomes page 1 under the same
+                // header" -- not yet built). Stall rather than reply with
+                // the wrong page's data.
+                return false;
+            }
+
+            // Stamp poll-recency + requested page BEFORE copying the
+            // reply, matching design sec 3 flow (a): "stamp
+            // s_telemetry_last_poll_us, copy s_telemetry into a static
+            // reply buffer, then tud_control_xfer." NO pl_log in this
+            // path (design sec 3: "NO pl_log in this path").
+            s_telemetry_last_poll_us = time_us_64();
+            s_telemetry_requested_page = page;
+
+            // Copying s_telemetry_buf here, inside SETUP, means a
+            // concurrent publish_telemetry (thread context, under
+            // save_and_disable_interrupts) can never tear this reply --
+            // this callback runs AS the excluded IRQ, same reasoning as
+            // GET_STATUS's reply just above.
+            static uint8_t reply[PL_CONFIG_TELEMETRY_BUF_LEN];
+            uint16_t reply_len = s_telemetry_len;
+            memcpy(reply, s_telemetry_buf, reply_len);
+
+            uint16_t xfer_len = reply_len;
+            if (xfer_len > request->wLength) {
+                xfer_len = request->wLength;
+            }
+            // A short (possibly zero-length) reply before the first
+            // successful generation is a legal control transfer, not a
+            // stall -- see this file's telemetry state comment above for
+            // why "not ready" is realised as "however much has ever been
+            // published" rather than a synthesized header.
+            return tud_control_xfer(rhport, request, reply, xfer_len);
+        }
+
+        if (request->bRequest == PL_CFG_REQ_GET_INFO &&
+            request->bmRequestType_bit.direction == TUSB_DIR_IN) {
+            // Static configuration only -- no Rust call, no dynamic
+            // state, no lock needed (design sec 5).
+            static pl_cfg_info_wire_t reply;
+            const char *version = PL_FW_VERSION_STRING;
+            size_t version_len = strnlen(version, sizeof(reply.version));
+
+            reply.info_ver = PL_CFG_INFO_VERSION;
+            reply.import_proto = PL_CFG_IMPORT_PROTO_VERSION;
+            reply.status_ver = PL_CFG_STATUS_VERSION;
+            reply.telemetry_proto = PL_CFG_TELEMETRY_PROTO_VERSION;
+            reply.telemetry_page_mask = PL_CFG_TELEMETRY_PAGE_MASK;
+            reply.version_len = (uint8_t)version_len;
+            memset(reply.version, 0, sizeof(reply.version));
+            memcpy(reply.version, version, version_len);
+
+            uint16_t xfer_len = (uint16_t)sizeof(reply);
+            if (xfer_len > request->wLength) {
+                xfer_len = request->wLength;
+            }
+            return tud_control_xfer(rhport, request, &reply, xfer_len);
         }
 
         return false;
