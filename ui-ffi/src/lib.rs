@@ -1265,6 +1265,17 @@ pub struct PlPresetDeletedPayload {
 pub struct PlPresetStoreLoadedPayload {
     pub count: u16,
     pub status: u8,
+    /// C's own preset-id high-water mark -- bead `pico-link-ryw.14`, Ada's
+    /// preset-id-allocation contract. [`PL_EVENT_ABI_VERSION`] bumped 6 ->
+    /// 7 for this field: a non-additive shape change to an existing tag's
+    /// payload, same class of bump every prior `PL_EVENT_ABI_VERSION` bump
+    /// documents. `core` now allocates every preset id itself
+    /// ([`pico_link_core::dsp::PresetStore::create`]) rather than C, so it
+    /// must be told C's own counter (via
+    /// [`pico_link_core::dsp::PresetStore::raise_next_id`]) before
+    /// allocating anything itself, or a fresh id could alias one C already
+    /// holds for a deleted-then-reused slot.
+    pub next_id: u16,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::DeviceDiscovered`. `name`
@@ -2081,7 +2092,12 @@ pub union PlEventPayload {
 // PresetStoreLoaded) are purely additive on their own and would not have
 // required a bump by themselves -- same discipline every tag from
 // `LevelsChanged` (13) on documents.
-pub const PL_EVENT_ABI_VERSION: u32 = 6;
+//
+// Bead pico-link-ryw.14, Ada's preset-id-allocation contract: bumped 6 ->
+// 7. `PlPresetStoreLoadedPayload` gained `next_id` -- a non-additive shape
+// change to an existing tag's payload, same class of bump as every one
+// above.
+pub const PL_EVENT_ABI_VERSION: u32 = 7;
 
 /// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
@@ -2498,7 +2514,7 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                     return;
                 }
             };
-            Event::PresetStoreLoaded { count: payload.count, status: status.into() }
+            Event::PresetStoreLoaded { count: payload.count, status: status.into(), next_id: payload.next_id }
         }
     };
     ui.app.handle_event(core_event);
@@ -2716,13 +2732,23 @@ pub struct PlSetDeviceLdacQualityPayload {
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::SavePreset` (bead
-/// `pico-link-ryw.5`, design sec 3.2). `preset_id == 0`
-/// ([`pico_link_core::dsp::store::NO_PRESET_ID`]) means "allocate a fresh
-/// id"; C's [`PlEventTag::PresetLoaded`] echo carries whichever id was
-/// actually used (the one supplied, or the freshly allocated one). `blob`
-/// is an inline fixed buffer copied by value, `blob_len` bytes meaningful
-/// -- same shape as [`PlPresetLoadedPayload`], and C treats it exactly as
-/// opaquely (design sec 2.2: "C NEVER parses the blob").
+/// `pico-link-ryw.5`, design sec 3.2; reallocation contract updated by bead
+/// `pico-link-ryw.14`, [`PL_COMMAND_ABI_VERSION`] 3 -> 4). `preset_id` is
+/// ALWAYS a real, already-allocated id -- `core` is now the sole allocator
+/// ([`pico_link_core::dsp::PresetStore::create`]); `0`
+/// ([`pico_link_core::dsp::store::NO_PRESET_ID`]) is never sent and C must
+/// refuse it (log only, no echo) if it ever sees one. C treats this as an
+/// UPSERT: if a slot already holds `preset_id`, overwrite it; if no slot
+/// holds it but it's at or past C's own high-water mark, claim a free slot
+/// and raise the mark past it; otherwise (a stale or already-deleted id, or
+/// no free slot) refuse. After every attempt, successful or refused, C
+/// emits exactly one truth echo for `preset_id` -- [`PlEventTag::
+/// PresetLoaded`] if a slot holds it (the new blob on success, the old one
+/// unchanged on a same-id refusal), else [`PlEventTag::PresetDeleted`] (a
+/// refused creation, which never had a slot to begin with). `blob` is an
+/// inline fixed buffer copied by value, `blob_len` bytes meaningful -- same
+/// shape as [`PlPresetLoadedPayload`], and C treats it exactly as opaquely
+/// (design sec 2.2: "C NEVER parses the blob").
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlSavePresetPayload {
@@ -2805,7 +2831,18 @@ pub union PlCommandPayload {
 // bumped this constant). `SavePreset`/`DeletePreset`/`AssignPreset`'s tag
 // values themselves are still purely additive -- this bump is about the
 // union's size, not about any *existing* tag's payload shape changing.
-pub const PL_COMMAND_ABI_VERSION: u32 = 3;
+//
+// Bead pico-link-ryw.14, Ada's preset-id-allocation contract: bumped 3 ->
+// 4. `PlSavePresetPayload`'s wire layout is UNCHANGED (`preset_id` is still
+// a plain `u16`), but its MEANING changed: `preset_id == 0` no longer means
+// "C, please allocate" -- every id `core` sends is now its own, already-
+// Rust-allocated, real id, and C must upsert rather than treat `0`
+// specially. A mismatched C build reading a `core` built against this
+// contract (or vice versa) would silently misinterpret every `SavePreset`
+// under the old allocate-on-0 rule (refusing every creation under rule (c)/
+// (d) of the new contract) -- bumping this constant turns that into a loud
+// version mismatch instead.
+pub const PL_COMMAND_ABI_VERSION: u32 = 4;
 
 /// One user-initiated command, Rust -> C. See [`PlCommandPayload`]'s doc
 /// comment for the extensibility rationale and [`PL_COMMAND_ABI_VERSION`]
@@ -3387,7 +3424,7 @@ impl PlImportResult {
 /// doc).
 fn import_error_result(e: pico_link_core::dsp::ImportError) -> PlImportResult {
     use pico_link_core::dsp::ImportError::{
-        FreqOutOfRange, GainOutOfRange, Line, PreampOutOfRange, QOutOfRange, Session, StoreFull,
+        FreqOutOfRange, GainOutOfRange, Line, NotReady, PreampOutOfRange, QOutOfRange, Session, StoreFull,
     };
     match e {
         Line(line_err) => {
@@ -3411,6 +3448,11 @@ fn import_error_result(e: pico_link_core::dsp::ImportError) -> PlImportResult {
             PlImportResult { code: -13, outcome: 0, preset_id: 0, line: 0, band_index: 0, value: preamp_db }
         }
         StoreFull => PlImportResult { code: -14, outcome: 0, preset_id: 0, line: 0, band_index: 0, value: 0.0 },
+        // Bead `pico-link-ryw.14`: C's boot-time preset-id high-water mark
+        // (`PlEventTag::PresetStoreLoaded`'s `next_id`) hasn't arrived yet
+        // -- `core` cannot safely allocate an id. See `PlPresetStoreLoadedPayload`'s
+        // doc comment.
+        NotReady => PlImportResult { code: -15, outcome: 0, preset_id: 0, line: 0, band_index: 0, value: 0.0 },
     }
 }
 
@@ -5046,7 +5088,9 @@ mod tests {
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::PresetStoreLoaded as u32,
-                payload: PlEventPayload { preset_store_loaded: PlPresetStoreLoadedPayload { count: 1, status: PlStoreStatus::Loaded as u8 } },
+                payload: PlEventPayload {
+                    preset_store_loaded: PlPresetStoreLoadedPayload { count: 1, status: PlStoreStatus::Loaded as u8, next_id: 2 },
+                },
             },
         ];
         unsafe {
@@ -5054,6 +5098,43 @@ mod tests {
                 pl_ui_push_event(ui, event);
             }
             assert_eq!(pl_ui_malformed_tag_count(ui), 0, "every tag above is legal -- none should be counted as malformed");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Bead `pico-link-ryw.14`, Ada's preset-id-allocation contract: pins
+    /// both ABI bumps this bead makes (a future accidental revert of
+    /// either would silently desync a mismatched C/Rust pair -- see
+    /// `PL_EVENT_ABI_VERSION`/`PL_COMMAND_ABI_VERSION`'s own doc comments),
+    /// and proves `PlPresetStoreLoadedPayload::next_id` actually reaches
+    /// `core`'s allocator through the real `pl_ui_push_event` round trip --
+    /// not just that the field exists on the wire struct.
+    #[test]
+    fn preset_store_loaded_next_id_round_trips_and_the_abi_bumps_are_pinned() {
+        assert_eq!(PL_EVENT_ABI_VERSION, 7, "bumped 6 -> 7 for PlPresetStoreLoadedPayload::next_id");
+        assert_eq!(PL_COMMAND_ABI_VERSION, 4, "bumped 3 -> 4 for the SavePreset preset_id==0 semantics change");
+
+        let ui = new_ui();
+        unsafe {
+            let event = PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::PresetStoreLoaded as u32,
+                payload: PlEventPayload {
+                    preset_store_loaded: PlPresetStoreLoadedPayload { count: 0, status: PlStoreStatus::FirstBoot as u8, next_id: 100 },
+                },
+            };
+            pl_ui_push_event(ui, event);
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0);
+
+            // The allocator must now respect C's high-water mark: the next
+            // import gets an id >= 100, even though nothing is actually
+            // loaded anywhere near that (a deleted-highest-id-then-
+            // rebooted scenario, finding 4 of Ada's design comment).
+            let name = "After Boot";
+            let result = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
+            assert_eq!(result.code, 0);
+            assert!(result.preset_id >= 100, "the allocator must respect next_id, got {}", result.preset_id);
+
             pl_ui_destroy(ui);
         }
     }

@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 
 use crate::audio::{AbrFloor, CushionPolicy};
-use crate::dsp::{Band, BandKind, Preset, Program};
+use crate::dsp::{Band, BandKind, CrossfeedLevel, Preset, Program};
 use crate::render::{ListItem, VerticalList};
 
 use super::model::MAX_PAIRED_DEVICES;
@@ -1416,4 +1416,188 @@ fn eq_commands_without_a_begin_report_not_in_session() {
     let mut app = App::new(240, 240);
     assert_eq!(app.debug_eq_line("Preamp: 0 dB").unwrap_err(), DebugEqCommandError::NotInSession);
     assert_eq!(app.debug_eq_end().unwrap_err(), DebugEqCommandError::NotInSession);
+}
+
+// --- Bead `pico-link-ryw.14`: Ada's preset-id-allocation contract ---
+//
+// `core` now allocates every preset id itself (`PresetStore::create`)
+// before queuing a `SavePreset` -- these tests exercise the real contract
+// (concurrent allocations, a refused save's truth echo, the readiness
+// gate) rather than hand-fed echoes, per Ada's design comment on this
+// bead. A minimal, valid Equalizer APO/AutoEQ document (one preamp line,
+// one enabled filter) stands in for `dsp::import::tests::XM3_PRESET`
+// (private to that module) -- these tests only need *an* import to
+// succeed, not any particular curve's numbers.
+const MINIMAL_EQ_APO_TEXT: &str = "Preamp: 0 dB\nFilter 1: ON PK Fc 100 Hz Gain 1 dB Q 1";
+
+/// Item 1 of Ada's design comment: opening "New effect" allocates id N and
+/// queues `SavePreset{preset_id: N, ..}` immediately; importing a
+/// genuinely new name BEFORE that save's echo arrives must allocate a
+/// DIFFERENT id (N+1), not collide with or overwrite N -- proving `core`'s
+/// own allocator, not a C round trip, is what keeps the two apart.
+/// Delivering the echoes in either order must leave the editor on N's own
+/// draft and the imported preset intact under its own id.
+#[test]
+fn concurrent_new_effect_and_import_allocate_distinct_ids() {
+    let mut app = App::new(240, 240);
+    open_effects_list(&mut app);
+    app.handle_input(vec![NavIntent::Select]); // "New effect" -> allocates N, saves, opens the editor
+    let Some(Command::SavePreset { preset_id: n_id, blob: n_blob }) = app.poll_command() else {
+        panic!("expected the New-effect creation save")
+    };
+    assert_ne!(n_id, 0, "the id is real and Rust-allocated from the start");
+
+    // Import a genuinely new name before N's own echo has arrived.
+    let (imported_id, outcome) = app.import_preset(MINIMAL_EQ_APO_TEXT, "Imported").expect("import must succeed");
+    assert_eq!(outcome, ImportOutcome::Created);
+    assert_ne!(imported_id, n_id, "two concurrent allocations must never collide");
+    let Some(Command::SavePreset { preset_id: imp_id, blob: imp_blob }) = app.poll_command() else {
+        panic!("expected the import's own save")
+    };
+    assert_eq!(imp_id, imported_id);
+    assert_eq!(app.poll_command(), None, "exactly two SavePresets queued, nothing more");
+
+    // Deliver the echoes in reverse order (import's first, N's second) --
+    // order must not matter, since neither adopts anything from the other
+    // any more.
+    app.handle_event(Event::PresetLoaded { id: imp_id, blob: imp_blob });
+    app.handle_event(Event::PresetLoaded { id: n_id, blob: n_blob });
+
+    assert_eq!(app.current_screen_title(), "Effect 1", "the editor must still be showing N's own draft, not the import's");
+    assert_eq!(app.presets_for_test().len(), 2, "both presets must be in the store, under their own distinct ids");
+    assert_eq!(app.presets_for_test().get(imported_id).map(|p| p.name.as_str()), Some("Imported"));
+}
+
+/// Item 2: two different-name imports back to back get two distinct
+/// `SavePreset`s under two distinct ids, with no leftover/overwritten entry.
+#[test]
+fn two_different_name_imports_back_to_back_get_distinct_ids() {
+    let mut app = App::new(240, 240);
+    let text_a = "Name: A\nPreamp: 0 dB\nFilter 1: ON PK Fc 100 Hz Gain 1 dB Q 1";
+    let text_b = "Name: B\nPreamp: 0 dB\nFilter 1: ON PK Fc 200 Hz Gain 1 dB Q 1";
+
+    let (id_a, outcome_a) = app.import_preset(text_a, "fallback").expect("import A must succeed");
+    assert_eq!(outcome_a, ImportOutcome::Created);
+    let Some(Command::SavePreset { preset_id: save_a, .. }) = app.poll_command() else { panic!("expected A's save") };
+    assert_eq!(save_a, id_a, "the returned id and the queued save's id must already agree, GET_STATUS-style");
+
+    let (id_b, outcome_b) = app.import_preset(text_b, "fallback").expect("import B must succeed");
+    assert_eq!(outcome_b, ImportOutcome::Created);
+    let Some(Command::SavePreset { preset_id: save_b, .. }) = app.poll_command() else { panic!("expected B's save") };
+    assert_eq!(save_b, id_b);
+
+    assert_ne!(id_a, id_b, "store len must have grown by exactly 2 under 2 distinct ids");
+    assert_eq!(app.presets_for_test().len(), 2, "no leftover entries");
+    assert_eq!(app.presets_for_test().get(id_a).unwrap().name, "A");
+    assert_eq!(app.presets_for_test().get(id_b).unwrap().name, "B");
+}
+
+/// Item 3: a refused save's truth echo is `PresetDeleted`, not silence --
+/// the preset vanishes from `core`'s own store (never lingers as a ghost
+/// entry believed-saved-but-not), a device assigned to it resolves Off by
+/// construction, and the refused id is never reused by a later create
+/// (`PresetStore::create`'s counter only ever advances, refused or not).
+#[test]
+fn a_refused_saves_truth_echo_drops_the_preset_and_its_id_is_never_reused() {
+    let mut app = App::new(240, 240);
+    open_effects_list(&mut app);
+    app.handle_input(vec![NavIntent::Select]); // New effect -> allocates n_id
+    let Some(Command::SavePreset { preset_id: n_id, .. }) = app.poll_command() else {
+        panic!("expected the creation save")
+    };
+
+    let addr: DeviceAddr = [7, 7, 7, 7, 7, 7];
+    app.handle_event(Event::PairedDeviceUpserted(PairedDevice {
+        addr,
+        name: alloc::string::String::from("Cans"),
+        mru_seq: 1,
+        ldac_quality: 0,
+        preset_id: n_id,
+    }));
+    app.handle_event(Event::LinkStateChanged(LinkState::Connected));
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let _ = app.poll_command(); // drain the connect's own PersistDevice, unrelated to this test
+
+    // C refuses the save (e.g. rule (e), no free slot) -- its truth echo:
+    // no slot holds `n_id`.
+    app.handle_event(Event::PresetDeleted { id: n_id });
+
+    assert!(app.presets_for_test().get(n_id).is_none(), "a refused save must not linger in core's own store");
+
+    // Close the editor first -- while it's open its own live preview wins
+    // over the connected device's assignment (design sec 5.1, unrelated to
+    // this bug); back out to see what the device itself now resolves to.
+    app.handle_input(vec![NavIntent::Back]);
+    assert_eq!(
+        app.dsp_program(TEST_DSP_FS_HZ),
+        Program::off(TEST_DSP_FS_HZ),
+        "a device assigned to a refused/vanished id must resolve Off, same as any dangling reference"
+    );
+
+    // A later create must never reuse `n_id` -- open a second "New effect"
+    // from the effects list `Back` just returned to.
+    app.handle_input(vec![NavIntent::Select]);
+    let Some(Command::SavePreset { preset_id: next_id, .. }) = app.poll_command() else {
+        panic!("expected the second creation save")
+    };
+    assert_ne!(next_id, n_id, "the refused id must never be handed out again");
+    assert!(next_id > n_id, "PresetStore::create's counter only ever advances");
+}
+
+/// Item 4, the ryw.14 regression itself: editing CROSSFEED on an imported
+/// (locked) preset must round-trip through a real save + truth echo, not
+/// silently vanish -- this is the bug Andreas originally reported, proven
+/// here against the real allocation contract rather than a hand-fed echo.
+#[test]
+fn an_edit_to_an_imported_locked_preset_round_trips() {
+    let mut app = App::new(240, 240);
+    open_effects_list(&mut app); // list open first, so import focus follows the row
+    let (id, outcome) = app.import_preset(MINIMAL_EQ_APO_TEXT, "XM3").expect("import must succeed");
+    assert_eq!(outcome, ImportOutcome::Created);
+    let _ = app.poll_command(); // drain the import's own save
+    assert!(app.presets_for_test().get(id).unwrap().eq_locked, "sanity: an import is always locked");
+    assert_eq!(app.presets_for_test().get(id).unwrap().crossfeed, CrossfeedLevel::Off, "sanity: imports start at Off");
+
+    app.handle_input(vec![NavIntent::Select]); // the import-focused row -> its editor
+    assert_eq!(app.current_screen_title(), "XM3");
+
+    // CROSSFEED is focused first (design sec 4.2): Off -> Weak -> Medium
+    // -> Strong, three Rights, three saves, same id every time.
+    for _ in 0..3 {
+        app.handle_input(vec![NavIntent::Right]);
+        let Some(Command::SavePreset { preset_id, blob }) = app.poll_command() else { panic!("expected one save per edit") };
+        assert_eq!(preset_id, id, "every edit on a locked preset must target its own real id");
+        // C's truth echo: the upsert succeeded.
+        app.handle_event(Event::PresetLoaded { id, blob });
+    }
+
+    assert_eq!(
+        app.presets_for_test().get(id).unwrap().crossfeed,
+        CrossfeedLevel::Strong,
+        "the crossfeed edit must survive in core's own store once the echo lands"
+    );
+}
+
+/// Item 5: a creation path attempted before C's boot-time high-water mark
+/// has arrived is refused with `ImportError::NotReady` and queues nothing
+/// -- once it does arrive, the allocator respects it even if every
+/// actually-loaded preset has a lower id (the "deleted the highest id,
+/// rebooted" scenario finding 4 of Ada's design comment describes).
+#[test]
+fn import_before_presets_ready_is_refused_and_the_allocator_then_respects_the_high_water_mark() {
+    let mut app = App::new(240, 240);
+    app.set_presets_ready_for_test(false);
+
+    let err = app.import_preset(MINIMAL_EQ_APO_TEXT, "fallback").unwrap_err();
+    assert_eq!(err, ImportError::NotReady);
+    assert_eq!(app.poll_command(), None, "a refused-before-ready import must queue nothing");
+
+    // C's boot-time high-water mark arrives: `next_id: 7`, even though
+    // nothing loaded actually has an id anywhere near that (the deleted-
+    // highest-id-then-rebooted scenario) -- the allocator must respect it,
+    // not just `max(loaded) + 1`.
+    app.handle_event(Event::PresetStoreLoaded { count: 0, status: StoreStatus::FirstBoot, next_id: 7 });
+
+    let (id, _) = app.import_preset(MINIMAL_EQ_APO_TEXT, "fallback").expect("ready now");
+    assert!(id >= 7, "the allocator must never hand out an id below C's own high-water mark");
 }

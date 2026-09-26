@@ -446,7 +446,15 @@ pub enum Event {
     /// four variants (the device store's own boot-status vocabulary
     /// already covers "first boot / loaded / one record's CRC failed /
     /// schema version mismatch" and nothing about it is device-specific).
-    PresetStoreLoaded { count: u16, status: StoreStatus },
+    ///
+    /// `next_id` (bead `pico-link-ryw.14`, Ada's preset-id-allocation
+    /// contract): C's own preset-id high-water mark -- the id C's flash
+    /// allocator would hand out next. `core` now owns id allocation
+    /// (`PresetStore::create`), so it must be seeded with this value
+    /// (`PresetStore::raise_next_id`) before allocating anything itself, or
+    /// a fresh id could alias one C already holds for a deleted-then-
+    /// reused slot.
+    PresetStoreLoaded { count: u16, status: StoreStatus, next_id: u16 },
 }
 
 /// Phase 4's four named connect sub-steps: naming the current one tells

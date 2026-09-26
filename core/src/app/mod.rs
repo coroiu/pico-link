@@ -203,43 +203,35 @@ pub struct App {
     /// pushed screen's own `Widget::sync`, the same [`ModelHandle`] shape
     /// every other piece of live app state already uses.
     presets: Rc<RefCell<PresetStore>>,
-    /// The DSP effects editor's currently-assigned preset id, while an
-    /// editor screen is open -- bead `pico-link-ryw.7`. `None` when no
-    /// editor is open. `Some(0)` means "a brand-new effect, saved once
-    /// already, whose real id hasn't echoed back from
-    /// `Event::PresetLoaded` yet" -- [`App::on_preset_loaded`] adopts the
-    /// first echo it sees while this reads `Some(0)`, the same "second
-    /// writer reaches into a live pushed screen via a shared mailbox" shape
-    /// `wizard_phase`/`home_face` already use. Safe in practice because
-    /// every boot-time `PresetLoaded` (C's own push sequence) has already
-    /// landed by the time a user could possibly have opened the editor.
-    editor_preset_id: Rc<RefCell<Option<u16>>>,
     /// The DSP effects editor's live preview, while an editor screen is
     /// open -- bead `pico-link-ryw.7` review fix, design sec 5.1. `None`
     /// when no editor is open (rule 3: [`App::dsp_program`] resolves the
     /// connected device's assignment, unchanged). `Some((draft, bypassed))`
     /// while an editor is open: rule 1 (not bypassed) previews `draft`
     /// instantly; rule 2 (bypassed, `X`) previews Off. Deliberately
-    /// separate from [`App::editor_preset_id`] (which names *where a save
-    /// goes*, not *what plays*) and from the draft this bead's
-    /// `EditorState` owns inside the pushed `EffectEditorView` itself --
-    /// `EditorState` cannot be read from here (no path back to a screen
-    /// buried in the `Navigator`'s stack), so the editor widget mirrors
-    /// its own draft into this `App`-owned mailbox on every change, the
-    /// same "second writer reaches into a live pushed screen via a shared
-    /// mailbox" shape `wizard_phase`/`home_face` already use -- except
-    /// here the pushed screen is the writer and `App` is the reader.
-    /// Updated independently of the `SavePreset` round trip: preview must
-    /// not wait on flash + the `PresetLoaded` echo (Andreas's 12:48
-    /// ruling: "applies to the stream instantly, independent of the
-    /// save").
+    /// separate from the editor's own currently-assigned preset id (which
+    /// names *where a save goes*, not *what plays* -- see
+    /// `screens::effects::EffectEditorView::editor_preset_id`'s doc
+    /// comment; `App` itself holds no field for that any more, since bead
+    /// `pico-link-ryw.14` made it always the real, already-Rust-allocated
+    /// id from the moment the editor opens, with nothing left for `App` to
+    /// adopt from an echo) and from the draft this bead's `EditorState`
+    /// owns inside the pushed `EffectEditorView` itself -- `EditorState`
+    /// cannot be read from here (no path back to a screen buried in the
+    /// `Navigator`'s stack), so the editor widget mirrors its own draft
+    /// into this `App`-owned mailbox on every change, the same "second
+    /// writer reaches into a live pushed screen via a shared mailbox" shape
+    /// `wizard_phase`/`home_face` already use -- except here the pushed
+    /// screen is the writer and `App` is the reader. Updated independently
+    /// of the `SavePreset` round trip: preview must not wait on flash +
+    /// the `PresetLoaded` echo (Andreas's 12:48 ruling: "applies to the
+    /// stream instantly, independent of the save").
     editor_preview: Rc<RefCell<Option<(Preset, bool)>>>,
     /// In-progress `EQ BEGIN` .. `EQ END` console session (bead
     /// `pico-link-ryw.11`), or `None` between sessions. Plain field, not
-    /// `Rc<RefCell<_>>` like `editor_preview`/`editor_preset_id`: nothing
-    /// in the `Navigator`'s screen stack reads or writes this -- only
-    /// `ui-ffi`'s `pl_ui_debug_eq_command` reaches it, directly through
-    /// `&mut App`.
+    /// `Rc<RefCell<_>>` like `editor_preview`: nothing in the `Navigator`'s
+    /// screen stack reads or writes this -- only `ui-ffi`'s
+    /// `pl_ui_debug_eq_command` reaches it, directly through `&mut App`.
     eq_import_session: Option<EqApoSession>,
     /// The effects list's one-shot "focus this row" mailbox -- bead
     /// `pico-link-ryw.12.4`, Uma's design (`ryw12-3-ux.md` sec 2): "move
@@ -254,6 +246,26 @@ pub struct App {
     /// simply never consumed, matching Uma's "anywhere else: nothing on
     /// screen" rule.
     import_focus: Rc<RefCell<Option<ListItemKey>>>,
+    /// Whether C's boot-time preset-store high-water mark has arrived yet
+    /// (`Event::PresetStoreLoaded`'s `next_id`) -- bead `pico-link-ryw.14`,
+    /// Ada's preset-id-allocation contract. `core` now allocates every
+    /// preset id itself ([`PresetStore::create`]), so it must not create
+    /// ANY preset (New effect, import) before this is `true`, or a fresh id
+    /// could alias one C already holds for a deleted-then-reused slot.
+    /// Starts `true`: on host builds with no real C boot sequence (every
+    /// test, the emulator's own synthetic-seed pattern
+    /// [`Event::DisplaySettingsLoaded`]'s doc comment describes) there is no
+    /// race to guard against, and gating by default would make every
+    /// existing import/New-effect test need to manufacture a
+    /// `PresetStoreLoaded` push it has no other reason to send. Real
+    /// firmware's own boot sequence pushes `PresetStoreLoaded` once, early,
+    /// well before any USB import could plausibly race it in practice --
+    /// this flag exists for the narrow window it doesn't, not to gate the
+    /// common case. `Rc<RefCell<_>>`, not a plain field: the effects list's
+    /// New-effect row (`build_effects_list_screen`) reads it from inside a
+    /// pushed screen, the same "second reader reaches into `App`'s state
+    /// via a shared mailbox" shape [`Self::presets`] itself already uses.
+    presets_ready: Rc<RefCell<bool>>,
     /// The debug DSP override a finished `EQ END` session produced, if
     /// any -- [`Self::dsp_program`] returns this AHEAD of the editor
     /// preview and the connected device's assigned preset (bead
@@ -283,6 +295,8 @@ impl App {
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
         let import_focus = Rc::new(RefCell::new(None));
+        // Starts `true` -- see this field's own doc comment for why.
+        let presets_ready = Rc::new(RefCell::new(true));
         let navigator = Navigator::new(build_home_screen(
             &model,
             &home_face,
@@ -296,6 +310,7 @@ impl App {
             &editor_preset_id,
             &editor_preview,
             &import_focus,
+            &presets_ready,
         ));
         Self {
             navigator,
@@ -311,12 +326,19 @@ impl App {
             cushion_policy,
             abr_floor,
             presets,
-            editor_preset_id,
             editor_preview,
             eq_import_session: None,
             debug_dsp_override: None,
             import_focus,
+            presets_ready,
         }
+        // `editor_preset_id` is not stored on `Self` -- see its local
+        // binding above. `App` never reads it back after construction
+        // (bead `pico-link-ryw.14` removed the one call site that used to,
+        // `on_preset_loaded`'s echo-adoption block); the `Rc` stays alive
+        // for the app's lifetime purely because `HomeView` (built once,
+        // never rebuilt) holds its own clone in the Effects-row activation
+        // closure, the same way every other per-screen mailbox here does.
     }
 
 
@@ -369,6 +391,16 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Test-only: forces [`Self::presets_ready`] directly, without going
+    /// through a real [`Event::PresetStoreLoaded`] -- bead `pico-link-
+    /// ryw.14`'s "not ready" regression test needs to observe the refused
+    /// state, which [`App::new`]'s own default (`true`; see that field's
+    /// doc comment) never naturally produces on a host build.
+    #[cfg(test)]
+    pub(in crate::app) fn set_presets_ready_for_test(&mut self, ready: bool) {
+        *self.presets_ready.borrow_mut() = ready;
     }
 
     /// The live global congestion-cushion policy -- bead pico-link-8pp1.4
@@ -580,6 +612,12 @@ impl App {
     /// [`crate::dsp::import::import`]'s own doc comment for the exact
     /// "never partially mutates on an error path" guarantee this forwards.
     pub fn import_preset(&mut self, text: &str, host_name: &str) -> Result<(u16, ImportOutcome), ImportError> {
+        // Bead `pico-link-ryw.14`, Ada's preset-id-allocation contract:
+        // refuse to allocate before C's boot-time high-water mark has
+        // arrived -- see `App::presets_ready`'s doc comment.
+        if !*self.presets_ready.borrow() {
+            return Err(ImportError::NotReady);
+        }
         let outcome = {
             let mut presets = self.presets.borrow_mut();
             import_preset(&mut presets, text, host_name)

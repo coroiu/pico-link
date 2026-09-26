@@ -581,14 +581,20 @@ void pl_bt_push_preset_deleted(uint16_t id) {
 }
 
 // Bead pico-link-ryw.6, design sec 2.2: pushes
-// Event::PresetStoreLoaded{count, status} -- the terminator of bt.c's
-// boot-time PresetLoaded push sequence, same shape pl_bt_push_store_loaded
-// is for PairedDeviceUpserted's boot sequence.
-void pl_bt_push_preset_store_loaded(uint32_t status, uint16_t count) {
+// Event::PresetStoreLoaded{count, status, next_id} -- the terminator of
+// bt.c's boot-time PresetLoaded push sequence, same shape
+// pl_bt_push_store_loaded is for PairedDeviceUpserted's boot sequence.
+//
+// `next_id` added by bead pico-link-ryw.14, Ada's preset-id-allocation
+// contract ([`PL_EVENT_ABI_VERSION`] 6 -> 7): C's own preset-id
+// high-water mark -- `core` now allocates every id itself and must be
+// seeded with this before it can safely allocate anything, or a fresh id
+// could alias one C already holds for a deleted-then-reused slot.
+void pl_bt_push_preset_store_loaded(uint32_t status, uint16_t count, uint16_t next_id) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_PRESET_STORE_LOADED,
-        .payload = {.preset_store_loaded = {.count = count, .status = (uint8_t)status}},
+        .payload = {.preset_store_loaded = {.count = count, .status = (uint8_t)status, .next_id = next_id}},
     };
     pl_bt_ring_push(event, NULL, 0);
 }
@@ -1102,16 +1108,21 @@ typedef enum {
     // PL_BT_PENDING_PERSIST_WRITE.
     PL_BT_PENDING_SET_DEVICE_SETTINGS,
     // Bead pico-link-ryw.6: reuses this exact queue/heartbeat idiom for
-    // persist.c's PL:P preset-save write -- same reentrancy reason as the
-    // other PL_BT_PENDING_* persist entries. Carries no payload -- persist.c
-    // already has the pending id/blob staged in its own
-    // s_preset_save_pending_id/s_preset_save_pending_blob.
+    // persist.c's PL:P preset save/delete drain -- same reentrancy reason
+    // as the other PL_BT_PENDING_* persist entries. Carries no payload --
+    // persist.c already has the pending operation staged in its own
+    // ordered per-id table (bead pico-link-ryw.14 replaced the old
+    // single-slot staging vars with that table; both this tag and
+    // PL_BT_PENDING_DELETE_PRESET below now drain the SAME table via the
+    // same pl_persist_execute_pending_save_preset_write/
+    // pl_persist_execute_pending_delete_preset_write functions -- see
+    // persist.h's doc comments).
     PL_BT_PENDING_SAVE_PRESET,
-    // Bead pico-link-ryw.6: reuses this exact queue/heartbeat idiom for
-    // persist.c's PL:P preset-delete write -- same reentrancy reason as the
-    // other PL_BT_PENDING_* persist entries. Carries no payload -- persist.c
-    // already has the pending id staged in its own
-    // s_preset_delete_pending_id.
+    // See PL_BT_PENDING_SAVE_PRESET above -- kept as its own tag for
+    // logging clarity, but persist.c only ever enqueues the SAVE_PRESET
+    // tag now (pl_persist_service checks one shared "table non-empty"
+    // condition); this tag's switch-case handler still correctly drains
+    // the table if it's ever reached.
     PL_BT_PENDING_DELETE_PRESET,
     // Bead pico-link-qivj.5 (S11): reuses this exact queue/heartbeat idiom
     // for persist.c's PL:S:0 display-settings write -- same reentrancy
@@ -1472,7 +1483,7 @@ void pl_bt_init(struct PlUi *ui) {
         pl_persist_boot_preset_at(i, &boot_preset_id, &boot_preset_blob_len, boot_preset_blob);
         pl_bt_push_preset_loaded(boot_preset_id, boot_preset_blob_len, boot_preset_blob);
     }
-    pl_bt_push_preset_store_loaded((uint32_t)pl_persist_preset_boot_status(), boot_preset_count);
+    pl_bt_push_preset_store_loaded((uint32_t)pl_persist_preset_boot_status(), boot_preset_count, pl_persist_preset_next_id());
 
     // RSSI + EIR (Extended Inquiry Response, which is where a discovered
     // device's name comes from) -- without this, GAP_EVENT_INQUIRY_RESULT
