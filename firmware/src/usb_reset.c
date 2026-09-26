@@ -15,6 +15,7 @@
 #include "hardware/watchdog.h"
 #include "device/usbd_pvt.h"
 
+#include "usb_config_itf.h"
 #include "usb_pump.h"
 
 static uint8_t itf_num;
@@ -103,12 +104,26 @@ static usbd_class_driver_t const _resetd_driver =
     .sof              = NULL
 };
 
-// Implement callback to add our custom driver. This is the strong
+// Implement callback to add our custom drivers. This is the strong
 // usbd_app_driver_get_cb symbol -- pico-sdk's reset_interface.c must NOT
 // also define it (see CMakeLists.txt:
 // PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=0 compiles that whole
 // translation unit down to nothing, freeing the symbol for this file).
+//
+// Bead pico-link-ryw.12.5: also returns pl_configd_driver()
+// (usb_config_itf.c), the "Pico Link Config" preset-import interface --
+// per its design comment, "usbd_app_driver_get_cb returns [resetd,
+// configd]". Order matters no more than array order ever does here: both
+// drivers dispatch purely on wIndex/itf_num, not on table position.
 usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
-    *driver_count = 1;
-    return &_resetd_driver;
+    // TinyUSB wants a CONTIGUOUS array of usbd_class_driver_t (see
+    // usbd.c: `_app_driver = usbd_app_driver_get_cb(...)`, then indexed as
+    // `_app_driver[drvid]`), not an array of pointers -- so this copies
+    // both driver tables into one static array rather than returning
+    // pointers to them.
+    static usbd_class_driver_t drivers[2];
+    drivers[0] = _resetd_driver;
+    drivers[1] = *pl_configd_driver();
+    *driver_count = 2;
+    return drivers;
 }

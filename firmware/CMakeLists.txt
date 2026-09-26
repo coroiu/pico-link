@@ -315,6 +315,12 @@ add_executable(pico_link
     # a shipping build until ryw.5/ryw.6 land); only the canned debug-
     # program loader inside dsp.c is PL_DEBUG_REMOTE-gated.
     src/dsp.c
+    # Bead pico-link-ryw.12.5 (design comment on pico-link-ryw.12, section
+    # 1): "Pico Link Config", the zero-endpoint vendor interface for
+    # host->device preset import -- see usb_config_itf.h's module doc.
+    # Compiled unconditionally, NOT gated on PL_DEBUG_REMOTE: the whole
+    # point of this transport is that it exists in release builds.
+    src/usb_config_itf.c
 )
 
 if(PL_DEBUG_REMOTE)
