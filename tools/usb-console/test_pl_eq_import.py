@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import struct
 import unittest
+from unittest import mock
 
 import pl_eq_import as m
 
@@ -98,6 +99,42 @@ class FormatStatusTests(unittest.TestCase):
         for state in range(0, 5):
             success = state == 2
             self.assertEqual(state == 2, success)
+
+
+class WireRequestTypeTests(unittest.TestCase):
+    """Regression test for pico-link-ryw.12.5's iface-6 STALL: pico-sdk
+    2.1.1's TinyUSB usbd.c routes every bmRequestType type==VENDOR request to
+    tud_vendor_control_xfer_cb and never to a class driver, so this tool must
+    send type==CLASS (0x21/0xA1), not type==VENDOR (0x41/0xC1), or every
+    control transfer stalls before it ever reaches firmware/src/usb_config_itf.c.
+    The earlier test suite mocked decode/format only and never asserted the
+    actual bmRequestType byte, which is why two code-review rounds missed
+    this."""
+
+    def test_bm_request_type_constants_are_class_not_vendor(self):
+        # type field is bits 6:5 of bmRequestType: 01 == CLASS, 10 == VENDOR.
+        self.assertEqual(m.BM_REQUEST_TYPE_OUT, 0x21)
+        self.assertEqual(m.BM_REQUEST_TYPE_IN, 0xA1)
+        self.assertNotEqual(m.BM_REQUEST_TYPE_OUT, 0x41)  # vendor|out|interface
+        self.assertNotEqual(m.BM_REQUEST_TYPE_IN, 0xC1)  # vendor|in|interface
+
+    def test_get_status_sends_class_interface_request(self):
+        dev = mock.Mock()
+        dev.ctrl_transfer.return_value = encode_status(state=0)
+
+        m.get_status(dev)
+
+        dev.ctrl_transfer.assert_called_once_with(
+            0xA1, m.REQ_GET_STATUS, 0, m.ITF_NUM_CONFIG, m.STATUS_WIRE_LEN
+        )
+
+    def test_import_preset_sends_class_interface_request(self):
+        dev = mock.Mock()
+        payload = m.build_payload("XM3", "Preamp: -6.0 dB\n")
+
+        m.send_import_preset(dev, payload)
+
+        dev.ctrl_transfer.assert_called_once_with(0x21, m.REQ_IMPORT_PRESET, 0, m.ITF_NUM_CONFIG, payload)
 
 
 if __name__ == "__main__":

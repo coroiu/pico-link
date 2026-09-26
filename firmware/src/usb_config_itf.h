@@ -40,9 +40,12 @@
 // pl_debug_remote_poll -- is the one place that flag is consumed and the
 // one place pl_ui_import_preset() is called.
 //
-// WIRE PROTOCOL (vendor class, interface recipient, wIndex ==
-// ITF_NUM_CONFIG). Exactly two requests, matching tools/usb-console/
-// pl_eq_import.py:
+// WIRE PROTOCOL (bmRequestType type==CLASS, recipient==INTERFACE, wIndex ==
+// ITF_NUM_CONFIG -- NOT type==VENDOR: pico-sdk 2.1.1's TinyUSB usbd.c routes
+// every VENDOR-type request to tud_vendor_control_xfer_cb and never to a
+// class driver, so a real vendor request would always stall here; CLASS is
+// the same convention usb_reset.c's resetd already uses). Exactly two
+// requests, matching tools/usb-console/pl_eq_import.py:
 //   0x01 IMPORT_PRESET, OUT, wLength 2..1024:
 //     byte 0: proto version, must be 1
 //     byte 1: name_len, <= PL_CONFIG_NAME_MAX (16)

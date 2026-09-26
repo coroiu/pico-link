@@ -14,9 +14,9 @@ at all, only plain USB control transfers via pyusb, the same mechanism
 cdc_sender.py/cdc_reader.py already use to enumerate this device.
 
 Wire protocol (see usb_config_itf.h for the authoritative doc):
-  IMPORT_PRESET (bRequest 0x01), OUT, vendor/interface, wIndex=ITF_NUM_CONFIG:
+  IMPORT_PRESET (bRequest 0x01), OUT, class/interface, wIndex=ITF_NUM_CONFIG:
     payload = proto(1) + name_len(1) + name(name_len) + APO text
-  GET_STATUS (bRequest 0x02), IN, vendor/interface, wIndex=ITF_NUM_CONFIG:
+  GET_STATUS (bRequest 0x02), IN, class/interface, wIndex=ITF_NUM_CONFIG:
     reply = state(1) + error(1) + outcome(1) + reserved(1) +
             preset_id(2) + line(2) + band_index(2) + value(4, f32), all
             little-endian -- 14 bytes total, matches pl_cfg_status_wire_t.
@@ -71,9 +71,15 @@ REQ_GET_STATUS = 0x02
 NAME_MAX = 16
 IMPORT_BUF_MAX = 1024
 
-# bmRequestType bytes: vendor request, interface recipient, OUT/IN.
-BM_REQUEST_TYPE_OUT = 0x21  # host-to-device | vendor | interface
-BM_REQUEST_TYPE_IN = 0xA1  # device-to-host | vendor | interface
+# bmRequestType bytes: CLASS request (not VENDOR), interface recipient,
+# OUT/IN. Must be CLASS: pico-sdk 2.1.1's TinyUSB usbd.c routes every
+# type==VENDOR request straight to tud_vendor_control_xfer_cb and never to a
+# class driver's control_xfer_cb, so a real VENDOR request would stall here
+# no matter what usb_config_itf.c does. type==CLASS + recipient==INTERFACE is
+# routed by wIndex to the owning driver -- the same convention the
+# pre-existing RESET interface (usb_reset.c) already relies on.
+BM_REQUEST_TYPE_OUT = 0x21  # host-to-device | class | interface
+BM_REQUEST_TYPE_IN = 0xA1  # device-to-host | class | interface
 
 STATE_NAMES = {
     0: "idle",
@@ -169,6 +175,15 @@ def find_device(vid, pid):
         print("Narrow with --vid/--pid.", file=sys.stderr)
         sys.exit(1)
     return devs[0]
+
+
+def send_import_preset(dev, payload: bytes) -> None:
+    """Sends IMPORT_PRESET. Split out of main() so tests can assert the
+    exact bmRequestType byte reaches ctrl_transfer -- see
+    test_pl_eq_import.py's WireRequestTypeTests, added after the iface-6
+    STALL (pico-link-ryw.12.5) that two code-review rounds missed because
+    the old test suite mocked USB entirely."""
+    dev.ctrl_transfer(BM_REQUEST_TYPE_OUT, REQ_IMPORT_PRESET, 0, ITF_NUM_CONFIG, payload)
 
 
 def get_status(dev) -> dict:
@@ -268,7 +283,7 @@ def main() -> int:
         return 1
 
     print(f"Sending IMPORT_PRESET: name={name!r}, {len(apo_text.splitlines())} source lines, {len(payload)} wire bytes")
-    dev.ctrl_transfer(BM_REQUEST_TYPE_OUT, REQ_IMPORT_PRESET, 0, ITF_NUM_CONFIG, payload)
+    send_import_preset(dev, payload)
 
     deadline = time.monotonic() + args.poll_timeout
     status = get_status(dev)

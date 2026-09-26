@@ -184,7 +184,14 @@ static bool configd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_
     if (request->wIndex != itf_num) {
         return false;
     }
-    if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR ||
+    // pico-sdk 2.1.1's TinyUSB usbd.c routes every type==VENDOR control
+    // request straight to tud_vendor_control_xfer_cb (never to a class
+    // driver's control_xfer_cb), so a real VENDOR request can never reach
+    // this callback and would always stall. type==CLASS + recipient
+    // INTERFACE IS routed here by wIndex -- the same convention usb_reset.c's
+    // resetd already relies on for its BOOTSEL request. Accept CLASS, not
+    // VENDOR.
+    if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_CLASS ||
         request->bmRequestType_bit.recipient != TUSB_REQ_RCPT_INTERFACE) {
         return false;
     }
