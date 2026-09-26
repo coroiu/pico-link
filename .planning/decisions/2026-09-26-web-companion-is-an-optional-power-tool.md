@@ -21,8 +21,15 @@ removing the worst on-device ergonomics (curve editing, preset libraries,
 database search). EQ first because its transport is proven; firmware update last
 because picotool already fails on this Mac and release builds lack remote reboot.
 
+**Amendment (same day, Andreas):** the companion *visually* mirrors the device.
+Its home page reuses the device's home layout, including the live moving level
+bars. This is a mirror of the visual language, not functional parity. Live bars
+need a small device-to-host telemetry stream (meter levels, link state), so that
+stream moves into F1. Whether the web renders through `core/` compiled to WASM
+(pixel-identical) or reimplements the layout natively is a design question for Fern.
+
 ## Alternatives
-- **Full mirror** — two equal front-ends; doubles every feature and dilutes the screen.
+- **Full functional mirror** — two equal front-ends; doubles every feature and dilutes the screen. (Rejected; the visual mirror above is different.)
 - **Web primary** — changes what the product is.
 - **Setup-only** — too narrow to justify the hosting and WebUSB work.
 - **Local-only hosting** — no plug-in-and-go, no AutoEQ fetch.

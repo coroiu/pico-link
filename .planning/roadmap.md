@@ -174,7 +174,9 @@ iface-6 config channel (CLASS requests). **Invariant: every function the device
 offers stays reachable from the buttons; the web only adds.** See
 [ADR 2026-09-26](decisions/2026-09-26-web-companion-is-an-optional-power-tool.md).
 
-- **F1** EQ editor + preset library (subsumes `pico-link-ryw.12.7`).
+- **F1** Home page that visually mirrors the device home (same layout, live
+  moving level bars over a telemetry stream), plus EQ editor + preset library
+  (subsumes `pico-link-ryw.12.7`).
 - **F2** AutoEQ search.
 - **F3** Live diagnostics — link graphs + log; retires the CDC tty for
   development; bandwidth budgeted against audio.
