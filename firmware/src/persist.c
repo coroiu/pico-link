@@ -1579,8 +1579,8 @@ static void pl_persist_drain_preset_stage_head(void) {
         return;
     }
 
-    pl_persist_preset_stage_entry_t entry = s_preset_stage[0];
     uint32_t irq_state = save_and_disable_interrupts();
+    pl_persist_preset_stage_entry_t entry = s_preset_stage[0];
     for (uint8_t i = 1; i < s_preset_stage_len; i++) {
         s_preset_stage[i - 1] = s_preset_stage[i];
     }
