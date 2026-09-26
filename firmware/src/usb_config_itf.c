@@ -91,7 +91,8 @@ void pl_config_itf_poll(struct PlUi *ui) {
     }
 
     uint16_t len = s_import_len;
-    set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_BUSY });
+    // BUSY is already set by configd_control_xfer_cb's ACK stage (see its
+    // comment) -- no need to set it again here.
 
     if (len < 2) {
         pl_log("usb-config: IMPORT_PRESET rejected -- header too short (len=%u)\r\n", (unsigned)len);
@@ -239,6 +240,16 @@ static bool configd_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_
             // polls. See pl_config_itf_poll for what happens next, in
             // thread context.
             s_import_len = request->wLength;
+            // Set BUSY here, in IRQ context, not just s_import_pending: the
+            // ACK completes before the host can issue its next SETUP, so a
+            // GET_STATUS that lands in the gap before pl_config_itf_poll
+            // (thread context) picks the import up must not see the
+            // *previous* import's final status (idle on a fresh board looks
+            // like a false failure; saved/rejected from a prior import looks
+            // like a false success for this one). Safe from IRQ context:
+            // set_status disables interrupts around its own write, and it is
+            // the only other writer of s_status.
+            set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_BUSY });
             s_import_pending = true;
         }
         return true;
