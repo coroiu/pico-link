@@ -276,6 +276,21 @@ pub struct App {
     /// exist across one). Survives Bluetooth connect/disconnect cycles
     /// untouched -- nothing here folds on any [`Event`].
     debug_dsp_override: Option<EqApoOverride>,
+    /// The page-0 Home telemetry snapshot's monotonic `snap_seq` counter
+    /// (bead `pico-link-jyhk.3`, "ADA DESIGN" comment on `pico-link-jyhk.1`,
+    /// section 3/4). `Cell`, not a plain field behind `&mut self`:
+    /// [`Self::telemetry_snapshot`] takes `&self` deliberately (the
+    /// design's Rust contract -- "the borrow is read-only... never touches
+    /// dirty, damage or idle state" -- reads as *no caller-visible
+    /// mutation*, and a private, monotonically-increasing wire counter
+    /// with no read-back API is the one piece of state that needs to
+    /// change on every poll regardless). Starts at `0`; the wire's own
+    /// `0 == not ready` convention is instead realised by C never having
+    /// called this function yet (its static reply buffer is zero-
+    /// initialised), so the first successful call here already returns
+    /// `1`, matching the design's "before the first generation... snap_seq
+    /// `0`" note.
+    telemetry_snap_seq: core::cell::Cell<u32>,
 }
 
 impl App {
@@ -333,6 +348,7 @@ impl App {
             debug_dsp_override: None,
             import_focus,
             presets_ready,
+            telemetry_snap_seq: core::cell::Cell::new(0),
         }
         // `editor_preset_id` is not stored on `Self` -- see its local
         // binding above. `App` never reads it back after construction
@@ -525,6 +541,53 @@ impl App {
             Some(preset) => Program::from_preset(preset, fs_hz),
             None => Program::off(fs_hz),
         }
+    }
+
+    /// Encodes the page-0 Home telemetry snapshot for the web companion's
+    /// `GET_TELEMETRY` poll (bead `pico-link-jyhk.3`, "ADA DESIGN" comment
+    /// on `pico-link-jyhk.1`, sections 3-4; wire layout owned by
+    /// [`telemetry::encode_home_snapshot`]). `page` selects which payload
+    /// to build; only [`telemetry::TELEMETRY_PAGE_HOME`] (`0`) exists
+    /// today (the design's "F3 diagnostics becomes page 1" note is a
+    /// future payload, not yet built).
+    ///
+    /// Writes into `buf` and returns the number of bytes written -- always
+    /// [`telemetry::HOME_SNAPSHOT_LEN`] on a successful page-0 encode.
+    /// Returns `0` (and never partially writes `buf`) if `page` is
+    /// unsupported or `buf` is too small to hold the whole snapshot; the
+    /// caller (`ui-ffi`'s `pl_ui_telemetry`) treats `0` as "don't publish
+    /// this poll," matching the design's C-side "not ready" handling.
+    ///
+    /// Takes `&self`, not `&mut self`: the design's Rust contract requires
+    /// "the borrow is read-only... never touches dirty, damage or idle
+    /// state." [`Self::telemetry_snap_seq`] is the one piece of state this
+    /// call advances regardless, via a `Cell` -- see that field's doc
+    /// comment for why an internal wire counter with no read-back API
+    /// doesn't count as caller-visible mutation.
+    #[must_use]
+    pub fn telemetry_snapshot(&self, page: u8, buf: &mut [u8]) -> usize {
+        if page != telemetry::TELEMETRY_PAGE_HOME {
+            return 0;
+        }
+        if buf.len() < telemetry::HOME_SNAPSHOT_LEN {
+            return 0;
+        }
+
+        // `0` is reserved for "not ready" (this field's doc comment); skip
+        // it on the vanishingly unlikely `u32` wraparound rather than let
+        // one poll in 2^32 read back as not-ready.
+        let mut seq = self.telemetry_snap_seq.get().wrapping_add(1);
+        if seq == 0 {
+            seq = 1;
+        }
+        self.telemetry_snap_seq.set(seq);
+
+        let now = Instant::from_micros(self.now_us);
+        let model = self.model.borrow();
+        let presets = self.presets.borrow();
+        let bytes = telemetry::encode_home_snapshot(&model, &presets, now, seq);
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        bytes.len()
     }
 
     /// `EQ BEGIN`: starts a fresh [`EqApoSession`], discarding any
