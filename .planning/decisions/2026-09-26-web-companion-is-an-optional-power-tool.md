@@ -47,3 +47,9 @@ logic; only the meter hold/decay is recomputed in JS.
 - A device feature that only the web exposes is a bug against this ADR.
 - Diagnostics must budget USB bandwidth against the audio stream.
 - `pico-link-ryw.12.7` folds into F1.
+
+**Amendment 3 (same day, Andreas):** the page is built with **Vite + React +
+TypeScript**, themed with Tailwind + shadcn/ui (CSS-variable themes; default theme
+derived from the device palette). Chosen over Fern's no-framework design for the
+EQ editor's app-grade UI and for theming. Live meters and the EQ curve render on
+canvas outside React's state cycle.
