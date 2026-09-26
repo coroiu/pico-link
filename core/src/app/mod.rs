@@ -251,20 +251,21 @@ pub struct App {
     /// Ada's preset-id-allocation contract. `core` now allocates every
     /// preset id itself ([`PresetStore::create`]), so it must not create
     /// ANY preset (New effect, import) before this is `true`, or a fresh id
-    /// could alias one C already holds for a deleted-then-reused slot.
-    /// Starts `true`: on host builds with no real C boot sequence (every
-    /// test, the emulator's own synthetic-seed pattern
-    /// [`Event::DisplaySettingsLoaded`]'s doc comment describes) there is no
-    /// race to guard against, and gating by default would make every
-    /// existing import/New-effect test need to manufacture a
-    /// `PresetStoreLoaded` push it has no other reason to send. Real
-    /// firmware's own boot sequence pushes `PresetStoreLoaded` once, early,
-    /// well before any USB import could plausibly race it in practice --
-    /// this flag exists for the narrow window it doesn't, not to gate the
-    /// common case. `Rc<RefCell<_>>`, not a plain field: the effects list's
-    /// New-effect row (`build_effects_list_screen`) reads it from inside a
-    /// pushed screen, the same "second reader reaches into `App`'s state
-    /// via a shared mailbox" shape [`Self::presets`] itself already uses.
+    /// could alias one C already holds for a deleted-then-reused slot --
+    /// with an upsert contract, a collision silently OVERWRITES an existing
+    /// stored preset rather than merely refusing, so this gate is not
+    /// optional defence-in-depth.
+    ///
+    /// Starts `false`, on every build alike (no test-only/production-only
+    /// split): a real boot genuinely has a window, however narrow, between
+    /// [`App::new`] and C's flash read finishing, and a host test that
+    /// wants to create/import a preset must push a real
+    /// [`Event::PresetStoreLoaded`] first, same as C's own boot sequence
+    /// would -- see `test_support::ready_presets`. `Rc<RefCell<_>>`, not a
+    /// plain field: the effects list's New-effect row
+    /// (`build_effects_list_screen`) reads it from inside a pushed screen,
+    /// the same "second reader reaches into `App`'s state via a shared
+    /// mailbox" shape [`Self::presets`] itself already uses.
     presets_ready: Rc<RefCell<bool>>,
     /// The debug DSP override a finished `EQ END` session produced, if
     /// any -- [`Self::dsp_program`] returns this AHEAD of the editor
@@ -295,8 +296,8 @@ impl App {
         let editor_preset_id = Rc::new(RefCell::new(None));
         let editor_preview = Rc::new(RefCell::new(None));
         let import_focus = Rc::new(RefCell::new(None));
-        // Starts `true` -- see this field's own doc comment for why.
-        let presets_ready = Rc::new(RefCell::new(true));
+        // Starts `false` -- see this field's own doc comment for why.
+        let presets_ready = Rc::new(RefCell::new(false));
         let navigator = Navigator::new(build_home_screen(
             &model,
             &home_face,
@@ -391,16 +392,6 @@ impl App {
         } else {
             None
         }
-    }
-
-    /// Test-only: forces [`Self::presets_ready`] directly, without going
-    /// through a real [`Event::PresetStoreLoaded`] -- bead `pico-link-
-    /// ryw.14`'s "not ready" regression test needs to observe the refused
-    /// state, which [`App::new`]'s own default (`true`; see that field's
-    /// doc comment) never naturally produces on a host build.
-    #[cfg(test)]
-    pub(in crate::app) fn set_presets_ready_for_test(&mut self, ready: bool) {
-        *self.presets_ready.borrow_mut() = ready;
     }
 
     /// The live global congestion-cushion policy -- bead pico-link-8pp1.4

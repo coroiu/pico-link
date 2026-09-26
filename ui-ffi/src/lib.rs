@@ -3546,6 +3546,28 @@ mod tests {
         ui
     }
 
+    /// Bead `pico-link-ryw.14`, Ada's preset-id-allocation contract:
+    /// `App::presets_ready` defaults `false` (same on every build, no test-
+    /// only split -- see that field's doc comment), so any test that goes
+    /// on to create/import a preset needs a real `PresetStoreLoaded` push
+    /// first, same as C's own real boot sequence would send. `next_id: 1`
+    /// matches `PresetStore::new`'s own starting value -- these tests want
+    /// an ordinary "nothing loaded yet" boot.
+    ///
+    /// # Safety
+    ///
+    /// `ui` must be a live pointer from [`pl_ui_create`], not yet destroyed.
+    unsafe fn ready_ui(ui: *mut PlUi) {
+        let event = PlEvent {
+            version: PL_EVENT_ABI_VERSION,
+            tag: PlEventTag::PresetStoreLoaded as u32,
+            payload: PlEventPayload {
+                preset_store_loaded: PlPresetStoreLoadedPayload { count: 0, status: PlStoreStatus::FirstBoot as u8, next_id: 1 },
+            },
+        };
+        unsafe { pl_ui_push_event(ui, event) };
+    }
+
     /// Renders once through the real FFI entry point purely to reach a
     /// known-clean (`!App::dirty()`) baseline before exercising input/tick
     /// behaviour -- the render-out payload itself is not asserted on here.
@@ -5325,6 +5347,7 @@ mod tests {
             assert!(pl_ui_take_dsp_program(ui, &mut before));
             assert_eq!(before.n_biquads, 0, "no connected device and no editor open must resolve Off");
 
+            ready_ui(ui);
             let open_new_effect_editor = [
                 PlIntent { tag: PlIntentTag::Select as u32, jump_by: 0 }, // Home status -> menu face
                 PlIntent { tag: PlIntentTag::Down as u32, jump_by: 0 },   // -> Effects row
@@ -5441,6 +5464,7 @@ mod tests {
     fn pl_ui_import_preset_the_xm3_file_returns_created_and_queues_exactly_one_save_preset() {
         let ui = new_ui();
         unsafe {
+            ready_ui(ui);
             let name = "XM3 Harman";
             let result = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
             assert_eq!(result.code, 0, "the XM3 file must import cleanly");
@@ -5466,6 +5490,7 @@ mod tests {
     fn pl_ui_import_preset_re_import_returns_replaced_with_the_same_id() {
         let ui = new_ui();
         unsafe {
+            ready_ui(ui);
             let name = "XM3 Harman";
             let first = pl_ui_import_preset(ui, XM3_TEXT.as_ptr(), XM3_TEXT.len(), name.as_ptr(), name.len());
             assert_eq!(first.code, 0);
@@ -5491,6 +5516,7 @@ mod tests {
     fn pl_ui_import_preset_a_full_store_returns_the_error() {
         let ui = new_ui();
         unsafe {
+            ready_ui(ui);
             // Fill the 8-slot store via 8 real imports under 8 distinct
             // names -- the FFI surface has no other way to seed the
             // store, and each import is itself proven to succeed above.

@@ -1265,6 +1265,7 @@ pub(crate) fn build_effects_list_screen(
 mod tests {
     use embedded_graphics::prelude::RgbColor;
 
+    use crate::app::test_support::ready_presets;
     use crate::app::{App, ConnectedCodec, Event, PairedDevice};
     use crate::input::NavIntent;
 
@@ -1483,6 +1484,11 @@ mod tests {
     // --- End-to-end through App: Home -> Effects -> New effect ---
 
     fn open_effects(app: &mut App) {
+        // Bead `pico-link-ryw.14`: `App::presets_ready` defaults `false` on
+        // a real boot, so every test here that goes on to create/import a
+        // preset needs this pushed first -- see `ready_presets`'s doc
+        // comment.
+        ready_presets(app);
         app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
         app.handle_input(vec![NavIntent::Down]); // Effects row
         app.handle_input(vec![NavIntent::Select]); // open Effects list
@@ -1663,6 +1669,7 @@ mod tests {
     #[test]
     fn an_import_does_not_move_focus_when_the_effects_list_is_not_open() {
         let mut app = App::new(240, 240);
+        ready_presets(&mut app);
         app.handle_event(Event::PresetLoaded { id: 1, blob: new_effect_preset("Relaxed").to_wire().to_vec() });
         // Deliberately NOT opening the effects list (still at Home root).
         let _ = app.import_preset(XM3_TEXT, "XM3 Harman").expect("import must still succeed");
@@ -1677,6 +1684,7 @@ mod tests {
     #[test]
     fn a_locked_editor_has_no_name_row_and_a_readonly_preamp_and_band_row_per_band() {
         let mut app = App::new(240, 240);
+        ready_presets(&mut app);
         let (id, _) = app.import_preset(XM3_TEXT, "XM3 Harman").unwrap();
         open_effects(&mut app);
         app.handle_input(vec![NavIntent::Select]); // the only row -- the imported effect
@@ -1786,6 +1794,7 @@ mod tests {
         std::fs::create_dir_all(&out_dir).expect("failed to create output dir");
 
         let mut app = App::new(240, 240);
+        ready_presets(&mut app);
         app.handle_event(Event::PresetLoaded { id: 1, blob: new_effect_preset("Relaxed").to_wire().to_vec() });
         let (id, _) = app.import_preset(XM3_TEXT, "XM3 Harman").expect("the XM3 text must import cleanly");
 

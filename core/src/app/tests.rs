@@ -1473,6 +1473,7 @@ fn concurrent_new_effect_and_import_allocate_distinct_ids() {
 #[test]
 fn two_different_name_imports_back_to_back_get_distinct_ids() {
     let mut app = App::new(240, 240);
+    ready_presets(&mut app);
     let text_a = "Name: A\nPreamp: 0 dB\nFilter 1: ON PK Fc 100 Hz Gain 1 dB Q 1";
     let text_b = "Name: B\nPreamp: 0 dB\nFilter 1: ON PK Fc 200 Hz Gain 1 dB Q 1";
 
@@ -1586,7 +1587,7 @@ fn an_edit_to_an_imported_locked_preset_round_trips() {
 #[test]
 fn import_before_presets_ready_is_refused_and_the_allocator_then_respects_the_high_water_mark() {
     let mut app = App::new(240, 240);
-    app.set_presets_ready_for_test(false);
+    // `App::presets_ready` defaults `false` -- nothing to force here.
 
     let err = app.import_preset(MINIMAL_EQ_APO_TEXT, "fallback").unwrap_err();
     assert_eq!(err, ImportError::NotReady);
