@@ -12,6 +12,8 @@ Bitwarden hardware-key prototype)
 Plug it into any computer, console or handheld. The host sees a driverless USB
 sound card. The dongle streams that audio to Bluetooth headphones over A2DP with
 a hi-res codec — LDAC first. No app, no driver, no pairing dance on the host.
+An optional web companion adds power tools the screen can't do well; the dongle
+never needs it.
 
 The thing that makes it ours is the **screen**. Comparable dongles are blind: a
 button, an LED, and a serial console if you're lucky. Pico Link has a display and
@@ -164,6 +166,19 @@ explicit-feedback clock loop in `embassy-rp`, and taking over USB peripheral
 ownership), then the audio pipeline
 and resampler. **BTstack and libldac stay C indefinitely** — wrapping them well is
 the Rust work, not replacing them. The real-time path goes last, deliberately.
+
+### F — Web companion (post-MVP)
+A WebUSB page on a public HTTPS static site, linked from the device's WebUSB
+landing-page descriptor (Chromium browsers). It talks to the device over the proven
+iface-6 config channel (CLASS requests). **Invariant: every function the device
+offers stays reachable from the buttons; the web only adds.** See
+[ADR 2026-09-26](decisions/2026-09-26-web-companion-is-an-optional-power-tool.md).
+
+- **F1** EQ editor + preset library (subsumes `pico-link-ryw.12.7`).
+- **F2** AutoEQ search.
+- **F3** Live diagnostics — link graphs + log; retires the CDC tty for
+  development; bandwidth budgeted against audio.
+- **F4** Firmware update over PICOBOOT — gated on a feasibility spike.
 
 ## Sequencing
 

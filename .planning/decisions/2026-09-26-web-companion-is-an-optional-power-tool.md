@@ -1,0 +1,34 @@
+# The web companion is an optional power tool
+
+**Date:** 2026-09-26 · **Status:** Accepted · **Source:** vision session with Andreas
+
+## Context
+The vision promises "no app, no driver" on the host and makes the screen the
+product's identity. WebUSB over the iface-6 config channel is proven (EQ import,
+`pico-link-ryw.12`), which opens the door to a browser UI alongside the device.
+
+## Decision
+Build a web companion as an **optional power tool**. The dongle stays fully usable
+without it: every function the device offers stays reachable from the buttons; the
+web only adds what 240x240 + a d-pad does badly. Host it as a public HTTPS static
+site, advertised via the WebUSB landing-page descriptor. Ship in order: EQ editor +
+preset library, AutoEQ search, live diagnostics, firmware update (after a
+PICOBOOT feasibility spike).
+
+## Rationale
+Keeps the "no app needed" promise and the screen-first identity intact while
+removing the worst on-device ergonomics (curve editing, preset libraries,
+database search). EQ first because its transport is proven; firmware update last
+because picotool already fails on this Mac and release builds lack remote reboot.
+
+## Alternatives
+- **Full mirror** — two equal front-ends; doubles every feature and dilutes the screen.
+- **Web primary** — changes what the product is.
+- **Setup-only** — too narrow to justify the hosting and WebUSB work.
+- **Local-only hosting** — no plug-in-and-go, no AutoEQ fetch.
+
+## Consequences
+- Chromium-only for the companion; acceptable because it is optional.
+- A device feature that only the web exposes is a bug against this ADR.
+- Diagnostics must budget USB bandwidth against the audio stream.
+- `pico-link-ryw.12.7` folds into F1.
