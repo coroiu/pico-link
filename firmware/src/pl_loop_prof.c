@@ -47,6 +47,7 @@ static const char *const kPhaseCodes[PL_LOOP_PHASE_COUNT] = {
     "shr",  // PL_LOOP_PHASE_SHARED_REPORT
     "log",  // PL_LOOP_PHASE_LOG_DRAIN
     "wdt",  // PL_LOOP_PHASE_WDT_SERVICE
+    "tel",  // PL_LOOP_PHASE_TELEMETRY
     "slp",  // PL_LOOP_PHASE_SLEEP
     "tot",  // PL_LOOP_PHASE_TOTAL
 };
