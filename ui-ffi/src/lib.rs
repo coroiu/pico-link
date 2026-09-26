@@ -3199,6 +3199,55 @@ pub unsafe extern "C" fn pl_ui_take_dsp_program(ui: *mut PlUi, out: *mut PlDspPr
     true
 }
 
+/// Encodes the page-0 Home telemetry snapshot into `buf` for the web
+/// companion's `GET_TELEMETRY` control request (bead `pico-link-jyhk.3`,
+/// "ADA DESIGN" comment on `pico-link-jyhk.1`, sections 3-4; wire layout
+/// owned by `pico_link_core::app::telemetry`, not duplicated here). `page`
+/// selects the payload -- only page `0` (Home) exists today; a future F3
+/// diagnostics page is a separate payload under the same header, per the
+/// design's own versioning note.
+///
+/// C is expected to call this from the superloop, gated by its own
+/// poll-recency/regeneration-interval rules (design section 3, flow step
+/// (b)) -- that gating, the 0x03/0x04 `usb_config_itf.c` request handlers,
+/// and the under-`save_and_disable_interrupts` publish into the SETUP
+/// reply buffer are `pico-link-jyhk.4`, not this crate.
+///
+/// Returns the number of bytes written into `buf[0..cap]` -- always
+/// [`pico_link_core::app::App::telemetry_snapshot`]'s `HOME_SNAPSHOT_LEN`
+/// (163 as of proto 1) on a successful page-0 encode -- or `0` if `ui` or
+/// `buf` is null, `cap` is too small to hold the whole snapshot, or `page`
+/// is unsupported. `0` here means "don't publish this poll," not "not
+/// ready": the wire's `snap_seq == 0` not-ready convention is realised
+/// entirely by C's own zero-initialised static reply buffer, which this
+/// function never touches before the first successful call (see
+/// `App::telemetry_snapshot`'s doc comment). Never performs a partial
+/// write.
+///
+/// `ui` is `*const`, not `*mut`, matching the design's Rust contract for
+/// this call ("the borrow is read-only... never touches dirty, damage or
+/// idle state") -- see `App::telemetry_snapshot`'s doc comment for the one
+/// piece of state (`snap_seq`) that still advances on every call, via an
+/// interior-mutable counter rather than a caller-visible mutation.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `buf`, if non-null, must point to at least `cap` bytes of
+/// valid, writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_telemetry(ui: *const PlUi, page: u8, buf: *mut u8, cap: usize) -> usize {
+    if ui.is_null() || buf.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract above.
+    let ui = unsafe { &*ui };
+    // SAFETY: `buf` is non-null and, per the caller contract, points to at
+    // least `cap` bytes of valid, writable storage.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
+    ui.app.telemetry_snapshot(page, out)
+}
+
 // --- Bead pico-link-ryw.11: debug-only EQ import over the PL_DEBUG_REMOTE
 // CDC console ---
 //

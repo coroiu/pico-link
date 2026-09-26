@@ -5,12 +5,13 @@
 //! implements; this doc comment plus [`golden_bytes_layout_is_stable`]
 //! (below) is the durable, checked-in copy of it).
 //!
-//! `dead_code` is allowed crate-wide for this module: `pico-link-jyhk.2`'s
-//! scope is deliberately this file only (encode/decode + tests, per the
-//! design's own task split) -- the `ui-ffi` call site
-//! (`pl_ui_telemetry`) that will make [`encode_home_snapshot`] a live
-//! export is `pico-link-jyhk.3`, not yet built.
-#![allow(dead_code)]
+//! [`encode_home_snapshot`] is live: [`super::App::telemetry_snapshot`]
+//! (`pico-link-jyhk.3`) is its `ui-ffi` call site.
+//! [`decode_home_snapshot`]/[`HomeSnapshot`] have no call site yet -- they
+//! exist for whichever host-side consumer decodes this wire format
+//! (`pico-link-jyhk.3`'s doc comment on those items has the detail) -- so
+//! they and the handful of helpers only decode uses keep a narrow,
+//! item-level `#[allow(dead_code)]` rather than a module-wide one.
 //!
 //! # What this is, and isn't
 //!
@@ -21,9 +22,8 @@
 //! is explicit that the host recomputes those against its own clock, the
 //! same way `render::hero` computes them at render time from
 //! `BtModel::out_level`/`FaultLog`. This module owns exactly the encode/
-//! decode round trip and nothing downstream of it -- no ui-ffi call site,
-//! no C, no `HomeInputs` refactor of `render::home::project_hero` (those
-//! are `pico-link-jyhk.3`/`.7`).
+//! decode round trip and nothing downstream of it -- no `HomeInputs`
+//! refactor of `render::home::project_hero` (that is `pico-link-jyhk.7`).
 //!
 //! `decode_home_snapshot` exists for the same reason `core` owns the
 //! schema at all (design: "C only copies opaque bytes"): whichever side
@@ -218,6 +218,7 @@ fn write_fixed_str(buf: &mut [u8], len_off: usize, bytes_off: usize, cap: usize,
 /// matters for a corrupt/malicious payload, which
 /// [`decode_home_snapshot`]'s callers must already treat as untrusted
 /// input off USB).
+#[allow(dead_code)] // Host-side decode helper; no call site yet (see this module's doc comment).
 fn read_fixed_str(buf: &[u8], len_off: usize, bytes_off: usize, cap: usize) -> String {
     let len = (buf[len_off] as usize).min(cap);
     String::from_utf8_lossy(&buf[bytes_off..bytes_off + len]).into_owned()
@@ -232,6 +233,7 @@ fn value_kind_and_value(value: Option<FaultValue>) -> (u8, u16) {
     }
 }
 
+#[allow(dead_code)] // Host-side decode helper; no call site yet (see this module's doc comment).
 fn value_from_kind(kind: u8, value: u16) -> Option<FaultValue> {
     match kind {
         VALUE_KIND_RATIO => Some(FaultValue::Ratio(value)),
@@ -264,6 +266,7 @@ fn volume_source_to_wire(source: VolumeSource) -> u8 {
     }
 }
 
+#[allow(dead_code)] // Host-side decode helper; no call site yet (see this module's doc comment).
 fn volume_source_from_wire(source: u8) -> VolumeSource {
     match source {
         1 => VolumeSource::Sink,
@@ -281,6 +284,7 @@ fn volume_source_from_wire(source: u8) -> VolumeSource {
 /// from -- see this module's doc comment on `received_ms`'s clock
 /// domain, which applies identically here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Host-side decode output; no call site yet (see this module's doc comment).
 pub(crate) struct DecodedFault {
     pub(crate) count: u16,
     pub(crate) first_seen_ms: u32,
@@ -302,6 +306,7 @@ pub(crate) struct DecodedFault {
 /// booleans -- collapsing them into an enum would just be re-deriving the
 /// wire layout this struct exists to mirror.
 #[allow(clippy::struct_excessive_bools)]
+#[allow(dead_code)] // Host-side decode output; no call site yet (see this module's doc comment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HomeSnapshot {
     pub(crate) uptime_ms: u32,
@@ -438,6 +443,7 @@ pub(crate) fn encode_home_snapshot(model: &BtModel, presets: &PresetStore, now: 
 /// past `HOME_SNAPSHOT_LEN` (a future proto's appended fields) are
 /// ignored, per the design's append-only versioning rule.
 #[must_use]
+#[allow(dead_code)] // Host-side decode; no call site yet (see this module's doc comment).
 pub(crate) fn decode_home_snapshot(bytes: &[u8]) -> Option<HomeSnapshot> {
     if bytes.len() < HOME_SNAPSHOT_LEN {
         return None;
