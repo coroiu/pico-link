@@ -13,7 +13,22 @@
 
 export const TELEMETRY_PROTO = 1;
 export const TELEMETRY_PAGE_HOME = 0;
+/**
+ * Proto 1's minimum page-0 length -- what `decodeHomeSnapshot` requires to
+ * decode at all. Proto 1 is append-only (core/src/app/telemetry.rs's module
+ * doc comment): older firmware may still send exactly this many bytes, so
+ * this stays the decode floor even as the wire grows past it.
+ */
 export const HOME_SNAPSHOT_LEN = 163;
+/**
+ * The current full page-0 length as of the `pico-link-jyhk.18` append
+ * (library revision, preview/editor-open flags, editor effect id, codec-
+ * fallback byte -- `core/src/app/telemetry.rs`'s `163..169` table). Checked
+ * against `fixtures/telemetry/constants.json`'s `HOME_SNAPSHOT_LEN` in
+ * `constants.fixture.test.ts`. A snapshot shorter than this but at least
+ * `HOME_SNAPSHOT_LEN` still decodes -- `extras` is `undefined` on it.
+ */
+export const HOME_SNAPSHOT_FULL_LEN = 169;
 
 const CODEC_WORD_CAP = 8;
 const DEVICE_NAME_CAP = 32;
@@ -43,6 +58,14 @@ const OFF_RMS_L = OFF_PEAK_R + 1;
 const OFF_RMS_R = OFF_RMS_L + 1;
 const OFF_RECEIVED_MS = OFF_RMS_R + 1;
 const OFF_FAULTS = OFF_RECEIVED_MS + 4;
+const OFF_LIBRARY_REV = OFF_FAULTS + FAULT_SLOT_COUNT * FAULT_SLOT_LEN; // 163
+const OFF_FLAGS2 = OFF_LIBRARY_REV + 2;
+const OFF_DEVICE_EDITOR_EFFECT_ID = OFF_FLAGS2 + 1;
+const OFF_CODEC_FALLBACK_REASON = OFF_DEVICE_EDITOR_EFFECT_ID + 2;
+
+const FLAG2_HOST_PREVIEW_ACTIVE = 1 << 0;
+const FLAG2_DEVICE_EDITOR_OPEN = 1 << 1;
+const FLAG2_PRESETS_READY = 1 << 2;
 
 const FLAG_ADAPTIVE = 1 << 0;
 const FLAG_KBPS_IS_LIVE = 1 << 1;
@@ -98,6 +121,22 @@ function decodeVolumeSource(source: number): VolumeSource {
   }
 }
 
+/**
+ * The `163..169` append (bead `pico-link-jyhk.18`) -- mirrors core's
+ * `HomeSnapshotExtras`/its round trip back off the wire. `undefined` on
+ * `HomeSnapshot.extras` when the payload is exactly `HOME_SNAPSHOT_LEN`
+ * (163) bytes, i.e. older firmware that predates this append.
+ */
+export interface HomeSnapshotExtras {
+  libraryRev: number;
+  hostPreviewActive: boolean;
+  deviceEditorOpen: boolean;
+  deviceEditorEffectId: number;
+  presetsReady: boolean;
+  /** `0` = none. */
+  codecFallbackReason: number;
+}
+
 export interface HomeSnapshot {
   uptimeMs: number;
   /** `0` means "not ready" (design section 3, flow step (c)). */
@@ -122,6 +161,8 @@ export interface HomeSnapshot {
   levelPresent: boolean;
   /** `FAULT_KEYS` order, `null` for a key never raised. */
   faults: Record<FaultKey, DecodedFault | null>;
+  /** The `163..169` append; `undefined` on a pre-append (163-byte) snapshot. */
+  extras: HomeSnapshotExtras | undefined;
 }
 
 const utf8Decoder = new TextDecoder("utf-8");
@@ -181,6 +222,19 @@ export function decodeHomeSnapshot(bytes: ArrayBuffer | Uint8Array): HomeSnapsho
     faults[key] = { count, firstSeenMs, lastSeenMs, value: decodeFaultValue(kind, value) };
   }
 
+  let extras: HomeSnapshotExtras | undefined;
+  if (u8.byteLength >= HOME_SNAPSHOT_FULL_LEN) {
+    const flags2 = view.getUint8(OFF_FLAGS2);
+    extras = {
+      libraryRev: view.getUint16(OFF_LIBRARY_REV, true),
+      hostPreviewActive: (flags2 & FLAG2_HOST_PREVIEW_ACTIVE) !== 0,
+      deviceEditorOpen: (flags2 & FLAG2_DEVICE_EDITOR_OPEN) !== 0,
+      deviceEditorEffectId: view.getUint16(OFF_DEVICE_EDITOR_EFFECT_ID, true),
+      presetsReady: (flags2 & FLAG2_PRESETS_READY) !== 0,
+      codecFallbackReason: view.getUint8(OFF_CODEC_FALLBACK_REASON),
+    };
+  }
+
   return {
     uptimeMs,
     snapSeq,
@@ -202,6 +256,7 @@ export function decodeHomeSnapshot(bytes: ArrayBuffer | Uint8Array): HomeSnapsho
     receivedMs,
     levelPresent: (flags & FLAG_LEVEL_PRESENT) !== 0,
     faults,
+    extras,
   };
 }
 
@@ -220,12 +275,13 @@ function writeFixedStr(u8: Uint8Array, view: DataView, lenOff: number, bytesOff:
  * this takes already-decoded fields, the inverse of `decodeHomeSnapshot`.
  */
 export function encodeHomeSnapshotForTest(input: HomeSnapshot): Uint8Array {
-  const u8 = new Uint8Array(HOME_SNAPSHOT_LEN);
+  const wireLen = input.extras === undefined ? HOME_SNAPSHOT_LEN : HOME_SNAPSHOT_FULL_LEN;
+  const u8 = new Uint8Array(wireLen);
   const view = new DataView(u8.buffer);
 
   view.setUint8(OFF_PROTO, TELEMETRY_PROTO);
   view.setUint8(OFF_PAGE, TELEMETRY_PAGE_HOME);
-  view.setUint16(OFF_LEN, HOME_SNAPSHOT_LEN, true);
+  view.setUint16(OFF_LEN, wireLen, true);
   view.setUint32(OFF_UPTIME_MS, input.uptimeMs, true);
   view.setUint32(OFF_SNAP_SEQ, input.snapSeq, true);
   view.setUint8(OFF_LINK, input.linkConnected ? 1 : 0);
@@ -262,6 +318,17 @@ export function encodeHomeSnapshotForTest(input: HomeSnapshot): Uint8Array {
     view.setUint16(slotOff + 11, entry.value.kind === "none" ? 0 : entry.value.value, true);
   }
 
+  if (input.extras !== undefined) {
+    view.setUint16(OFF_LIBRARY_REV, input.extras.libraryRev, true);
+    let flags2 = 0;
+    if (input.extras.hostPreviewActive) flags2 |= FLAG2_HOST_PREVIEW_ACTIVE;
+    if (input.extras.deviceEditorOpen) flags2 |= FLAG2_DEVICE_EDITOR_OPEN;
+    if (input.extras.presetsReady) flags2 |= FLAG2_PRESETS_READY;
+    view.setUint8(OFF_FLAGS2, flags2);
+    view.setUint16(OFF_DEVICE_EDITOR_EFFECT_ID, input.extras.deviceEditorEffectId, true);
+    view.setUint8(OFF_CODEC_FALLBACK_REASON, input.extras.codecFallbackReason);
+  }
+
   return u8;
 }
 
@@ -290,5 +357,6 @@ export function emptyHomeSnapshot(): HomeSnapshot {
     receivedMs: 0,
     levelPresent: false,
     faults,
+    extras: undefined,
   };
 }
