@@ -330,6 +330,22 @@ pub struct PlUi {
     /// (the initial Off program still needs to reach C's engine once, so
     /// its own bypass path is armed correctly at boot).
     last_dsp_program: Option<pico_link_core::dsp::Program>,
+    /// The `library_rev` [`pl_ui_library`] last returned a nonzero-length
+    /// encode for, or `0` if it has never yet published one -- bead
+    /// `pico-link-jyhk.20`'s "returns 0 when unchanged" contract (design
+    /// section 11 Task 3). [`pico_link_core::app::App::library_snapshot`]
+    /// always encodes a fresh full snapshot on every call (it has no
+    /// "don't bother, nothing changed" signal of its own -- see that
+    /// method's doc comment), so the unchanged-detection this FFI layer
+    /// promises C lives here, one call above core, compared against the
+    /// `library_rev` field already inside the freshly encoded bytes.
+    /// `Cell`, not a plain field, because [`pl_ui_library`] takes `*const
+    /// PlUi` (mirrors [`pl_ui_telemetry`]'s "read-only from the caller's
+    /// point of view" contract) -- same interior-mutability shape `App`
+    /// itself uses for `library_rev`/`telemetry_snap_seq`. `0` is a safe
+    /// "never published" sentinel: `App::refresh_library_rev`'s own doc
+    /// comment guarantees a real rev is never `0`.
+    last_library_rev: core::cell::Cell<u16>,
 }
 
 /// Creates a new UI instance rendering into a `width`x`height` framebuffer,
@@ -385,6 +401,7 @@ pub extern "C" fn pl_ui_create(width: u32, height: u32) -> *mut PlUi {
         malformed_tag_count: 0,
         last_damage_rects: [PlDamageRect { x: 0, y: 0, w: 0, h: 0 }; 1],
         last_dsp_program: None,
+        last_library_rev: core::cell::Cell::new(0),
     };
     Box::into_raw(Box::new(ui))
 }
@@ -3248,6 +3265,179 @@ pub unsafe extern "C" fn pl_ui_telemetry(ui: *const PlUi, page: u8, buf: *mut u8
     ui.app.telemetry_snapshot(page, out)
 }
 
+// --- Bead pico-link-jyhk.20: the web companion's EQ management protocol
+// (`GET_LIBRARY` 0x05 / `HOST_OP` 0x06 / `GET_OP_STATUS` 0x07), Task 3 of
+// `.planning/design/2026-09-27-iface6-eq-management-protocol.md` ("ADA
+// DESIGN" on `pico-link-jyhk.17`) ---
+//
+// Three new `pl_ui_*` entry points wrapping `pico-link-jyhk.18`/`.19`'s
+// core API (`App::library_snapshot`/`host_op`/`host_op_status`/
+// `host_preview_end`). No `PlEvent`/`PlCommand` ABI change: `GET_LIBRARY`
+// and `GET_OP_STATUS` are C-published SETUP replies (same shape as
+// `pl_ui_telemetry` above), and `HOST_OP` is a mailbox the superloop hands
+// straight to `App::host_op` -- none of the three needs a new tagged
+// union variant. `firmware/src/usb_config_itf.c`'s 0x05/0x06/0x07 request
+// handlers, the shared mailbox/reply buffer, and the 2s host-preview
+// lease timer that calls `pl_ui_host_preview_end` are `pico-link-jyhk.21`,
+// not this bead.
+
+/// Encodes the `GET_LIBRARY` (0x05) snapshot into `buf` (design section 3;
+/// wire layout owned by `pico_link_core::app::library`, not duplicated
+/// here) -- `ui-ffi`'s wrapper over
+/// [`pico_link_core::app::App::library_snapshot`]. C is expected to call
+/// this from the superloop, gated by the same poll-recency rule
+/// `pl_ui_telemetry` already documents, and to run it BEFORE the page-0
+/// telemetry step so page 0's `library_rev` append is always fresh
+/// (design section 3: "Generation runs ... BEFORE the telemetry step").
+///
+/// Returns the number of bytes written -- `0` if `ui`/`buf` is null, `cap`
+/// is too small to hold the whole snapshot (never a partial write, same
+/// contract as [`pl_ui_telemetry`]), OR the freshly encoded snapshot's
+/// `library_rev` is unchanged from the last snapshot THIS `PlUi` handed
+/// back through this function (design section 11 Task 3: "returns 0 when
+/// unchanged"). That third case is this function's own bookkeeping
+/// ([`PlUi::last_library_rev`]) layered on top of `library_snapshot`,
+/// which always fully re-encodes on every call and has no such signal of
+/// its own -- see that method's doc comment. The `library_rev` field lives
+/// at wire offset 4 (design section 3's header: `u8 lib_proto, u8
+/// reserved, u16 len, u16 library_rev, ...`), read directly out of the
+/// freshly written `buf` rather than re-deriving it, so this can never
+/// drift from what C actually receives.
+///
+/// A caller that always wants the bytes regardless of change (e.g. to
+/// seed its own cache on first use) should compare its own last-seen
+/// `library_rev` from a previous successful call instead of relying on
+/// `0` meaning "nothing to see" -- `0` here also covers the ordinary
+/// too-small-buffer failure, exactly as [`pl_ui_telemetry`]'s `0` does.
+///
+/// `ui` is `*const`, not `*mut`, matching `library_snapshot`'s own `&self`
+/// contract (interior-mutable `library_rev`/`library_last_bytes`, same
+/// shape `telemetry_snap_seq` uses) -- see that method's doc comment.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `buf`, if non-null, must point to at least `cap` bytes of
+/// valid, writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_library(ui: *const PlUi, buf: *mut u8, cap: usize) -> usize {
+    if ui.is_null() || buf.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract above.
+    let ui = unsafe { &*ui };
+    // SAFETY: `buf` is non-null and, per the caller contract, points to at
+    // least `cap` bytes of valid, writable storage.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
+    let written = ui.app.library_snapshot(out);
+    if written < 6 {
+        // Too small to hold even the header's `library_rev` field (offset
+        // 4..6) -- `library_snapshot` already returned `0` for "buffer too
+        // small", but guard defensively rather than reading past what was
+        // actually written.
+        return written;
+    }
+    let rev = u16::from_le_bytes([out[4], out[5]]);
+    if rev == ui.last_library_rev.get() {
+        return 0;
+    }
+    ui.last_library_rev.set(rev);
+    written
+}
+
+/// Runs one `HOST_OP` (0x06) request through `ui`'s [`App`], then
+/// immediately encodes the resulting `GET_OP_STATUS` (0x07) reply into
+/// `out` -- `ui-ffi`'s wrapper over
+/// [`pico_link_core::app::App::host_op`]/[`host_op_status`](pico_link_core::app::App::host_op_status).
+/// One call does both halves because the op runs synchronously (design
+/// section 4): C's `HOST_OP` SETUP handler hands the OUT data-stage bytes
+/// to the superloop, which calls this function once and publishes `out`'s
+/// bytes as the `GET_OP_STATUS` reply buffer under
+/// `save_and_disable_interrupts` (same publish pattern as `GET_LIBRARY`/
+/// `GET_TELEMETRY`) -- a real `GET_OP_STATUS` (0x07) SETUP arriving later
+/// just memcpys straight out of that already-published buffer, with no
+/// further FFI call needed (design section 4's "the host polls
+/// `GET_OP_STATUS` until `seq` matches ... and `state != 0`" only requires
+/// the LATEST result to already be sitting there).
+///
+/// `request` (`in_len` bytes) is the raw `HOST_OP` request body,
+/// unvalidated -- [`App::host_op`](pico_link_core::app::App::host_op)
+/// never panics on a malformed/truncated request (see its own doc
+/// comment), so this wrapper does no length checking of its own beyond
+/// null.
+///
+/// Returns the number of bytes written into `out[0..out_cap]` -- always
+/// nonzero on success (`GET_OP_STATUS`'s header alone is `21` bytes, see
+/// `host_op`'s module doc comment for the full field list) -- or `0` if
+/// `ui`/`out` is null, `request` is null with `in_len > 0`, or `out_cap`
+/// is too small to hold the encoded reply (never a partial write, same
+/// contract as [`pl_ui_telemetry`]). A null `request` with `in_len == 0`
+/// is accepted as an empty (necessarily malformed -- shorter than the
+/// 4-byte request header) request, same as any other too-short one:
+/// [`App::host_op`](pico_link_core::app::App::host_op) never panics on a
+/// malformed/truncated request (see its own doc comment) and instead
+/// stores a real `InvalidRequest` error status for this call to encode
+/// and return, rather than this wrapper silently dropping the call. A `0`
+/// return means C must not publish
+/// anything new for `GET_OP_STATUS` -- the previous reply (if any) stays
+/// live, same as a too-small [`pl_ui_telemetry`]/[`pl_ui_library`] call
+/// never clobbers an already-published buffer.
+///
+/// `ui` is `*mut`, not `*const`: unlike `GET_LIBRARY`/`GET_TELEMETRY`,
+/// `HOST_OP` can mutate `App` state (the preset store, `BtModel`-bound
+/// commands queued for `pl_ui_poll_command`, the host-preview mailbox) --
+/// see `host_op`'s module doc comment for exactly what each op does.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `request`, if non-null, must point to at least `in_len`
+/// valid, readable bytes for the duration of this call (borrowed only,
+/// not retained past it); if null, `in_len` must be `0`. `out`, if
+/// non-null, must point to at least `out_cap` bytes of valid, writable
+/// storage.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_host_op(ui: *mut PlUi, request: *const u8, in_len: usize, out: *mut u8, out_cap: usize) -> usize {
+    if ui.is_null() || out.is_null() || (request.is_null() && in_len > 0) {
+        return 0;
+    }
+    // SAFETY: caller contract above.
+    let ui = unsafe { &mut *ui };
+    // SAFETY: `request` is either null with `in_len == 0` (an empty slice
+    // needs no valid pointer to dereference) or, per the caller contract,
+    // non-null and pointing to at least `in_len` valid, readable bytes for
+    // this call's duration.
+    let request: &[u8] = if request.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(request, in_len) } };
+    ui.app.host_op(request);
+    // SAFETY: `out` is non-null and, per the caller contract, points to at
+    // least `out_cap` bytes of valid, writable storage.
+    let out = unsafe { core::slice::from_raw_parts_mut(out, out_cap) };
+    ui.app.host_op_status(out)
+}
+
+/// Clears any active host preview (`ui-ffi`'s wrapper over
+/// [`pico_link_core::app::App::host_preview_end`]) -- called by C after
+/// ~2s with no `iface-6` SETUP traffic (design section 7's lease), NOT by
+/// the `PREVIEW_END` op itself (`op 5`, handled inside [`pl_ui_host_op`]
+/// via `App::host_op`'s own dispatch). A no-op if there was no active
+/// preview.
+///
+/// Does nothing if `ui` is null.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_host_preview_end(ui: *mut PlUi) {
+    if ui.is_null() {
+        return;
+    }
+    // SAFETY: caller contract above.
+    let ui = unsafe { &mut *ui };
+    ui.app.host_preview_end();
+}
+
 // --- Bead pico-link-ryw.11: debug-only EQ import over the PL_DEBUG_REMOTE
 // CDC console ---
 //
@@ -5604,6 +5794,177 @@ mod tests {
 
             let command = pl_ui_poll_command(ui);
             assert_eq!(command.tag as u32, PlCommandTag::None as u32, "a rejected/null import must queue nothing");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    // --- Bead pico-link-jyhk.20: pl_ui_library / pl_ui_host_op /
+    // pl_ui_host_preview_end ---
+    //
+    // The `request-*`/`status-*` fixtures under `fixtures/host_op/` are
+    // proven-real -- `core`'s own `host_op_fixtures.rs` builds each one by
+    // actually running it through `App::host_op`/`host_op_status`, never
+    // hand-assembling bytes (see that file's module doc). Reusing them
+    // here round-trips this crate's `pl_ui_host_op` wrapper against the
+    // exact same canonical bytes `pico-link-jyhk.22`'s web decoder is
+    // checked against, rather than a second, independently-typed request.
+
+    const REQUEST_SAVE_CREATE: &[u8] = include_bytes!("../../fixtures/host_op/request-save-create.bin");
+    const STATUS_SAVE_SUCCESS: &[u8] = include_bytes!("../../fixtures/host_op/status-save-success.bin");
+    const STATUS_NOT_READY: &[u8] = include_bytes!("../../fixtures/host_op/status-not-ready.bin");
+
+    #[test]
+    fn pl_ui_host_op_null_or_empty_returns_zero_without_touching_state() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+            let mut out = [0u8; 200];
+
+            let n = pl_ui_host_op(core::ptr::null_mut(), REQUEST_SAVE_CREATE.as_ptr(), REQUEST_SAVE_CREATE.len(), out.as_mut_ptr(), out.len());
+            assert_eq!(n, 0, "null ui must return 0");
+
+            let n = pl_ui_host_op(ui, REQUEST_SAVE_CREATE.as_ptr(), REQUEST_SAVE_CREATE.len(), core::ptr::null_mut(), out.len());
+            assert_eq!(n, 0, "null out must return 0");
+
+            let n = pl_ui_host_op(ui, core::ptr::null(), 4, out.as_mut_ptr(), out.len());
+            assert_eq!(n, 0, "null request with nonzero in_len must return 0");
+
+            // A malformed (all-zero, wrong op_proto) request, not the real
+            // SAVE fixture -- this sub-case only wants to prove the
+            // too-small-`out` path returns `0`, without incidentally
+            // running (and queuing a command for) a real SAVE.
+            let garbage_request = [0u8; 4];
+            let n = pl_ui_host_op(ui, garbage_request.as_ptr(), garbage_request.len(), out.as_mut_ptr(), 2);
+            assert_eq!(n, 0, "an out buffer too small for even the header must return 0");
+
+            // A rejected/skipped call above must never have queued
+            // anything (there is no valid SAVE in any of these calls).
+            let command = pl_ui_poll_command(ui);
+            assert_eq!(command.tag as u32, PlCommandTag::None as u32);
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// A null `request` with `in_len == 0` is accepted as an empty (too
+    /// short for the 4-byte header) request -- `App::host_op` rejects it
+    /// gracefully as `InvalidRequest` (`error == 1`) rather than this
+    /// wrapper silently dropping the call, matching the doc comment's
+    /// "never panics on malformed/truncated" contract.
+    #[test]
+    fn pl_ui_host_op_null_request_with_zero_len_decodes_as_invalid_request() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+            let mut out = [0u8; 200];
+            let n = pl_ui_host_op(ui, core::ptr::null(), 0, out.as_mut_ptr(), out.len());
+            assert!(n > 0, "an empty request must still produce a real GET_OP_STATUS reply");
+            assert_eq!(out[3], 2, "state must be REJECTED");
+            assert_eq!(out[4], 1, "error must be InvalidRequest");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// `pico-link-jyhk.19`'s `NotReady` gate (`App::presets_ready` false on
+    /// a fresh app): feeding the real `request-save-create` fixture before
+    /// `ready_ui` reproduces `fixtures/host_op/status-not-ready.bin`
+    /// byte-for-byte -- proves this wrapper doesn't reorder/skip the gate
+    /// `core` already enforces.
+    #[test]
+    fn pl_ui_host_op_before_presets_ready_matches_the_not_ready_fixture() {
+        let ui = new_ui();
+        unsafe {
+            let mut out = [0u8; 200];
+            let n = pl_ui_host_op(ui, REQUEST_SAVE_CREATE.as_ptr(), REQUEST_SAVE_CREATE.len(), out.as_mut_ptr(), out.len());
+            assert_eq!(&out[..n], STATUS_NOT_READY, "must match fixtures/host_op/status-not-ready.bin exactly");
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// The success path, same fixture: after `ready_ui`, the real
+    /// `SAVE_EFFECT` create request reproduces
+    /// `fixtures/host_op/status-save-success.bin` byte-for-byte, and
+    /// queues exactly one `SavePreset` command (Andreas's "no on-device
+    /// confirm" ruling, same as `pl_ui_import_preset`).
+    #[test]
+    fn pl_ui_host_op_save_create_matches_the_success_fixture_and_queues_save_preset() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+            let mut out = [0u8; 200];
+            let n = pl_ui_host_op(ui, REQUEST_SAVE_CREATE.as_ptr(), REQUEST_SAVE_CREATE.len(), out.as_mut_ptr(), out.len());
+            assert_eq!(&out[..n], STATUS_SAVE_SUCCESS, "must match fixtures/host_op/status-save-success.bin exactly");
+
+            let command = pl_ui_poll_command(ui);
+            assert_eq!(command.tag as u32, PlCommandTag::SavePreset as u32, "a successful SAVE create must queue exactly one SavePreset");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_host_preview_end_null_is_a_no_op() {
+        unsafe {
+            pl_ui_host_preview_end(core::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn pl_ui_library_null_or_too_small_returns_zero() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+            let mut buf = [0u8; 2048];
+
+            let n = pl_ui_library(core::ptr::null(), buf.as_mut_ptr(), buf.len());
+            assert_eq!(n, 0, "null ui must return 0");
+
+            let n = pl_ui_library(ui, core::ptr::null_mut(), buf.len());
+            assert_eq!(n, 0, "null buf must return 0");
+
+            let n = pl_ui_library(ui, buf.as_mut_ptr(), 2);
+            assert_eq!(n, 0, "a buffer too small for even the header must return 0");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Design section 11 Task 3 / section 3: a second call with nothing
+    /// changed must return `0` (this crate's own [`PlUi::last_library_rev`]
+    /// bookkeeping, layered on top of `App::library_snapshot`'s
+    /// always-re-encode behaviour -- see [`pl_ui_library`]'s doc comment),
+    /// and a real mutation (a `SAVE` create via [`pl_ui_host_op`], which --
+    /// unlike `DELETE`/`ASSIGN` -- writes the preset store immediately, not
+    /// only on the `PresetLoaded` echo) must make the next call publish
+    /// again with a strictly greater `library_rev`.
+    #[test]
+    fn pl_ui_library_returns_zero_when_unchanged_and_republishes_after_a_real_change() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+            let mut buf = [0u8; 2048];
+
+            let first = pl_ui_library(ui, buf.as_mut_ptr(), buf.len());
+            assert!(first >= 6, "first call must publish a real snapshot");
+            let first_rev = u16::from_le_bytes([buf[4], buf[5]]);
+            assert_ne!(first_rev, 0, "App::refresh_library_rev never yields 0");
+
+            let second = pl_ui_library(ui, buf.as_mut_ptr(), buf.len());
+            assert_eq!(second, 0, "an unchanged library must return 0 on the second call");
+
+            let mut op_out = [0u8; 200];
+            let n = pl_ui_host_op(ui, REQUEST_SAVE_CREATE.as_ptr(), REQUEST_SAVE_CREATE.len(), op_out.as_mut_ptr(), op_out.len());
+            assert_eq!(op_out[3], 1, "the SAVE create must be accepted (state DONE)");
+            let _ = n;
+
+            let third = pl_ui_library(ui, buf.as_mut_ptr(), buf.len());
+            assert!(third >= 6, "a real content change must publish again");
+            let third_rev = u16::from_le_bytes([buf[4], buf[5]]);
+            assert_ne!(third_rev, first_rev, "library_rev must change after a real SAVE create");
+
+            let fourth = pl_ui_library(ui, buf.as_mut_ptr(), buf.len());
+            assert_eq!(fourth, 0, "unchanged again after the settled state must return 0");
 
             pl_ui_destroy(ui);
         }
