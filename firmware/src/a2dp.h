@@ -75,6 +75,35 @@ void pl_a2dp_connect(const uint8_t *addr);
 // of scope here.
 void pl_a2dp_disconnect(void);
 
+// Bead pico-link-chc3, design `.planning/design/2026-08-30-cancel-connect.md`
+// (D1-D4, C3): user-initiated abort of the CURRENT in-flight connect
+// attempt -- PL_COMMAND_TAG_CANCEL_CONNECT's C-side implementation, dead
+// since the tag was plumbed (pico-link-znb.7). Plain bookkeeping only, no
+// BTstack call here (D4): clears `attempt_live` so every connect-lifecycle
+// emit in a2dp.c's packet handler (ConnectStepChanged/ConnectSucceeded/
+// ConnectFailed/CodecChanged) silently no-ops for the rest of this attempt,
+// bumps `cancels_requested`, and arms `cancel_pending` for
+// pl_a2dp_service_cancel (below) to actually tear down on the next
+// heartbeat. `addr` is accepted but not compared against `pending_addr` --
+// core only ever emits this for the wizard's own current attempt (design
+// sec "Why an epoch counter, and why in C": core cannot address-filter these
+// events at all), so C aborts whatever attempt is live, unconditionally.
+// Called from bt.c's PL_BT_PENDING_CANCEL_CONNECT case (pl_bt_pending_service,
+// run-loop/IRQ context) -- never from thread context, matching every other
+// pl_a2dp_* mutator in this header.
+void pl_a2dp_cancel_connect(const uint8_t *addr);
+
+// Bead pico-link-chc3 (C4): services a pending cancel armed by
+// pl_a2dp_cancel_connect above -- if one is outstanding and there is still a
+// live a2dp_cid, tears it down with a2dp_source_disconnect (D1: the only
+// BTstack call that does anything useful at any stage, valid from the
+// instant establish_stream returned). Called once per tick from bt.c's
+// pl_bt_wdt_heartbeat_handler, right after pl_bt_pending_service -- same
+// IRQ/run-loop context pl_a2dp_prepare_switch below already runs in. A
+// same-cycle no-op when nothing is pending (checked every tick regardless,
+// same idiom as pl_bt_switch_service).
+void pl_a2dp_service_cancel(void);
+
 // Bead pico-link-sfw6, design sec 2: cancels A's in-flight 0x0b retry and
 // wizard-dismiss timers so neither can fire into the switch attempt that's
 // about to start. Called from bt.c's pl_bt_connect_or_switch, run-loop/IRQ

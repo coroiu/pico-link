@@ -1142,6 +1142,19 @@ typedef enum {
     // addr -- persist.c already has the pending record staged in its own
     // s_abr_floor_pending_floor.
     PL_BT_PENDING_SET_ABR_FLOOR,
+    // Bead pico-link-chc3, design C3: reuses this exact queue/heartbeat
+    // idiom for PL_COMMAND_TAG_CANCEL_CONNECT -- pl_a2dp_cancel_connect
+    // itself does no BTstack call (D4), but it does write a2dp.c's shared
+    // s_ctx bookkeeping fields, which the packet handler's IRQ context also
+    // reads/writes; deferring onto this queue's single IRQ-context consumer
+    // avoids a thread-vs-IRQ race on that state, same reason every other
+    // a2dp.c mutator in this table is deferred rather than called inline
+    // from pl_bt_poll_commands. Carries the target addr, same as
+    // PL_BT_PENDING_CONNECT/PL_BT_PENDING_FORGET_DEVICE (unused today --
+    // see a2dp.h's doc comment on pl_a2dp_cancel_connect for why -- but
+    // carried for symmetry and in case a future address-scoped cancel needs
+    // it).
+    PL_BT_PENDING_CANCEL_CONNECT,
 } pl_bt_pending_tag_t;
 
 typedef struct {
@@ -1186,6 +1199,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "SET_CUSHION_POLICY";
         case PL_BT_PENDING_SET_ABR_FLOOR:
             return "SET_ABR_FLOOR";
+        case PL_BT_PENDING_CANCEL_CONNECT:
+            return "CANCEL_CONNECT";
         default:
             return "?";
     }
@@ -1214,7 +1229,7 @@ static bool pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
         return false;
     }
     s_bt_pending[head].tag = tag;
-    if (tag == PL_BT_PENDING_CONNECT || tag == PL_BT_PENDING_FORGET_DEVICE) {
+    if (tag == PL_BT_PENDING_CONNECT || tag == PL_BT_PENDING_FORGET_DEVICE || tag == PL_BT_PENDING_CANCEL_CONNECT) {
         memcpy(s_bt_pending[head].addr, addr, sizeof(bd_addr_t));
     }
     s_bt_pending_head = next_head;
@@ -1385,6 +1400,28 @@ static void pl_bt_pending_service(void) {
                 // PL_BT_PENDING_PERSIST_WRITE above.
                 pl_persist_execute_pending_abr_floor_write();
                 break;
+            case PL_BT_PENDING_CANCEL_CONNECT:
+                // Bead pico-link-chc3, design C3: bookkeeping-only (D4) --
+                // pl_a2dp_cancel_connect makes no BTstack call itself, it
+                // just flips a2dp.c's attempt_live/cancel_pending state from
+                // the same IRQ/run-loop context every other a2dp.c mutator
+                // in this table runs from.
+                pl_a2dp_cancel_connect(entry.addr);
+                // Bead pico-link-chc3: if this cancel landed mid-switch
+                // (design sec 2's break-before-make -- B during the
+                // DISCONNECTING/PAGING steps of a device switch, not just a
+                // plain from-idle connect), the switch state machine's own
+                // terminal hooks (pl_bt_push_connect_succeeded/_failed) will
+                // never fire for this attempt now that attempt_live is
+                // false -- without this, s_switch_state would stay PAGING
+                // forever and wedge every future switch/connect behind a
+                // dead in-flight marker. Same reset pl_bt_switch_service's
+                // own timeout path already does.
+                if (s_switch_state == PL_BT_SWITCH_PAGING || s_switch_state == PL_BT_SWITCH_WAIT_ACL_DOWN) {
+                    s_switch_state = PL_BT_SWITCH_NONE;
+                    pl_bt_update_scan_mode();
+                }
+                break;
         }
     }
 }
@@ -1449,6 +1486,11 @@ static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
     // pl_bt_pending_service so a switch that just started this same tick
     // (via PL_BT_PENDING_CONNECT above) is observed starting next tick.
     pl_bt_switch_service();
+    // Bead pico-link-chc3, design C4: services any cancel armed this tick
+    // (or an earlier one) by PL_BT_PENDING_CANCEL_CONNECT's servicing below
+    // -- same "no BTstack call from thread context" reasoning as
+    // pl_bt_switch_service, same 100ms period.
+    pl_a2dp_service_cancel();
     // T3 (pico-link-4v2.3), design sec 9: the "-> pl_bt_wdt_heartbeat_handler
     // (0xFF) -> avrcp_controller_set_absolute_volume" hop. Same context as
     // pl_bt_pending_service above, so it's safe to call a2dp.c's AVRCP API
@@ -1652,6 +1694,26 @@ void pl_bt_poll_commands(struct PlUi *ui) {
                 addr[5]
             );
             pl_bt_pending_push(PL_BT_PENDING_FORGET_DEVICE, addr);
+            break;
+        }
+
+        case PL_COMMAND_TAG_CANCEL_CONNECT: {
+            // Bead pico-link-chc3, design .planning/design/2026-08-30-
+            // cancel-connect.md (D3/D4/D6): PL_COMMAND_TAG_CANCEL_CONNECT
+            // was plumbed all the way from wizard.rs's B handler
+            // (pico-link-znb.7) and fell into `default:` here ever since --
+            // this is the fix. D6: the observable effect is
+            // LinkStateChanged(Idle) pushed IMMEDIATELY, inline, same as
+            // every other UI-event push in this switch (only the BTstack
+            // call itself is deferred -- see the pending-queue case this
+            // enqueues into).
+            const uint8_t *addr = command.payload.addr.addr;
+            pl_log(
+                "BT: PL_CMD_CANCEL_CONNECT %02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3],
+                addr[4], addr[5]
+            );
+            pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+            pl_bt_pending_push(PL_BT_PENDING_CANCEL_CONNECT, addr);
             break;
         }
 
