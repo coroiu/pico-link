@@ -250,3 +250,214 @@ preview mailbox (`App::host_preview`) is kept, not cleared -- the precedence
 rule in section 7 already makes the device editor's own preview win for as
 long as it's open, and the host preview resumes on its own once the editor
 closes and stops shadowing it.
+
+## 13. Device management from the web (bead pico-link-jyhk.24)
+
+Ada, 2026-09-27. Extends this protocol; no second channel. Scope: scan, pair
+(= connect to a discovered device), connect/switch, disconnect, forget, and the
+per-device LDAC quality the device page already offers.
+
+### 13.1 Ground truth this design is built on
+
+- Commands already exist and C already services them: StartScan, CancelScan,
+  Connect{addr,name}, Disconnect, ForgetDevice, SetDeviceLdacQuality
+  (events.rs:11-103; bt.c:1559-1700). The web adds NO new Command variant and
+  NO C Bluetooth code path. Every web op queues the exact Command the button
+  path queues.
+- Radio work is bounded by construction: one inquiry = 8 x 1.28 s = 10.24 s
+  (bt.c:36-39, 643-644); a connect ends in ConnectSucceeded or ConnectFailed
+  after the ACL page timeout plus at most one 0x0b retry (a2dp.c:3204-3215).
+  So one op cannot leave the radio busy forever; the lease (13.6) guards the
+  real risks: an inquiry competing with A2DP airtime after the page is gone,
+  and an abandoned host scan the device user did not ask for.
+- One ACL at a time, dongle never discoverable (bt.c:775-790,
+  MAX_NR_HCI_CONNECTIONS 1): "connect B" while A is up is a switch. Pairing is
+  always initiated from the dongle.
+- CancelConnect is plumbed but DEAD in C: bt.c's switch has no case for tag 4
+  (bt.c:1559-1800; watchdog_sup.h:179 names it). The device wizard's B during
+  Connecting (wizard.rs:423-428) therefore does nothing today. Pre-existing
+  debt; the web must not expose a cancel until C implements it (13.8, task R0b).
+- ConnectRetrying is never pushed by C (no producer in firmware/src), so
+  NotResponding is unreachable on hardware. The snapshot carries the field
+  anyway (0 today).
+
+### 13.2 Out, by hardware or by ADR
+
+- HFP / mic / call audio: dead on CYW43439. No op, no snapshot field, no UI.
+- Multipoint (two sinks at once): one ACL (above). CONNECT is always a switch.
+- PIN entry (ConnectFailureReason::NeedsPin): the device has no text entry, so
+  a web-only PIN path is a feature the buttons cannot reach -- a bug against
+  ADR 2026-09-26. Stays non-retryable. Vera decides if it ever changes.
+- Rename / alias: PairedDevice.name is the remote name (model.rs:377-392);
+  there is no alias store and no device text entry. Same ADR argument. Out.
+- Making the dongle discoverable from a phone: discoverable is always off by
+  design (bt.c:786). Out.
+
+### 13.3 Ops (op_proto stays 1; append-only op codes; each gated by op_mask)
+
+| op | Name | Body | Result payload |
+|---|---|---|---|
+| 7 | SCAN_START | - | u16 scan_seq |
+| 8 | SCAN_STOP | - | - |
+| 9 | CONNECT | addr[6] | u16 attempt_seq |
+| 10 | DISCONNECT | addr[6] | - |
+| 11 | FORGET | addr[6] | - |
+| 12 | SET_DEVICE_QUALITY | addr[6], u8 ldac_quality (1..3, 4 = Adaptive) | - |
+| 13 | reserved: CONNECT_CANCEL | addr[6] | op_mask bit stays 0 until C implements tag 4 |
+
+Semantics (core, one function each, sharing the action helpers in 13.5):
+
+- SCAN_START: NOT_READY until StoreLoaded folded (store_status Some).
+  PAIRED_FULL if paired.len() == 8 (same gate as devices.rs:111-116: the web
+  then offers FORGET, as the device offers the forget picker). DEVICE_BUSY if
+  the device wizard is open or a device-owned attempt is in flight. RADIO_BUSY
+  if connecting. If already discovering with owner Host: DONE, no new
+  command (idempotent; never restarts an inquiry). Else: clear discovered,
+  queue StartScan, scan_owner = Host.
+- SCAN_STOP: DONE no-op if not discovering. DEVICE_BUSY if scan_owner ==
+  Device (the web never cancels the person holding the dongle). Else queue
+  CancelScan.
+- CONNECT: resolve addr in core, never trust a host name. addr ==
+  connected_addr: DONE no-op. addr in paired: switch, name from the paired
+  record. addr in the snapshot's scan list (audio sink, 13.4): pair, name
+  from DeviceEntry, PAIRED_FULL if 8 paired. Otherwise UNKNOWN_DEVICE (17,
+  reused). DEVICE_BUSY / RADIO_BUSY as above. If a host scan is running, queue
+  CancelScan first (same as the device, which ends the scan by leaving it).
+  Queue Connect via truncate_device_name. attempt_seq++ and record the
+  attempt with initiator Host.
+- DISCONNECT: addr must equal connected_addr, else NOT_CONNECTED. The addr is
+  an intent guard only: Command::Disconnect stays addressless (events.rs:52-58).
+- FORGET: UNKNOWN_DEVICE unless paired. DEVICE_BUSY if a connect attempt for
+  that addr is in flight. Queue ForgetDevice. Allowed on the connected device,
+  exactly like the device page's Forget row. Never mutates paired locally;
+  the PairedDeviceForgotten echo bumps library_rev (fold.rs:211-214).
+- SET_DEVICE_QUALITY: UNKNOWN_DEVICE / INVALID_REQUEST on range; queue
+  SetDeviceLdacQuality. Echo via PairedDeviceUpserted.
+- DONE always means queued. Outcomes are observed, never inferred: paired
+  list changes via GET_LIBRARY (library_rev), connect progress and scan
+  results via GET_RADIO (radio_rev).
+
+New OpError codes (append to host_op.rs:166-213, fixture-emitted):
+20 DEVICE_BUSY, 21 RADIO_BUSY, 22 NOT_CONNECTED, 23 PAIRED_FULL.
+ConnectFailureReason gets a core-owned wire code + retryable + text fixture
+table (reasons.json) so JS never retypes events.rs:116-137.
+
+### 13.4 GET_RADIO (0x08, IN), radio_proto 1 -- a snapshot, not telemetry
+
+Same pattern as GET_LIBRARY (sec 2-3): Rust encodes in the superloop under
+the poll-recency gate, C publishes, SETUP memcpys. Not a telemetry page:
+telemetry generates only the last requested page into one buffer
+(usb_config_itf.c:188-191, 227-229), so alternating page 0 and a list page
+would serve the wrong page; and not folded into GET_LIBRARY, because scan
+churn would bump library_rev and force 1 KB effect re-reads during a scan.
+
+Header 36 B, LE: u8 radio_proto=1, u8 reserved, u16 len, u16 radio_rev,
+u8 flags (bit0 discovering, bit1 connecting, bit2 device_wizard_open,
+bit3 paired_full, bit4 store_ready), u8 scan_owner (0 none, 1 device,
+2 host), u16 scan_seq,
+attempt: u16 attempt_seq, u8 initiator (0 none, 1 device, 2 host,
+3 auto-reconnect), u8 step (ConnectStep wire; 0 none), addr[6], u8 retries,
+u8 reserved,
+last outcome: u16 outcome_seq (the attempt_seq it concludes), u8 outcome
+(0 none, 1 ok, 2 ok_degraded, 3 failed), u8 reason (wire code, 0 none),
+addr[6],
+u8 scan_count, u8 scan_rec_len, u8 scan_total_audio, u8 reserved.
+
+Scan record 42 B: addr[6], u8 bars (0..4, wizard.rs:96 signal_bar_level),
+u8 flags (bit0 already_paired), u8 name_len, name[32], u8 reserved.
+
+The list is EXACTLY what the wizard shows: audio sinks only
+(model.rs:114 is_audio_sink), capped at MAX_SCAN_LIST_ITEMS 12, in the same
+order (wizard.rs:305-307) -- factored into one core fn both call. Bars, not
+raw RSSI: RSSI jitter must not bump radio_rev on every inquiry result, and
+the ADR says resolved values. Max 36 + 12 x 42 = 540 B; fits the shared
+1536 B reply buffer (sec 5).
+
+radio_rev: encode-compare, same as library_rev (sec 3). Telemetry page 0
+appends u16 radio_rev at 169..171 (len 171, proto stays 1). The page re-reads
+GET_RADIO only when radio_rev moves -- ~33 ms latency for connect steps with
+no new traffic class.
+
+GET_INFO: info_ver 3 appends u8 radio_proto=1, u16 radio_max_len. op_mask
+bits 7..12 set; bit 13 clear until R0b.
+
+### 13.5 core model changes (the part that keeps it one control path)
+
+- BtModel gains a radio-session record folded from events regardless of which
+  screen is open: attempt {seq, addr, initiator, step, retries}, last
+  outcome {seq, addr, result}, scan_owner, scan_seq. Today the only record of
+  "attempt for addr X at step Y" is WizardPhase, a UI enum that fold.rs
+  writes unconditionally (fold.rs:489-499, 152-163). The web must read model
+  state, not a screen's phase. Cheap and right: add the record, keep
+  WizardPhase as is. (Quick path rejected: reading WizardPhase from the
+  encoder ties a wire format to a presentation enum whose default is
+  NothingFound even when no wizard exists, ui_state.rs:38-45.)
+- One action helper per verb over the shared handles (model, commands):
+  start_scan(origin), cancel_scan, connect(addr, origin), disconnect,
+  forget(addr), set_quality. Device call sites switch to them with no
+  behaviour change: devices.rs:118-123, 167-171, 440; wizard.rs:345-348,
+  383-386, 410-413; device_page.rs:433-435; on_store_loaded fold.rs:185-188
+  (origin AutoReconnect). Host ops call the same helpers. This is the
+  "reuse the device's flows" guarantee, enforced by code shape rather than
+  review vigilance.
+- ScreenId::PairingWizard on build_wizard_screen (wizard.rs:76-79 has none),
+  so "device wizard open" is a navigator query (navigator.rs:222 id_at).
+
+### 13.6 Lease
+
+One host lease, not two. Sec 7's 2 s SETUP-recency lease generalises:
+pl_ui_host_preview_end becomes pl_ui_host_lease_expired (keep the old symbol
+as an alias until C switches), which ends a host preview AND, if
+scan_owner == Host and discovering, queues CancelScan. Also on
+configd_reset. Connect needs no lease (bounded, and a half-finished pairing
+the user asked for should complete and persist -- memory: save the pairing
+at pairing time). No web auto-rescan: SCAN_START never restarts a running
+inquiry, and the page must not re-issue it on a timer (Uma: an explicit
+Rescan button).
+
+### 13.7 Concurrency with the device UI
+
+Rule (same as preview precedence, sec 7): the person holding the dongle wins.
+- Device wizard open, or a device/auto-reconnect attempt in flight: every
+  radio op returns DEVICE_BUSY; the page shows "in use on the device".
+- Host scan running and the device user opens Pair new: device StartScan
+  proceeds (C restarts the inquiry, bt.c:1559-1571), scan_owner flips to
+  Device, the page sees it via radio_rev and becomes read-only on the list.
+- The device panel is never navigated by a web op: no screen push, no pop.
+- BUG this design depends on fixing first (R0a): on_wizard_auto_dismiss
+  guards on phase only (fold.rs:232-236) and C arms the dismiss timer on
+  EVERY success (a2dp.c:3885-3898). So any plain success -- device-page X
+  relink (device_page.rs:435, no wizard pushed), boot auto-reconnect, and
+  every web CONNECT -- pop_to_root()s the device user to Home ~2 s later from
+  wherever they are (the effects editor, a picker). Fix: also require
+  navigator top id == ScreenId::PairingWizard. Its doc comment already
+  claims this guard; the code does not have it.
+- A web FORGET of the device whose page is open on the panel: existing
+  navigator truncation handles the vanished DevicePage (navigator.rs:231).
+
+### 13.8 Tasks (ordered, one bead each)
+
+R0a core: auto-dismiss requires the wizard on top + ScreenId::PairingWizard.
+    Standalone bug, ship first -> Ruby.
+R0b C: implement PL_COMMAND_TAG_CANCEL_CONNECT (abort paging / ACL
+    teardown via the existing pending queue). Fixes the device's dead B
+    today; unlocks op 13. Parallel, not blocking -> Ruby, Tess on hardware.
+R1 core: BtModel radio-session record + fold; action helpers; migrate every
+    device call site; tests prove zero behaviour change (dep R0a).
+R2 core: GET_RADIO encoder + radio_rev + page-0 append + shared scan-list fn;
+    reason/error fixture tables; fixtures radio-*.bin (dep R1).
+R3 core: ops 7..12 in host_op_radio.rs (host_op.rs is 1198 lines), new
+    OpErrors, lease-expiry scan cancel (dep R1).
+R4 ui-ffi: pl_ui_radio(ui, buf, cap) (0 when unchanged),
+    pl_ui_host_lease_expired (+ alias), header regen. No event/command ABI
+    change (dep R2, R3).
+R5 C: 0x08 publish buffer + SETUP, radio generation beside library, lease
+    call rename, GET_INFO v3 + assert + info-v3.bin, op_mask bits;
+    pl_eq.py grows scan/connect/forget (dep R4, and jyhk.21 merged) -> Ruby,
+    then Tess: pair fresh headphones from the page, switch, forget, tab close
+    mid-scan cancels within ~2 s, scan-while-streaming audio A/B.
+R6 web API: proto/radio.ts vs fixtures, ops 7..12, seq/attempt_seq
+    correlation, FakeTransport radio model (dep R2, R3 fixtures).
+R7 Uma then web UI: Devices tab (scan list, connect progress by step,
+    failure reason + retry only if retryable, busy states, forget confirm)
+    (dep R6).
