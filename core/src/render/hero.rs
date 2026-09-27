@@ -1330,10 +1330,10 @@ impl Widget for HeroStatusView {
                 let hold_segments_r = theme::vertical_level_dbfs_segment_count(level.hold_r);
                 key.fold(1)
                     .fold(level.received_at.as_micros())
-                    .fold(u64::try_from(segments_l).expect("segment count is in 0..=48"))
-                    .fold(u64::try_from(segments_r).expect("segment count is in 0..=48"))
-                    .fold(u64::try_from(hold_segments_l).expect("segment count is in 0..=48"))
-                    .fold(u64::try_from(hold_segments_r).expect("segment count is in 0..=48"))
+                    .fold(u64::try_from(segments_l).expect("segment count is in 0..=16"))
+                    .fold(u64::try_from(segments_r).expect("segment count is in 0..=16"))
+                    .fold(u64::try_from(hold_segments_l).expect("segment count is in 0..=16"))
+                    .fold(u64::try_from(hold_segments_r).expect("segment count is in 0..=16"))
                     .fold(u64::from(stale))
             }
         }
