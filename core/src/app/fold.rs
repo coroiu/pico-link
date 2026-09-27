@@ -162,22 +162,18 @@ impl App {
     /// why that, not `WizardPhase`, is the source of truth: it works
     /// identically for a wizard-driven connect and the `PL_DEBUG_REMOTE`
     /// bypass, which never touches `WizardPhase` at all).
+    ///
+    /// Unconditional even if [`radio_actions::cancel_connect`] already
+    /// concluded `BtModel::attempt` as `Cancelled` for this `addr` -- see
+    /// ADA DESIGN v2 (bead `pico-link-chc3`): C's cancel is fire-and-forget,
+    /// so a `ConnectSucceeded` arriving after it means the link really did
+    /// come up, and that's simply a (new) successful connection, correctly
+    /// overwriting `last_outcome`. An earlier address-keyed guard here
+    /// (bead `pico-link-jyhk.25`) swallowed this real success and also
+    /// false-dropped a headset-initiated reconnect to the same address;
+    /// removed rather than kept until `chc3`'s seq-scoped suppression
+    /// lands.
     fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
-        {
-            let mut model = self.model.borrow_mut();
-            // Bead pico-link-jyhk.25 review fix: a stray late echo of an
-            // attempt the user already cancelled (`radio_actions::
-            // cancel_connect` is the only writer of `cancelled_attempt` --
-            // see its doc comment) must not resurrect `connected_addr`/
-            // `last_outcome` as if the cancel never happened. `attempt`
-            // being `None` alone can't distinguish this from a legitimate
-            // zero-`attempt` conclusion (e.g. the `PL_DEBUG_REMOTE` bypass),
-            // hence the explicit marker.
-            if model.attempt.is_none() && model.cancelled_attempt.is_some_and(|(_, cancelled_addr)| cancelled_addr == addr) {
-                model.cancelled_attempt = None;
-                return;
-            }
-        }
         self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
         {
             let mut model = self.model.borrow_mut();
@@ -554,12 +550,6 @@ impl App {
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
         {
             let mut model = self.model.borrow_mut();
-            // Bead pico-link-jyhk.25 review fix: same stray-late-echo guard
-            // as `App::on_connect_succeeded` -- see that guard's comment.
-            if model.attempt.is_none() && model.cancelled_attempt.is_some_and(|(_, cancelled_addr)| cancelled_addr == addr) {
-                model.cancelled_attempt = None;
-                return;
-            }
             model.last_connect_failure = Some((addr, reason));
             // Design sec 13.5: conclude the radio-session record -- same
             // "take the in-flight attempt's seq, fall back to 0 if there

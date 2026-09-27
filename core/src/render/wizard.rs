@@ -1181,13 +1181,18 @@ mod tests {
         assert_eq!(app.model().last_outcome.expect("must survive the Idle echo").result, ConnectOutcomeResult::Cancelled);
     }
 
-    /// A stray, late `ConnectSucceeded` for the exact attempt just cancelled
-    /// (C's cancel does not suppress an outcome already in flight on the
-    /// wire) must not resurrect `attempt`/`connected_addr`, nor flip
-    /// `last_outcome` back from `Cancelled` to `Ok` -- see
-    /// `App::on_connect_succeeded`'s stray-echo guard.
+    /// ADA DESIGN v2 (bead `pico-link-chc3`): a `ConnectSucceeded` arriving
+    /// after the user cancelled the attempt that requested it is a real,
+    /// new connection -- C's cancel is fire-and-forget and does not
+    /// suppress an outcome already in flight on the wire, so if the link
+    /// genuinely comes up, `core` must report it as connected, not swallow
+    /// it as a stray echo. Supersedes bead `pico-link-jyhk.25`'s
+    /// `stray_connect_succeeded_after_cancel_does_not_resurrect_the_attempt`,
+    /// which asserted the opposite and, by keying suppression on address
+    /// alone, also would have false-dropped a headset-initiated reconnect
+    /// to the same address.
     #[test]
-    fn stray_connect_succeeded_after_cancel_does_not_resurrect_the_attempt() {
+    fn connect_succeeded_after_cancel_is_reported_as_a_real_connection() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
         let addr = [17; 6];
@@ -1198,16 +1203,18 @@ mod tests {
 
         app.handle_input(vec![NavIntent::Back]);
         app.poll_command(); // drain CancelConnect
+        assert_eq!(app.model().attempt, None, "cancelling must conclude the attempt");
 
-        // The stray echo of the attempt that just got cancelled.
+        // The link actually came up after the cancel was sent -- C's cancel
+        // doesn't suppress an outcome already in flight on the wire.
         app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
 
-        assert_eq!(app.model().attempt, None, "a stray success must not recreate the attempt");
-        assert_eq!(app.model().connected_addr, None, "a stray success must not resurrect connected_addr either");
+        assert_eq!(app.model().connected_addr, Some(addr), "a genuine post-cancel success must be reported as connected");
+        assert_eq!(app.model().attempt, None, "a concluded success leaves no in-flight attempt");
         assert_eq!(
-            app.model().last_outcome.expect("Cancelled must survive the stray echo").result,
-            ConnectOutcomeResult::Cancelled,
-            "a stray success for a cancelled attempt must not flip last_outcome back to Ok"
+            app.model().last_outcome.expect("must record the new outcome").result,
+            ConnectOutcomeResult::Ok,
+            "the real success must overwrite Cancelled, not be swallowed by it"
         );
     }
 

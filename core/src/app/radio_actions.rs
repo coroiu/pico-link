@@ -85,15 +85,6 @@ pub(crate) fn connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Comman
         let mut model = model.borrow_mut();
         let seq = model.bump_attempt_seq();
         model.attempt = Some(ConnectAttempt { seq, addr, initiator, step: None, retries: 0 });
-        // A fresh attempt supersedes any earlier cancel marker -- see
-        // `BtModel::cancelled_attempt`'s doc comment. Without this, a stray
-        // late echo of the *cancelled* attempt could still be misidentified
-        // once this new attempt for the same `addr` is also underway (the
-        // guard in `App::on_connect_succeeded`/`record_connect_failure`
-        // only fires while `attempt` is `None`, so this is belt-and-braces
-        // rather than load-bearing, but leaving a stale marker around is a
-        // trap for the next reader).
-        model.cancelled_attempt = None;
     }
     commands.borrow_mut().push_back(Command::Connect { addr, name });
 }
@@ -111,13 +102,17 @@ pub(crate) fn connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Comman
 /// `BtModel::attempt` forever and a `GET_RADIO` snapshot would report a
 /// phantom in-flight connect indefinitely.
 ///
-/// Records the conclusion in both [`BtModel::last_outcome`]
-/// ([`ConnectOutcomeResult::Cancelled`]) and [`BtModel::cancelled_attempt`]
-/// -- the latter so a late [`Event::ConnectSucceeded`]/[`Event::
-/// ConnectFailed`] for the attempt just cancelled (C's cancel does not
-/// suppress an outcome already in flight on the wire) doesn't overwrite
-/// `Cancelled` back to `Ok`/`Failed`; see
-/// [`App::on_connect_succeeded`]/[`App::record_connect_failure`]'s guard.
+/// Records the conclusion in [`BtModel::last_outcome`]
+/// ([`ConnectOutcomeResult::Cancelled`]). A late [`Event::ConnectSucceeded`]
+/// for the attempt just cancelled (C's cancel does not suppress an outcome
+/// already in flight on the wire) is *not* suppressed -- see ADA DESIGN v2
+/// (bead `pico-link-chc3`): if the link genuinely comes up after a cancel,
+/// that's a real, new connection and is reported as such, not swallowed. The
+/// address-keyed `cancelled_attempt` marker this function used to write was
+/// removed for exactly that reason -- it also falsely dropped a
+/// headset-initiated reconnect to the same address arriving after an
+/// unrelated cancel. Seq-scoped suppression (distinguishing a genuinely
+/// stray echo of *this* attempt from a fresh session) lands with `chc3`.
 ///
 /// A no-op on `BtModel::attempt`/`last_outcome` if there is no attempt in
 /// flight (e.g. a stray B press after the attempt already concluded on its
@@ -128,7 +123,6 @@ pub(crate) fn cancel_connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque
     {
         let mut model = model.borrow_mut();
         if let Some(attempt) = model.attempt.take() {
-            model.cancelled_attempt = Some((attempt.seq, attempt.addr));
             model.last_outcome =
                 Some(ConnectOutcome { seq: attempt.seq, addr: attempt.addr, result: ConnectOutcomeResult::Cancelled, reason: None });
         }
