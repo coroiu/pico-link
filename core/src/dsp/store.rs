@@ -152,3 +152,66 @@ impl PresetStore {
         self.presets.get(&device_preset_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsp::preset::Preset;
+
+    /// Bead `pico-link-ryw.15`: reproduces the exact scenario the bug
+    /// described -- delete the highest-id preset, "reboot" (rebuild the
+    /// store the way C's boot push does: [`PresetStore::from_loaded`] from
+    /// whatever survived, then [`PresetStore::raise_next_id`] from C's
+    /// persisted high-water mark, mirroring `Event::PresetStoreLoaded`'s
+    /// `next_id` field), then create a new preset. Without a durable
+    /// high-water mark (i.e. without the `raise_next_id` call this test
+    /// performs), `from_loaded` alone would recompute `next_id` from the
+    /// two SURVIVING presets and hand the deleted id straight back out --
+    /// this test's whole point is proving `raise_next_id` prevents that,
+    /// which is the Rust-side half of this bead's contract (the C-side half
+    /// is persist.c's new PL:S:3 record, which is what actually supplies a
+    /// durable `next_id` across a real reboot).
+    #[test]
+    fn delete_highest_then_reboot_then_create_does_not_reuse_the_deleted_id() {
+        let mut store = PresetStore::new();
+        let id_a = store.create(Preset::new("A"));
+        let id_b = store.create(Preset::new("B"));
+        let id_c = store.create(Preset::new("C"));
+        assert_eq!((id_a, id_b, id_c), (1, 2, 3));
+
+        // Delete the highest-id preset -- C's flash store now only holds
+        // A and B, but its own high-water mark (persist.c's
+        // s_next_preset_id) stayed at 4 because rule (b) already raised it
+        // when C created id_c.
+        store.delete(id_c);
+        let durable_high_water_mark = id_c + 1; // what C's PL:S:3 record holds
+
+        // Simulate a reboot: a fresh store rebuilt purely from the
+        // survivors (A, B) would recompute next_id = 3 on its own --
+        // reusing id_c. Feed it the durable mark, exactly as
+        // `on_preset_store_loaded` (fold.rs) does with
+        // `Event::PresetStoreLoaded`'s `next_id`.
+        let mut rebooted = PresetStore::from_loaded([(id_a, store.get(id_a).unwrap().clone()), (id_b, store.get(id_b).unwrap().clone())]);
+        rebooted.raise_next_id(durable_high_water_mark);
+
+        let id_new = rebooted.create(Preset::new("New"));
+        assert_ne!(id_new, id_c, "the deleted preset's id must never be reused");
+        assert_eq!(id_new, durable_high_water_mark, "the new preset must get the id right after the durable high-water mark");
+    }
+
+    /// Without `raise_next_id`, the naive from-survivors-only
+    /// reconstruction WOULD reuse the deleted id -- this test documents
+    /// that failure mode explicitly (it is not itself the regression test
+    /// above; it's the negative control proving the scenario is real).
+    #[test]
+    fn without_raising_next_id_a_naive_reboot_would_reuse_the_deleted_id() {
+        let mut store = PresetStore::new();
+        let id_a = store.create(Preset::new("A"));
+        let id_c = store.create(Preset::new("C"));
+        store.delete(id_c);
+
+        let mut rebooted = PresetStore::from_loaded([(id_a, store.get(id_a).unwrap().clone())]);
+        let id_new = rebooted.create(Preset::new("New"));
+        assert_eq!(id_new, id_c, "control: from_loaded alone recomputes next_id from survivors only");
+    }
+}

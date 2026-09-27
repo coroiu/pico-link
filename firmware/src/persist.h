@@ -529,6 +529,26 @@ typedef enum {
 // independent-versioning discipline as PL_PERSIST_INDEX_CUSHION_POLICY
 // above.
 #define PL_PERSIST_INDEX_ABR_FLOOR 2u
+// Bead pico-link-ryw.15: PL:S:3, a FOURTH, independent record under
+// PL_PERSIST_KIND_SETTINGS -- the durable preset-id high-water mark. Own
+// index (3), own version byte (PL_PERSIST_PRESET_NEXT_ID_VERSION in
+// persist.c), same independent-versioning discipline as
+// PL_PERSIST_INDEX_CUSHION_POLICY/PL_PERSIST_INDEX_ABR_FLOOR above.
+//
+// Bug this closes: before this bead, s_next_preset_id (persist.c) was
+// recomputed at boot purely from max(occupied PL:P slots)+1, with no
+// durable record of its own. Deleting the highest-id preset and rebooting
+// therefore made the boot-time max drop back down, and the next created
+// preset reused the deleted id -- silently becoming the effect of every
+// device record still referencing it (design sec 2.4's "dangling
+// reference resolves Off" invariant only holds if ids are truly never
+// reused). PL:S:3 makes the high-water mark itself durable: written
+// synchronously every time pl_persist_drain_preset_stage_head's rule (b)
+// raises s_next_preset_id (persist.c), read at boot alongside the
+// slot-derived value, and the boot value is the max of the two so an
+// older flash image with no PL:S:3 record yet still falls back to the
+// slot-derived computation exactly as before.
+#define PL_PERSIST_INDEX_PRESET_NEXT_ID 3u
 
 // Number of PL:D:<i> device slots the store holds, i in [0, PL_PERSIST_DEVICE_SLOTS).
 // Widened from a single slot (index 0 only) to 8 by bead pico-link-4vb.6
