@@ -7,6 +7,7 @@ use crate::render::Instant;
 use super::events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus, VolumeSource, VolumeState};
 use super::fault::{FaultKey, FaultValue};
 use super::model::{decay_peak, truncate_device_name, DeviceEntry, OutLevelSample, OUT_LEVEL_HOLD_DURATION};
+use super::screen_id::ScreenId;
 use super::ui_state::{HomeFace, PENDING_TIMESTAMP, WizardPhase};
 use super::{App, ConnectedCodec, DeviceAddr, LinkState, PairedDevice};
 
@@ -223,14 +224,25 @@ impl App {
 
     /// Folds one [`Event::WizardAutoDismiss`] -- pops all the way back to
     /// Home, but **only** if it's currently showing a plain (non-degraded)
-    /// success; see that event's doc comment for why this guard exists.
+    /// success **and** the pairing wizard is actually the top of the
+    /// [`Navigator`] stack; see that event's doc comment for why this guard
+    /// exists. Bead `pico-link-vuou`: C arms the dismiss timer on *every*
+    /// successful connect -- a device-page relink, a boot auto-reconnect, a
+    /// web CONNECT -- not just ones the wizard started, so `WizardPhase`
+    /// alone (which fold.rs writes unconditionally regardless of which
+    /// screen is open) isn't enough of a guard; without the
+    /// [`ScreenId::PairingWizard`] check any of those plain successes would
+    /// yank the user back to Home ~2s later from wherever they were.
     /// Calls [`crate::render::Navigator::pop_to_root`] rather than
     /// [`crate::render::Navigator::pop`] so it lands on Home, not
     /// Devices -- a no-op if the wizard isn't actually the top of the
     /// stack any more (e.g. this event arrived after the user already
     /// backed out via B), same as `pop` was.
     fn on_wizard_auto_dismiss(&mut self) {
-        let should_pop = matches!(*self.wizard_phase.borrow(), WizardPhase::Succeeded { degraded: false });
+        let wizard_on_top =
+            self.navigator.depth() > 0 && self.navigator.id_at(self.navigator.depth() - 1) == Some(ScreenId::PairingWizard);
+        let should_pop =
+            wizard_on_top && matches!(*self.wizard_phase.borrow(), WizardPhase::Succeeded { degraded: false });
         if should_pop {
             self.navigator.pop_to_root();
             *self.wizard_phase.borrow_mut() = WizardPhase::default();
