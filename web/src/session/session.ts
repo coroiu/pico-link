@@ -81,7 +81,16 @@ export class Session {
   readonly ballistics = new OutLevelBallistics();
   readonly clock = new ClockOffsetEstimator();
 
-  private readonly transport: Transport;
+  /**
+   * The transport this session drives -- `readonly` (not `private`) so a
+   * companion controller sharing this session's single-flight command
+   * queue (`enqueueCommand`) can issue its own `controlIn`/`controlOut`
+   * calls against the same device, e.g. `LibraryController`
+   * (pico-link-jyhk.22) for `GET_LIBRARY`/`HOST_OP`/`GET_OP_STATUS`. Never
+   * call `transport.open()`/`close()` from outside `Session` -- lifecycle
+   * stays here.
+   */
+  readonly transport: Transport;
   private readonly opts: Required<Omit<SessionOptions, "now" | "visibilityDocument">>;
   private readonly now: () => number;
   private readonly visibilityDocument: Document | undefined;

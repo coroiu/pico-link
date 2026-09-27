@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebUsbSessionManager } from "./webusbSession";
 import { Session } from "./session";
 import { encodeDeviceInfoForTest } from "../proto/info";
-import type { DeviceInfo } from "../proto/info";
+import type { DeviceInfoInput } from "../proto/info";
 import { encodeHomeSnapshotForTest, emptyHomeSnapshot, TELEMETRY_PAGE_HOME } from "../proto/telemetry";
 import { PL_CFG_REQ_GET_INFO, PL_CFG_REQ_GET_TELEMETRY } from "../transport/types";
 import { PL_USB_PRODUCT_ID, PL_USB_VENDOR_ID } from "../transport/webusb";
@@ -15,7 +15,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const DEFAULT_INFO: DeviceInfo = {
+const DEFAULT_INFO: DeviceInfoInput = {
   infoVer: 1,
   importProto: 1,
   statusVer: 1,

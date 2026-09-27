@@ -7,11 +7,22 @@
 //   0x01 IMPORT_PRESET (out), 0x02 GET_STATUS (in), 0x03 GET_TELEMETRY (in,
 //   wValue = page id), 0x04 GET_INFO (in). See
 //   firmware/src/usb_config_itf.h:97-100.
+//
+// 0x05 GET_LIBRARY (in), 0x06 HOST_OP (out), 0x07 GET_OP_STATUS (in) are
+// NEW per ADA DESIGN on pico-link-jyhk.17 (`.planning/design/
+// 2026-09-27-iface6-eq-management-protocol.md` section 2) -- firmware does
+// not implement these yet (that's pico-link-jyhk.17's tasks 3-4); callers
+// must gate on `DeviceInfo.opMask`/`libProto`/`opProto` (design section 8)
+// before ever issuing them against real hardware. `FakeTransport` emulates
+// them for tests and the dev page.
 
 export const PL_CFG_REQ_IMPORT_PRESET = 0x01;
 export const PL_CFG_REQ_GET_STATUS = 0x02;
 export const PL_CFG_REQ_GET_TELEMETRY = 0x03;
 export const PL_CFG_REQ_GET_INFO = 0x04;
+export const PL_CFG_REQ_GET_LIBRARY = 0x05;
+export const PL_CFG_REQ_HOST_OP = 0x06;
+export const PL_CFG_REQ_GET_OP_STATUS = 0x07;
 
 /** Unregisters a callback previously passed to `Transport.onDisconnect`. */
 export type Unsubscribe = () => void;
