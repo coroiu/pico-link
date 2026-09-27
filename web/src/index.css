@@ -2,100 +2,120 @@
 
 /*
  * Theme tokens. Three themes selected by [data-theme] on <html>: "device"
- * (default), "light", "dark". "device" is the default theme, derived from
- * core/src/render/theme.rs's Rgb565 device palette (module `theme::color`,
- * lines ~47-97) -- hardcoded here for now (bead pico-link-jyhk.10); a
- * fixture-exported source of truth is a follow-up (jyhk.9 or later), noted
- * in the FERN DESIGN comment on pico-link-jyhk.8, section 5.
+ * (default), "light", "dark". Palette direction: IRIS (blue-violet on
+ * violet-graphite), chosen by Andreas 2026-09-27 -- see
+ * `.planning/design/2026-09-27-visual-identity.md` §3/§4/§7 (bead
+ * pico-link-5ful, this file done in pico-link-5ful.2). Replaces the
+ * Bitwarden-era navy+blue palette this file previously carried
+ * (`BRAND` #195dde on a #081021 navy ground).
  *
- * Conversion: Rgb565::new(r5, g6, b5) -> 8-bit-per-channel hex, rounding
- * r8 = round(r5 * 255/31), g8 = round(g6 * 255/63), b8 = round(b5 * 255/31).
- *   BACKGROUND         (1,4,4)    -> #081021
- *   SURFACE            (3,8,7)    -> #19203a
- *   SURFACE_ELEVATED   (4,10,9)   -> #21284a
- *   BRAND              (3,23,27)  -> #195dde
- *   BRAND_BRIGHT       (7,32,30)  -> #3a82f7
- *   TEXT_PRIMARY       (30,61,30) -> #f7f7f7
- *   TEXT_SECONDARY     (19,41,23) -> #9ca6bd
- *   DIVIDER            (4,12,10)  -> #213152
- *   STATUS_SUCCESS     (7,54,16)  -> #3adb84
- *   STATUS_ERROR       (31,22,12) -> #ff5963
- *   STATUS_WARNING     (31,44,4)  -> #ffb221
+ * "device" is the dark set, taken verbatim from
+ * `core/src/render/theme.rs`'s `palette` module (Iris column) -- same
+ * conversion as before: Rgb565::new(r5, g6, b5) -> 8-bit-per-channel hex,
+ * r8 = round(r5*255/31), g8 = round(g6*255/63), b8 = round(b5*255/31).
+ * These are exactly the hex values already in theme.rs's own doc comments
+ * (verified, not re-derived): BACKGROUND #080810, SURFACE #191821,
+ * SURFACE_ELEVATED #29283a, BRAND #5a49d6, BRAND_BRIGHT #948aff,
+ * TEXT_PRIMARY #f7f7f7, TEXT_SECONDARY #a5a2bd, DIVIDER #313142,
+ * METER_SAFE = TEXT_PRIMARY, STATUS_SUCCESS #42db8c, STATUS_ERROR #ff595a,
+ * STATUS_WARNING #ffb221, STATUS_ERROR_DIM #843131, STATUS_WARNING_DIM
+ * #845d19. "dark" mirrors "device" (no separate non-device dark direction
+ * was specified in the design doc; keeping the old slate-blue third theme
+ * would leave one palette un-Irised).
+ *
+ * "light" is the Iris light set from the design doc §4 table, not derived
+ * mechanically from the dark set -- text/surface relationships invert, and
+ * the error hue is deliberately shifted to crimson (`#c0145e`, not the
+ * `#ff595a` hue kept as-is) because the obvious red collapses against
+ * warning under deuteranopia (design §5: dE 8 vs dE 38 for crimson).
+ *
+ * Foreground picks (`*-foreground`, `--on-brand`/`--on-warn`) were chosen by
+ * measuring WCAG contrast against each fill, not by convention (checked with
+ * a throwaway relative-luminance script against the exact hex pairs below;
+ * every text/fill pair here lands >= 4.5:1, matching the ranges design §5
+ * states). `--meter-safe/-warn/-err`, `--text-3`, `--on-brand`, `--on-warn`,
+ * `--scrim`, `--wash`, `--zero` are web-only tokens (design §4) with no
+ * device CSS-var equivalent: the meter's fills can run brighter than body
+ * text, `--text-3` is the fault-strip Recent-tier metadata color (was
+ * hardcoded `#6d7690`), `--scrim`/`--wash`/`--zero` are modal-backdrop /
+ * EQ-band-fill / meter-gridline colors with no on-device analog.
  */
 :root,
-[data-theme="device"] {
-  --background: #081021;
+[data-theme="device"],
+[data-theme="dark"] {
+  --background: #080810;
   --foreground: #f7f7f7;
-  --card: #19203a;
+  --card: #191821;
   --card-foreground: #f7f7f7;
-  --popover: #21284a;
+  --popover: #29283a;
   --popover-foreground: #f7f7f7;
-  --primary: #195dde;
+  --primary: #5a49d6;
   --primary-foreground: #f7f7f7;
-  --secondary: #21284a;
+  --secondary: #29283a;
   --secondary-foreground: #f7f7f7;
-  --muted: #19203a;
-  --muted-foreground: #9ca6bd;
-  --accent: #3a82f7;
-  --accent-foreground: #f7f7f7;
-  --destructive: #ff5963;
-  --destructive-foreground: #f7f7f7;
-  --success: #3adb84;
+  --muted: #191821;
+  --muted-foreground: #a5a2bd;
+  --accent: #948aff;
+  --accent-foreground: #080810;
+  --destructive: #ff595a;
+  --destructive-foreground: #080810;
+  --success: #42db8c;
+  --success-foreground: #080810;
   --warning: #ffb221;
-  --border: #213152;
-  --input: #213152;
-  --ring: #3a82f7;
+  --warning-foreground: #080810;
+  --border: #313142;
+  --input: #313142;
+  --ring: #948aff;
   --radius: 0.5rem;
+
+  /* Web-only extras, design §4/§6. */
+  --text-3: #6e6b85;
+  --meter-safe: #f7f7f7;
+  --meter-warn: #ffb221;
+  --meter-err: #ff595a;
+  --on-brand: #f7f7f7;
+  --on-warn: #080810;
+  --scrim: rgb(8 8 16 / 60%);
+  --wash: rgb(90 73 214 / 15%);
+  --zero: #4a4a5e;
 }
 
 [data-theme="light"] {
-  --background: #ffffff;
-  --foreground: #0f172a;
-  --card: #f8fafc;
-  --card-foreground: #0f172a;
-  --popover: #ffffff;
-  --popover-foreground: #0f172a;
-  --primary: #195dde;
+  --background: #f6f6f9;
+  --foreground: #15141c;
+  --card: #ffffff;
+  --card-foreground: #15141c;
+  --popover: #ecebf4;
+  --popover-foreground: #15141c;
+  --primary: #5a49d6;
   --primary-foreground: #ffffff;
-  --secondary: #e2e8f0;
-  --secondary-foreground: #0f172a;
-  --muted: #f1f5f9;
-  --muted-foreground: #64748b;
-  --accent: #3a82f7;
+  --secondary: #ecebf4;
+  --secondary-foreground: #15141c;
+  --muted: #ecebf4;
+  --muted-foreground: #5c5a6e;
+  --accent: #4a39c2;
   --accent-foreground: #ffffff;
-  --destructive: #dc2626;
+  --destructive: #c0145e;
   --destructive-foreground: #ffffff;
-  --success: #16a34a;
-  --warning: #d97706;
-  --border: #e2e8f0;
-  --input: #e2e8f0;
-  --ring: #3a82f7;
+  --success: #137a4b;
+  --success-foreground: #ffffff;
+  --warning: #8c5800;
+  --warning-foreground: #ffffff;
+  --border: #d9d7e6;
+  --input: #d9d7e6;
+  --ring: #4a39c2;
   --radius: 0.5rem;
-}
 
-[data-theme="dark"] {
-  --background: #0b0d12;
-  --foreground: #e5e7eb;
-  --card: #14161d;
-  --card-foreground: #e5e7eb;
-  --popover: #14161d;
-  --popover-foreground: #e5e7eb;
-  --primary: #3a82f7;
-  --primary-foreground: #0b0d12;
-  --secondary: #1f2230;
-  --secondary-foreground: #e5e7eb;
-  --muted: #14161d;
-  --muted-foreground: #9ca3af;
-  --accent: #3a82f7;
-  --accent-foreground: #0b0d12;
-  --destructive: #f87171;
-  --destructive-foreground: #0b0d12;
-  --success: #4ade80;
-  --warning: #fbbf24;
-  --border: #1f2230;
-  --input: #1f2230;
-  --ring: #3a82f7;
-  --radius: 0.5rem;
+  /* Web-only extras, design §4/§6. */
+  --text-3: #8f8ca0;
+  --meter-safe: #2b2a36;
+  --meter-warn: #e8a200;
+  --meter-err: #c8175a;
+  --on-brand: #ffffff;
+  --on-warn: #15141c;
+  --scrim: rgb(21 20 28 / 40%);
+  --wash: rgb(90 73 214 / 12%);
+  --zero: #b8b6c6;
 }
 
 @theme inline {
@@ -116,10 +136,21 @@
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
   --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-text-3: var(--text-3);
+  --color-meter-safe: var(--meter-safe);
+  --color-meter-warn: var(--meter-warn);
+  --color-meter-err: var(--meter-err);
+  --color-on-brand: var(--on-brand);
+  --color-on-warn: var(--on-warn);
+  --color-scrim: var(--scrim);
+  --color-wash: var(--wash);
+  --color-zero: var(--zero);
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 2px);
   --radius-sm: calc(var(--radius) - 4px);
