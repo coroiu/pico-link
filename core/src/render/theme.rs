@@ -42,59 +42,74 @@ use u8g2_fonts::FontRenderer;
 pub mod palette {
     use embedded_graphics::pixelcolor::Rgb565;
 
-    /// Screen base fill (`#0B1120`): whatever isn't covered by a bar,
+    // Palette direction: IRIS (blue-violet on violet-graphite), chosen by
+    // Andreas 2026-09-27 over Orchid/Ink -- see
+    // `.planning/design/2026-09-27-visual-identity.md` §3/§7 (bead
+    // pico-link-5ful) for the token table, contrast/CVD checks and the two
+    // runner-up directions. Replaces the Bitwarden-era navy+blue palette
+    // (`BRAND` used to be one RGB565 step from Bitwarden's `#175DDC` on a
+    // `#0B1120` navy ground); every token below is new.
+
+    /// Screen base fill (`#080810`): whatever isn't covered by a bar,
     /// card, or row — the "void" behind all content.
-    pub const BACKGROUND: Rgb565 = Rgb565::new(1, 4, 4);
+    pub const BACKGROUND: Rgb565 = Rgb565::new(1, 2, 2);
     /// Chrome bars (title/hint) and an unselected row's implicit
-    /// backdrop (`#16213A`) — one step brighter than `BACKGROUND`.
-    pub const SURFACE: Rgb565 = Rgb565::new(3, 8, 7);
-    /// A selected row or focused field's backdrop (`#1E2A47`) — one step
+    /// backdrop (`#191821`) — one step brighter than `BACKGROUND`.
+    pub const SURFACE: Rgb565 = Rgb565::new(3, 6, 4);
+    /// A selected row or focused field's backdrop (`#29283A`) — one step
     /// brighter than `SURFACE`, giving focus a visible lift without a
     /// literal raised/rounded card.
-    pub const SURFACE_ELEVATED: Rgb565 = Rgb565::new(4, 10, 9);
-    /// The brand fill color (`#175DDC`) — used for solid brand-colored
+    pub const SURFACE_ELEVATED: Rgb565 = Rgb565::new(5, 10, 7);
+    /// The brand fill color (`#5A49D6`) — used for solid brand-colored
     /// shapes (e.g. the initial chip's background), not text or icons.
-    pub const BRAND: Rgb565 = Rgb565::new(3, 23, 27);
-    /// The brighter brand accent (`#3B82F6`) — selection accent bars,
+    pub const BRAND: Rgb565 = Rgb565::new(11, 18, 26);
+    /// The brighter brand accent (`#948AFF`) — selection accent bars,
     /// active/positive icon glyphs; reserved for things that should read
     /// as "brand, but louder" than a plain `BRAND` fill.
-    pub const BRAND_BRIGHT: Rgb565 = Rgb565::new(7, 32, 30);
-    /// Primary text and glyph color (`#F5F7FA`) — list row names,
+    pub const BRAND_BRIGHT: Rgb565 = Rgb565::new(18, 34, 31);
+    /// Primary text and glyph color (`#F7F7F7`) — list row names,
     /// field values, chip initials.
     pub const TEXT_PRIMARY: Rgb565 = Rgb565::new(30, 61, 30);
-    /// Secondary/muted text (`#9AA6BF`) — usernames, hints, field
+    /// Secondary/muted text (`#A5A2BD`) — usernames, hints, field
     /// labels, the sync counter.
-    pub const TEXT_SECONDARY: Rgb565 = Rgb565::new(19, 41, 23);
+    pub const TEXT_SECONDARY: Rgb565 = Rgb565::new(20, 40, 23);
     /// Hairline separators between chrome and content, or between rows
-    /// (`#22304F`).
-    pub const DIVIDER: Rgb565 = Rgb565::new(4, 12, 10);
-    /// A successful/positive status indicator (`#3DDC84`) — e.g. a
-    /// sync-ok dot.
-    pub const STATUS_SUCCESS: Rgb565 = Rgb565::new(7, 54, 16);
-    /// An error/negative status indicator (`#FF5964`).
-    pub const STATUS_ERROR: Rgb565 = Rgb565::new(31, 22, 12);
-    /// A caution/attention status indicator (`#FFB020`) — e.g. "secret
-    /// currently revealed."
+    /// (`#313142`).
+    pub const DIVIDER: Rgb565 = Rgb565::new(6, 12, 8);
+    /// The level meter's normal (below -18 dBFS) zone fill. Decoupled from
+    /// [`TEXT_PRIMARY`] (design §2, bead pico-link-5ful.1) even though Iris
+    /// sets it to the same value -- Ink's monochrome direction needs the
+    /// peak-hold cap ([`BRAND_BRIGHT`], white there) to stay visible against
+    /// a white safe zone, which sharing `TEXT_PRIMARY` would prevent.
+    pub const METER_SAFE: Rgb565 = Rgb565::new(30, 61, 30);
+    /// A successful/positive status indicator (`#42DB8C`) — e.g. a
+    /// sync-ok dot. Identical across all three directions: this is meaning,
+    /// not identity.
+    pub const STATUS_SUCCESS: Rgb565 = Rgb565::new(8, 54, 17);
+    /// An error/negative status indicator (`#FF595A`). Identical across all
+    /// three directions.
+    pub const STATUS_ERROR: Rgb565 = Rgb565::new(31, 22, 11);
+    /// A caution/attention status indicator (`#FFB221`) — e.g. "secret
+    /// currently revealed." Identical across all three directions.
     pub const STATUS_WARNING: Rgb565 = Rgb565::new(31, 44, 4);
-    /// [`STATUS_ERROR`] blended exactly 50% toward [`BACKGROUND`] (within
-    /// the design's requested ~45-50% band) — the Home fault strip's
-    /// "Recent" tier for an `Audible` (red) key (design
-    /// `.planning/design/2026-09-07-home-fault-strip.md` §3/§6.3: outline
-    /// glyph, dim colour, 20-120s since last occurrence). Bead
-    /// `pico-link-9eq2.3.3`. Component-wise midpoint:
-    /// `r=(31+1)/2=16, g=(22+4)/2=13, b=(12+4)/2=8`. Verified distinguishable
-    /// from [`STATUS_WARNING_DIM`] and from [`TEXT_SECONDARY`] at 8px on a
-    /// zoomed capture (`core/examples/fault_strip_probe.rs`, its
-    /// `dim_swatch` output) rather than asserted from the hex values alone
-    /// -- confirmed 2026-09-08: at 6x zoom the three read as dark
-    /// maroon-red, dark olive-brown and blue-gray respectively, clearly
-    /// separable by hue, not merely by brightness.
-    pub const STATUS_ERROR_DIM: Rgb565 = Rgb565::new(16, 13, 8);
-    /// [`STATUS_WARNING`] blended exactly 50% toward [`BACKGROUND`] — the
-    /// Home fault strip's "Recent" tier for a `Concealed` (amber) key. Same
-    /// derivation and verification as [`STATUS_ERROR_DIM`]:
-    /// `r=(31+1)/2=16, g=(44+4)/2=24, b=(4+4)/2=4`.
-    pub const STATUS_WARNING_DIM: Rgb565 = Rgb565::new(16, 24, 4);
+    /// [`STATUS_ERROR`] blended toward [`BACKGROUND`] (design's ~45-50%
+    /// band) — the Home fault strip's "Recent" tier for an `Audible` (red)
+    /// key (design `.planning/design/2026-09-07-home-fault-strip.md`
+    /// §3/§6.3: outline glyph, dim colour, 20-120s since last occurrence).
+    /// Value from `.planning/design/2026-09-27-visual-identity.md`'s token
+    /// table (identical across all three directions). Verified
+    /// distinguishable from [`STATUS_WARNING_DIM`] and from
+    /// [`TEXT_SECONDARY`] at 8px on a zoomed capture (`core/examples/
+    /// fault_strip_probe.rs`, its `dim_swatch` output) rather than asserted
+    /// from the hex values alone -- confirmed 2026-09-08: at 6x zoom the
+    /// three read as dark maroon-red, dark olive-brown and blue-gray
+    /// respectively, clearly separable by hue, not merely by brightness.
+    pub const STATUS_ERROR_DIM: Rgb565 = Rgb565::new(16, 12, 6);
+    /// [`STATUS_WARNING`] blended toward [`BACKGROUND`] — the Home fault
+    /// strip's "Recent" tier for a `Concealed` (amber) key. Same derivation
+    /// and verification as [`STATUS_ERROR_DIM`]; value from the Iris column
+    /// of `.planning/design/2026-09-27-visual-identity.md`'s token table.
+    pub const STATUS_WARNING_DIM: Rgb565 = Rgb565::new(16, 23, 3);
 }
 
 /// Per-role `u8g2-fonts` accessors. Each returns a fresh, independently
@@ -596,7 +611,7 @@ fn level_segment_color(index: i32) -> Rgb565 {
     } else if index >= METER_SEGMENT_COUNT - 3 {
         palette::STATUS_WARNING
     } else {
-        palette::TEXT_PRIMARY
+        palette::METER_SAFE
     }
 }
 
@@ -662,53 +677,49 @@ where
 }
 
 /// Number of segments in one [`draw_vertical_level_meter`] channel column —
-/// `.planning/design/2026-09-03-vertical-out-meter.md` section 5: 16, up
-/// from [`METER_SEGMENT_COUNT`]'s 8, doubled again to 32 by bead
-/// pico-link-53c once the smoothed damage pass made the meter worth
-/// judging at finer resolution. The horizontal meter's 8 segments in a
-/// 174px-tall column would read as a crude three-state light; 32 stay
-/// individually resolvable at 30-50cm and halve the dBFS step to 1.5dB
-/// (see [`VERTICAL_METER_DBFS_THRESHOLDS`]).
-const VERTICAL_METER_SEGMENT_COUNT: i32 = 32;
-/// Height (px) of a single vertical-meter segment. 32*9 + 31*2 would no
-/// longer fit the fixed 174px footprint the 16-segment geometry used, so
-/// bead pico-link-53c shrank this (and [`VERTICAL_METER_SEGMENT_GAP`])
-/// instead of changing [`VERTICAL_METER_GLYPH_HEIGHT`], which the
-/// surrounding layout depends on. 32*4 + 31*1 = 159px, 15px short of the
-/// 174px footprint; the drawn column is centred inside it via
-/// [`VERTICAL_METER_TOP_PAD`] rather than flush to the top or bottom edge.
-const VERTICAL_METER_SEGMENT_HEIGHT: i32 = 4;
+/// `.planning/design/2026-09-27-visual-identity.md` §6 (bead
+/// pico-link-5ful.1): 48, up from 32 (itself up from
+/// `.planning/design/2026-09-03-vertical-out-meter.md` section 5's 16, doubled
+/// by bead pico-link-53c). 48 over -48..0 dBFS lands exactly 1 dB per
+/// segment (see [`VERTICAL_METER_DBFS_THRESHOLDS`]), making the colour-zone
+/// boundaries the conventional -18/-6 dBFS marks.
+const VERTICAL_METER_SEGMENT_COUNT: i32 = 48;
+/// Height (px) of a single vertical-meter segment. 48*2 + 47*1 = 143px fits
+/// the fixed 174px footprint (bead pico-link-5ful.1; see
+/// [`VERTICAL_METER_DRAWN_HEIGHT`]) -- 48*(3+1) = 191px would not, which is
+/// why the segment shrank to 2px rather than the gap changing.
+const VERTICAL_METER_SEGMENT_HEIGHT: i32 = 2;
 /// Gap (px) between adjacent vertical-meter segments — see
 /// [`VERTICAL_METER_SEGMENT_HEIGHT`]'s doc comment for how this and the
 /// segment height were chosen to fit inside the fixed footprint.
 const VERTICAL_METER_SEGMENT_GAP: i32 = 1;
-/// Height (px) of the actually-drawn column: 32 segments of
-/// [`VERTICAL_METER_SEGMENT_HEIGHT`] separated by 31 gaps of
-/// [`VERTICAL_METER_SEGMENT_GAP`]. Strictly less than
-/// [`VERTICAL_METER_GLYPH_HEIGHT`] as of bead pico-link-53c — see that
-/// constant's doc comment for why the two are no longer equal.
+/// Height (px) of the actually-drawn column: 48 segments of
+/// [`VERTICAL_METER_SEGMENT_HEIGHT`] separated by 47 gaps of
+/// [`VERTICAL_METER_SEGMENT_GAP`] = 143px. Strictly less than
+/// [`VERTICAL_METER_GLYPH_HEIGHT`] — see that constant's doc comment for why
+/// the two are no longer equal.
 const VERTICAL_METER_DRAWN_HEIGHT: i32 =
     VERTICAL_METER_SEGMENT_COUNT * VERTICAL_METER_SEGMENT_HEIGHT + (VERTICAL_METER_SEGMENT_COUNT - 1) * VERTICAL_METER_SEGMENT_GAP;
 /// Total footprint (px) of one full vertical meter column — fixed at 174,
 /// exactly the design's meter-block height (section 4). Held fixed rather
-/// than recomputed from the segment geometry (as it was before the
-/// 16-to-32 segment bump, bead pico-link-53c) because the surrounding
-/// layout is built against this exact number; 32 segments do not divide
-/// 174 evenly, so [`VERTICAL_METER_DRAWN_HEIGHT`] (159px) is centred inside
-/// this footprint instead via [`VERTICAL_METER_TOP_PAD`].
+/// than recomputed from the segment geometry because the surrounding layout
+/// is built against this exact number; 48 segments do not divide 174 evenly,
+/// so [`VERTICAL_METER_DRAWN_HEIGHT`] (143px) is centred inside this
+/// footprint instead via [`VERTICAL_METER_TOP_PAD`].
 pub const VERTICAL_METER_GLYPH_HEIGHT: u32 = 174;
 /// Padding (px) above the drawn column within [`VERTICAL_METER_GLYPH_HEIGHT`]'s
-/// footprint: half of the `174 - `[`VERTICAL_METER_DRAWN_HEIGHT`]` = 15`px
-/// of slack, so the column sits centred rather than flush to the top edge
-/// (bead pico-link-53c). Integer division rounds down, so any odd leftover
-/// pixel goes to the bottom pad instead — arbitrary but deterministic.
+/// footprint: half of the `174 - `[`VERTICAL_METER_DRAWN_HEIGHT`]` = 31`px
+/// of slack, so the column sits centred rather than flush to the top edge.
+/// Integer division rounds down, so any odd leftover pixel goes to the
+/// bottom pad instead — arbitrary but deterministic.
 const VERTICAL_METER_TOP_PAD: i32 = (VERTICAL_METER_GLYPH_HEIGHT as i32 - VERTICAL_METER_DRAWN_HEIGHT) / 2;
 
 /// dBFS threshold, per vertical-meter segment, that `level` (linear 0-255,
 /// see [`draw_vertical_level_meter`]'s doc comment) must meet or exceed for
-/// that segment to be considered "lit" — bead pico-link-ajj.
+/// that segment to be considered "lit" — bead pico-link-ajj, resized to 48
+/// entries by bead pico-link-5ful.1.
 ///
-/// A linear `level*16/256` mapping (the previous behaviour) put typical
+/// A linear `level*16/256` mapping (the original behaviour) put typical
 /// music RMS (-10..-20 dBFS, i.e. 0.1-0.3 linear) at only 1-3 of 16
 /// segments: a level meter reads amplitude on a log scale, not a linear
 /// one, so a linear segment count is wrong on any real program material,
@@ -716,25 +727,26 @@ const VERTICAL_METER_TOP_PAD: i32 = (VERTICAL_METER_GLYPH_HEIGHT as i32 - VERTIC
 ///
 /// `core` is `no_std` with no `libm`, so this is a precomputed const table
 /// rather than a `log10` call at render time. Each entry is
-/// `round(255 * 10^((-48 + 1.5*(i+1)) / 20))` for `i` in `0..32` — a 1.5
-/// dB-per-segment scale (halved from 3dB by bead pico-link-53c, doubling
-/// the segment count from 16 to 32) spanning -48 dBFS (segment 1 lit) to
-/// 0 dBFS (full scale, all 32 lit). Segment `i`'s threshold is this array's
-/// `i`-th entry (0-indexed, quietest/bottom-most first, same convention as
+/// `round(255 * 10^((-48 + i + 1) / 20))` for `i` in `0..48` — exactly 1 dB
+/// per segment (design `.planning/design/2026-09-27-visual-identity.md` §6),
+/// spanning -48 dBFS (segment 1 lit) to 0 dBFS (full scale, all 48 lit).
+/// Segment `i`'s threshold is this array's `i`-th entry (0-indexed,
+/// quietest/bottom-most first, same convention as
 /// [`vertical_level_segment_color`]).
 ///
-/// Several of the lowest entries round to the same `u8` (`1, 1, 2, 2, 2, 3,
-/// 3, ...`) — unavoidable once a 1.5dB step is quantised onto a linear 0-255
-/// input at the quiet end of the scale, where consecutive dB steps are only
-/// a couple of linear units apart. The practical effect is that the bottom
-/// few segments light together rather than strictly one at a time; this was
-/// called out and accepted when the segment count was doubled, not an
-/// oversight.
+/// Only 38 of the 48 entries are distinct — unavoidable once a 1dB step is
+/// quantised onto a linear 0-255 input at the quiet end of the scale, where
+/// consecutive dB steps are only a fraction of a linear unit apart. The
+/// bottom 18 segments (-48..-30 dBFS) share just 8 distinct thresholds and
+/// move in clumps of 2-3; flagged as a known, accepted limit (design §6) --
+/// harmless for music, which lives above -30 dBFS. A true 1dB step at the
+/// bottom needs a wider (u16) level or a dB-domain u8 fed from C.
 const VERTICAL_METER_DBFS_THRESHOLDS: [u8; VERTICAL_METER_SEGMENT_COUNT as usize] = [
-    1, 1, 2, 2, 2, 3, 3, 4, 5, 6, 7, 8, 10, 11, 14, 16, 19, 23, 27, 32, 38, 45, 54, 64, 76, 90, 108, 128, 152, 181, 215, 255,
+    1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 23, 26, 29, 32, 36, 40, 45, 51, 57, 64,
+    72, 81, 90, 102, 114, 128, 143, 161, 181, 203, 227, 255,
 ];
 
-/// Maps a linear 0-255 level to a segment *count* (0..=32) via
+/// Maps a linear 0-255 level to a segment *count* (0..=48) via
 /// [`VERTICAL_METER_DBFS_THRESHOLDS`]: the number of thresholds `level`
 /// meets or exceeds. Shared by the moving bar (`filled`) and the peak-hold
 /// cap (`hold_index`) in [`draw_vertical_level_meter`] so both read off one
@@ -752,24 +764,24 @@ pub(crate) fn vertical_level_dbfs_segment_count(level: u8) -> i32 {
 }
 
 /// Which colour segment `index` (0-based, quietest/bottom-most first) draws
-/// in when filled — design section 5: the colour zones keep the *same
-/// proportions* as the horizontal meter (green bottom 5/8, amber next 2/8,
-/// red top 1/8), not the literal indices, since porting the indices from
-/// [`level_segment_color`] verbatim would halve the red zone at 16
-/// segments. At 16 (before bead pico-link-53c doubled the segment count):
-/// green bottom 10/16 (indices 0-9), amber next 4/16 (indices 10-13), red
-/// top 2/16 (indices 14-15). At 32, the same proportions become green
-/// bottom 20/32 (indices 0-19), amber next 8/32 (indices 20-27), red top
-/// 4/32 (indices 28-31) — this is exactly the trap this doc comment already
-/// warned about: porting the *indices* (`-2`/`-6`) instead of recomputing
-/// them from the proportions would have halved the red zone again.
+/// in when filled — design `.planning/design/2026-09-27-visual-identity.md`
+/// §6 (bead pico-link-5ful.1): at 1dB/segment, the conventional dBFS zone
+/// marks land exactly on segment boundaries. Red = top 6 (indices 42-47,
+/// -6..0 dBFS); amber = the next 12 (indices 30-41, -18..-6 dBFS, -18 being
+/// the EBU alignment level); safe = the bottom 30 (indices 0-29), in
+/// [`palette::METER_SAFE`] rather than [`palette::TEXT_PRIMARY`] (design §2:
+/// decoupled so Ink's white peak-hold cap stays visible against a white safe
+/// zone). Same 5/8, 2/8, 1/8 proportions the meter has always used --
+/// porting the *indices* from a previous segment count instead of
+/// recomputing them from the proportions is the trap this doc comment has
+/// warned about since the 16- and 32-segment geometries.
 fn vertical_level_segment_color(index: i32) -> Rgb565 {
-    if index >= VERTICAL_METER_SEGMENT_COUNT - 4 {
+    if index >= VERTICAL_METER_SEGMENT_COUNT - 6 {
         palette::STATUS_ERROR
-    } else if index >= VERTICAL_METER_SEGMENT_COUNT - 12 {
+    } else if index >= VERTICAL_METER_SEGMENT_COUNT - 18 {
         palette::STATUS_WARNING
     } else {
-        palette::TEXT_PRIMARY
+        palette::METER_SAFE
     }
 }
 
@@ -1082,28 +1094,29 @@ mod tests {
         let mut fb = FrameBuffer565::new(20, 180);
         let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
         draw_vertical_level_meter(&mut fb, rect, 255, 0).unwrap();
-        // Bottom 20/32 segments (indices 0-19) are the green zone -- same
-        // 5/8 proportion as the 16-segment geometry, doubled by bead
-        // pico-link-53c.
-        for i in 0..20 {
+        // Bottom 30/48 segments (indices 0-29) are the safe zone -- same
+        // 5/8 proportion as the earlier geometries, now 1dB/segment (design
+        // `.planning/design/2026-09-27-visual-identity.md` §6, bead
+        // pico-link-5ful.1).
+        for i in 0..30 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
-                palette::TEXT_PRIMARY,
-                "segment {i} from the bottom must be in the green (TEXT_PRIMARY) zone"
+                palette::METER_SAFE,
+                "segment {i} from the bottom must be in the safe (METER_SAFE) zone"
             );
         }
-        // Next 8/32 (indices 20-27) are the amber zone.
-        for i in 20..28 {
+        // Next 12/48 (indices 30-41) are the amber zone, -18..-6 dBFS.
+        for i in 30..42 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::STATUS_WARNING,
                 "segment {i} from the bottom must be in the amber (STATUS_WARNING) zone"
             );
         }
-        // Top 4/32 (indices 28-31) are the red zone -- porting the
-        // horizontal meter's literal indices (top 1/8) instead of the
-        // proportion would wrongly leave index 28 amber.
-        for i in 28..32 {
+        // Top 6/48 (indices 42-47) are the red zone, -6..0 dBFS -- porting
+        // the horizontal meter's literal indices (top 1/8) instead of the
+        // proportion would wrongly leave index 42 amber.
+        for i in 42..48 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::STATUS_ERROR,
@@ -1113,25 +1126,25 @@ mod tests {
     }
 
     #[test]
-    fn draw_vertical_level_meter_half_linear_scale_fills_28_of_32_on_the_dbfs_scale() {
+    fn draw_vertical_level_meter_half_linear_scale_fills_42_of_48_on_the_dbfs_scale() {
         // 128/255 linear is -6 dBFS, not -infinity-to-0's midpoint -- on a
         // log scale that is loud, not "half". This replaces a pre-pico-
         // link-ajj test that expected a linear split; the dBFS mapping is
         // the point of this bead, so the old expectation would be testing
-        // the bug. 28/32 (bead pico-link-53c's 1.5dB-per-segment scale)
-        // lands -6 dBFS's 28-segment fill exactly at the green/amber/red
-        // boundary the top 4-segment red zone starts at.
+        // the bug. 42/48 (bead pico-link-5ful.1's 1dB-per-segment scale)
+        // lands -6 dBFS's 42-segment fill exactly at the safe/amber/red
+        // boundary the top 6-segment red zone starts at.
         let mut fb = FrameBuffer565::new(20, 180);
         let rect = Rectangle::new(Point::new(0, 0), Size::new(12, VERTICAL_METER_GLYPH_HEIGHT));
         draw_vertical_level_meter(&mut fb, rect, 128, 0).unwrap();
-        for i in 0..28 {
+        for i in 0..42 {
             assert_ne!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::DIVIDER,
                 "segment {i} from the bottom should be filled at level=128 (-6 dBFS)"
             );
         }
-        for i in 28..32 {
+        for i in 42..48 {
             assert_eq!(
                 vertical_meter_segment_color_at(&fb, rect, i),
                 palette::DIVIDER,
@@ -1141,8 +1154,8 @@ mod tests {
     }
 
     #[test]
-    fn vertical_level_dbfs_segment_count_full_scale_fills_32() {
-        assert_eq!(vertical_level_dbfs_segment_count(255), 32);
+    fn vertical_level_dbfs_segment_count_full_scale_fills_48() {
+        assert_eq!(vertical_level_dbfs_segment_count(255), 48);
     }
 
     #[test]
@@ -1151,15 +1164,15 @@ mod tests {
     }
 
     #[test]
-    fn vertical_level_dbfs_segment_count_typical_music_rms_lands_around_segment_18() {
+    fn vertical_level_dbfs_segment_count_typical_music_rms_lands_around_segment_28() {
         // 0.1 linear RMS (-20 dBFS) is squarely in typical-music territory
         // (bead pico-link-ajj) -- the linear mapping this replaces put it
         // at only a handful of segments; a dBFS mapping must land it well
-        // up the column instead. At the 1.5dB-per-segment, 32-segment scale
-        // (bead pico-link-53c doubled from 16 at 3dB/segment), -20 dBFS is
-        // `(-20 - -48) / 1.5 = 18.67` segments up from the floor.
+        // up the column instead. At the 1dB-per-segment, 48-segment scale
+        // (bead pico-link-5ful.1), -20 dBFS is `(-20 - -48) / 1 = 28`
+        // segments up from the floor.
         let filled = vertical_level_dbfs_segment_count(26); // round(0.1 * 255)
-        assert!((17..=19).contains(&filled), "expected ~segment 18, got {filled}");
+        assert!((27..=29).contains(&filled), "expected ~segment 28, got {filled}");
     }
 
     #[test]
