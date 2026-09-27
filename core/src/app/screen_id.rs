@@ -45,6 +45,13 @@ pub enum ScreenId {
     /// ... move FOCUS to the new/updated row. Anywhere else: nothing on
     /// screen").
     EffectsList,
+    /// The pairing wizard -- a singleton, no payload, reached only from
+    /// Devices' "Pair new" row. Added by bead `pico-link-vuou` so
+    /// `App::on_wizard_auto_dismiss` can require this screen actually be on
+    /// top of the [`Navigator`] stack before popping to Home, rather than
+    /// trusting `WizardPhase` alone (which C's dismiss timer arms on
+    /// *every* successful connect, wizard-initiated or not).
+    PairingWizard,
 }
 
 /// Which picker a [`ScreenId::Picker`] identifies -- distinguishes screens

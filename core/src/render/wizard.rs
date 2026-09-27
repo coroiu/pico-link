@@ -46,7 +46,8 @@ use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use crate::app::{
-    is_audio_sink, truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, ModelHandle, WizardPhase, MAX_SCAN_LIST_ITEMS,
+    is_audio_sink, truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, ModelHandle, ScreenId, WizardPhase,
+    MAX_SCAN_LIST_ITEMS,
 };
 use crate::input::NavIntent;
 
@@ -75,7 +76,7 @@ pub const WIZARD_TITLE: &str = "Pair headphones";
 #[must_use]
 pub fn build_wizard_screen(phase: Rc<RefCell<WizardPhase>>, model: ModelHandle, commands: Rc<RefCell<VecDeque<Command>>>) -> Screen {
     let view = PairingWizardView::new(phase, model, commands);
-    Screen::new(WIZARD_TITLE, vec![Box::new(view)])
+    Screen::new(WIZARD_TITLE, vec![Box::new(view)]).with_id(ScreenId::PairingWizard)
 }
 
 /// Phase 2's 4-bar signal glyph (design section 9 rule 4: "signal as a
@@ -988,6 +989,28 @@ mod tests {
             HomeFace::Status,
             "auto-dismiss must land on the status hero, not whatever face was showing when the wizard was opened"
         );
+    }
+
+    #[test]
+    fn background_connect_success_does_not_navigate_away_from_another_screen() {
+        // pico-link-vuou: C arms the auto-dismiss timer on *every*
+        // `ConnectSucceeded`, not just wizard-initiated ones (a device-page
+        // relink, a boot auto-reconnect, a future web CONNECT). Before the
+        // fix, `on_wizard_auto_dismiss` only checked `WizardPhase` -- which
+        // `on_connect_succeeded` sets unconditionally -- so this scenario
+        // yanked the user back to Home ~2s later from wherever they were.
+        let mut app = App::new(240, 240);
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+        app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+        assert_eq!(app.navigator_depth(), 2, "sitting on Devices, not the wizard");
+
+        let addr = [10; 6];
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded: false }, "C sets this regardless of screen");
+
+        app.handle_event(Event::WizardAutoDismiss);
+        assert_eq!(app.navigator_depth(), 2, "a connect success must not pop a screen the wizard didn't push");
+        assert_eq!(app.home_face_for_test(), HomeFace::Menu, "must not force Home's face either when the wizard isn't on top");
     }
 
     #[test]
