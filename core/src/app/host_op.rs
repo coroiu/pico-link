@@ -97,6 +97,26 @@ pub(crate) const FLAG_BYPASS: u8 = 1 << 0;
 /// message."
 const MAX_APO_TEXT_LEN: usize = 1000;
 
+/// `GET_OP_STATUS`'s fixed 21-byte header (see [`encode_op_status`] --
+/// `op_proto`/`seq`/`op`/`state`/`error`/reserved (1 byte each), `effect_id`/
+/// `library_rev`/`persisted_seq`/`line`/`band` (`u16` each), `value` (`f32`),
+/// `payload_len` (`u8`)).
+const OP_STATUS_HEADER_LEN: usize = 21;
+
+/// The largest payload any [`HostOpStatus`] can carry: `PARSE_APO`'s
+/// `blob[BLOB_LEN] + collides_with(u16) + copy_name_len(u8) + copy_name[MAX_NAME_BYTES]`
+/// (module doc comment's `PARSE_APO` row; see the payload built in
+/// [`App::host_op`]'s `op 6` arm).
+const MAX_OP_STATUS_PAYLOAD_LEN: usize = BLOB_LEN + 2 + 1 + MAX_NAME_BYTES;
+
+/// The largest a [`super::App::host_op_status`] reply can ever be --
+/// [`OP_STATUS_HEADER_LEN`] plus the largest possible payload
+/// ([`MAX_OP_STATUS_PAYLOAD_LEN`], from `PARSE_APO`). `pub` (re-exported from
+/// [`super`]) so `ui-ffi`'s `pl_ui_host_op` can reject a too-small `out_cap`
+/// BEFORE calling [`super::App::host_op`], rather than mutating state it
+/// then can't report (bead `pico-link-jyhk.20` review fix).
+pub const MAX_OP_STATUS_LEN: usize = OP_STATUS_HEADER_LEN + MAX_OP_STATUS_PAYLOAD_LEN;
+
 #[allow(dead_code)] // Referenced only from tests/doc comments -- a fresh App's HostOpStatus::default() already IS 0 without naming this constant at the runtime call site.
 const STATE_NONE: u8 = 0;
 const STATE_DONE: u8 = 1;
@@ -272,7 +292,7 @@ impl HostOpStatus {
 /// Encodes a [`HostOpStatus`] into the `GET_OP_STATUS` wire layout -- see
 /// this module's doc comment for the field order.
 fn encode_op_status(status: &HostOpStatus) -> Vec<u8> {
-    let mut out = Vec::with_capacity(21 + status.payload.len());
+    let mut out = Vec::with_capacity(OP_STATUS_HEADER_LEN + status.payload.len());
     out.push(OP_PROTO);
     out.push(status.seq);
     out.push(status.op);

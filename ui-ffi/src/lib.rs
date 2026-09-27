@@ -3369,9 +3369,14 @@ pub unsafe extern "C" fn pl_ui_library(ui: *const PlUi, buf: *mut u8, cap: usize
 /// Returns the number of bytes written into `out[0..out_cap]` -- always
 /// nonzero on success (`GET_OP_STATUS`'s header alone is `21` bytes, see
 /// `host_op`'s module doc comment for the full field list) -- or `0` if
-/// `ui`/`out` is null, `request` is null with `in_len > 0`, or `out_cap`
-/// is too small to hold the encoded reply (never a partial write, same
-/// contract as [`pl_ui_telemetry`]). A null `request` with `in_len == 0`
+/// `ui`/`out` is null, `request` is null with `in_len > 0`, or `out_cap` is
+/// smaller than [`pico_link_core::app::MAX_OP_STATUS_LEN`] (the worst-case
+/// reply length, since the actual reply isn't known until `host_op` has
+/// already run -- so this checks `out_cap` against the ceiling and rejects
+/// BEFORE calling `host_op`, never after: a too-small `out` must not execute
+/// the op and lose its status, same contract as [`pl_ui_telemetry`] but
+/// checked earlier because this call, unlike telemetry, has side effects).
+/// A null `request` with `in_len == 0`
 /// is accepted as an empty (necessarily malformed -- shorter than the
 /// 4-byte request header) request, same as any other too-short one:
 /// [`App::host_op`](pico_link_core::app::App::host_op) never panics on a
@@ -3398,7 +3403,14 @@ pub unsafe extern "C" fn pl_ui_library(ui: *const PlUi, buf: *mut u8, cap: usize
 /// storage.
 #[no_mangle]
 pub unsafe extern "C" fn pl_ui_host_op(ui: *mut PlUi, request: *const u8, in_len: usize, out: *mut u8, out_cap: usize) -> usize {
-    if ui.is_null() || out.is_null() || (request.is_null() && in_len > 0) {
+    // `out_cap` is checked against the worst-case reply length (not the
+    // actual reply, which isn't known until `host_op` has already run)
+    // BEFORE `host_op` is called: `host_op` mutates the store / queues
+    // commands, so calling it first on a too-small `out` would execute the
+    // op and then lose its status forever (bead `pico-link-jyhk.20` review
+    // fix -- `host_op_status`'s own too-small-buf check runs after the
+    // mutation already happened).
+    if ui.is_null() || out.is_null() || (request.is_null() && in_len > 0) || out_cap < pico_link_core::app::MAX_OP_STATUS_LEN {
         return 0;
     }
     // SAFETY: caller contract above.
@@ -5830,18 +5842,50 @@ mod tests {
             let n = pl_ui_host_op(ui, core::ptr::null(), 4, out.as_mut_ptr(), out.len());
             assert_eq!(n, 0, "null request with nonzero in_len must return 0");
 
-            // A malformed (all-zero, wrong op_proto) request, not the real
-            // SAVE fixture -- this sub-case only wants to prove the
-            // too-small-`out` path returns `0`, without incidentally
-            // running (and queuing a command for) a real SAVE.
-            let garbage_request = [0u8; 4];
-            let n = pl_ui_host_op(ui, garbage_request.as_ptr(), garbage_request.len(), out.as_mut_ptr(), 2);
-            assert_eq!(n, 0, "an out buffer too small for even the header must return 0");
-
             // A rejected/skipped call above must never have queued
             // anything (there is no valid SAVE in any of these calls).
             let command = pl_ui_poll_command(ui);
             assert_eq!(command.tag as u32, PlCommandTag::None as u32);
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Review fix (bead `pico-link-jyhk.20`): a too-small `out_cap` must
+    /// reject BEFORE `App::host_op` runs, not after -- otherwise a REAL
+    /// SAVE-create request executes (mutating the preset store and queuing
+    /// a `SavePreset` command) and only then discovers `out` can't hold the
+    /// status, losing it forever. Sends the real `request-save-create.bin`
+    /// fixture (not a garbage/malformed request -- that would prove nothing
+    /// about ordering, since a rejected request never mutates anything
+    /// either way) with `out_cap` one byte under
+    /// [`pico_link_core::app::MAX_OP_STATUS_LEN`], and asserts the call had
+    /// NO effect at all: no bytes written, no command queued, no store
+    /// mutation (`pl_ui_library`'s `library_rev` unchanged).
+    #[test]
+    fn pl_ui_host_op_too_small_out_cap_rejects_before_mutating_anything() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+
+            // Baseline: establish `PlUi::last_library_rev` so a later
+            // `pl_ui_library` call returning `0` (unchanged) is meaningful
+            // rather than just "first call always sets the cache".
+            let mut lib_buf = [0u8; 2048];
+            let baseline_n = pl_ui_library(ui, lib_buf.as_mut_ptr(), lib_buf.len());
+            assert!(baseline_n > 0, "a ready store must publish a real library snapshot");
+
+            let too_small = pico_link_core::app::MAX_OP_STATUS_LEN - 1;
+            let mut out = [0xAAu8; 200];
+            let n = pl_ui_host_op(ui, REQUEST_SAVE_CREATE.as_ptr(), REQUEST_SAVE_CREATE.len(), out.as_mut_ptr(), too_small);
+            assert_eq!(n, 0, "out_cap one byte under MAX_OP_STATUS_LEN must reject, not truncate");
+            assert_eq!(out, [0xAAu8; 200], "a rejected too-small call must not write anything into out");
+
+            let command = pl_ui_poll_command(ui);
+            assert_eq!(command.tag as u32, PlCommandTag::None as u32, "a rejected too-small call must not queue SavePreset");
+
+            let after_n = pl_ui_library(ui, lib_buf.as_mut_ptr(), lib_buf.len());
+            assert_eq!(after_n, 0, "library_rev must be unchanged -- pl_ui_library returns 0 when unchanged from the last read");
 
             pl_ui_destroy(ui);
         }
