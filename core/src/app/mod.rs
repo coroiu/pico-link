@@ -57,6 +57,8 @@ mod screen_id;
 mod screens;
 mod telemetry;
 #[cfg(test)]
+mod host_op_fixtures;
+#[cfg(test)]
 mod library_fixtures;
 #[cfg(test)]
 mod telemetry_fixtures;

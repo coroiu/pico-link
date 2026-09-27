@@ -79,8 +79,9 @@ use crate::dsp::{import, MAX_PRESETS};
 use crate::dsp::preset::{PresetBlobError, BLOB_LEN};
 
 /// This request/reply payload's protocol version -- design section 4's
-/// `op_proto 1`.
-const OP_PROTO: u8 = 1;
+/// `op_proto 1`. `pub(crate)` for [`super::host_op_fixtures`]'s request
+/// builders.
+pub(crate) const OP_PROTO: u8 = 1;
 
 const REQ_HEADER_LEN: usize = 4;
 const SAVE_BODY_LEN: usize = 2 + 2 + BLOB_LEN;
@@ -89,8 +90,8 @@ const ASSIGN_BODY_LEN: usize = 6 + 2;
 const PREVIEW_BODY_LEN: usize = 2 + BLOB_LEN;
 
 /// `flags` bit0 on a `PREVIEW` request -- design section 4: "flags bit0 =
-/// bypass".
-const FLAG_BYPASS: u8 = 1 << 0;
+/// bypass". `pub(crate)` for [`super::host_op_fixtures`].
+pub(crate) const FLAG_BYPASS: u8 = 1 << 0;
 
 /// Design section 5: "APO text above ~1000 B is rejected with a clear
 /// message."
@@ -101,15 +102,20 @@ const STATE_NONE: u8 = 0;
 const STATE_DONE: u8 = 1;
 const STATE_REJECTED: u8 = 2;
 
-/// The six `HOST_OP` mutations -- design section 4's table.
+/// The six `HOST_OP` mutations -- design section 4's table. `#[repr(u8)]`
+/// with explicit discriminants so [`Self::wire`] and [`Self::from_wire`]
+/// stay a single source of truth for the wire value -- [`super::host_op_fixtures`]'s
+/// `op-errors.json` reads [`Self::wire`] rather than hand-duplicating these
+/// numbers, so a renumbering here shows up as a fixture-drift test failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostOpCode {
-    SaveEffect,
-    DeleteEffect,
-    Assign,
-    Preview,
-    PreviewEnd,
-    ParseApo,
+#[repr(u8)]
+pub(crate) enum HostOpCode {
+    SaveEffect = 1,
+    DeleteEffect = 2,
+    Assign = 3,
+    Preview = 4,
+    PreviewEnd = 5,
+    ParseApo = 6,
 }
 
 impl HostOpCode {
@@ -123,6 +129,12 @@ impl HostOpCode {
             6 => Some(Self::ParseApo),
             _ => None,
         }
+    }
+
+    /// This op's wire byte -- the inverse of [`Self::from_wire`].
+    #[cfg(test)]
+    pub(crate) const fn wire(self) -> u8 {
+        self as u8
     }
 }
 

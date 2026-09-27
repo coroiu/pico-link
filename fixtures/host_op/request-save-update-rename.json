@@ -1,0 +1,10 @@
+{
+  "op": "SAVE_EFFECT",
+  "op_code": 1,
+  "seq": 2,
+  "flags": 0,
+  "id": 1,
+  "base_seq": 1,
+  "blob_len": 80,
+  "preset_name": "Warmer"
+}

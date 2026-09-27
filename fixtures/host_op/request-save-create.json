@@ -1,0 +1,10 @@
+{
+  "op": "SAVE_EFFECT",
+  "op_code": 1,
+  "seq": 1,
+  "flags": 0,
+  "id": 0,
+  "base_seq": 0,
+  "blob_len": 80,
+  "preset_name": "Warm"
+}

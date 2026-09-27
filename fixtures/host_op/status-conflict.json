@@ -1,0 +1,15 @@
+{
+  "op_proto": 1,
+  "op": "SAVE_EFFECT",
+  "op_code": 1,
+  "seq": 2,
+  "state": 2,
+  "error": 6,
+  "effect_id": 1,
+  "library_rev": 2,
+  "persisted_seq": 1,
+  "line": 0,
+  "band": 0,
+  "value": 0,
+  "payload_len": 0
+}
