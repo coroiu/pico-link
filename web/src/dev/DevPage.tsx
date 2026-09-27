@@ -2,13 +2,14 @@ import * as React from "react";
 import { Button } from "../components/ui/button";
 import { THEME_NAMES, useTheme } from "../theme/ThemeProvider";
 import { FakeTransport } from "../transport/fake";
-import { decodeHomeSnapshot, emptyHomeSnapshot } from "../proto/telemetry";
+import { isWebUsbSupported, WebUsbTransport } from "../transport/webusb";
+import { emptyHomeSnapshot } from "../proto/telemetry";
 import type { HomeSnapshot } from "../proto/telemetry";
-import { decodeDeviceInfo } from "../proto/info";
-import { PL_CFG_REQ_GET_INFO, PL_CFG_REQ_GET_TELEMETRY } from "../transport/types";
+import { Session } from "../session/session";
+import type { SessionState } from "../session/session";
+import { useStore } from "../session/store";
 import { MeterCanvas } from "./MeterCanvas";
 
-const POLL_MS = 33;
 const DEBUG_REFRESH_MS = 250;
 
 /** A synthesized "golden" snapshot, loosely modelled on the design's worked example. */
@@ -18,7 +19,7 @@ function goldenSnapshot(uptimeMs: number): HomeSnapshot {
   return {
     ...emptyHomeSnapshot(),
     uptimeMs,
-    snapSeq: Math.floor(uptimeMs / POLL_MS) + 1,
+    snapSeq: Math.floor(uptimeMs / 33) + 1,
     linkConnected: true,
     codecWord: "LDAC",
     kbps: Math.round(660 + wobble * 300),
@@ -39,59 +40,71 @@ function goldenSnapshot(uptimeMs: number): HomeSnapshot {
   };
 }
 
+function statusLine(status: SessionState): string {
+  switch (status.phase) {
+    case "idle":
+      return "idle";
+    case "opening":
+      return "opening...";
+    case "handshaking":
+      return "handshaking...";
+    case "ready":
+      return `ready · fw ${status.info?.version ?? "?"} · telemetry proto ${status.info?.telemetryProto ?? "?"}`;
+    case "lost":
+      return "lost -- device disconnected";
+    case "incompatible":
+      return `incompatible firmware (telemetry proto ${status.info?.telemetryProto ?? "?"}) -- update firmware or reload`;
+    case "busy-elsewhere":
+      return "busy -- another tab or tool holds the config interface";
+    default:
+      return status.phase;
+  }
+}
+
 /**
- * Dev page: runs the app against `FakeTransport` with a theme switcher and
- * a minimal debug readout of the decoded Home snapshot. No Home visuals
- * yet -- that's `pico-link-jyhk.12`, pending Uma's design. This is the
- * page's headless run mode (FERN DESIGN section 7): agents screenshot it
- * via headless Chrome.
+ * Dev page: runs against `FakeTransport` by default, with a "Connect
+ * (WebUSB)" button that swaps in a real `Session` + `WebUsbTransport` (this
+ * bead, pico-link-jyhk.11). Home visuals proper are `pico-link-jyhk.12`.
+ * This is the page's headless run mode (FERN DESIGN section 7): agents
+ * screenshot it via headless Chrome.
  */
 export function DevPage() {
   const { theme, setTheme } = useTheme();
-  const [transport] = React.useState(() => new FakeTransport({ snapshot: () => goldenSnapshot(performance.now()) }));
+  const [session, setSession] = React.useState<Session>(() => new Session(new FakeTransport({ snapshot: () => goldenSnapshot(performance.now()) })));
+  const status = useStore(session.statusStore);
   const [debug, setDebug] = React.useState<HomeSnapshot>(emptyHomeSnapshot());
-  const [infoLine, setInfoLine] = React.useState("connecting...");
-  const snapshotRef = React.useRef<HomeSnapshot | null>(null);
+  const [connectError, setConnectError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    let cancelled = false;
-    let pollTimer: ReturnType<typeof setInterval> | undefined;
-    let debugTimer: ReturnType<typeof setInterval> | undefined;
-
-    void (async () => {
-      await transport.open();
-      const infoView = await transport.controlIn(PL_CFG_REQ_GET_INFO, 0, 64);
-      const info = decodeDeviceInfo(new Uint8Array(infoView.buffer, infoView.byteOffset, infoView.byteLength));
-      if (cancelled) return;
-      setInfoLine(info ? `fw ${info.version} · telemetry proto ${info.telemetryProto}` : "GET_INFO decode failed");
-
-      pollTimer = setInterval(async () => {
-        try {
-          const view = await transport.controlIn(PL_CFG_REQ_GET_TELEMETRY, 0, 256);
-          const snapshot = decodeHomeSnapshot(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-          if (snapshot) snapshotRef.current = snapshot;
-        } catch {
-          // Dev-page best-effort poll; the session layer (jyhk.11) owns
-          // real reconnect/backoff behaviour.
-        }
-      }, POLL_MS);
-
-      // Debug text panel refreshes far below 30Hz -- the only React state
-      // in this component that mirrors the poll data (the constraint this
-      // scaffold must honor is on the *canvas hot path*, not any state at
-      // all).
-      debugTimer = setInterval(() => {
-        if (snapshotRef.current) setDebug(snapshotRef.current);
-      }, DEBUG_REFRESH_MS);
-    })();
-
+    void session.start();
     return () => {
-      cancelled = true;
-      if (pollTimer) clearInterval(pollTimer);
-      if (debugTimer) clearInterval(debugTimer);
-      void transport.close();
+      void session.stop();
     };
-  }, [transport]);
+  }, [session]);
+
+  React.useEffect(() => {
+    const debugTimer = setInterval(() => {
+      if (session.snapshotRef.current) setDebug(session.snapshotRef.current);
+    }, DEBUG_REFRESH_MS);
+    return () => clearInterval(debugTimer);
+  }, [session]);
+
+  const connectWebUsb = React.useCallback(() => {
+    setConnectError(null);
+    // Must run synchronously from this click handler, no `await` before it
+    // -- `navigator.usb.requestDevice` (inside `WebUsbTransport.open()`)
+    // requires an active user gesture.
+    const nextSession = new Session(new WebUsbTransport());
+    setSession(nextSession);
+    nextSession.start().catch((err: unknown) => {
+      setConnectError(err instanceof Error ? err.message : String(err));
+    });
+  }, []);
+
+  const reconnectFake = React.useCallback(() => {
+    setConnectError(null);
+    setSession(new Session(new FakeTransport({ snapshot: () => goldenSnapshot(performance.now()) })));
+  }, []);
 
   return (
     <div className="min-h-svh bg-background text-foreground p-6 flex flex-col gap-6">
@@ -106,12 +119,27 @@ export function DevPage() {
         </div>
       </header>
 
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={connectWebUsb} disabled={!isWebUsbSupported()} data-testid="connect-webusb">
+          Connect (WebUSB)
+        </Button>
+        <Button size="sm" variant="outline" onClick={reconnectFake} data-testid="use-fake">
+          Use Fake
+        </Button>
+        {!isWebUsbSupported() && <span className="text-xs text-muted-foreground">WebUSB unsupported in this browser</span>}
+      </div>
+
       <p className="text-sm text-muted-foreground" data-testid="info-line">
-        {infoLine}
+        {statusLine(status)}
       </p>
+      {connectError && (
+        <p className="text-sm text-destructive" data-testid="connect-error">
+          {connectError}
+        </p>
+      )}
 
       <section className="flex gap-6 items-start">
-        <MeterCanvas snapshotRef={snapshotRef} />
+        <MeterCanvas snapshotRef={session.snapshotRef} />
 
         <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm bg-card text-card-foreground rounded-md border border-border p-4" data-testid="debug-readout">
           <dt className="text-muted-foreground">link</dt>

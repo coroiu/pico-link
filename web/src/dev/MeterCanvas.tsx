@@ -1,5 +1,24 @@
 import * as React from "react";
 import type { HomeSnapshot } from "../proto/telemetry";
+import { useTheme } from "../theme/ThemeProvider";
+
+interface MeterColors {
+  card: string;
+  primary: string;
+  accent: string;
+}
+
+const FALLBACK_COLORS: MeterColors = { card: "#19203a", primary: "#195dde", accent: "#3a82f7" };
+
+function readMeterColors(): MeterColors {
+  if (typeof document === "undefined") return FALLBACK_COLORS;
+  const style = getComputedStyle(document.documentElement);
+  return {
+    card: style.getPropertyValue("--card").trim() || FALLBACK_COLORS.card,
+    primary: style.getPropertyValue("--primary").trim() || FALLBACK_COLORS.primary,
+    accent: style.getPropertyValue("--accent").trim() || FALLBACK_COLORS.accent,
+  };
+}
 
 /**
  * Renders the stereo peak/RMS bars straight to a canvas via
@@ -8,9 +27,20 @@ import type { HomeSnapshot } from "../proto/telemetry";
  * path: meters ... draw on canvas via refs/requestAnimationFrame, never
  * through React state at 30Hz"). This is a placeholder debug meter, not
  * Home's real visual design -- that's Uma's pass on jyhk.12.
+ *
+ * Theme colours are read via `getComputedStyle` once per theme change (a
+ * `useTheme()`-triggered re-render), cached in a ref for the rAF loop to
+ * read -- review follow-up on pico-link-jyhk.11: "MeterCanvas calls
+ * getComputedStyle per frame - cache on theme change."
  */
 export function MeterCanvas({ snapshotRef }: { snapshotRef: React.RefObject<HomeSnapshot | null> }) {
   const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
+  const { theme } = useTheme();
+  const colorsRef = React.useRef<MeterColors>(FALLBACK_COLORS);
+
+  React.useEffect(() => {
+    colorsRef.current = readMeterColors();
+  }, [theme]);
 
   React.useEffect(() => {
     const canvas = canvasRef.current;
@@ -23,18 +53,18 @@ export function MeterCanvas({ snapshotRef }: { snapshotRef: React.RefObject<Home
       const { width, height } = canvas;
       ctx.clearRect(0, 0, width, height);
 
-      const style = getComputedStyle(document.documentElement);
-      ctx.fillStyle = style.getPropertyValue("--card") || "#19203a";
+      const colors = colorsRef.current;
+      ctx.fillStyle = colors.card;
       ctx.fillRect(0, 0, width, height);
 
       const snapshot = snapshotRef.current;
       const barW = width / 4;
       const bars: Array<[number, string]> = snapshot?.levelPresent
         ? [
-            [snapshot.peakL, style.getPropertyValue("--primary") || "#195dde"],
-            [snapshot.rmsL, style.getPropertyValue("--accent") || "#3a82f7"],
-            [snapshot.peakR, style.getPropertyValue("--primary") || "#195dde"],
-            [snapshot.rmsR, style.getPropertyValue("--accent") || "#3a82f7"],
+            [snapshot.peakL, colors.primary],
+            [snapshot.rmsL, colors.accent],
+            [snapshot.peakR, colors.primary],
+            [snapshot.rmsR, colors.accent],
           ]
         : [];
 

@@ -13,12 +13,22 @@ export const PL_CFG_REQ_GET_STATUS = 0x02;
 export const PL_CFG_REQ_GET_TELEMETRY = 0x03;
 export const PL_CFG_REQ_GET_INFO = 0x04;
 
+/** Unregisters a callback previously passed to `Transport.onDisconnect`. */
+export type Unsubscribe = () => void;
+
 export interface Transport {
   open(): Promise<void>;
   controlIn(bRequest: number, wValue: number, length: number): Promise<DataView>;
   controlOut(bRequest: number, wValue: number, bytes: Uint8Array): Promise<void>;
   close(): Promise<void>;
-  onDisconnect(cb: () => void): void;
+  /**
+   * Registers `cb` to fire when the device disconnects. Returns an
+   * unsubscribe function (review follow-up on pico-link-jyhk.10: "Transport.
+   * onDisconnect has no unsubscribe") -- the session layer must be able to
+   * detach its listener when it replaces or tears down a transport, or a
+   * stale callback from a previous session fires alongside the new one.
+   */
+  onDisconnect(cb: () => void): Unsubscribe;
 }
 
 /** Thrown by a transport when a request has no answer configured/replayed. */
