@@ -71,20 +71,30 @@ function fakeUsbDevice(): USBDevice {
   } as unknown as USBDevice;
 }
 
-/** A minimal `navigator.usb` fake: a real `EventTarget` for connect/disconnect, plus an authorized-devices list. */
+/**
+ * A minimal `navigator.usb` fake: a real `EventTarget` for connect/disconnect,
+ * plus an authorized-devices list. `requestDevice` resolves whatever
+ * `nextRequestedDevice` is currently set to -- tests that exercise
+ * `WebUsbSessionManager.requestDevice()` set it before calling in, mirroring
+ * the chooser resolving with the device the (fake) user picked.
+ */
 function fakeNavigatorUsb() {
   const target = new EventTarget();
   const authorized: USBDevice[] = [];
+  let nextRequestedDevice: USBDevice | undefined;
   const usb = {
     addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => target.addEventListener(type, listener),
     removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => target.removeEventListener(type, listener),
     getDevices: () => Promise.resolve([...authorized]),
-    requestDevice: () => Promise.reject(new Error("not used in this test")),
+    requestDevice: () => (nextRequestedDevice ? Promise.resolve(nextRequestedDevice) : Promise.reject(new Error("not used in this test"))),
   };
   return {
     usb: usb as unknown as USB,
     authorize(device: USBDevice) {
       authorized.push(device);
+    },
+    setNextRequestedDevice(device: USBDevice) {
+      nextRequestedDevice = device;
     },
     dispatchConnect(device: USBDevice) {
       const event = new Event("connect") as USBConnectionEvent;
@@ -97,6 +107,11 @@ function fakeNavigatorUsb() {
       target.dispatchEvent(event);
     },
   };
+}
+
+/** Counts sessions whose phase is `ready` -- the invariant every concurrency test checks: exactly one live session, no matter how many opens raced. */
+function readyCount(sessions: Session[]): number {
+  return sessions.filter((s) => s.statusStore.getSnapshot().phase === "ready").length;
 }
 
 describe("WebUsbSessionManager", () => {
@@ -186,5 +201,93 @@ describe("WebUsbSessionManager", () => {
     // running (which would leave two loops driving the meter/status).
     expect(firstSession.statusStore.getSnapshot().phase).toBe("idle");
     expect(manager.session).toBe(secondSession);
+  });
+
+  // Review fix-first (pico-link-jyhk.11), second round: `openDevice`/
+  // `requestDevice` had no mutual exclusion -- each begins with
+  // `await this.stopCurrentSession()`, which always yields, so two calls
+  // racing each read the same "previous" session and both go on to assign
+  // `currentSession`/`currentTransport`, leaking the loser (open device,
+  // live poll loop, disconnect listener). These three cases fire the races
+  // back-to-back with NO sleep in between, so a passing run means the
+  // serialization actually closed the gap rather than the fixture giving it
+  // time to resolve on its own.
+
+  it("two connect events for different devices, fired back-to-back, yield exactly one live session", async () => {
+    const fake = fakeNavigatorUsb();
+    const device = fakeUsbDevice();
+    fake.authorize(device);
+    Object.defineProperty(navigator, "usb", { value: fake.usb, configurable: true });
+
+    const sessions: Session[] = [];
+    const manager = new WebUsbSessionManager({ pollIntervalMs: 5, onSession: (s) => sessions.push(s) });
+    await manager.start();
+    await sleep(15);
+    expect(sessions).toHaveLength(1);
+
+    // Two more `connect` events, no await/sleep between them: both
+    // `openDevice()` calls start before either has stopped anything.
+    const second = fakeUsbDevice();
+    const third = fakeUsbDevice();
+    fake.dispatchConnect(second);
+    fake.dispatchConnect(third);
+    await sleep(20);
+
+    expect(sessions).toHaveLength(3);
+    expect(readyCount(sessions)).toBe(1);
+    expect(sessions[2].statusStore.getSnapshot().phase).toBe("ready");
+    expect(sessions[0].statusStore.getSnapshot().phase).toBe("idle");
+    expect(sessions[1].statusStore.getSnapshot().phase).toBe("idle");
+    expect(manager.session).toBe(sessions[2]);
+  });
+
+  it("a connect event racing start()'s own initial open yields exactly one live session", async () => {
+    const fake = fakeNavigatorUsb();
+    const device = fakeUsbDevice();
+    const racer = fakeUsbDevice();
+    fake.authorize(device);
+    Object.defineProperty(navigator, "usb", { value: fake.usb, configurable: true });
+
+    const sessions: Session[] = [];
+    const manager = new WebUsbSessionManager({ pollIntervalMs: 5, onSession: (s) => sessions.push(s) });
+
+    // `start()` awaits `listAuthorizedDevices()` before opening `device` --
+    // fire a `connect` for a second device synchronously, before that await
+    // (and therefore `start()`'s own `openDevice`) has resolved.
+    const startPromise = manager.start();
+    fake.dispatchConnect(racer);
+    await startPromise;
+    await sleep(20);
+
+    expect(sessions).toHaveLength(2);
+    expect(readyCount(sessions)).toBe(1);
+    const readySession = sessions.find((s) => s.statusStore.getSnapshot().phase === "ready");
+    expect(readySession).toBeDefined();
+    expect(manager.session).toBe(readySession);
+  });
+
+  it("requestDevice racing a connect event yields exactly one live session", async () => {
+    const fake = fakeNavigatorUsb();
+    const chosen = fakeUsbDevice();
+    const racer = fakeUsbDevice();
+    fake.setNextRequestedDevice(chosen);
+    Object.defineProperty(navigator, "usb", { value: fake.usb, configurable: true });
+
+    const sessions: Session[] = [];
+    const manager = new WebUsbSessionManager({ pollIntervalMs: 5, onSession: (s) => sessions.push(s) });
+    await manager.start();
+
+    // No await between the user-gesture chooser call and the browser's own
+    // `connect` event (e.g. the device the user is about to pick re-enumerating).
+    const requestPromise = manager.requestDevice();
+    fake.dispatchConnect(racer);
+    await requestPromise;
+    await sleep(20);
+
+    expect(sessions).toHaveLength(2);
+    expect(readyCount(sessions)).toBe(1);
+    const readySession = sessions.find((s) => s.statusStore.getSnapshot().phase === "ready");
+    expect(readySession).toBeDefined();
+    expect(manager.session).toBe(readySession);
   });
 });
