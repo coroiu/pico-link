@@ -66,3 +66,4 @@ status in `.planning/progress.md`.
 | 2026-09-01 | `2026-09-01-idle-policy-across-the-ffi-seam.md` | `pl_ui_display_power` as a pull-based level; **the firmware does not run `core/src/run.rs`** | Live |
 | 2026-09-01 | `2026-09-01-remembered-devices.md` | Remembered-device model, store schema, FFI delta | Live |
 | 2026-09-24 | `2026-09-24-congestion-cushion.md` | Cushioning audio against congested air: trim hold timer + ABR, measurement round, PL:S:1 setting (pico-link-8pp1) | Live |
+| 2026-09-27 | `2026-09-27-visual-identity.md` | New visual identity (Uma): three palette directions (Iris / Orchid / Ink) in RGB565 + web dark/light tokens replacing the Bitwarden-era palette, new METER_SAFE token, contrast + CVD checks; 48-segment meter at 2px+1px (1 dB/segment). Bead pico-link-5ful. | Proposed; awaiting direction pick (Uma recommends Orchid) |

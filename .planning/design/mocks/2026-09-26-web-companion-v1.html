@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pico Link companion (mockup)</title>
+<style>
+/* Palette: core/src/render/theme.rs RGB565 values, expanded to 8-bit. */
+:root{
+  --bg:#081021; --surface:#19203a; --surface-2:#21284a; --divider:#213152;
+  --brand:#195dde; --brand-bright:#3a82f7;
+  --text:#f7f7f7; --text-2:#9ca6bd;
+  --ok:#3adb84; --err:#ff5963; --warn:#ffb221; --err-dim:#843542; --warn-dim:#846121;
+  --font: "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
+  --radius:6px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);-webkit-font-smoothing:antialiased}
+button,select,input{font:inherit;color:inherit}
+.num{font-variant-numeric:tabular-nums}
+
+/* ---------- Top bar: the device's title bar, grown up ---------- */
+.topbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:20px;height:52px;padding:0 20px;
+  background:var(--surface);border-bottom:1px solid var(--divider)}
+.wordmark{font-weight:700;font-size:17px;letter-spacing:.01em;white-space:nowrap}
+.tabs{display:flex;gap:4px;height:100%}
+.tab{background:none;border:0;padding:0 14px;height:100%;color:var(--text-2);cursor:pointer;font-weight:600;font-size:15px;
+  border-bottom:3px solid transparent}
+.tab[aria-selected=true]{color:var(--text);border-bottom-color:var(--brand-bright)}
+.tab:disabled{opacity:.35;cursor:default}
+.spacer{flex:1}
+.mini{display:none;align-items:center;gap:10px;color:var(--text-2);font-size:13px;cursor:pointer}
+.mini.show{display:flex}
+.mini b{color:var(--text);font-size:15px;letter-spacing:.02em}
+.mini-meter{display:flex;gap:2px;height:26px;align-items:flex-end;width:14px}
+.mini-meter i{display:block;width:6px;background:var(--ok);border-radius:1px}
+.cluster{display:flex;align-items:center;gap:14px;font-weight:700;font-size:15px}
+.vol.warn{color:var(--warn)}
+.bt{width:14px;height:18px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--text-2);display:inline-block}
+.dot.on{background:var(--ok)}
+.usbchip{font-size:12px;font-weight:600;color:var(--text-2);border:1px solid var(--divider);border-radius:99px;padding:3px 10px;white-space:nowrap}
+.usbchip.on{color:var(--text)}
+
+main{max-width:1180px;margin:0 auto;padding:28px 24px 120px}
+
+/* ---------- HOME ---------- */
+.home{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:clamp(20px,4vw,56px);max-width:920px;margin:0 auto}
+.home[hidden]{display:none}
+.home .body{min-width:0}
+.devname{font-size:clamp(18px,2.2vw,26px);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:4px 0 0;min-height:1.2em}
+.hero{font-size:clamp(68px,13vw,168px);font-weight:800;line-height:.92;letter-spacing:-.02em;margin:clamp(8px,1.5vw,18px) 0 0;white-space:nowrap}
+.hero.nolink{color:var(--err)} .hero.fallback{color:var(--warn)}
+.bitrate{display:flex;align-items:baseline;gap:14px;min-height:1.3em;font-size:clamp(22px,3vw,36px);margin-top:6px}
+.tag{font-size:clamp(11px,1vw,13px);font-weight:700;letter-spacing:.12em;color:var(--text-2);text-transform:uppercase}
+.banner{min-height:1.6em;margin-top:clamp(10px,2vw,22px);font-size:clamp(14px,1.4vw,17px);font-weight:700;letter-spacing:.04em;color:var(--warn)}
+.fx{min-height:1.6em;font-size:clamp(15px,1.5vw,19px);color:var(--text-2)}
+.fx a{color:inherit;text-decoration:none;border-bottom:1px dashed var(--divider);cursor:pointer}
+.fx a:hover{color:var(--text);border-bottom-color:var(--text-2)}
+.faultwrap{grid-column:1}
+.faultrule{height:1px;background:var(--divider);margin:clamp(14px,2.5vw,28px) 0 10px}
+.faults{display:flex;flex-direction:column-reverse;min-height:calc(4 * 30px)} /* reserved: nothing moves when a fault arrives */
+.frow{display:grid;grid-template-columns:18px minmax(0,1fr) auto 44px;align-items:center;gap:12px;height:30px;font-weight:700;
+  font-size:clamp(14px,1.4vw,16px);letter-spacing:.04em}
+.frow .meta{font-weight:400;letter-spacing:0;color:var(--text-2);font-size:13px}
+.frow .cnt{text-align:right}
+.frow.audible{color:var(--err)} .frow.concealed{color:var(--warn)}
+.frow.recent.audible{color:var(--err-dim)} .frow.recent.concealed{color:var(--warn-dim)}
+.frow.recent .meta{color:#6d7690}
+
+.meter{grid-column:2;grid-row:1 / span 2;display:grid;grid-template-rows:auto 1fr auto;justify-items:center;gap:8px;padding-top:6px}
+.meter .lab{font-size:12px;font-weight:700;letter-spacing:.14em;color:var(--text-2)}
+.meter .cols{display:flex;gap:clamp(6px,1vw,10px);height:100%;min-height:220px}
+.col{display:flex;flex-direction:column-reverse;gap:3px;width:clamp(22px,3.4vw,40px);height:100%}
+.seg{flex:1;border-radius:2px;background:var(--divider)}
+.meter.absent .lab,.meter.absent .lr{visibility:hidden}
+.meter .lr{display:flex;gap:clamp(6px,1vw,10px)} .meter .lr span{width:clamp(22px,3.4vw,40px);text-align:center;font-size:12px;color:var(--text-2);font-weight:700}
+
+/* narrow window: fault strip drops below both columns, meter stays beside the hero */
+@media (max-width:620px){
+  .meter{grid-row:1}
+  .faultwrap{grid-column:1 / -1}
+  .meter .cols{min-height:170px}
+  main{padding:18px 14px 120px}
+  .topbar{gap:10px;padding:0 12px} .usbchip,.mini span{display:none}
+}
+
+/* ---------- EFFECTS ---------- */
+.fxpage{display:grid;grid-template-columns:280px minmax(0,1fr);gap:24px}
+.fxpage[hidden]{display:none}
+.panel{background:var(--surface);border:1px solid var(--divider);border-radius:var(--radius)}
+.panel h3{margin:0;padding:14px 16px 10px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--text-2);display:flex;justify-content:space-between}
+.lib{list-style:none;margin:0;padding:0 0 6px}
+.lib li{display:grid;grid-template-columns:4px 16px minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 14px 9px 0;cursor:pointer}
+.lib li:hover{background:var(--surface-2)}
+.lib li .acc{align-self:stretch}
+.lib li.sel{background:var(--surface-2)} .lib li.sel .acc{background:var(--brand-bright)}
+.lib .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+.lib .ct{font-size:12px;color:var(--text-2);white-space:nowrap}
+.lib .chk{color:var(--ok);font-size:13px;text-align:center}
+.lock{display:inline-block;width:9px;height:11px;margin-left:6px;vertical-align:-1px;opacity:.7}
+.libactions{display:flex;gap:8px;padding:8px 14px 14px;flex-wrap:wrap}
+.btn{background:var(--surface-2);border:1px solid var(--divider);border-radius:5px;padding:7px 12px;cursor:pointer;font-size:14px;font-weight:600}
+.btn:hover{border-color:var(--text-2)}
+.btn.primary{background:var(--brand);border-color:var(--brand)} .btn.primary:hover{background:var(--brand-bright)}
+.btn.danger{color:var(--err)}
+.btn:disabled{opacity:.4;cursor:default}
+.btn.toggle[aria-pressed=true]{background:var(--warn);color:#1a1200;border-color:var(--warn)}
+.hint{font-size:12px;color:var(--text-2);padding:0 16px 14px;line-height:1.45}
+.devlist{list-style:none;margin:0;padding:0 0 10px}
+.devlist li{display:grid;grid-template-columns:10px minmax(0,1fr);gap:4px 10px;align-items:center;padding:7px 16px}
+.devlist .dn{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}
+.devlist select{grid-column:2;background:var(--bg);border:1px solid var(--divider);border-radius:4px;padding:4px 6px;font-size:13px}
+.side{display:flex;flex-direction:column;gap:18px}
+
+.editor{display:flex;flex-direction:column;gap:14px;min-width:0}
+.editor[hidden]{display:none}
+.edhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.nameinput{background:transparent;border:1px solid transparent;border-radius:4px;font-size:26px;font-weight:700;padding:2px 6px;margin-left:-7px;width:min(100%,280px)}
+.nameinput:hover{border-color:var(--divider)} .nameinput:focus{outline:none;border-color:var(--brand-bright);background:var(--bg)}
+.bytes{font-size:12px;color:var(--text-2)}
+.edstatus{font-size:13px;color:var(--text-2);display:flex;gap:6px 16px;flex-wrap:wrap;align-items:center;min-height:18px}
+.edstatus .warn{color:var(--warn);font-weight:700}
+.dirty{color:var(--brand-bright);font-weight:700}
+.curvewrap{position:relative;height:clamp(240px,34vw,380px);padding:0}
+canvas{display:block;width:100%;height:100%;border-radius:var(--radius);cursor:crosshair;touch-action:none}
+.readout{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--divider);font-size:12px;padding:3px 7px;border-radius:4px;display:none;white-space:nowrap}
+.curvefoot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-2);padding:0 4px}
+.row2{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:14px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-2);text-align:left;font-weight:700;padding:8px}
+td{padding:4px 8px;border-top:1px solid var(--divider)}
+tr.bsel td{background:var(--surface-2)} tr.bsel td:first-child{box-shadow:inset 4px 0 0 var(--brand-bright)}
+td input,td select{background:var(--bg);border:1px solid var(--divider);border-radius:4px;padding:4px 6px;width:100%;font-size:13px}
+td input{text-align:right;font-variant-numeric:tabular-nums}
+td.idx{color:var(--text-2);width:34px;font-weight:700;padding-left:12px}
+td.x{width:30px} td.x button{background:none;border:0;color:var(--text-2);cursor:pointer;font-size:16px}
+td.x button:hover{color:var(--err)}
+.seg3{display:flex;border:1px solid var(--divider);border-radius:5px;overflow:hidden}
+.seg3 button{flex:1;background:var(--bg);border:0;padding:7px 0;cursor:pointer;font-size:13px;font-weight:600;color:var(--text-2)}
+.seg3 button+button{border-left:1px solid var(--divider)}
+.seg3 button[aria-pressed=true]{background:var(--brand);color:var(--text)}
+.usedby{list-style:none;margin:0;padding:0 16px 10px}
+.usedby li{display:flex;align-items:center;gap:10px;padding:6px 0;font-size:14px}
+.usedby small{color:var(--text-2)}
+.box{padding:0 16px 14px}
+.edempty{color:var(--text-2);padding:60px 20px;text-align:center}
+
+@media (max-width:900px){
+  .fxpage{grid-template-columns:1fr}
+  .row2{grid-template-columns:1fr}
+  .side{order:2}
+}
+
+/* ---------- STATES ---------- */
+.state{max-width:560px;margin:8vh auto 0}
+.state[hidden]{display:none}
+.state h1{font-size:30px;margin:0 0 12px}
+.state p{color:var(--text-2);line-height:1.55;font-size:16px;margin:0 0 14px}
+.state .strong{color:var(--text)}
+.state .actions{display:flex;gap:10px;margin-top:22px}
+.state .note{margin-top:14px;font-size:14px;color:var(--warn)}
+.dongle{width:120px;height:56px;border:2px solid var(--divider);border-radius:8px;display:flex;align-items:center;justify-content:center;margin:0 0 26px 18px;position:relative}
+.dongle:after{content:"";position:absolute;left:-18px;top:18px;width:16px;height:18px;border:2px solid var(--divider);border-right:0;border-radius:3px 0 0 3px}
+.dongle i{width:36px;height:36px;background:var(--surface-2);border-radius:3px}
+.overlay{position:fixed;inset:52px 0 0 0;background:rgba(8,16,33,.72);display:none;align-items:flex-start;justify-content:center;padding-top:14vh;z-index:4}
+.overlay.show{display:flex}
+.overlay .card{background:var(--surface);border:1px solid var(--divider);border-radius:8px;padding:22px 26px;max-width:460px}
+.overlay h2{margin:0 0 8px;font-size:20px}
+.overlay p{margin:0;color:var(--text-2);line-height:1.5}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:20}
+.modal.show{display:flex}
+.modal .card{background:var(--surface);border:1px solid var(--divider);border-radius:8px;padding:22px 24px;width:min(92vw,480px)}
+.modal h2{margin:0 0 10px;font-size:19px}
+.modal p{color:var(--text-2);line-height:1.5;margin:0 0 16px}
+.modal textarea{width:100%;height:160px;background:var(--bg);border:1px solid var(--divider);border-radius:5px;color:var(--text);font:12px ui-monospace,Menlo,monospace;padding:8px}
+.modal .actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
+.drop{position:fixed;inset:0;border:3px dashed var(--brand-bright);background:rgba(8,16,33,.85);display:none;align-items:center;justify-content:center;font-size:22px;font-weight:700;z-index:30;pointer-events:none}
+.drop.show{display:flex}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--surface-2);border:1px solid var(--divider);border-radius:6px;padding:10px 16px;font-size:14px;display:none;z-index:25;max-width:90vw}
+.toast.show{display:block}
+
+/* ---------- mock-only controls (NOT part of the design) ---------- */
+.mockctl{position:fixed;right:14px;bottom:14px;z-index:40;background:#2a1f3d;border:1px dashed #b58cff;border-radius:6px;padding:10px 12px;font-size:12px;color:#e3d5ff;width:240px}
+.mockctl b{display:block;margin-bottom:6px;letter-spacing:.1em}
+.mockctl label{display:block;margin:6px 0 2px;color:#bda8e6}
+.mockctl select{width:100%;background:#1b1429;border:1px solid #6b4fa0;border-radius:4px;padding:3px;font-size:12px}
+.mockctl.min .body{display:none}
+.mockctl .tg{float:right;cursor:pointer;color:#bda8e6}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wordmark">Pico Link</div>
+  <nav class="tabs" role="tablist">
+    <button class="tab" id="tab-home" role="tab" aria-selected="true">Home</button>
+    <button class="tab" id="tab-fx" role="tab" aria-selected="false">Effects</button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="mini" id="mini" title="Live from the dongle. Click for Home."><b id="miniCodec">LDAC</b><span id="miniKbps" class="num"></span>
+    <div class="mini-meter"><i id="miniL"></i><i id="miniR"></i></div></div>
+  <span class="usbchip" id="usbchip">Not connected</span>
+  <div class="cluster">
+    <span class="vol num" id="vol"></span>
+    <svg class="bt" id="bt" viewBox="0 0 14 18"><path d="M3 5l8 8-4 4V1l4 4-8 8" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <span class="dot" id="dot"></span>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- HOME: the device Home layout at browser resolution. No button rail. -->
+  <section id="page-home" class="home">
+    <div class="body">
+      <div class="devname" id="hDev"></div>
+      <div class="hero" id="hHero"></div>
+      <div class="bitrate"><span class="num" id="hKbps"></span><span class="tag" id="hAdaptive"></span></div>
+      <div class="banner" id="hBanner"></div>
+      <div class="fx" id="hFx"></div>
+    </div>
+    <div class="meter" id="meter">
+      <div class="lab">OUT</div>
+      <div class="cols"><div class="col" id="colL"></div><div class="col" id="colR"></div></div>
+      <div class="lr"><span>L</span><span>R</span></div>
+    </div>
+    <div class="faultwrap">
+      <div class="faultrule"></div>
+      <div class="faults" id="hFaults"></div>
+    </div>
+  </section>
+
+  <!-- EFFECTS: the reason the companion exists -->
+  <section id="page-fx" class="fxpage" hidden>
+    <aside class="side">
+      <div class="panel">
+        <h3><span>Effects</span><span id="slots" class="num"></span></h3>
+        <ul class="lib" id="lib"></ul>
+        <div class="libactions">
+          <button class="btn" id="bNew">New</button>
+          <button class="btn" id="bImport">Import file</button>
+          <button class="btn" id="bPaste">Paste text</button>
+        </div>
+        <div class="hint">Drop an Equalizer APO or AutoEQ .txt anywhere on this page. Effects live on the dongle and belong to no single headphone: forgetting a device never deletes one.</div>
+      </div>
+      <div class="panel">
+        <h3><span>Headphones</span></h3>
+        <ul class="devlist" id="devlist"></ul>
+      </div>
+    </aside>
+
+    <div class="edempty" id="edEmpty" hidden>No effects yet. New, or drop an AutoEQ file here.</div>
+    <div class="editor" id="editor">
+      <div class="edhead">
+        <input class="nameinput" id="edName" maxlength="32" spellcheck="false" aria-label="Effect name">
+        <span class="bytes num" id="edBytes"></span>
+        <div class="spacer"></div>
+        <button class="btn toggle" id="bBypass" aria-pressed="false" title="A/B: hear the stream without this effect (key B)">Bypass</button>
+        <button class="btn" id="bDup">Duplicate</button>
+        <button class="btn danger" id="bDel">Delete</button>
+        <button class="btn" id="bRevert" disabled>Revert</button>
+        <button class="btn primary" id="bSave" disabled>Save to device</button>
+      </div>
+      <div class="edstatus" id="edStatus"></div>
+
+      <div class="panel curvewrap"><canvas id="curve"></canvas><div class="readout num" id="readout"></div></div>
+      <div class="curvefoot">
+        <span>Drag a point: frequency + gain (Shift: fine). Scroll on it: Q. Double-click empty space: add a band. Arrows nudge, Tab cycles, Delete removes.</span>
+        <span id="preampLine" class="num"></span>
+      </div>
+
+      <div class="row2">
+        <div class="panel">
+          <h3><span>Bands</span><span id="bandCount" class="num"></span></h3>
+          <table><thead><tr><th style="padding-left:12px">#</th><th>Type</th><th style="text-align:right">Freq Hz</th><th style="text-align:right">Gain dB</th><th style="text-align:right">Q</th><th></th></tr></thead>
+            <tbody id="bands"></tbody></table>
+          <div class="libactions"><button class="btn" id="bAddBand">Add band</button></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:14px">
+          <div class="panel">
+            <h3><span>Crossfeed</span></h3>
+            <div class="box"><div class="seg3" id="xfeed"></div></div>
+            <div class="hint">Eases hard-left/right stereo on long listens.</div>
+          </div>
+          <div class="panel">
+            <h3><span>Preamp</span></h3>
+            <div class="box"><div class="seg3" id="preampMode"><button data-m="auto">Auto</button><button data-m="fixed">Fixed</button></div>
+              <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><input id="preampVal" class="num" type="number" step="0.1" max="0" min="-24" style="width:90px;background:var(--bg);border:1px solid var(--divider);border-radius:4px;padding:4px 6px;text-align:right"> <span class="bytes">dB</span></div></div>
+          </div>
+          <div class="panel">
+            <h3><span>Used by</span></h3>
+            <ul class="usedby" id="usedby"></ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ENVIRONMENT STATES (replace main content; top bar stays) -->
+  <section id="page-state" class="state" hidden></section>
+</main>
+
+<div class="overlay" id="unplugged"><div class="card"><h2>Pico Link was unplugged</h2>
+  <p>Plug it back in and this page reconnects by itself. Unsaved effect edits stay here until then.</p></div></div>
+
+<div class="modal" id="modal"><div class="card" id="modalCard"></div></div>
+<div class="drop" id="drop">Drop to import as an effect</div>
+<div class="toast" id="toast"></div>
+<input type="file" id="file" accept=".txt,text/plain" hidden>
+
+<div class="mockctl" id="mockctl"><span class="tg" id="mockTg">hide</span><b>MOCK CONTROLS</b>
+  <div class="body">
+  <label>Browser / USB state</label>
+  <select id="mEnv">
+    <option value="ok">Connected</option>
+    <option value="noperm">Not connected yet (first visit)</option>
+    <option value="cancelled">Chooser cancelled</option>
+    <option value="busy">Device busy (other tab/app)</option>
+    <option value="unplugged">Unplugged mid-session</option>
+    <option value="oldfw">Firmware too old</option>
+    <option value="nochromium">Not Chromium</option>
+  </select>
+  <label>Device state (Home)</label>
+  <select id="mScn">
+    <option value="ldac">LDAC, adaptive, FX on</option>
+    <option value="faults">LDAC with faults</option>
+    <option value="fallback">SBC fallback (needs a telemetry flag)</option>
+    <option value="muted">Muted on the Mac</option>
+    <option value="idle">Linked, no audio</option>
+    <option value="nolink">No headphones</option>
+  </select>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const CS = getComputedStyle(document.documentElement);
+const C = n => CS.getPropertyValue(n).trim();
+
+/* ================= fake device model ================= */
+let nextId = 6;
+const S = {
+  env: "ok", page: "home", scn: "ldac",
+  presets: [
+    {id:1,name:"Relaxed",exact:false,xfeed:2,preampAuto:true,preamp:0,bands:[
+      {k:"LS",f:100,g:2,q:0.7},{k:"PK",f:250,g:1,q:1.4},{k:"PK",f:3150,g:-2,q:1.4},{k:"HS",f:8000,g:-3,q:0.7}]},
+    {id:2,name:"XM5 Harman",exact:true,xfeed:0,preampAuto:false,preamp:-6.2,bands:[
+      {k:"LS",f:105,g:5.4,q:0.7},{k:"PK",f:180,g:-3.1,q:0.62},{k:"PK",f:1150,g:1.9,q:1.8},{k:"PK",f:2941,g:-2.41,q:5.9},
+      {k:"PK",f:4300,g:3.2,q:3.1},{k:"PK",f:5820,g:1.9,q:4.1},{k:"PK",f:7300,g:-2.6,q:3.5},{k:"PK",f:9800,g:1.2,q:2},{k:"HS",f:10000,g:-1.8,q:0.7}]},
+    {id:3,name:"Meetings",exact:false,xfeed:1,preampAuto:true,preamp:0,bands:[{k:"LS",f:125,g:-6,q:0.7},{k:"PK",f:2500,g:3,q:1}]},
+    {id:4,name:"Late night",exact:false,xfeed:3,preampAuto:true,preamp:0,bands:[{k:"LS",f:80,g:-4,q:0.7},{k:"HS",f:6300,g:-4,q:0.7}]},
+    {id:5,name:"HD600 Oratory",exact:true,xfeed:0,preampAuto:false,preamp:-4.1,bands:[{k:"LS",f:105,g:4,q:0.7},{k:"PK",f:3500,g:-2.2,q:2.5},{k:"HS",f:10000,g:-1,q:0.7}]},
+  ],
+  devices: [
+    {name:"Sony WH-1000XM5", connected:true, preset:2},
+    {name:"Bose QC45", connected:false, preset:1},
+    {name:"AirPods Pro", connected:false, preset:0},
+  ],
+  sel: 2, draft: null, dirty: false, bypass: false, band: 0,
+};
+const preset = id => S.presets.find(p=>p.id===id);
+const clone = o => JSON.parse(JSON.stringify(o));
+const usedBy = id => S.devices.filter(d=>d.preset===id);
+const connected = () => S.devices.find(d=>d.connected);
+const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
+const esc = s => String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ================= telemetry snapshot (fake, 20 Hz) =================
+   Shape mirrors core/src/app/telemetry.rs page 0: resolved values only. */
+const t0 = performance.now();
+function snapshot(now){
+  const sc = S.scn, dev = connected(), p = dev && preset(dev.preset);
+  const snap = {link:true, codec:"LDAC", kbps:990, adaptive:true, kbpsLive:true,
+    device: dev ? dev.name : "", fx: p ? p.name : "", volume:79, volPresent:true, muted:false,
+    levelPresent:true, peakL:0, peakR:0, faults:[]};
+  if (sc==="nolink") Object.assign(snap,{link:false,codec:"",kbps:0,levelPresent:false,fx:"",device:"",volPresent:false});
+  if (sc==="fallback") Object.assign(snap,{codec:"SBC",kbps:328,adaptive:false,fallback:true});
+  if (sc==="muted") Object.assign(snap,{muted:true});
+  if (sc==="idle") Object.assign(snap,{kbpsLive:false,levelPresent:false});
+  if (sc==="faults"){
+    const secs = (now - t0)/1000;
+    snap.faults = [
+      {name:"AIR CONGESTED", glyph:"sq", sev:"concealed", count:3, age:48, first:612, value:""},
+      {name:"BUF STARVED", glyph:"dn", sev:"audible", count:7, age:(secs % 30), first:302, value:"min fill 3 ms"},
+      {name:"ENC RESYNC", glyph:"sq", sev:"concealed", count:1, age:12, first:12, value:""},
+    ];
+  }
+  if (snap.levelPresent && !snap.muted){
+    const tt = (now - t0)/1000;
+    const beat = Math.pow(Math.max(0, Math.sin(tt*Math.PI*2*2.05)), 6);
+    const body = 0.12 + 0.05*Math.sin(tt*0.7) + 0.04*Math.random();
+    snap.peakL = Math.min(255, Math.round(255*(body + 0.3*beat + 0.03*Math.random())));
+    snap.peakR = Math.min(255, Math.round(255*(body*0.93 + 0.28*beat + 0.04*Math.random())));
+    if (S.bypass){ snap.peakL = Math.round(snap.peakL*0.8); snap.peakR = Math.round(snap.peakR*0.8); }
+  }
+  return snap;
+}
+
+/* ================= meter ballistics (recomputed in JS; ADR amendment 2) =================
+   Approximation for the mock. Real build: port core decay_peak / hold / staleness exactly. */
+const SEGS = 16, HOLD_MS = 1500, STALE_MS = 200, RELEASE_PER_MS = 0.9965;
+const M = { L:{anchor:0,at:0,hold:0,holdAt:0}, R:{anchor:0,at:0,hold:0,holdAt:0}, lastSample:-1e9 };
+function feedLevels(snap, now){
+  if (!snap.levelPresent) return;
+  M.lastSample = now;
+  for (const [ch,v] of [["L",snap.peakL],["R",snap.peakR]]){
+    const m = M[ch], cur = m.anchor * Math.pow(RELEASE_PER_MS, now - m.at);
+    if (v >= cur){ m.anchor = v; m.at = now; }
+    if (v >= m.hold || now - m.holdAt > HOLD_MS){ m.hold = Math.max(v, Math.round(m.anchor * Math.pow(RELEASE_PER_MS, now - m.at))); m.holdAt = now; }
+  }
+}
+function toSeg(v){ if (v<=0) return 0; const db = 20*Math.log10(v/255); return clamp(Math.ceil((db+48)/48*SEGS),0,SEGS); }
+function segColor(i){ return i>=14 ? C("--err") : i>=10 ? C("--warn") : C("--ok"); }
+function buildMeter(){ for (const id of ["colL","colR"]){ const c=$(id); for(let i=0;i<SEGS;i++){ const s=document.createElement("div"); s.className="seg"; c.appendChild(s);} } }
+function paintMeter(now){
+  const live = S.env==="ok" && now - M.lastSample < STALE_MS;
+  $("meter").classList.toggle("absent", !live);   // absent, never frozen, no ghost outline
+  for (const ch of ["L","R"]){
+    const m = M[ch];
+    const lvl = toSeg(m.anchor * Math.pow(RELEASE_PER_MS, Math.max(0, now - m.at)));
+    const hold = now - m.holdAt <= HOLD_MS ? toSeg(m.hold) : 0;
+    const segs = $("col"+ch).children;
+    for (let i=0;i<SEGS;i++){
+      segs[i].style.background = !live ? "transparent"
+        : (hold && i===hold-1) ? (i===SEGS-1 ? C("--err") : C("--brand-bright"))
+        : i<lvl ? segColor(i) : C("--divider");
+    }
+    const mini = $("mini"+ch);
+    mini.style.height = live ? Math.max(2, lvl/SEGS*26)+"px" : "0px";
+    mini.style.background = lvl>14 ? C("--err") : lvl>10 ? C("--warn") : C("--ok");
+  }
+}
+
+/* ================= HOME render ================= */
+const GLYPH = {
+  up:f=>`<svg width="14" height="14" viewBox="0 0 14 14"><path d="M7 2 L13 12 L1 12 Z" ${f?'fill="currentColor"':'fill="none" stroke="currentColor" stroke-width="1.6"'}/></svg>`,
+  dn:f=>`<svg width="14" height="14" viewBox="0 0 14 14"><path d="M1 2 L13 2 L7 12 Z" ${f?'fill="currentColor"':'fill="none" stroke="currentColor" stroke-width="1.6"'}/></svg>`,
+  sq:f=>`<svg width="14" height="14" viewBox="0 0 14 14"><rect x="3" y="3" width="8" height="8" ${f?'fill="currentColor"':'fill="none" stroke="currentColor" stroke-width="1.6"'}/></svg>`,
+};
+function ago(s){ s=Math.round(s); return s<60 ? s+" s ago" : Math.round(s/60)+" min ago"; }
+let homeKey = "";
+function renderHome(snap){
+  $("hDev").textContent = snap.link ? snap.device : "";
+  const hero = $("hHero");
+  hero.className = "hero" + (!snap.link ? " nolink" : snap.fallback ? " fallback" : "");
+  hero.textContent = snap.link ? snap.codec : "NO LINK";
+  $("hKbps").textContent = !snap.link ? "" : snap.kbpsLive ? snap.kbps+" kbps" : "idle";
+  $("hAdaptive").textContent = snap.link && snap.adaptive ? "Adaptive" : "";
+  $("hBanner").textContent = snap.muted ? "MUTED Unmute on Mac" : snap.fallback ? "Headphones don't support LDAC" : "";
+  const fxHtml = snap.link && snap.fx ? `FX <a title="Edit this effect">${esc(snap.fx)}</a>` : "";
+  if ($("hFx").dataset.k !== fxHtml){ $("hFx").innerHTML = fxHtml; $("hFx").dataset.k = fxHtml;
+    const a=$("hFx").querySelector("a"); if (a) a.onclick = ()=>{ const d=connected(); if(d && d.preset) S.sel=d.preset; S.draft=null; go("fx"); }; }
+  // fault strip: first-seen at the bottom, growing upward, retired after 120 s, Live 0-20 s filled
+  const rows = snap.faults.filter(f=>f.age<=120).sort((a,b)=>b.first-a.first).slice(0,4);
+  const html = rows.map(f=>{ const live = f.age <= 20;
+    return `<div class="frow ${f.sev} ${live?"":"recent"}" title="First seen ${ago(f.first)}">${GLYPH[f.glyph](live)}<span>${f.name}</span>`
+      + `<span class="meta num">${f.value ? f.value+" · " : ""}${ago(f.age)}</span><span class="cnt num">${f.count>1 ? "x"+(f.count>99?"99+":f.count) : ""}</span></div>`; }).join("");
+  if (html !== homeKey){ $("hFaults").innerHTML = html; homeKey = html; }
+}
+
+/* title bar mirror (volume, link glyph, dot) + the mini live strip on non-Home pages */
+function renderChrome(snap){
+  const on = S.env==="ok";
+  $("usbchip").textContent = on ? "Pico Link · USB" : S.env==="unplugged" ? "Unplugged" : "Not connected";
+  $("usbchip").classList.toggle("on", on);
+  const v = $("vol");
+  if (!on || !snap.volPresent) v.textContent = "";
+  else if (snap.muted || snap.volume===0){ v.textContent = "MUTE"; v.className = "vol num warn"; }
+  else { v.textContent = Math.round((snap.volume*100+63)/127)+"%"; v.className = "vol num"; }
+  $("bt").style.color = on && snap.link ? C("--brand-bright") : C("--text-2");
+  $("dot").classList.toggle("on", on && snap.link);
+  $("mini").classList.toggle("show", on && S.page!=="home");
+  $("miniCodec").textContent = snap.link ? snap.codec : "NO LINK";
+  $("miniCodec").style.color = !snap.link ? C("--err") : snap.fallback ? C("--warn") : "";
+  $("miniKbps").textContent = snap.link ? (snap.kbpsLive ? snap.kbps+" kbps" : "idle") : "";
+}
+$("mini").onclick = ()=>go("home");
+
+/* ================= EQ math: RBJ biquads at 48 kHz ================= */
+const FS = 48000;
+function coeffs(b){
+  const A = Math.pow(10, b.g/40), w = 2*Math.PI*b.f/FS, cw = Math.cos(w), sw = Math.sin(w), al = sw/(2*b.q);
+  let b0,b1,b2,a0,a1,a2;
+  if (b.k==="PK"){ b0=1+al*A; b1=-2*cw; b2=1-al*A; a0=1+al/A; a1=-2*cw; a2=1-al/A; }
+  else { const s = 2*Math.sqrt(A)*al;
+    if (b.k==="LS"){ b0=A*((A+1)-(A-1)*cw+s); b1=2*A*((A-1)-(A+1)*cw); b2=A*((A+1)-(A-1)*cw-s); a0=(A+1)+(A-1)*cw+s; a1=-2*((A-1)+(A+1)*cw); a2=(A+1)+(A-1)*cw-s; }
+    else { b0=A*((A+1)+(A-1)*cw+s); b1=-2*A*((A-1)+(A+1)*cw); b2=A*((A+1)+(A-1)*cw-s); a0=(A+1)-(A-1)*cw+s; a1=2*((A-1)-(A+1)*cw); a2=(A+1)-(A-1)*cw-s; } }
+  return [b0/a0,b1/a0,b2/a0,a1/a0,a2/a0];
+}
+function magDb(c, f){
+  const w = 2*Math.PI*f/FS, c1=Math.cos(w), s1=Math.sin(w), c2=Math.cos(2*w), s2=Math.sin(2*w);
+  const nr=c[0]+c[1]*c1+c[2]*c2, ni=-(c[1]*s1+c[2]*s2), dr=1+c[3]*c1+c[4]*c2, di=-(c[3]*s1+c[4]*s2);
+  return 10*Math.log10((nr*nr+ni*ni)/(dr*dr+di*di));
+}
+function response(bands, f){ let s=0; for (const b of bands) if (Math.abs(b.g)>0.001) s+=magDb(coeffs(b),f); return s; }
+function peakBoost(bands){ let m=0; for(let i=0;i<=200;i++){ m=Math.max(m,response(bands,20*Math.pow(1000,i/200))); } return m; }
+function effPreamp(p){ return p.preampAuto ? clamp(-peakBoost(p.bands),-12,0) : p.preamp; }
+
+/* ================= EFFECTS render ================= */
+const XF = ["Off","Light","Medium","Strong"];
+const LOCK = `<svg class="lock" viewBox="0 0 9 11"><rect x="0.5" y="4.5" width="8" height="6" rx="1" fill="currentColor"/><path d="M2 4.5V3a2.5 2.5 0 0 1 5 0v1.5" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>`;
+const byteLen = s => new TextEncoder().encode(s).length;
+function ensureDraft(){
+  if (!S.presets.length) { S.draft=null; return false; }
+  if (!preset(S.sel)) S.sel = S.presets[0].id;
+  if (!S.draft || S.draft.id!==S.sel){ S.draft = clone(preset(S.sel)); S.dirty=false; S.bypass=false; S.band=0; }
+  return true;
+}
+
+function renderLib(){
+  const cur = connected();
+  $("slots").textContent = S.presets.length+" of 8";
+  $("lib").innerHTML = S.presets.map(p=>{
+    const n = usedBy(p.id).length, playing = cur && cur.preset===p.id;
+    const nm = p.id===S.sel && S.draft ? S.draft.name : p.name;
+    return `<li data-id="${p.id}" class="${p.id===S.sel?"sel":""}"><span class="acc"></span>
+      <span class="chk" title="${playing?"Playing on "+esc(cur.name):""}">${playing?"✓":""}</span>
+      <span class="nm">${esc(nm)}${p.exact?`<span title="Exact values: its band rows are read-only on the device; crossfeed stays editable there">${LOCK}</span>`:""}${p.id===S.sel&&S.dirty?' <span class="dirty">•</span>':""}</span>
+      <span class="ct">${n===0?"unused":n===1?"1 device":n+" devices"}</span></li>`; }).join("");
+  $("lib").querySelectorAll("li").forEach(li=>li.onclick=()=>selectPreset(+li.dataset.id));
+  const full = S.presets.length>=8;
+  for (const id of ["bNew","bImport","bPaste","bDup"]){ $(id).disabled = full; $(id).title = full ? "8 of 8 effects: delete one first" : ""; }
+  $("devlist").innerHTML = S.devices.map((d,i)=>`<li><span class="dot ${d.connected?"on":""}"></span><span class="dn">${esc(d.name)}${d.connected?' <small style="color:var(--text-2)">connected</small>':""}</span>
+    <select data-i="${i}" aria-label="Effect for ${esc(d.name)}"><option value="0">Off</option>${S.presets.map(p=>`<option value="${p.id}" ${d.preset===p.id?"selected":""}>${esc(p.name)}</option>`).join("")}</select></li>`).join("");
+  $("devlist").querySelectorAll("select").forEach(s=>s.onchange=()=>{ S.devices[+s.dataset.i].preset=+s.value; toast("Assigned on the dongle."); renderFx(); });
+}
+
+function selectPreset(id){
+  if (S.dirty && id!==S.sel) return confirmModal("Unsaved changes", `Save "${esc(S.draft.name)}" before opening another effect?`,
+    [["Discard",()=>{ S.dirty=false; S.draft=null; S.sel=id; renderFx(); }],["Save",()=>{ save(); S.sel=id; S.draft=null; renderFx(); },"primary"]]);
+  S.sel=id; S.draft=null; renderFx();
+}
+
+function renderFx(){
+  const has = ensureDraft(); renderLib();
+  $("editor").hidden = !has; $("edEmpty").hidden = has;
+  if (!has) return;
+  const d = S.draft, cur = connected();
+  $("edName").value = d.name;
+  nameState();
+  $("bRevert").disabled = !S.dirty;
+  $("bBypass").setAttribute("aria-pressed", S.bypass); $("bBypass").textContent = S.bypass ? "Bypassed" : "Bypass";
+  const st = [];
+  if (cur) st.push(S.dirty ? `Previewing on <b style="color:var(--text)">${esc(cur.name)}</b>` : cur.preset===d.id ? `Playing on ${esc(cur.name)}` : `Opening an effect previews it on ${esc(cur.name)}`);
+  else st.push("No headphones connected: you are editing silently");
+  if (S.bypass) st.push(`<span class="warn">Bypassed: hearing the stream without this effect</span>`);
+  if (S.dirty) st.push(`<span class="dirty">Unsaved</span><span>Saving writes flash; audio may hiccup for a moment.</span>`);
+  if (!d.exact) st.push(`Made on the device. Saving here stores exact values, so its band rows become read-only on the device.`);
+  $("edStatus").innerHTML = st.join("");
+  $("bandCount").textContent = d.bands.length+" of 10";
+  $("bAddBand").disabled = d.bands.length>=10;
+  $("bands").innerHTML = d.bands.map((b,i)=>`<tr class="${i===S.band?"bsel":""}" data-i="${i}">
+    <td class="idx">${i+1}</td>
+    <td><select data-k="k"><option value="PK" ${b.k==="PK"?"selected":""}>Peak</option><option value="LS" ${b.k==="LS"?"selected":""}>Low shelf</option><option value="HS" ${b.k==="HS"?"selected":""}>High shelf</option></select></td>
+    <td><input data-k="f" type="number" min="20" max="20000" step="1" value="${fmtF(b.f)}"></td>
+    <td><input data-k="g" type="number" min="-24" max="24" step="0.1" value="${b.g.toFixed(2)}"></td>
+    <td><input data-k="q" type="number" min="0.1" max="20" step="0.05" value="${b.q.toFixed(2)}"></td>
+    <td class="x"><button title="Remove band">×</button></td></tr>`).join("");
+  $("bands").querySelectorAll("tr").forEach(tr=>{
+    const i=+tr.dataset.i;
+    tr.onclick=()=>{ if(S.band!==i){ S.band=i; markBandSel(); drawCurve(); } };
+    tr.querySelectorAll("[data-k]").forEach(inp=>inp.onchange=()=>{ const k=inp.dataset.k, b=d.bands[i];
+      if (k==="k") b.k=inp.value; else { const v=parseFloat(inp.value); if (isNaN(v)) return;
+        b[k] = k==="f" ? clamp(v,20,20000) : k==="g" ? clamp(v,-24,24) : clamp(v,0.1,20); }
+      touch(); });
+    tr.querySelector(".x button").onclick=e=>{ e.stopPropagation(); d.bands.splice(i,1); S.band=clamp(S.band,0,d.bands.length-1); touch(); };
+  });
+  $("xfeed").innerHTML = XF.map((n,i)=>`<button aria-pressed="${d.xfeed===i}" data-i="${i}">${n}</button>`).join("");
+  $("xfeed").querySelectorAll("button").forEach(b=>b.onclick=()=>{ d.xfeed=+b.dataset.i; touch(); });
+  $("preampMode").querySelectorAll("button").forEach(b=>{ b.setAttribute("aria-pressed", (b.dataset.m==="auto")===d.preampAuto);
+    b.onclick=()=>{ const auto=b.dataset.m==="auto"; if(!auto && d.preampAuto) d.preamp=+effPreamp(d).toFixed(1); d.preampAuto=auto; touch(); }; });
+  $("preampVal").value = effPreamp(d).toFixed(1); $("preampVal").disabled = d.preampAuto;
+  $("usedby").innerHTML = S.devices.map((dv,i)=>{ const other = dv.preset && dv.preset!==d.id ? preset(dv.preset) : null;
+    return `<li><input type="checkbox" data-i="${i}" ${dv.preset===d.id?"checked":""}><span>${esc(dv.name)}${other?` <small>(now ${esc(other.name)})</small>`:""}</span></li>`; }).join("");
+  $("usedby").querySelectorAll("input").forEach(cb=>cb.onchange=()=>{ S.devices[+cb.dataset.i].preset = cb.checked ? d.id : 0; toast(cb.checked?"Assigned on the dongle.":"Set to Off."); renderFx(); });
+  drawCurve();
+}
+$("preampVal").onchange = ()=>{ const v=parseFloat($("preampVal").value); if(!isNaN(v)){ S.draft.preamp=clamp(v,-24,0); touch(); } };
+function nameState(){
+  const d=S.draft, n=byteLen(d.name), dup = S.presets.some(p=>p.id!==d.id && p.name===d.name.trim());
+  $("edBytes").textContent = dup ? "name taken" : n+" / 16"; $("edBytes").style.color = (n>16||dup) ? C("--err") : "";
+  $("bSave").disabled = !S.dirty || n>16 || dup || !d.name.trim();
+}
+function markBandSel(){ $("bands").querySelectorAll("tr").forEach(tr=>tr.classList.toggle("bsel", +tr.dataset.i===S.band)); }
+function fmtF(f){ return f<100 ? f.toFixed(1).replace(/\.0$/,"") : Math.round(f); }
+function fmtHz(f){ return f>=1000 ? (f/1000).toFixed(2).replace(/\.?0+$/,"")+" kHz" : Math.round(f)+" Hz"; }
+function touch(soft){ S.dirty=true; S.bypass=false; if (soft){ drawCurve(); syncRow(); nameState(); $("bRevert").disabled=false; } else renderFx(); }
+function syncRow(){ const tr=$("bands").querySelector(`tr[data-i="${S.band}"]`); if(!tr) return; const b=S.draft.bands[S.band];
+  tr.querySelector('[data-k=f]').value=fmtF(b.f); tr.querySelector('[data-k=g]').value=b.g.toFixed(2); tr.querySelector('[data-k=q]').value=b.q.toFixed(2);
+  $("preampVal").value = effPreamp(S.draft).toFixed(1); }
+
+/* ---------- curve canvas ---------- */
+const cv = $("curve"), ctx = cv.getContext("2d");
+const DBR = 15, PAD = {l:40,r:14,t:14,b:24};
+function geom(){ const r=cv.getBoundingClientRect(); return {w:r.width,h:r.height}; }
+const fx2x = (f,g) => PAD.l + (Math.log10(f/20)/3)*(g.w-PAD.l-PAD.r);
+const x2f = (x,g) => 20*Math.pow(1000, clamp((x-PAD.l)/(g.w-PAD.l-PAD.r),0,1));
+const db2y = (d,g) => PAD.t + (1-(d+DBR)/(2*DBR))*(g.h-PAD.t-PAD.b);
+const y2db = (y,g) => (1-(y-PAD.t)/(g.h-PAD.t-PAD.b))*2*DBR-DBR;
+function drawCurve(){
+  if (!S.draft || $("page-fx").hidden) return;
+  const dpr = devicePixelRatio||1, g = geom(), font = C("--font");
+  cv.width = Math.round(g.w*dpr); cv.height = Math.round(g.h*dpr); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,g.w,g.h); ctx.font = "11px "+font; ctx.textBaseline="middle"; ctx.lineWidth=1;
+  for (const f of [20,50,100,200,500,1000,2000,5000,10000,20000]){ const x=Math.round(fx2x(f,g))+.5;
+    ctx.strokeStyle=C("--divider"); ctx.beginPath(); ctx.moveTo(x,PAD.t); ctx.lineTo(x,g.h-PAD.b); ctx.stroke();
+    ctx.fillStyle=C("--text-2"); ctx.textAlign="center"; ctx.fillText(f>=1000?(f/1000)+"k":f, x, g.h-PAD.b+12); }
+  for (let d=-DBR; d<=DBR; d+=5){ const y=Math.round(db2y(d,g))+.5;
+    ctx.strokeStyle = d===0 ? "#3a4a70" : C("--divider"); ctx.beginPath(); ctx.moveTo(PAD.l,y); ctx.lineTo(g.w-PAD.r,y); ctx.stroke();
+    ctx.fillStyle=C("--text-2"); ctx.textAlign="right"; ctx.fillText((d>0?"+":"")+d, PAD.l-8, y); }
+  const d = S.draft, N = 360, sb = d.bands[S.band];
+  if (sb){ const c=coeffs(sb); ctx.beginPath(); ctx.moveTo(fx2x(20,g), db2y(0,g));
+    for (let i=0;i<=N;i++){ const f=20*Math.pow(1000,i/N); ctx.lineTo(fx2x(f,g), db2y(clamp(magDb(c,f),-DBR,DBR),g)); }
+    ctx.lineTo(fx2x(20000,g), db2y(0,g)); ctx.closePath(); ctx.fillStyle="rgba(58,130,247,.16)"; ctx.fill(); }
+  ctx.beginPath(); let mx=0;
+  for (let i=0;i<=N;i++){ const f=20*Math.pow(1000,i/N), r=response(d.bands,f); mx=Math.max(mx,r); const x=fx2x(f,g), y=db2y(clamp(r,-DBR,DBR),g); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }
+  ctx.strokeStyle = S.bypass ? C("--text-2") : C("--brand-bright"); ctx.lineWidth=2.5; ctx.setLineDash(S.bypass?[6,5]:[]); ctx.stroke(); ctx.setLineDash([]);
+  d.bands.forEach((b,i)=>{ const x=fx2x(b.f,g), y=db2y(clamp(b.g,-DBR,DBR),g), sel=i===S.band;
+    ctx.beginPath(); ctx.arc(x,y,sel?11:9,0,Math.PI*2); ctx.fillStyle = sel ? C("--brand-bright") : C("--surface-2"); ctx.fill();
+    ctx.lineWidth=2; ctx.strokeStyle = sel ? C("--text") : C("--brand-bright"); ctx.stroke();
+    ctx.fillStyle=C("--text"); ctx.textAlign="center"; ctx.font="bold 11px "+font; ctx.fillText(i+1, x, y+.5); ctx.font="11px "+font; });
+  const pre = effPreamp(d), over = mx + pre;
+  $("preampLine").innerHTML = `Peak boost +${mx.toFixed(1)} dB · preamp ${pre.toFixed(1)} dB${d.preampAuto?" (auto)":""}`
+    + (over>0.05 ? ` · <span style="color:var(--warn);font-weight:700">+${over.toFixed(1)} dB over 0: may clip on loud tracks</span>` : "");
+}
+let drag = null;
+function hit(x,y){ const g=geom(); let best=-1, bd=16; S.draft.bands.forEach((b,i)=>{ const dd=Math.hypot(fx2x(b.f,g)-x, db2y(clamp(b.g,-DBR,DBR),g)-y); if(dd<bd){ bd=dd; best=i; } }); return best; }
+function local(e){ const r=cv.getBoundingClientRect(); return [e.clientX-r.left, e.clientY-r.top]; }
+cv.addEventListener("pointerdown", e=>{ const [x,y]=local(e), i=hit(x,y); if(i<0) return; S.band=i; markBandSel();
+  const b=S.draft.bands[i]; drag={i, x0:x, y0:y, f0:b.f, g0:b.g}; cv.setPointerCapture(e.pointerId); drawCurve(); });
+cv.addEventListener("pointermove", e=>{ const [x,y]=local(e), g=geom(), ro=$("readout");
+  if (drag){ const b=S.draft.bands[drag.i], k=e.shiftKey?0.2:1;
+    const f = clamp(x2f(fx2x(drag.f0,g)+(x-drag.x0)*k, g), 20, 20000); b.f = f<100 ? Math.round(f*10)/10 : Math.round(f);
+    b.g = Math.round(clamp(drag.g0 + (y2db(drag.y0+(y-drag.y0)*k,g)-y2db(drag.y0,g)), -DBR, DBR)*10)/10;
+    touch(true); }
+  const i = drag ? drag.i : hit(x,y);
+  cv.style.cursor = i>=0 ? (drag?"grabbing":"grab") : "crosshair";
+  const f = i>=0 ? S.draft.bands[i].f : x2f(x,g), db = i>=0 ? S.draft.bands[i].g : response(S.draft.bands, f);
+  ro.style.display="block"; ro.style.left=Math.min(x+14, g.w-190)+"px"; ro.style.top=Math.max(4,y-30)+"px";
+  ro.textContent = (i>=0 ? `${i+1} · ` : "") + `${fmtHz(f)} · ${db>0?"+":""}${db.toFixed(1)} dB` + (i>=0 ? ` · Q ${S.draft.bands[i].q.toFixed(2)}` : ""); });
+cv.addEventListener("pointerup", ()=>{ if (drag){ drag=null; renderFx(); } });
+cv.addEventListener("pointerleave", ()=>{ $("readout").style.display="none"; });
+cv.addEventListener("wheel", e=>{ const [x,y]=local(e); let i=hit(x,y); if(i<0) i=S.band; const b=S.draft.bands[i]; if(!b) return; e.preventDefault();
+  b.q = Math.round(clamp(b.q * Math.pow(e.shiftKey?1.02:1.1, e.deltaY<0?1:-1), 0.1, 20)*100)/100; S.band=i; markBandSel(); touch(true); }, {passive:false});
+cv.addEventListener("dblclick", e=>{ const [x,y]=local(e), g=geom(); if (hit(x,y)>=0 || S.draft.bands.length>=10) return;
+  S.draft.bands.push({k:"PK", f:Math.round(x2f(x,g)), g:Math.round(y2db(y,g)*10)/10, q:1.41}); S.band=S.draft.bands.length-1; touch(); });
+document.addEventListener("keydown", e=>{
+  if (S.page!=="fx" || S.env!=="ok" || !S.draft || $("modal").classList.contains("show") || /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
+  const b = S.draft.bands[S.band], oct = e.shiftKey ? 1/3 : 1/12;
+  if (e.key==="b"||e.key==="B"){ S.bypass=!S.bypass; renderFx(); return; }
+  if (!b) return;
+  if (e.key==="ArrowLeft") b.f=clamp(b.f*Math.pow(2,-oct),20,20000);
+  else if (e.key==="ArrowRight") b.f=clamp(b.f*Math.pow(2,oct),20,20000);
+  else if (e.key==="ArrowUp") b.g=clamp(Math.round((b.g+(e.shiftKey?1:0.1))*10)/10,-DBR,DBR);
+  else if (e.key==="ArrowDown") b.g=clamp(Math.round((b.g-(e.shiftKey?1:0.1))*10)/10,-DBR,DBR);
+  else if (e.key==="Delete"||e.key==="Backspace"){ e.preventDefault(); S.draft.bands.splice(S.band,1); S.band=Math.max(0,S.band-1); touch(); return; }
+  else if (e.key==="Tab"){ e.preventDefault(); S.band=(S.band+(e.shiftKey?-1:1)+S.draft.bands.length)%S.draft.bands.length; renderFx(); return; }
+  else return;
+  e.preventDefault(); b.f = b.f<100 ? Math.round(b.f*10)/10 : Math.round(b.f); touch(true);
+});
+
+/* ---------- editor actions ---------- */
+$("edName").oninput = ()=>{ S.draft.name=$("edName").value; S.dirty=true; $("bRevert").disabled=false; nameState(); };
+$("edName").onchange = ()=>renderFx();
+$("bBypass").onclick = ()=>{ S.bypass=!S.bypass; renderFx(); };
+$("bRevert").onclick = ()=>{ S.draft=null; renderFx(); };
+$("bSave").onclick = save;
+function save(){ const d=S.draft; if(!d) return; d.exact=true; d.name=d.name.trim();
+  const i=S.presets.findIndex(p=>p.id===d.id); S.presets[i]=clone(d); S.dirty=false; toast(`Saved "${d.name}" on the dongle`); renderFx(); }
+$("bDel").onclick = ()=>{ const d=S.draft, us=usedBy(d.id);
+  confirmModal(`Delete "${esc(d.name)}"?`, us.length ? `${us.map(x=>esc(x.name)).join(" and ")} will play without effects (Off). This cannot be undone.` : "No headphones use it. This cannot be undone.",
+    [["Cancel",null],["Delete",()=>{ S.presets=S.presets.filter(p=>p.id!==d.id); S.devices.forEach(x=>{ if(x.preset===d.id) x.preset=0; }); S.draft=null; S.dirty=false; renderFx(); },"danger"]]); };
+$("bDup").onclick = ()=>{ const d=clone(S.draft); d.id=nextId++; d.name=uniqueName(d.name.slice(0,13)+" 2"); d.exact=true; S.presets.push(d); S.sel=d.id; S.draft=null; S.dirty=false; renderFx(); toast("Duplicated. Tweak it without touching the original."); };
+$("bNew").onclick = ()=>{ const p={id:nextId++, name:uniqueName("Effect 1"), exact:true, xfeed:0, preampAuto:true, preamp:0,
+  bands:[{k:"LS",f:100,g:0,q:0.7},{k:"PK",f:250,g:0,q:1.41},{k:"PK",f:1000,g:0,q:1.41},{k:"PK",f:4000,g:0,q:1.41},{k:"HS",f:8000,g:0,q:0.7}]};
+  S.presets.push(p); S.sel=p.id; S.draft=null; renderFx(); };
+$("bAddBand").onclick = ()=>{ S.draft.bands.push({k:"PK",f:1000,g:0,q:1.41}); S.band=S.draft.bands.length-1; touch(); };
+function uniqueName(base){ let n=base, k=2; const stem=base.replace(/ \d+$/,""); while (S.presets.some(p=>p.name===n)) n = stem+" "+k++; return n; }
+
+/* ---------- import (Equalizer APO / AutoEQ text) ---------- */
+function parseApo(text){
+  const out={preamp:null,bands:[]};
+  for (const line of text.split(/\r?\n/)){
+    const pm = line.match(/^\s*Preamp:\s*(-?[\d.]+)\s*dB/i); if (pm){ out.preamp=parseFloat(pm[1]); continue; }
+    const fm = line.match(/^\s*Filter\s*\d*:\s*ON\s+(PK|LSC?|HSC?)\s+Fc\s+([\d.]+)\s*Hz\s+Gain\s+(-?[\d.]+)\s*dB(?:\s+Q\s+([\d.]+))?/i);
+    if (fm){ const t=fm[1].toUpperCase(); out.bands.push({k:t[0]==="L"?"LS":t[0]==="H"?"HS":"PK", f:+fm[2], g:+fm[3], q:fm[4]?+fm[4]:0.71}); }
+  }
+  return out;
+}
+function importText(text, name){
+  const r = parseApo(text);
+  if (!r.bands.length) return toast("No filters found. Expected lines like: Filter 1: ON PK Fc 105 Hz Gain 5.4 dB Q 0.70");
+  if (r.bands.length>10) return toast(`${r.bands.length} filters: the dongle holds 10. Trim the file and try again.`);
+  let base = (name||"Imported").replace(/\.txt$/i,"").replace(/ ParametricEQ$/i,"");
+  while (byteLen(base)>16) base = base.slice(0,-1);
+  const same = S.presets.find(p=>p.name===base && p.exact);
+  const make = (id,nm)=>({id, name:nm, exact:true, xfeed:0, preampAuto:r.preamp===null, preamp:r.preamp||0, bands:r.bands});
+  if (same) return confirmModal(`Replace "${esc(base)}"?`, "An imported effect with this name exists. Replacing keeps its place, its crossfeed and every headphone that uses it.",
+    [["Import as copy",()=>{ if (S.presets.length>=8) return toast("8 of 8 effects: delete one first"); addImported(make(nextId++, uniqueName(base.slice(0,14)+" 2"))); }],
+     ["Replace",()=>{ const p=make(same.id,base); p.xfeed=same.xfeed; S.presets[S.presets.indexOf(same)]=p; S.sel=p.id; S.draft=null; if (S.page!=="fx") go("fx"); else renderFx(); toast(`Replaced "${base}" on the dongle`); },"primary"]]);
+  if (S.presets.length>=8) return toast("8 of 8 effects: delete one first");
+  addImported(make(nextId++, uniqueName(base)));
+}
+function addImported(p){ S.presets.push(p); S.sel=p.id; S.draft=null; S.dirty=false; if (S.page!=="fx") go("fx"); else renderFx(); toast(`Imported "${p.name}" (${p.bands.length} bands) on the dongle. Tick a headphone under Used by.`); }
+$("bImport").onclick = ()=>$("file").click();
+$("file").onchange = async ()=>{ const f=$("file").files[0]; if (f) importText(await f.text(), f.name); $("file").value=""; };
+$("bPaste").onclick = ()=>{ $("modalCard").innerHTML = `<h2>Paste Equalizer APO / AutoEQ text</h2><p>A ParametricEQ.txt: one Preamp line and up to 10 Filter lines.</p>
+  <textarea id="pasteTa" placeholder="Preamp: -6.2 dB&#10;Filter 1: ON LSC Fc 105 Hz Gain 5.4 dB Q 0.70&#10;Filter 2: ON PK Fc 180 Hz Gain -3.1 dB Q 0.62"></textarea>
+  <div class="actions"><button class="btn" id="pc">Cancel</button><button class="btn primary" id="pi">Import</button></div>`; $("modal").classList.add("show");
+  $("pc").onclick=closeModal; $("pi").onclick=()=>{ const t=$("pasteTa").value; closeModal(); importText(t, "Pasted"); }; };
+let dragDepth=0;
+addEventListener("dragenter", e=>{ if (S.env!=="ok") return; e.preventDefault(); dragDepth++; $("drop").classList.add("show"); });
+addEventListener("dragleave", ()=>{ if (--dragDepth<=0){ dragDepth=0; $("drop").classList.remove("show"); } });
+addEventListener("dragover", e=>e.preventDefault());
+addEventListener("drop", async e=>{ e.preventDefault(); dragDepth=0; $("drop").classList.remove("show"); const f=e.dataTransfer.files[0]; if (f && S.env==="ok") importText(await f.text(), f.name); });
+
+/* ---------- modal / toast ---------- */
+function confirmModal(title, body, buttons){
+  $("modalCard").innerHTML = `<h2>${title}</h2><p>${body}</p><div class="actions">${buttons.map((b,i)=>`<button class="btn ${b[2]||""}" data-i="${i}">${b[0]}</button>`).join("")}</div>`;
+  $("modal").classList.add("show");
+  $("modalCard").querySelectorAll("button").forEach(bt=>bt.onclick=()=>{ closeModal(); const fn=buttons[+bt.dataset.i][1]; if (fn) fn(); });
+}
+function closeModal(){ $("modal").classList.remove("show"); }
+let toastT; function toast(m){ const t=$("toast"); t.textContent=m; t.classList.add("show"); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("show"),3500); }
+
+/* ================= environment states ================= */
+const DONGLE = `<div class="dongle"><i></i></div>`;
+function connectState(note){ return `${DONGLE}<h1>Connect your Pico Link</h1>
+  <p>Plug it in, then pick <b style="color:var(--text)">Pico Link</b> in the list your browser shows. Once per computer; after that this page connects by itself.</p>
+  ${note ? `<div class="note">${note}</div>` : ""}
+  <div class="actions"><button class="btn primary" id="connectBtn">Connect</button></div>
+  <p style="margin-top:22px;font-size:13px">Audio keeps playing while this page is open. It reads status and writes effects, nothing else.</p>`; }
+const STATES = {
+  nochromium: ()=>`${DONGLE}<h1>This page needs Chrome or Edge</h1>
+    <p>The companion talks to Pico Link over WebUSB, which only Chromium browsers on a computer support: Chrome, Edge, Opera, Brave.</p>
+    <p class="strong">Your dongle does not need this page. Pairing, switching headphones, codec and effects all work from its own screen.</p>`,
+  noperm: ()=>connectState(""),
+  cancelled: ()=>connectState("No device was chosen. Is it plugged in? It shows up as Pico Link."),
+  busy: ()=>`${DONGLE}<h1>Pico Link is open somewhere else</h1>
+    <p>Another tab or app is already talking to it. Close the companion there, then retry. One page at a time.</p>
+    <div class="actions"><button class="btn primary" id="connectBtn">Retry</button></div>`,
+  oldfw: ()=>`${DONGLE}<h1>Firmware update needed</h1>
+    <p>This Pico Link speaks an older protocol than this page. Everything on the device still works; only the companion needs newer firmware.</p>`,
+};
+
+/* ================= page switching ================= */
+function go(p){ S.page=p; render(); }
+$("tab-home").onclick=()=>go("home"); $("tab-fx").onclick=()=>go("fx");
+function render(){
+  const envOk = S.env==="ok" || S.env==="unplugged";
+  $("page-state").hidden = envOk;
+  $("page-home").hidden = !envOk || S.page!=="home";
+  $("page-fx").hidden = !envOk || S.page!=="fx";
+  $("tab-home").setAttribute("aria-selected", S.page==="home"); $("tab-fx").setAttribute("aria-selected", S.page==="fx");
+  $("tab-home").disabled = $("tab-fx").disabled = !envOk;
+  $("unplugged").classList.toggle("show", S.env==="unplugged");
+  if (!envOk){ $("page-state").innerHTML = STATES[S.env](); const cb=$("connectBtn"); if (cb) cb.onclick=()=>{ $("mEnv").value="ok"; S.env="ok"; render(); }; }
+  if (envOk && S.page==="fx") renderFx();
+}
+$("mEnv").onchange=()=>{ S.env=$("mEnv").value; render(); };
+$("mScn").onchange=()=>{ S.scn=$("mScn").value; };
+$("mockTg").onclick=()=>{ $("mockctl").classList.toggle("min"); $("mockTg").textContent=$("mockctl").classList.contains("min")?"show":"hide"; };
+addEventListener("resize", drawCurve);
+addEventListener("beforeunload", e=>{ if (S.dirty){ e.preventDefault(); e.returnValue=""; } });
+
+/* ================= loops ================= */
+let lastSnap = snapshot(performance.now());
+setInterval(()=>{ if (S.env!=="ok") return; const now=performance.now(); lastSnap=snapshot(now); feedLevels(lastSnap, now); renderHome(lastSnap); }, 50);
+function frame(){ const now = performance.now(); /* one clock for feed and paint */ renderChrome(S.env==="ok" ? lastSnap : {link:false,volPresent:false}); paintMeter(now); requestAnimationFrame(frame); }
+buildMeter(); renderHome(lastSnap); render(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
