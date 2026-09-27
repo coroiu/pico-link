@@ -1,5 +1,5 @@
 import { TransportError } from "./types";
-import type { Transport } from "./types";
+import type { Transport, Unsubscribe } from "./types";
 
 /**
  * One recorded reply from `tools/usb-console`'s pyusb poller
@@ -48,8 +48,11 @@ export class ReplayTransport implements Transport {
     // Nothing to release; the capture is just an in-memory array.
   }
 
-  onDisconnect(cb: () => void): void {
+  onDisconnect(cb: () => void): Unsubscribe {
     this.disconnectCbs.push(cb);
+    return () => {
+      this.disconnectCbs = this.disconnectCbs.filter((registered) => registered !== cb);
+    };
   }
 
   /** Test/dev-page hook: fires the registered disconnect callbacks. */

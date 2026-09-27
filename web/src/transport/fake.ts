@@ -3,7 +3,7 @@ import type { HomeSnapshot } from "../proto/telemetry";
 import { encodeDeviceInfoForTest } from "../proto/info";
 import type { DeviceInfo } from "../proto/info";
 import { PL_CFG_REQ_GET_INFO, PL_CFG_REQ_GET_TELEMETRY, TransportError } from "./types";
-import type { Transport } from "./types";
+import type { Transport, Unsubscribe } from "./types";
 
 const DEFAULT_INFO: DeviceInfo = {
   infoVer: 1,
@@ -48,8 +48,11 @@ export class FakeTransport implements Transport {
     this.opened = false;
   }
 
-  onDisconnect(cb: () => void): void {
+  onDisconnect(cb: () => void): Unsubscribe {
     this.disconnectCbs.push(cb);
+    return () => {
+      this.disconnectCbs = this.disconnectCbs.filter((registered) => registered !== cb);
+    };
   }
 
   /** Test/dev-page hook: simulates the device unplugging. */
