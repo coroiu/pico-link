@@ -15,7 +15,16 @@ import type { Band, BandKind, Preamp } from "../../proto/library";
 export const FS = 48000;
 export const DB_RANGE = 15;
 export const FREQ_MIN = 20;
-export const FREQ_MAX = 20_000;
+/**
+ * Must match `core/src/dsp/validate.rs`'s `FREQ_HZ_MAX` (`0.45 * 44_100.0 =
+ * 19_845.0`) exactly -- that Rust constant is the one core actually enforces
+ * on `SAVE_EFFECT`/`PREVIEW`, so a looser client-side max here would let the
+ * UI accept a value the device then rejects. No fixture currently carries
+ * this constant (unlike `fixtures/telemetry/constants.json` for the
+ * telemetry side); if one is ever added under `fixtures/host_op/`, assert
+ * against it here instead of hand-copying the number.
+ */
+export const FREQ_MAX = 19_845;
 
 export function bandFreqHz(band: Band): number {
   return band.freqHalfHz * 0.5;

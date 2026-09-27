@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { LibraryEffect, Preset } from "../../proto/library";
-import { checkName, clampFreqHz, clampGainDb, clampQ, truncateToNameBudget, uniqueName, utf8ByteLength } from "./bandOps";
+import { BAND_FREQ_MAX, checkName, clampFreqHz, clampGainDb, clampQ, truncateToNameBudget, uniqueName, utf8ByteLength } from "./bandOps";
+import { FREQ_MAX } from "./math";
 
 function effect(id: number, name: string): LibraryEffect {
   const preset: Preset = { name, crossfeed: "off", bands: [], preamp: { kind: "auto" }, eqLocked: true };
@@ -9,8 +10,14 @@ function effect(id: number, name: string): LibraryEffect {
 
 describe("clamps", () => {
   it("clamps freq/gain/q to the mock's table ranges", () => {
+    // 19_845 = core's real ceiling (`core/src/dsp/validate.rs::FREQ_HZ_MAX`,
+    // `0.45 * 44_100`), not the mock's cosmetic 20_000 -- a client-side max
+    // looser than the device's would let the UI accept a value core then
+    // rejects. `BAND_FREQ_MAX` and `FREQ_MAX` must be the same constant.
+    expect(BAND_FREQ_MAX).toBe(FREQ_MAX);
+    expect(FREQ_MAX).toBe(19_845);
     expect(clampFreqHz(5)).toBe(20);
-    expect(clampFreqHz(50000)).toBe(20000);
+    expect(clampFreqHz(50000)).toBe(19_845);
     expect(clampGainDb(-100)).toBe(-24);
     expect(clampGainDb(100)).toBe(24);
     expect(clampQ(0)).toBe(0.1);

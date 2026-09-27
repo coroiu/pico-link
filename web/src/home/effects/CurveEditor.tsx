@@ -16,6 +16,7 @@ import {
   freqToX,
   hitTestBand,
   magnitudeDb,
+  FREQ_MAX,
   responseDb,
 } from "./math";
 import type { CurveGeom, NudgeKey } from "./math";
@@ -225,7 +226,7 @@ export function CurveEditor({ bands, selected, bypass, onSelect, onChangeBand, o
     const g = geom();
     if (hitTestBand(bands, x, y, g) >= 0 || bands.length >= 10) return;
     const u = clamp((x - g.padLeft) / (g.width - g.padLeft - g.padRight), 0, 1);
-    const freqHz = Math.round(20 * 1000 ** u);
+    const freqHz = Math.min(Math.round(20 * 1000 ** u), FREQ_MAX);
     const gainDb = Math.round((((1 - (y - g.padTop) / (g.height - g.padTop - g.padBottom)) * 2 * DB_RANGE - DB_RANGE) * 10)) / 10;
     onAddBand(freqHz, gainDb);
   };

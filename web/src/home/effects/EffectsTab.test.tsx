@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Session } from "../../session/session";
 import { LibraryController } from "../../session/library";
 import { FakeTransport } from "../../transport/fake";
@@ -33,13 +33,34 @@ afterEach(async () => {
   activeSessions = [];
 });
 
-async function setup(fakeOpts: FakeTransportOptions = {}): Promise<{ session: Session; controller: LibraryController; transport: FakeTransport }> {
+interface FakeDoc {
+  hidden: boolean;
+  addEventListener(type: string, cb: () => void): void;
+  removeEventListener(type: string): void;
+}
+
+function makeFakeDoc(): { doc: Document; impl: FakeDoc; fire: () => void } {
+  const listeners = new Map<string, () => void>();
+  const impl: FakeDoc = {
+    hidden: false,
+    addEventListener(type, cb) {
+      listeners.set(type, cb);
+    },
+    removeEventListener(type) {
+      listeners.delete(type);
+    },
+  };
+  return { doc: impl as unknown as Document, impl, fire: () => listeners.get("visibilitychange")?.() };
+}
+
+async function setup(fakeOpts: FakeTransportOptions = {}, visibilityDocument?: Document): Promise<{ session: Session; controller: LibraryController; transport: FakeTransport }> {
   const lib = fakeOpts.library ?? libraryWith();
   const transport = new FakeTransport({ enableLibrary: true, library: lib, snapshot: () => snapshotFor(lib), ...fakeOpts });
-  const session = new Session(transport, { now: () => 0, visibilityDocument: undefined });
+  const session = new Session(transport, { now: () => 0, visibilityDocument });
   activeSessions.push(session);
   await session.start();
-  const controller = new LibraryController(session, { previewKeepaliveMs: 10_000 });
+  const controller = new LibraryController(session, { previewKeepaliveMs: 10_000, visibilityDocument });
+  controller.start();
   await controller.refreshLibrary();
   return { session, controller, transport };
 }
@@ -120,6 +141,106 @@ describe("EffectsTab editing and save", () => {
     fireEvent.change(nameInput, { target: { value: "Cozy" } });
     fireEvent.click(await screen.findByTestId("effect-item-2"));
     expect(await screen.findByText(/unsaved changes/i)).toBeTruthy();
+  });
+
+  it("offers a working Reload on CONFLICT that pulls in the winning save", async () => {
+    const lib = libraryWith([{ id: 1, persistedSeq: 1, preset: WARM }]);
+    const transport = new FakeTransport({ enableLibrary: true, library: lib, snapshot: () => snapshotFor(lib) });
+    const session = new Session(transport, { now: () => 0, visibilityDocument: undefined });
+    activeSessions.push(session);
+    await session.start();
+    const controller = new LibraryController(session, { previewKeepaliveMs: 10_000 });
+    await controller.refreshLibrary();
+
+    // Someone else's save lands first, advancing persisted_seq behind this
+    // controller's already-fetched (now stale) snapshot.
+    const otherController = new LibraryController(session, { previewKeepaliveMs: 10_000 });
+    const winning = await otherController.saveEffect({ ...WARM, name: "Elsewhere" }, { id: 1, baseSeq: 1 });
+    expect(winning.kind).toBe("queued");
+
+    render(<EffectsTab library={controller} connectedAddr={null} />);
+    const nameInput = (await screen.findByTestId("effect-name-input")) as HTMLInputElement;
+    expect(nameInput.value).toBe("Warm");
+    fireEvent.change(nameInput, { target: { value: "Cozy" } });
+    const saveButton = await screen.findByTestId("save-button");
+    await waitFor(() => expect(saveButton).not.toBeDisabled());
+    fireEvent.click(saveButton);
+
+    const reloadButton = await screen.findByTestId("reload-button");
+    fireEvent.click(reloadButton);
+
+    await waitFor(() => expect((screen.getByTestId("effect-name-input") as HTMLInputElement).value).toBe("Elsewhere"));
+    expect(screen.queryByTestId("reload-button")).toBeNull();
+  });
+});
+
+describe("EffectsTab live preview", () => {
+  const CONNECTED_DEVICE: LibrarySnapshot["devices"][number] = { addr: "AA:BB:CC:DD:EE:FF", presetId: 1, connected: true, name: "Cans" };
+
+  it("previews the opened effect once a connected device is present", async () => {
+    const { controller, transport } = await setup({ library: libraryWith([{ id: 1, persistedSeq: 1, preset: WARM }], [CONNECTED_DEVICE]) });
+    const controlOutSpy = vi.spyOn(transport, "controlOut");
+    render(<EffectsTab library={controller} connectedAddr={CONNECTED_DEVICE.addr} />);
+    await screen.findByTestId("effect-name-input");
+    expect(screen.getByTestId("effect-status")).toHaveTextContent(/previewing on cans/i);
+    await waitFor(() => expect(controlOutSpy.mock.calls.length).toBeGreaterThan(0), { timeout: 1000 });
+  });
+
+  it("sends no PREVIEW traffic at all while the document is hidden", async () => {
+    const { doc, impl } = makeFakeDoc();
+    impl.hidden = true;
+    const { controller, transport } = await setup({ library: libraryWith([{ id: 1, persistedSeq: 1, preset: WARM }], [CONNECTED_DEVICE]) }, doc);
+    const controlOutSpy = vi.spyOn(transport, "controlOut");
+    render(<EffectsTab library={controller} connectedAddr={CONNECTED_DEVICE.addr} />);
+    await screen.findByTestId("effect-name-input");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(controlOutSpy).not.toHaveBeenCalled();
+  });
+
+  it("stops resending once the document goes hidden mid-preview", async () => {
+    const { doc, impl, fire } = makeFakeDoc();
+    const { controller, transport } = await setup({ library: libraryWith([{ id: 1, persistedSeq: 1, preset: WARM }], [CONNECTED_DEVICE]) }, doc);
+    const controlOutSpy = vi.spyOn(transport, "controlOut");
+    render(<EffectsTab library={controller} connectedAddr={CONNECTED_DEVICE.addr} />);
+    await screen.findByTestId("effect-name-input");
+    await waitFor(() => expect(controlOutSpy.mock.calls.length).toBeGreaterThan(0), { timeout: 1000 });
+    const callsWhileVisible = controlOutSpy.mock.calls.length;
+
+    impl.hidden = true;
+    fire();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(controlOutSpy.mock.calls.length).toBe(callsWhileVisible);
+  });
+
+  it("ends the preview when the effect's editor is closed by leaving the tab (unmount)", async () => {
+    const { controller, transport } = await setup({ library: libraryWith([{ id: 1, persistedSeq: 1, preset: WARM }], [CONNECTED_DEVICE]) });
+    const controlOutSpy = vi.spyOn(transport, "controlOut");
+    const previewEndSpy = vi.spyOn(controller, "previewEnd");
+    const { unmount } = render(<EffectsTab library={controller} connectedAddr={CONNECTED_DEVICE.addr} />);
+    await screen.findByTestId("effect-name-input");
+    // Wait for the debounced preview to actually start before leaving --
+    // otherwise there is nothing for unmount's cleanup to end.
+    await waitFor(() => expect(controlOutSpy.mock.calls.length).toBeGreaterThan(0), { timeout: 1000 });
+    unmount();
+    expect(previewEndSpy).toHaveBeenCalled();
+  });
+
+  it("ends the preview on Save", async () => {
+    const { controller, transport } = await setup({ library: libraryWith([{ id: 1, persistedSeq: 1, preset: WARM }], [CONNECTED_DEVICE]) });
+    const controlOutSpy = vi.spyOn(transport, "controlOut");
+    render(<EffectsTab library={controller} connectedAddr={CONNECTED_DEVICE.addr} />);
+    const nameInput = (await screen.findByTestId("effect-name-input")) as HTMLInputElement;
+    // Wait for the debounced open-preview to actually land before editing --
+    // otherwise Save can race ahead of `previewActiveRef` ever going true.
+    await waitFor(() => expect(controlOutSpy.mock.calls.length).toBeGreaterThan(0), { timeout: 1000 });
+
+    fireEvent.change(nameInput, { target: { value: "Cozy" } });
+    const previewEndSpy = vi.spyOn(controller, "previewEnd");
+    const saveButton = await screen.findByTestId("save-button");
+    await waitFor(() => expect(saveButton).not.toBeDisabled());
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(screen.getByTestId("effect-status")).toHaveTextContent("Saved"), { timeout: 3000 });
+    expect(previewEndSpy).toHaveBeenCalled();
   });
 });
 

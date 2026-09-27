@@ -41,7 +41,7 @@ function clonePreset(p: Preset): Preset {
 function describeOutcome(outcome: Exclude<OpOutcome, { kind: "done" }> | Exclude<SaveOutcome, { kind: "queued" }>): string {
   switch (outcome.kind) {
     case "conflict":
-      return "Someone else changed this effect first. Reload and try again.";
+      return "Someone else changed this effect first.";
     case "editorOpen":
       return "The device's own editor is open. Close it there first.";
     case "timeout":
@@ -87,6 +87,7 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
   const [saving, setSaving] = React.useState(false);
   const [saveMsg, setSaveMsg] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [errorKind, setErrorKind] = React.useState<"conflict" | null>(null);
   const [modal, setModal] = React.useState<Modal | null>(null);
   const [dropActive, setDropActive] = React.useState(false);
   const loadedIdRef = React.useRef<number | null>(null);
@@ -119,42 +120,37 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
     setSelectedBand(0);
     setSaveMsg(null);
     setError(null);
+    setErrorKind(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, effects, isNew]);
 
-  // --- Live preview: rate-limited (~10/s) while dirty or bypassed. -------
+  // --- Live preview: opening an effect previews it (matching the on-device
+  // editor), for as long as the editor stays open on a connected device --
+  // per the orchestrator's decision on this bead's review, this is not
+  // conditioned on `dirty`. Edits are debounced (waits for a pause, not a
+  // fixed-rate resend) into a single `library.previewStart` call;
+  // `LibraryController` owns the actual keepalive resend and is the only
+  // thing that decides whether a send happens while the tab is hidden --
+  // this component must never run its own send loop that could bypass that
+  // gate (see `LibraryController.previewStart`/`armKeepalive`/`isHidden`).
+  const connectedDevice = devices.find((d) => d.addr === connectedAddr) ?? devices.find((d) => d.connected) ?? null;
   const previewActiveRef = React.useRef(false);
-  const pendingRef = React.useRef<{ effectId: number; preset: Preset; bypass: boolean } | null>(null);
-  const lastSentRef = React.useRef(0);
 
   React.useEffect(() => {
-    if (!opsOk || !draft) {
-      pendingRef.current = null;
-      return;
-    }
-    if (dirty || bypass) {
-      pendingRef.current = { effectId: dirty ? 0 : (selectedId ?? 0), preset: draft, bypass };
-    } else {
-      pendingRef.current = null;
+    if (!opsOk || !draft || !connectedDevice) {
       if (previewActiveRef.current) {
         previewActiveRef.current = false;
         void library.previewEnd();
       }
+      return;
     }
-  }, [draft, dirty, bypass, selectedId, opsOk, library]);
-
-  React.useEffect(() => {
-    const id = setInterval(() => {
-      const pending = pendingRef.current;
-      if (!pending) return;
-      const now = performance.now();
-      if (now - lastSentRef.current < 100) return;
-      lastSentRef.current = now;
+    const effectId = isNew || dirty ? 0 : (selectedId ?? 0);
+    const timer = setTimeout(() => {
       previewActiveRef.current = true;
-      void library.previewStart(pending.effectId, pending.preset, pending.bypass);
+      void library.previewStart(effectId, draft, bypass);
     }, 100);
-    return () => clearInterval(id);
-  }, [library]);
+    return () => clearTimeout(timer);
+  }, [draft, dirty, bypass, selectedId, isNew, opsOk, connectedDevice, library]);
 
   React.useEffect(
     () => () => {
@@ -176,6 +172,7 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
 
   function openTarget(target: number | "new") {
     setError(null);
+    setErrorKind(null);
     setSaveMsg(null);
     if (target === "new") {
       setSelectedId(null);
@@ -228,23 +225,59 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
     setDirty(true);
   }
 
+  /** Sets both the error text and, for a `"conflict"` outcome, the kind that unlocks the Reload action. */
+  function reportOutcomeError(outcome: Exclude<OpOutcome, { kind: "done" }> | Exclude<SaveOutcome, { kind: "queued" }>) {
+    setError(describeOutcome(outcome));
+    setErrorKind(outcome.kind === "conflict" ? "conflict" : null);
+  }
+
+  /** CONFLICT recovery: refetch the library and reset the draft to the device's current version (or close the editor if the effect no longer exists). */
+  async function handleReload() {
+    setError(null);
+    setErrorKind(null);
+    await library.refreshLibrary();
+    const fresh = library.store.getSnapshot().snapshot?.effects ?? [];
+    if (selectedId !== null) {
+      const effect = fresh.find((e) => e.id === selectedId);
+      if (effect) {
+        loadedIdRef.current = selectedId;
+        setDraft(clonePreset(effect.preset));
+        setBaseline(effect.preset);
+      } else {
+        setSelectedId(null);
+        setIsNew(false);
+        setDraft(null);
+        setBaseline(null);
+      }
+    }
+    setDirty(false);
+    setBypass(false);
+  }
+
   async function handleSave() {
     if (!draft || !canSave) return;
     setSaving(true);
     setError(null);
+    setErrorKind(null);
     setSaveMsg(null);
     const toSave: Preset = { ...draft, name: draft.name.trim(), eqLocked: true };
     const existing = isNew ? undefined : { id: selectedId!, baseSeq: effects.find((e) => e.id === selectedId)?.persistedSeq ?? 0 };
     const outcome = await library.saveEffect(toSave, existing);
     setSaving(false);
     if (outcome.kind === "queued") {
+      // Design decision on this bead's review: Save ends the host preview --
+      // the device's own persisted/assigned playback takes over from here.
+      if (previewActiveRef.current) {
+        previewActiveRef.current = false;
+        void library.previewEnd();
+      }
       setIsNew(false);
       setSelectedId(outcome.effectId);
       loadedIdRef.current = null;
       setDirty(false);
       setSaveMsg(outcome.confirmed ? "Saved" : "Not confirmed yet — it may still be saving.");
     } else {
-      setError(describeOutcome(outcome));
+      reportOutcomeError(outcome);
     }
   }
 
@@ -282,7 +315,7 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
       setBaseline(null);
       setDirty(false);
     } else {
-      setError(describeOutcome(outcome));
+      reportOutcomeError(outcome);
     }
   }
 
@@ -294,7 +327,7 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
 
   async function handleAssign(addr: string, effectId: number) {
     const outcome = await library.assign(addr, effectId);
-    if (outcome.kind !== "done") setError(describeOutcome(outcome));
+    if (outcome.kind !== "done") reportOutcomeError(outcome);
   }
 
   async function runImport(text: string, filename: string) {
@@ -302,12 +335,13 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
     const base = deriveImportBaseName(filename);
     const outcome = await library.parseApo(base, text);
     if (outcome.kind !== "done") {
-      setError(describeOutcome(outcome));
+      reportOutcomeError(outcome);
       return;
     }
     const result = decodeParseApoResult(outcome.status.payload);
     if (!result) {
       setError("The dongle's reply couldn't be read.");
+      setErrorKind(null);
       return;
     }
     const plan = planImport(result.collidesWith, effects.length, maxEffects, result.copyName);
@@ -334,7 +368,7 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
       setDirty(false);
       setSaveMsg(outcome.confirmed ? "Saved" : null);
     } else {
-      setError(describeOutcome(outcome));
+      reportOutcomeError(outcome);
     }
   }
 
@@ -375,7 +409,6 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
     );
   }
 
-  const connectedDevice = devices.find((d) => d.addr === connectedAddr) ?? devices.find((d) => d.connected) ?? null;
   const hasEditor = !!draft;
 
   return (
@@ -447,21 +480,26 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
 
           <div className="min-h-[1.4em] text-sm text-muted-foreground" data-testid="effect-status">
             {error ? (
-              <span className="text-destructive">{error}</span>
+              <span className="text-destructive">
+                {error}
+                {errorKind === "conflict" ? (
+                  <Button variant="outline" size="sm" className="ml-2" onClick={() => void handleReload()} data-testid="reload-button">
+                    Reload
+                  </Button>
+                ) : null}
+              </span>
             ) : saveMsg ? (
               <span className="text-success">{saveMsg}</span>
             ) : (
               <>
                 {connectedDevice ? (
-                  dirty ? (
-                    <>
-                      Previewing on <b className="text-foreground">{connectedDevice.name}</b>
-                    </>
-                  ) : connectedDevice.presetId === selectedId ? (
-                    `Playing on ${connectedDevice.name}`
-                  ) : (
-                    `Opening an effect previews it on ${connectedDevice.name}`
-                  )
+                  // Opening an effect previews it immediately (matching the
+                  // on-device editor) -- this is truthful for the whole time
+                  // the editor is open, dirty or not (decision on this
+                  // bead's review).
+                  <>
+                    Previewing on <b className="text-foreground">{connectedDevice.name}</b>
+                  </>
                 ) : (
                   "No headphones connected: you are editing silently"
                 )}

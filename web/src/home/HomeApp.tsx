@@ -122,9 +122,12 @@ export function HomeApp() {
     return () => controller.stop();
   }, [session]);
 
-  // DEMO: `?nolib=1` forces the pre-v2-firmware gate (`effects-firmware-gate`)
-  // so it's screenshot/QA-able without a real old-firmware dongle.
-  const noLib = React.useMemo(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).get("nolib") === "1", []);
+  // DEMO (dev builds only): `?nolib=1` forces the pre-v2-firmware gate
+  // (`effects-firmware-gate`) so it's screenshot/QA-able without a real
+  // old-firmware dongle. Gated on `import.meta.env.DEV` -- unlike `?fake=1`,
+  // this is a developer QA hook, not a production demo mode, so it must not
+  // be reachable in a shipped build.
+  const noLib = React.useMemo(() => import.meta.env.DEV && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("nolib") === "1", []);
 
   React.useEffect(() => {
     if (useFake) {

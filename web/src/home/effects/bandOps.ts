@@ -8,10 +8,11 @@
 // obviously-invalid input.
 import type { LibraryEffect } from "../../proto/library";
 import { MAX_NAME_BYTES } from "../../proto/library";
-import { clamp } from "./math";
+import { clamp, FREQ_MAX } from "./math";
 
 export const BAND_FREQ_MIN = 20;
-export const BAND_FREQ_MAX = 20_000;
+/** Derived from `math.ts`'s `FREQ_MAX` (core's `validate.rs::FREQ_HZ_MAX`) so there is one source of truth for the device's real ceiling. */
+export const BAND_FREQ_MAX = FREQ_MAX;
 export const BAND_GAIN_MIN = -24;
 export const BAND_GAIN_MAX = 24;
 export const BAND_Q_MIN = 0.1;

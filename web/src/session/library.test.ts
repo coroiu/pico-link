@@ -219,6 +219,40 @@ describe("LibraryController preview + keepalive", () => {
     await session.stop();
     controller.stop();
   });
+
+  it("previewStart itself refuses to send while hidden (not just the keepalive), and resumes on visible", async () => {
+    const listeners = new Map<string, () => void>();
+    const fakeDocImpl = {
+      hidden: true,
+      addEventListener(type: string, cb: () => void) {
+        listeners.set(type, cb);
+      },
+      removeEventListener(type: string) {
+        listeners.delete(type);
+      },
+    };
+    const fakeDoc = fakeDocImpl as unknown as Document;
+
+    const transport = new FakeTransport({ enableLibrary: true, snapshot: () => snapshotWithLibraryRev(1) });
+    const session = new Session(transport, { now: () => 0, visibilityDocument: fakeDoc });
+    await session.start();
+
+    const controller = new LibraryController(session, { visibilityDocument: fakeDoc });
+    controller.start();
+    const controlOutSpy = vi.spyOn(transport, "controlOut");
+
+    const outcome = await controller.previewStart(0, WARM, false);
+    expect(outcome.kind).toBe("hidden");
+    expect(controlOutSpy).not.toHaveBeenCalled();
+
+    fakeDocImpl.hidden = false;
+    listeners.get("visibilitychange")!();
+    // Design: a return to visibility resumes the recorded `activePreview`.
+    await vi.waitFor(() => expect(controlOutSpy).toHaveBeenCalled());
+
+    await session.stop();
+    controller.stop();
+  });
 });
 
 describe("LibraryController.parseApo", () => {
