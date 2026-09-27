@@ -80,22 +80,27 @@ void pl_bt_push_link_state_disconnected(void);
 // NegotiatingCodec=3 -- see ui-ffi/src/lib.rs; cbindgen does not emit
 // C constants for this enum because no FFI struct field is typed as it,
 // only as a plain u32, so a2dp.c/a2dp.h define their own PL_CONNECT_STEP_*
-// constants matching those discriminants exactly).
-void pl_bt_push_connect_step(uint32_t step);
+// constants matching those discriminants exactly). `seq` (ADA DESIGN v2,
+// bead pico-link-chc3) is the attempt this step belongs to -- see
+// a2dp.h's PL_SEQ_ANY doc comment for the shared seq convention.
+void pl_bt_push_connect_step(uint32_t step, uint16_t seq);
 
-// Pushes Event::ConnectSucceeded{addr, degraded}. `addr` added by bead
+// Pushes Event::ConnectSucceeded{addr, degraded, seq}. `addr` added by bead
 // pico-link-cz0.6 (M5 persistence, PL_EVENT_ABI_VERSION bumped 1 -> 2) so
 // core's auto-reconnect persistence policy always knows which device
 // succeeded, including via the PL_DEBUG_REMOTE bypass path (which never
 // drives the wizard, core's only other source for this) -- see
-// PlConnectSucceededPayload's doc comment in ui-ffi/src/lib.rs.
-void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded);
+// PlConnectSucceededPayload's doc comment in ui-ffi/src/lib.rs. `seq`
+// (ADA DESIGN v2) is 0 for a session core did not initiate (remote/
+// PL_DEBUG_REMOTE), else the owning attempt's seq.
+void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded, uint16_t seq);
 
-// Pushes Event::ConnectFailed{addr, reason}. `reason` is the raw wire
+// Pushes Event::ConnectFailed{addr, reason, seq}. `reason` is the raw wire
 // value of ui-ffi's PlFailureReason (PL_FAILURE_REASON_* constants,
 // generated into pico_link_ui.h since PlConnectFailedPayload::reason IS a
-// real FFI field of that numeric type).
-void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
+// real FFI field of that numeric type). `seq` (ADA DESIGN v2) is the
+// owning attempt's seq, 0 if none.
+void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason, uint16_t seq);
 
 // Pushes Event::CodecChanged{addr, word, nominal_bitrate_bps} (bead
 // pico-link-1v5: the Home hero's live codec/bitrate). `name`/`name_len`
