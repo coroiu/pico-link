@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+/*
+ * Theme tokens. Three themes selected by [data-theme] on <html>: "device"
+ * (default), "light", "dark". "device" is the default theme, derived from
+ * core/src/render/theme.rs's Rgb565 device palette (module `theme::color`,
+ * lines ~47-97) -- hardcoded here for now (bead pico-link-jyhk.10); a
+ * fixture-exported source of truth is a follow-up (jyhk.9 or later), noted
+ * in the FERN DESIGN comment on pico-link-jyhk.8, section 5.
+ *
+ * Conversion: Rgb565::new(r5, g6, b5) -> 8-bit-per-channel hex, rounding
+ * r8 = round(r5 * 255/31), g8 = round(g6 * 255/63), b8 = round(b5 * 255/31).
+ *   BACKGROUND         (1,4,4)    -> #081021
+ *   SURFACE            (3,8,7)    -> #19203a
+ *   SURFACE_ELEVATED   (4,10,9)   -> #21284a
+ *   BRAND              (3,23,27)  -> #195dde
+ *   BRAND_BRIGHT       (7,32,30)  -> #3a82f7
+ *   TEXT_PRIMARY       (30,61,30) -> #f7f7f7
+ *   TEXT_SECONDARY     (19,41,23) -> #9ca6bd
+ *   DIVIDER            (4,12,10)  -> #213152
+ *   STATUS_SUCCESS     (7,54,16)  -> #3adb84
+ *   STATUS_ERROR       (31,22,12) -> #ff5963
+ *   STATUS_WARNING     (31,44,4)  -> #ffb221
+ */
+:root,
+[data-theme="device"] {
+  --background: #081021;
+  --foreground: #f7f7f7;
+  --card: #19203a;
+  --card-foreground: #f7f7f7;
+  --popover: #21284a;
+  --popover-foreground: #f7f7f7;
+  --primary: #195dde;
+  --primary-foreground: #f7f7f7;
+  --secondary: #21284a;
+  --secondary-foreground: #f7f7f7;
+  --muted: #19203a;
+  --muted-foreground: #9ca6bd;
+  --accent: #3a82f7;
+  --accent-foreground: #f7f7f7;
+  --destructive: #ff5963;
+  --destructive-foreground: #f7f7f7;
+  --success: #3adb84;
+  --warning: #ffb221;
+  --border: #213152;
+  --input: #213152;
+  --ring: #3a82f7;
+  --radius: 0.5rem;
+}
+
+[data-theme="light"] {
+  --background: #ffffff;
+  --foreground: #0f172a;
+  --card: #f8fafc;
+  --card-foreground: #0f172a;
+  --popover: #ffffff;
+  --popover-foreground: #0f172a;
+  --primary: #195dde;
+  --primary-foreground: #ffffff;
+  --secondary: #e2e8f0;
+  --secondary-foreground: #0f172a;
+  --muted: #f1f5f9;
+  --muted-foreground: #64748b;
+  --accent: #3a82f7;
+  --accent-foreground: #ffffff;
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+  --success: #16a34a;
+  --warning: #d97706;
+  --border: #e2e8f0;
+  --input: #e2e8f0;
+  --ring: #3a82f7;
+  --radius: 0.5rem;
+}
+
+[data-theme="dark"] {
+  --background: #0b0d12;
+  --foreground: #e5e7eb;
+  --card: #14161d;
+  --card-foreground: #e5e7eb;
+  --popover: #14161d;
+  --popover-foreground: #e5e7eb;
+  --primary: #3a82f7;
+  --primary-foreground: #0b0d12;
+  --secondary: #1f2230;
+  --secondary-foreground: #e5e7eb;
+  --muted: #14161d;
+  --muted-foreground: #9ca3af;
+  --accent: #3a82f7;
+  --accent-foreground: #0b0d12;
+  --destructive: #f87171;
+  --destructive-foreground: #0b0d12;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --border: #1f2230;
+  --input: #1f2230;
+  --ring: #3a82f7;
+  --radius: 0.5rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+#root {
+  min-height: 100svh;
+}
