@@ -25,6 +25,7 @@ export class WebUsbSessionManager {
   private readonly options: WebUsbSessionManagerOptions;
   private unwatch: Unsubscribe | undefined;
   private currentSession: Session | undefined;
+  private currentTransport: WebUsbTransport | undefined;
 
   constructor(options: WebUsbSessionManagerOptions) {
     this.options = options;
@@ -40,9 +41,18 @@ export class WebUsbSessionManager {
           void this.openDevice(device);
         }
       },
-      () => {
-        // The `Transport`'s own `onDisconnect` (wired inside `Session`)
-        // handles the session-level "lost" transition; nothing to do here.
+      (device) => {
+        // Review fix-first (pico-link-jyhk.11): route the browser-level
+        // `navigator.usb` `disconnect` event to the *matching* transport's
+        // `notifyDisconnected()`, which in turn fires the `onDisconnect`
+        // callback `Session.start()` registered -> `Session.handleDisconnected`
+        // -> phase goes `lost`. Without this call `notifyDisconnected()` is
+        // dead code and a real unplug never reaches the session. Match by
+        // identity against the currently-open transport's device, since an
+        // unrelated device's `disconnect` event must not tear this one down.
+        if (this.currentTransport?.underlyingDevice === device) {
+          this.currentTransport.notifyDisconnected();
+        }
       },
     );
 
@@ -55,7 +65,9 @@ export class WebUsbSessionManager {
 
   /** Shows the chooser (must be called synchronously from a user gesture) and opens whatever the user picks. */
   async requestDevice(): Promise<void> {
+    await this.stopCurrentSession();
     const transport = new WebUsbTransport();
+    this.currentTransport = transport;
     const session = new Session(transport, this.options);
     this.currentSession = session;
     this.options.onSession(session);
@@ -65,14 +77,30 @@ export class WebUsbSessionManager {
   stop(): void {
     this.unwatch?.();
     this.unwatch = undefined;
+    void this.stopCurrentSession();
   }
 
   private async openDevice(device: USBDevice): Promise<void> {
+    // Review fix-first (pico-link-jyhk.11): a `connect` event (replug, or a
+    // stale-then-reconnected device) must not leave the previous session's
+    // run loop / timers / disconnect listener alive alongside the new one.
+    await this.stopCurrentSession();
     const transport = new WebUsbTransport(device);
+    this.currentTransport = transport;
     const session = new Session(transport, this.options);
     this.currentSession = session;
     this.options.onSession(session);
     await session.start();
+  }
+
+  /** Stops and discards whatever session/transport is currently live, if any. */
+  private async stopCurrentSession(): Promise<void> {
+    const previous = this.currentSession;
+    this.currentSession = undefined;
+    this.currentTransport = undefined;
+    if (previous) {
+      await previous.stop();
+    }
   }
 
   /** Test/debug hook. */

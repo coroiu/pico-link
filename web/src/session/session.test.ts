@@ -185,6 +185,37 @@ describe("Session", () => {
     expect(session.statusStore.getSnapshot().phase).toBe("lost");
   });
 
+  it("transitions to lost after repeated consecutive poll failures, even with no disconnect event", async () => {
+    // Review fix-first (pico-link-jyhk.11): a transport that never fires
+    // `onDisconnect` but fails every poll (e.g. a stale/half-closed WebUSB
+    // handle) must not spin forever -- N consecutive failures should also
+    // reach `lost`.
+    const inner = new FakeTransport({ snapshot: () => goldenSnapshot() });
+    let pollsShouldFail = false;
+    const flaky: Transport = {
+      open: () => inner.open(),
+      controlIn: (bReq, wValue, len) => {
+        if (bReq === PL_CFG_REQ_GET_TELEMETRY && pollsShouldFail) {
+          return Promise.reject(new TransportError("simulated poll failure"));
+        }
+        return inner.controlIn(bReq, wValue, len);
+      },
+      controlOut: (bReq, wValue, bytes) => inner.controlOut(bReq, wValue, bytes),
+      close: () => inner.close(),
+      onDisconnect: (cb) => inner.onDisconnect(cb),
+    };
+    const session = new Session(flaky, { pollIntervalMs: 5 });
+
+    await session.start();
+    await sleep(15);
+    expect(session.statusStore.getSnapshot().phase).toBe("ready");
+
+    pollsShouldFail = true;
+    await sleep(100);
+
+    expect(session.statusStore.getSnapshot().phase).toBe("lost");
+  });
+
   it("detects a reboot (uptime going backwards), resets clock/ballistics, and re-handshakes", async () => {
     let uptime = 1000;
     const transport = new FakeTransport({ snapshot: () => goldenSnapshot({ uptimeMs: uptime, receivedMs: uptime, peakL: 200, peakR: 200 }) });

@@ -58,6 +58,17 @@ const DEFAULTS: Required<Omit<SessionOptions, "now" | "visibilityDocument">> = {
 };
 
 /**
+ * Review fix-first (pico-link-jyhk.11): a transport whose device is already
+ * gone can fail every `controlIn` forever without ever firing the browser's
+ * `disconnect` event (seen with a stale/half-closed handle) -- swallowing
+ * those errors indefinitely (design section 4's "only disconnect ends a
+ * session") left the loop spinning against a dead device. After this many
+ * *consecutive* poll failures, treat the session as lost rather than retrying
+ * forever.
+ */
+const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+
+/**
  * One connected-device session. Construct with an already-instantiated
  * (but not yet opened) `Transport`; call `start()`. `statusStore` carries
  * the slow-changing session phase for React; `snapshotRef` and
@@ -85,6 +96,7 @@ export class Session {
   private lastUptimeMs: number | null = null;
   private lastSnapSeq: number | null = null;
   private lastLevelReceivedMs: number | null = null;
+  private consecutivePollFailures = 0;
 
   constructor(transport: Transport, options: SessionOptions = {}) {
     this.transport = transport;
@@ -206,10 +218,18 @@ export class Session {
       let rebooted = false;
       try {
         rebooted = await this.pollOnce();
+        this.consecutivePollFailures = 0;
       } catch {
         // Slow/failed replies are normal (WebUSB has no per-transfer
         // timeout, design section 4: "Only the disconnect event ends a
-        // session") -- swallow and retry next tick.
+        // session") -- swallow and retry next tick, unless they're
+        // *consecutive*: a stale device that never fires `disconnect` (e.g.
+        // a half-closed handle) would otherwise spin forever.
+        this.consecutivePollFailures += 1;
+        if (this.consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+          this.handleDisconnected();
+          return;
+        }
       }
       if (!this.running) return;
 
