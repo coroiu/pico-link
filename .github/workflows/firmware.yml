@@ -98,7 +98,7 @@ jobs:
           path: ~/.pico-sdk/sdk/${{ env.PICO_SDK_VERSION }}
           # Keyed on the sdk-patches applier script too: any change there
           # means the cached, already-patched checkout is stale.
-          key: pico-sdk-${{ env.PICO_SDK_VERSION }}-${{ hashFiles('tools/apply-sdk-patches.sh') }}
+          key: pico-sdk-${{ env.PICO_SDK_VERSION }}-${{ hashFiles('tools/apply-sdk-patches.sh', '.github/workflows/firmware.yml') }}
 
       - name: Clone pico-sdk (with submodules, pinned to release tag)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
@@ -107,8 +107,20 @@ jobs:
           git clone --branch "$PICO_SDK_VERSION" --depth 1 \
             https://github.com/raspberrypi/pico-sdk.git \
             "$HOME/.pico-sdk/sdk/$PICO_SDK_VERSION"
+          # lib/lwip is required even though our own code never includes lwIP
+          # headers (CYW43_LWIP=0 below): pico-sdk's own
+          # pico_cyw43_arch/CMakeLists.txt only defines the
+          # pico_cyw43_arch_threadsafe_background target (the one
+          # firmware/CMakeLists.txt links against) inside an
+          # `if (TARGET pico_lwip) ... else()` branch keyed on the lwIP
+          # submodule being present -- without it that target does not
+          # exist and main.c's #include <pico/cyw43_arch.h> fails with
+          # "must specify support pico_cyw43_arch architecture type".
+          # lib/mbedtls is picotool's own optional signing/hashing support
+          # (unused by this project -- it only warns without it) so it is
+          # deliberately left uninitialized here.
           git -C "$HOME/.pico-sdk/sdk/$PICO_SDK_VERSION" submodule update --init --depth 1 \
-            lib/tinyusb lib/btstack lib/cyw43-driver
+            lib/tinyusb lib/btstack lib/cyw43-driver lib/lwip
 
       - name: Apply vendored pico-sdk patches
         env:
