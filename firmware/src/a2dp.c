@@ -3616,7 +3616,25 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 // suppression via `cid` (the real avdtp cid the packet
                 // itself carries, not `s_ctx.a2dp_cid` which was just
                 // zeroed above).
-                pl_a2dp_emit_connect_failed(s_ctx.pending_addr, pl_a2dp_failure_reason_for_status(status), cid, s_ctx.attempt.seq);
+                //
+                // Code review, bead `pico-link-chc3`: `s_ctx.attempt.seq`
+                // is only meaningful while the attempt is actually
+                // IN_FLIGHT -- once concluded (ATT_NONE) or requeued
+                // behind a cancel (ATT_HELD), the field is stale and can
+                // still hold a nonzero seq from whichever attempt last
+                // occupied it. Emitting that stale seq risks tagging an
+                // unrelated failure as belonging to a since-concluded (or
+                // not-yet-reissued) attempt, which core's `attempt_seq_
+                // matches` would then wrongly accept or reject. Emit the
+                // real seq only while this failure's cid could plausibly
+                // BE that attempt (IN_FLIGHT); otherwise 0, core's
+                // documented "nothing to attribute" sentinel.
+                pl_a2dp_emit_connect_failed(
+                    s_ctx.pending_addr,
+                    pl_a2dp_failure_reason_for_status(status),
+                    cid,
+                    s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT ? s_ctx.attempt.seq : 0
+                );
                 break;
             }
             // A real success cancels any retry that might still be armed

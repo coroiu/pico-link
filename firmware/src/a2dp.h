@@ -61,6 +61,18 @@ uint32_t pl_a2dp_encoder_quiesce_timeouts(void);
 // this deliberately never matches a live `session_seq`.
 #define PL_SEQ_ANY ((uint16_t)0xFFFFu)
 
+// Testability follow-up (bead pico-link-chc3, code review 2026-09-27): a
+// C-only debug-seq range that core's `bump_attempt_seq` never allocates
+// into, reserved for bt.c's PL_DEBUG_REMOTE CONNECT bypass so it can tag its
+// attempt with a real, distinct seq instead of colliding with `PL_SEQ_ANY`
+// (the collision that made H4 -- a stale CANCELCONNECT against an
+// already-live debug session -- untestable: both were 0xFFFF, so Match 3's
+// `seq == session_seq` legitimately fired ANY==ANY). `bump_attempt_seq`
+// additionally skips this whole range on wrap so a real core-driven attempt
+// can never land here either. `..MAX` is exclusive of `PL_SEQ_ANY` itself.
+#define PL_A2DP_DEBUG_SEQ_MIN ((uint16_t)0xFF00u)
+#define PL_A2DP_DEBUG_SEQ_MAX ((uint16_t)0xFFFEu) // inclusive; PL_SEQ_ANY is 0xFFFF
+
 // Initiates an A2DP source connection to `addr` -- wraps
 // a2dp_source_establish_stream() and pushes
 // Event::ConnectStepChanged(SettingUpAudio). Called from bt.c's

@@ -1930,10 +1930,26 @@ void pl_bt_poll_commands(struct PlUi *ui) {
 // debug_remote.h's module doc), so this has the exact same pico-link-ouw
 // hazard as PL_COMMAND_TAG_CONNECT and gets the same fix: defer the actual
 // BTstack call to the heartbeat handler.
+// Bead pico-link-chc3, code review 2026-09-27, testability follow-up:
+// allocates a real, distinct seq for each debug CONNECT from a2dp.h's
+// PL_A2DP_DEBUG_SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX range -- a C-only range
+// core's own bump_attempt_seq is documented to never allocate into (see
+// that function's doc comment), so a debug session's seq is never
+// confusable with a real core-driven attempt's. Wraps within the range
+// (never emits 0 or strays into PL_SEQ_ANY/0xFFFF); thread-context only,
+// same caller as pl_bt_debug_connect below.
+static uint16_t pl_bt_debug_next_seq(void) {
+    static uint16_t s_next = PL_A2DP_DEBUG_SEQ_MIN;
+    uint16_t seq = s_next;
+    s_next = (s_next >= PL_A2DP_DEBUG_SEQ_MAX) ? PL_A2DP_DEBUG_SEQ_MIN : (uint16_t)(s_next + 1);
+    return seq;
+}
+
 void pl_bt_debug_connect(const uint8_t *addr) {
+    uint16_t seq = pl_bt_debug_next_seq();
     pl_log(
-        "BT: debug-remote CONNECT %02x:%02x:%02x:%02x:%02x:%02x (bypassing inquiry)\r\n",
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+        "BT: debug-remote CONNECT %02x:%02x:%02x:%02x:%02x:%02x (bypassing inquiry) seq=%u\r\n",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], (unsigned)seq
     );
     // Bead pico-link-4vb.7 (T3): no name available here (this bypasses
     // inquiry entirely) -- name_len = 0 caches "no name", which
@@ -1941,7 +1957,7 @@ void pl_bt_debug_connect(const uint8_t *addr) {
     // already on record" when the write actually happens.
     pl_bt_set_connect_target(addr, NULL, 0);
     pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
-    pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
+    pl_bt_pending_push_seq(PL_BT_PENDING_CONNECT, addr, seq);
 }
 
 // Bead pico-link-nb6: debug-only disconnect, letting an unattended hardware
@@ -1976,5 +1992,19 @@ void pl_bt_debug_cancel_connect(void) {
     pl_log("BT: debug-remote CANCEL_CONNECT (seq=ANY)\r\n");
     pl_bt_push_link_state(PL_LINK_STATE_IDLE);
     pl_bt_pending_push_seq(PL_BT_PENDING_CANCEL_CONNECT, zero_addr, PL_SEQ_ANY);
+}
+
+// Bead pico-link-chc3, code review 2026-09-27, testability follow-up -- see
+// bt.h's doc comment. Identical to pl_bt_debug_cancel_connect above except
+// for the seq it targets: the caller supplies it explicitly (from
+// cdc_sender.py's --cancel-connect --seq N, echoing the seq a prior debug
+// CONNECT logged), so this can hit Match 3 in pl_a2dp_cancel_connect (a live
+// session via `session_seq`) instead of only ever matching HELD/IN_FLIGHT
+// via PL_SEQ_ANY.
+void pl_bt_debug_cancel_connect_seq(uint16_t seq) {
+    static const bd_addr_t zero_addr = {0, 0, 0, 0, 0, 0};
+    pl_log("BT: debug-remote CANCEL_CONNECT (seq=%u)\r\n", (unsigned)seq);
+    pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+    pl_bt_pending_push_seq(PL_BT_PENDING_CANCEL_CONNECT, zero_addr, seq);
 }
 #endif

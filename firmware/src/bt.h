@@ -232,6 +232,17 @@ void pl_bt_push_preset_store_loaded(uint32_t status, uint16_t count, uint16_t ne
 // pl_debug_remote_poll, same convention as the normal command path via
 // pl_bt_poll_commands). Compiled only when PL_DEBUG_REMOTE is set (see
 // firmware/CMakeLists.txt) -- entirely absent from a shipping build.
+//
+// Testability follow-up (bead pico-link-chc3, code review 2026-09-27): this
+// now allocates a real, distinct seq from a2dp.h's
+// `PL_A2DP_DEBUG_SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX` C-only range (bt.c's
+// static counter, wrapping within the range) instead of the seq-less
+// `0` it used to pass -- `0` collided with core's "not core's attempt"
+// sentinel, and every debug-established session's seq was previously
+// tagged with `PL_SEQ_ANY` further downstream, which is what made H4 (a
+// stale cancel against an already-live debug session) untestable: the
+// cancel and the session shared the exact same sentinel. Logged so a
+// capture can read back which seq a given debug CONNECT got.
 void pl_bt_debug_connect(const uint8_t *addr);
 
 // Bead pico-link-nb6: debug-only direct disconnect of the current A2DP
@@ -257,6 +268,21 @@ void pl_bt_debug_disconnect(void);
 // Compiled only when PL_DEBUG_REMOTE is set; entirely absent from a
 // shipping build.
 void pl_bt_debug_cancel_connect(void);
+
+// Bead pico-link-chc3, code review 2026-09-27, testability follow-up:
+// CANCELCONNECT variant taking an explicit `seq` instead of always passing
+// `PL_SEQ_ANY` -- lets a hardware test target the real seq a debug CONNECT
+// (see pl_bt_debug_connect above) was allocated, so H4 (a stale cancel
+// against an already-live session, S5's late-success race) can be driven
+// headlessly: `--cancel-connect --seq N` targets a specific debug session's
+// `session_seq` via `pl_a2dp_cancel_connect`'s Match 3, instead of `PL_SEQ_
+// ANY` (which deliberately never matches a live session -- see that
+// function's doc comment). `pl_bt_debug_cancel_connect()` above (no seq,
+// PL_SEQ_ANY) is unchanged and still the right tool for "cancel whatever is
+// HELD/IN_FLIGHT" with no live session in play. Same context discipline as
+// every other debug entry point in this block. Compiled only when
+// PL_DEBUG_REMOTE is set; entirely absent from a shipping build.
+void pl_bt_debug_cancel_connect_seq(uint16_t seq);
 #endif
 
 // Bead pico-link-cz0.6 (M5 persistence), code-review finding 1: enqueues a

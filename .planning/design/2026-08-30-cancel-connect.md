@@ -457,8 +457,11 @@ lossy (F3) and are supporting evidence only. Start each case from Idle
 - **H3 cancel-then-retry:** `--connect --delay 0.05 --cancel-connect` then
   `--connect` immediately. Pass: exactly one new session reaches LDAC,
   timeouts +0, held reissue logged or counted.
-- **H4 stale cancel:** connect to LDAC, wait 5 s, send `--cancel-connect`.
-  Pass: `cancels_stale` +1, stream still up (proves F2 is fixed).
+- **H4 stale cancel:** `--connect <addr>`, wait for LDAC, note the seq the
+  console logged for that debug CONNECT (`BT: debug-remote CONNECT ... seq=N`),
+  wait 5 s, then `--cancel-connect --seq N` (that same seq -- NOT bare
+  `--cancel-connect`, see the note below). Pass: `cancels_stale` +1, stream
+  still up (proves F2 is fixed).
 - **H5 headset-initiated reconnect -- NEEDS ANDREAS:** with the board Idle
   and connectable, Andreas power-cycles the headphones (94:DB:56:54:7C:F2).
   Pass: `remote_sessions` +1, report shows LDAC streaming, link Connected,
@@ -469,6 +472,19 @@ lossy (F3) and are supporting evidence only. Start each case from Idle
   session reaching LDAC with no disconnect/re-page (adopt rule); count
   `remote_sessions` to see which won.
 
-Note on H4: debug CANCELCONNECT uses `PL_SEQ_ANY`, which by rule 6 matches
-only a HELD/IN_FLIGHT attempt, never a concluded session -- so H4 must be a
-no-op. `PL_SEQ_ANY` never matches `session_seq`.
+Note on H4: bare `--cancel-connect` sends `PL_SEQ_ANY`, which by rule 6
+matches only a HELD/IN_FLIGHT attempt, never a concluded/live session
+(`PL_SEQ_ANY` never matches `session_seq`) -- so a bare `--cancel-connect`
+against an already-LDAC session is always a no-op, not evidence of anything.
+Code review, bead `pico-link-chc3`, found this made H4 untestable outright:
+the debug CONNECT bypass used to tag its own session with `PL_SEQ_ANY` too
+(seq=0 on the wire, `PL_SEQ_ANY` internally for the old no-seq
+`pl_bt_debug_cancel_connect`), so a stale cancel and the session it was
+supposed to fail to touch were indistinguishable -- `ANY == ANY` legitimately
+matched. Fixed: a debug CONNECT now allocates a real, distinct seq from
+a2dp.h's `PL_A2DP_DEBUG_SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX` C-only range
+(logged as `seq=N`), and `cdc_sender.py --cancel-connect --seq N` (wire:
+`CANCELCONNECT N`) targets that seq explicitly via Match 3 (`session_seq`),
+which is what actually exercises the stale-cancel path H4 is meant to prove.
+`--cancel-connect` with no `--seq` is unchanged (`PL_SEQ_ANY`) and remains
+the right tool for H1-H3's HELD/IN_FLIGHT cases.

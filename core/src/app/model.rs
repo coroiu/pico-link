@@ -384,12 +384,16 @@ impl BtModel {
     /// always a *fresh* attempt's `seq`, never reused). Skips `0` (ADA
     /// DESIGN v2, bead `pico-link-chc3`: `seq == 0` is the wire's "not
     /// core's attempt" sentinel -- a remote-initiated session or the
-    /// `PL_DEBUG_REMOTE` bypass) and `0xFFFF` (`PL_SEQ_ANY`, C's debug
-    /// cancel-any value) on wrap, so a real attempt's `seq` is never
-    /// confusable with either reserved value.
+    /// `PL_DEBUG_REMOTE` bypass) and `0xFF00..=0xFFFF` (code review,
+    /// testability follow-up, bead `pico-link-chc3`: `0xFFFF` is
+    /// `PL_SEQ_ANY`, C's debug cancel-any value, and `0xFF00..=0xFFFE` is
+    /// `PL_A2DP_DEBUG_SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX` in `a2dp.h`, the
+    /// C-only range the `PL_DEBUG_REMOTE` CONNECT bypass allocates its own
+    /// real seqs from) on wrap, so a real attempt's `seq` is never
+    /// confusable with any reserved value.
     pub(crate) fn bump_attempt_seq(&mut self) -> u16 {
         let mut next = self.attempt_seq_counter.wrapping_add(1);
-        if next == 0 || next == 0xFFFF {
+        if next == 0 || next >= 0xFF00 {
             next = 1;
         }
         self.attempt_seq_counter = next;

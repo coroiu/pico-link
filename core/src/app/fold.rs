@@ -599,7 +599,21 @@ impl App {
     /// screen deciding whether to offer a retry").
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason, seq: u16) {
         self.model.borrow_mut().last_connect_failure = Some((addr, reason));
-        if seq != 0 && !self.attempt_seq_matches(seq) {
+        // ADA DESIGN v2 (bead `pico-link-chc3`), mirroring `on_connect_
+        // succeeded`'s `seq == 0` early return: a remote-initiated or
+        // `PL_DEBUG_REMOTE`-bypass failure never called
+        // `radio_actions::connect` to record a `BtModel::attempt`, so there
+        // is no attempt to conclude and no wizard screen to flip to
+        // `Failed` on the user's behalf -- doing so anyway (the bug this
+        // comment replaces) could force `wizard_phase` to `Failed` even
+        // with no attempt in flight and no wizard open. `last_connect_
+        // failure` above is the one deliberately non-attempt-scoped
+        // exception (see its own doc comment).
+        if seq == 0 {
+            self.mark_model_changed();
+            return;
+        }
+        if !self.attempt_seq_matches(seq) {
             self.mark_model_changed();
             return;
         }

@@ -32,6 +32,11 @@ Wire protocol (one command per line, LF-terminated):
                        the wizard screen entirely, so there is nothing on
                        screen for NAV BACK to cancel. See --cancel-connect
                        below.
+  CANCELCONNECT <N> -- code review 2026-09-27, testability follow-up: same
+                       as bare CANCELCONNECT, but targets seq N (0..65535)
+                       instead of PL_SEQ_ANY, so a stale-cancel test can hit
+                       an already-live session (H4) instead of only ever
+                       matching a HELD/IN_FLIGHT attempt. See --seq below.
   BOOTSEL          -- bead pico-link-vu4: reboots the board straight into
                        the USB mass-storage bootloader (reset_usb_boot),
                        so a flash-verify loop no longer needs a human
@@ -231,7 +236,24 @@ def main():
             "wizard's B button does during Connecting/NotResponding -- lets an unattended "
             "test cancel a --connect mid-flight (S1-S5, per the design's per-stage abort "
             "table) by tuning --delay. Sent after --connect/--disconnect, before --bootsel. "
-            "PL_DEBUG_REMOTE-only, like every other command in this file except NAV."
+            "PL_DEBUG_REMOTE-only, like every other command in this file except NAV. With no "
+            "--seq, sends bare CANCELCONNECT (PL_SEQ_ANY -- cancels whatever is HELD/IN_FLIGHT, "
+            "never a live session). Pass --seq to target a specific session instead (see --seq)."
+        ),
+    )
+    ap.add_argument(
+        "--seq",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "code review 2026-09-27, testability follow-up (bead pico-link-chc3): only "
+            "meaningful with --cancel-connect. Targets an explicit seq (0..65535) instead of "
+            "PL_SEQ_ANY, so a stale cancel can be tested against an already-live session (H4) "
+            "-- e.g. the seq a prior debug --connect logged over the console (firmware now "
+            "allocates a real, distinct seq per debug CONNECT from a2dp.h's "
+            "PL_A2DP_DEBUG_SEQ_MIN..MAX range, logged as 'seq=N'). Sends 'CANCELCONNECT N' "
+            "instead of bare 'CANCELCONNECT'. Requires --cancel-connect; ignored otherwise."
         ),
     )
     ap.add_argument(
@@ -289,8 +311,15 @@ def main():
             lines.append(to_connect_line(args.connect))
         if args.disconnect:
             lines.append("DISCONNECT")
+        if args.seq is not None and not args.cancel_connect:
+            raise ValueError("--seq requires --cancel-connect")
         if args.cancel_connect:
-            lines.append("CANCELCONNECT")
+            if args.seq is not None:
+                if not (0 <= args.seq <= 0xFFFF):
+                    raise ValueError(f"--seq must be 0..65535, got {args.seq}")
+                lines.append(f"CANCELCONNECT {args.seq}")
+            else:
+                lines.append("CANCELCONNECT")
         if args.bootsel:
             # Sent last and unconditionally last of all -- reset_usb_boot()
             # on the firmware side is noreturn, so anything queued after it

@@ -166,6 +166,37 @@ static bool parse_connect_addr(const char *line, uint8_t addr[6]) {
 // contract for malformed input -- an oversized K still does SOMETHING
 // bounded rather than nothing.
 #define PL_DEBUG_SKIP_TICKS_MAX 1000u
+// Bead pico-link-chc3, code review 2026-09-27, testability follow-up:
+// parses "CANCELCONNECT <N>" where <N> is a decimal seq (0..65535,
+// typically one a debug CONNECT just logged, from a2dp.h's PL_A2DP_DEBUG_
+// SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX range) -- same rejection discipline as
+// parse_connect_addr/parse_skip_ticks (malformed input is rejected
+// outright, not guessed at). Deliberately does NOT accept a value that
+// overflows uint16_t; a decimal literal >65535 is rejected rather than
+// silently truncated, since a wrong (truncated) seq could accidentally
+// collide with a live session and cancel the wrong one.
+static bool parse_cancel_connect_seq(const char *line, uint16_t *out_seq) {
+    if (strncmp(line, "CANCELCONNECT ", 14) != 0) {
+        return false;
+    }
+    const char *p = line + 14;
+    if (*p == '\0') {
+        return false;
+    }
+    uint32_t value = 0;
+    for (; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        value = value * 10u + (uint32_t)(*p - '0');
+        if (value > 0xFFFFu) {
+            return false;
+        }
+    }
+    *out_seq = (uint16_t)value;
+    return true;
+}
+
 static bool parse_skip_ticks(const char *line, uint32_t *out_ticks) {
     if (strncmp(line, "SKIPTICKS ", 10) != 0) {
         return false;
@@ -308,6 +339,7 @@ size_t pl_debug_remote_poll(struct PlUi *ui, PlIntent *out, size_t max) {
                 s_line[s_line_len] = '\0';
                 uint8_t connect_addr[6];
                 uint32_t skip_ticks;
+                uint16_t cancel_seq;
                 if (strcmp(s_line, "BOOTSEL") == 0) {
                     // Bead pico-link-vu4: routes around pico-link-d74 (the
                     // vendor CONTROL transfer on interface 4 that STALLs on
@@ -345,6 +377,18 @@ size_t pl_debug_remote_poll(struct PlUi *ui, PlIntent *out, size_t max) {
                     // No address needed (there is only ever one connection).
                     pl_log("debug-remote: DISCONNECT -> dispatched\r\n");
                     pl_bt_debug_disconnect();
+                } else if (parse_cancel_connect_seq(s_line, &cancel_seq)) {
+                    // Bead pico-link-chc3, code review 2026-09-27,
+                    // testability follow-up: "CANCELCONNECT <seq>" targets
+                    // an explicit seq (typically one a prior debug CONNECT
+                    // logged) instead of PL_SEQ_ANY -- see bt.h's
+                    // pl_bt_debug_cancel_connect_seq doc comment for why
+                    // (H4: a stale cancel against an already-live session
+                    // needs a real seq to be testable at all). Checked
+                    // before the plain "CANCELCONNECT" strcmp below so a
+                    // seq argument is never swallowed by it.
+                    pl_log("debug-remote: CANCELCONNECT %u -> dispatched\r\n", (unsigned)cancel_seq);
+                    pl_bt_debug_cancel_connect_seq(cancel_seq);
                 } else if (strcmp(s_line, "CANCELCONNECT") == 0) {
                     // Bead pico-link-chc3, testability follow-up: injects
                     // Command::CancelConnect the same way core's wizard

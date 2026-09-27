@@ -1013,6 +1013,28 @@ mod tests {
     }
 
     #[test]
+    fn seq_zero_connect_failed_does_not_touch_attempt_or_wizard() {
+        // Code review on bead `pico-link-chc3`: `record_connect_failure`
+        // did not special-case `seq == 0` the way `on_connect_succeeded`
+        // does, so a remote-initiated or `PL_DEBUG_REMOTE`-bypass
+        // `ConnectFailed { seq: 0 }` unconditionally forced `wizard_phase`
+        // to `Failed` even with no attempt in flight and no wizard open.
+        // Mirrors `background_connect_success_does_not_navigate_away_
+        // from_another_screen`'s shape, but for the failure path.
+        let mut app = App::new(240, 240);
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+        app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+        assert_eq!(app.navigator_depth(), 2, "sitting on Devices, no wizard open, no attempt in flight");
+
+        let phase_before = app.wizard_phase_for_test();
+        let addr = [13; 6];
+        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout, seq: 0 });
+
+        assert_eq!(app.wizard_phase_for_test(), phase_before, "seq == 0 must not touch wizard_phase -- there is no attempt to fail");
+        assert_eq!(app.navigator_depth(), 2, "seq == 0 must not navigate anywhere");
+    }
+
+    #[test]
     fn degraded_success_does_not_auto_dismiss() {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
