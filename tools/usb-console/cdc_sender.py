@@ -23,6 +23,15 @@ Wire protocol (one command per line, LF-terminated):
   DISCONNECT       -- bead pico-link-nb6: tears down the current A2DP
                        connection, if any. No address (there is only ever
                        one). See --disconnect below.
+  CANCELCONNECT    -- bead pico-link-chc3: injects Command::CancelConnect
+                       exactly as the on-device pairing wizard's B button
+                       does during Connecting/NotResponding, letting an
+                       unattended test drive cancel-at-stage S1-S5 without
+                       a human at the d-pad. NAV BACK after a debug CONNECT
+                       does NOT do this -- the debug CONNECT path bypasses
+                       the wizard screen entirely, so there is nothing on
+                       screen for NAV BACK to cancel. See --cancel-connect
+                       below.
   BOOTSEL          -- bead pico-link-vu4: reboots the board straight into
                        the USB mass-storage bootloader (reset_usb_boot),
                        so a flash-verify loop no longer needs a human
@@ -40,6 +49,9 @@ Usage:
   python3 cdc_sender.py --vid 0x2e8a --pid 0xc  # override device match
   python3 cdc_sender.py --connect AABBCCDDEEFF  # connect directly to a known device address
   python3 cdc_sender.py --bootsel               # reboot the board into the USB bootloader
+  python3 cdc_sender.py --connect AABBCCDDEEFF --delay 0.2 --cancel-connect
+                                                 # drive a connect then cancel it mid-flight,
+                                                 # e.g. at whatever stage --delay lands on (S1-S5)
 
 Command shorthand accepted (case-insensitive): UP, DOWN, LEFT, RIGHT,
 SELECT, BACK, X, Y, JUMP:<n> (e.g. JUMP:-3). Each is turned into the matching
@@ -212,6 +224,17 @@ def main():
         ),
     )
     ap.add_argument(
+        "--cancel-connect",
+        action="store_true",
+        help=(
+            "bead pico-link-chc3: inject Command::CancelConnect, exactly as the on-device "
+            "wizard's B button does during Connecting/NotResponding -- lets an unattended "
+            "test cancel a --connect mid-flight (S1-S5, per the design's per-stage abort "
+            "table) by tuning --delay. Sent after --connect/--disconnect, before --bootsel. "
+            "PL_DEBUG_REMOTE-only, like every other command in this file except NAV."
+        ),
+    )
+    ap.add_argument(
         "--bootsel",
         action="store_true",
         help=(
@@ -266,6 +289,8 @@ def main():
             lines.append(to_connect_line(args.connect))
         if args.disconnect:
             lines.append("DISCONNECT")
+        if args.cancel_connect:
+            lines.append("CANCELCONNECT")
         if args.bootsel:
             # Sent last and unconditionally last of all -- reset_usb_boot()
             # on the firmware side is noreturn, so anything queued after it
@@ -278,7 +303,7 @@ def main():
     if not lines:
         print(
             "No commands given -- nothing to send. Pass e.g. UP DOWN SELECT, --raw 'NAV JUMP -3', "
-            "--connect AABBCCDDEEFF, --disconnect, or --bootsel.",
+            "--connect AABBCCDDEEFF, --disconnect, --cancel-connect, or --bootsel.",
             file=sys.stderr,
         )
         sys.exit(2)

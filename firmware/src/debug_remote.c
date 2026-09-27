@@ -345,6 +345,16 @@ size_t pl_debug_remote_poll(struct PlUi *ui, PlIntent *out, size_t max) {
                     // No address needed (there is only ever one connection).
                     pl_log("debug-remote: DISCONNECT -> dispatched\r\n");
                     pl_bt_debug_disconnect();
+                } else if (strcmp(s_line, "CANCELCONNECT") == 0) {
+                    // Bead pico-link-chc3, testability follow-up: injects
+                    // Command::CancelConnect the same way core's wizard
+                    // does on NAV BACK during Connecting/NotResponding --
+                    // see bt.h's pl_bt_debug_cancel_connect doc comment for
+                    // why CONNECT + NAV BACK alone can't reach this (the
+                    // debug CONNECT path never puts the wizard on screen).
+                    // No address, same convention as DISCONNECT above.
+                    pl_log("debug-remote: CANCELCONNECT -> dispatched\r\n");
+                    pl_bt_debug_cancel_connect();
                 } else if (strcmp(s_line, "MEDIA PLAYPAUSE") == 0) {
                     // Bead pico-link-47z.2 (T2): exercises the USB HID half
                     // of media keys with NO Bluetooth/AVRCP involved -- see

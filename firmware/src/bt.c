@@ -1902,4 +1902,21 @@ void pl_bt_debug_disconnect(void) {
     pl_log("BT: debug-remote DISCONNECT\r\n");
     pl_bt_pending_push(PL_BT_PENDING_DISCONNECT, NULL);
 }
+
+// Bead pico-link-chc3, testability follow-up -- see bt.h's doc comment.
+// Body is deliberately identical to PL_COMMAND_TAG_CANCEL_CONNECT's real
+// handler above (push LinkState(Idle) inline, defer the actual
+// pl_a2dp_cancel_connect bookkeeping call through the pending queue), minus
+// the PlCommand indirection -- same relationship pl_bt_debug_connect has to
+// PL_COMMAND_TAG_CONNECT. The pending-queue entry needs SOME addr buffer
+// (pl_bt_pending_push's memcpy for this tag), but pl_a2dp_cancel_connect
+// ignores it (see its own doc comment on why), so an all-zero placeholder
+// is fine -- unlike pl_bt_debug_connect's addr, this one is never a real
+// BD_ADDR and is never compared against one.
+void pl_bt_debug_cancel_connect(void) {
+    static const bd_addr_t zero_addr = {0, 0, 0, 0, 0, 0};
+    pl_log("BT: debug-remote CANCEL_CONNECT\r\n");
+    pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+    pl_bt_pending_push(PL_BT_PENDING_CANCEL_CONNECT, zero_addr);
+}
 #endif

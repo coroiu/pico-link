@@ -236,6 +236,22 @@ void pl_bt_debug_connect(const uint8_t *addr);
 // Compiled only when PL_DEBUG_REMOTE is set; entirely absent from a
 // shipping build.
 void pl_bt_debug_disconnect(void);
+
+// Bead pico-link-chc3, testability follow-up: debug-only injection of
+// Command::CancelConnect exactly as core/src/render/wizard.rs's own
+// NavIntent::Back handler produces it -- lets an unattended hardware test
+// drive cancel-at-stage S1-S5 (design .planning/design/2026-08-30-cancel-
+// connect.md) without a human at the d-pad mid-Connecting, which the
+// debug-remote CONNECT path alone could never reach (it bypasses the
+// wizard screen entirely, so NAV BACK right after a debug CONNECT is a
+// no-op -- see this bead's own hardware-round comment on the board). No
+// address needed: mirrors the real PL_COMMAND_TAG_CANCEL_CONNECT handler's
+// own addr (ignored by pl_a2dp_cancel_connect -- see its doc comment), and
+// pl_bt_debug_disconnect's "there is only ever one" convention. Same
+// context discipline as pl_bt_debug_connect/pl_bt_debug_disconnect above.
+// Compiled only when PL_DEBUG_REMOTE is set; entirely absent from a
+// shipping build.
+void pl_bt_debug_cancel_connect(void);
 #endif
 
 // Bead pico-link-cz0.6 (M5 persistence), code-review finding 1: enqueues a

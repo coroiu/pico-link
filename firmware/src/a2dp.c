@@ -253,6 +253,15 @@ _Static_assert(
 // enough that Andreas isn't left waiting on a screen he's done with.
 #define PL_A2DP_WIZARD_DISMISS_DELAY_MS 2000
 
+// Bead pico-link-chc3, review fix-first: bounded fallback for a
+// cancel-then-immediate-retry's held connect (see cancel_teardown_armed's
+// doc comment on pl_a2dp_ctx_t). Comfortably longer than a real
+// a2dp_source_disconnect -> SIGNALING_CONNECTION_RELEASED round trip ever
+// takes on hardware (that's normally sub-second), short enough that a user
+// who reconnects into a genuinely wedged teardown isn't left staring at a
+// stuck wizard for long.
+#define PL_A2DP_CANCEL_TEARDOWN_TIMEOUT_MS 3000
+
 // Bead pico-link-pbv: PL_A2DP_MAX_FRAMES_PER_TICK (a fixed constant, 5) is
 // GONE. Round 1 replaced it with s_ctx.frames_per_tick_cap, a per-stream
 // FRAME-COUNT cap computed from the negotiated payload size and the
@@ -372,6 +381,22 @@ typedef struct {
     // target (pl_bt_connect_or_switch).
     bool held_connect_pending;
     bd_addr_t held_connect_addr;
+
+    // Bead pico-link-chc3, review fix-first: bounded fallback for the
+    // cancel_pending window above. Armed the instant cancel_pending goes
+    // true (i.e. there is a real a2dp_source_disconnect outstanding),
+    // disarmed the instant A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED
+    // confirms that teardown actually completed. If RELEASED never arrives
+    // (a wedged stack, or a session that was already dead at the HCI layer
+    // when a2dp_source_disconnect was issued), this fires once and forces
+    // recovery instead of holding a connect forever -- see
+    // pl_a2dp_cancel_teardown_timeout_handler. cancel_teardown_timeouts is a
+    // falsifiable counter in pl_a2dp_report, same discipline as
+    // cancels_requested/cancels_late_success above: it should stay 0 on
+    // healthy hardware.
+    btstack_timer_source_t cancel_teardown_timer;
+    bool cancel_teardown_armed;
+    volatile uint32_t cancel_teardown_timeouts;
 
     // Bead pico-link-0cq2: split into the ATTEMPT (`pending_addr`) and the
     // COMMITTED session (`connect_addr`) -- they used to be one field,
@@ -3387,6 +3412,59 @@ static void pl_a2dp_wizard_dismiss_timer_arm(void) {
     s_ctx.wizard_dismiss_armed = true;
 }
 
+// Bead pico-link-chc3, review fix-first: cancels the bounded teardown-
+// timeout fallback -- see cancel_teardown_armed's doc comment on
+// pl_a2dp_ctx_t. Safe to call unconditionally (same idiom as every other
+// *_timer_cancel in this file). Called the instant SIGNALING_CONNECTION_
+// RELEASED confirms the teardown this timer was guarding actually
+// completed.
+static void pl_a2dp_cancel_teardown_timer_cancel(void) {
+    if (!s_ctx.cancel_teardown_armed) {
+        return;
+    }
+    btstack_run_loop_remove_timer(&s_ctx.cancel_teardown_timer);
+    s_ctx.cancel_teardown_armed = false;
+}
+
+// Bead pico-link-chc3, review fix-first: fires only if
+// SIGNALING_CONNECTION_RELEASED never showed up within
+// PL_A2DP_CANCEL_TEARDOWN_TIMEOUT_MS of a cancel's own deferred
+// a2dp_source_disconnect (pl_a2dp_service_cancel). Forces cancel_pending
+// closed (best-effort recovery -- the alternative is holding a connect
+// forever) and reissues whatever connect was held while waiting, exactly
+// as the real RELEASED path does. cancel_teardown_timeouts is the
+// falsifiable counter in pl_a2dp_report: it staying 0 is what proves this
+// fallback is never actually needed on healthy hardware.
+static void pl_a2dp_cancel_teardown_timeout_handler(btstack_timer_source_t *ts) {
+    (void)ts;
+    s_ctx.cancel_teardown_armed = false;
+    s_ctx.cancel_teardown_timeouts++;
+    pl_log(
+        "a2dp: cancel teardown timeout (RELEASED never arrived), forcing recovery, cid=0x%04x\r\n",
+        s_ctx.a2dp_cid
+    );
+    s_ctx.cancel_pending = false;
+    if (s_ctx.held_connect_pending) {
+        s_ctx.held_connect_pending = false;
+        bd_addr_t held_addr;
+        memcpy(held_addr, s_ctx.held_connect_addr, 6);
+        pl_log("a2dp: teardown timeout, issuing held connect anyway\r\n");
+        pl_a2dp_connect(held_addr);
+    }
+}
+
+// Bead pico-link-chc3, review fix-first: arms the one-shot bounded fallback
+// above. Called only from pl_a2dp_cancel_connect, exactly where
+// cancel_pending itself is set true (there's a real deferred disconnect for
+// this timer to bound).
+static void pl_a2dp_cancel_teardown_timer_arm(void) {
+    btstack_run_loop_remove_timer(&s_ctx.cancel_teardown_timer); // safe even if not currently added
+    btstack_run_loop_set_timer_handler(&s_ctx.cancel_teardown_timer, pl_a2dp_cancel_teardown_timeout_handler);
+    btstack_run_loop_set_timer(&s_ctx.cancel_teardown_timer, PL_A2DP_CANCEL_TEARDOWN_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&s_ctx.cancel_teardown_timer);
+    s_ctx.cancel_teardown_armed = true;
+}
+
 static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -4319,6 +4397,12 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // just finished releasing -- nothing left for
             // pl_a2dp_service_cancel to do on the next tick.
             s_ctx.cancel_pending = false;
+            // Bead pico-link-chc3, review fix-first: RELEASED is the real
+            // confirmation the teardown timeout above exists to bound --
+            // disarm it now that it actually arrived. A no-op if it wasn't
+            // armed (e.g. this RELEASED belongs to a session that was never
+            // being cancelled).
+            pl_a2dp_cancel_teardown_timer_cancel();
             // Bead pico-link-chc3 (C5): a connect that arrived while this
             // teardown was still outstanding was held rather than reported
             // as a spurious RadioError failure (see
@@ -4557,6 +4641,29 @@ void pl_a2dp_poll_ldac_bitrate(struct PlUi *ui) {
 }
 
 void pl_a2dp_connect(const uint8_t *addr) {
+    // Bead pico-link-chc3, review fix-first: a cancel's own deferred
+    // teardown (pl_a2dp_service_cancel, called once per heartbeat AFTER
+    // pl_bt_pending_service) may still be outstanding when this fires --
+    // bt.c's PL_BT_PENDING_CANCEL_CONNECT and PL_BT_PENDING_CONNECT can land
+    // in the SAME heartbeat tick (cancel-then-immediate-retry). Unconditionally
+    // clearing cancel_pending here (as this function used to) dropped the
+    // deferred a2dp_source_disconnect on the prior still-live cid entirely
+    // (D1 violated) -- service_cancel would see cancel_pending already false
+    // and never call a2dp_source_disconnect at all. Instead: hold the new
+    // address (same held_connect_pending idiom as the C5
+    // ERROR_CODE_COMMAND_DISALLOWED branch in
+    // pl_a2dp_establish_stream_now below) and let cancel_pending survive
+    // this tick so service_cancel still tears the old session down; the
+    // held connect is reissued from A2DP_SUBEVENT_SIGNALING_CONNECTION_
+    // RELEASED once that teardown actually completes, or from
+    // pl_a2dp_cancel_teardown_timeout_handler's bounded fallback if RELEASED
+    // never arrives.
+    if (s_ctx.cancel_pending) {
+        pl_log("a2dp: connect requested while cancel teardown outstanding, holding until RELEASED\r\n");
+        memcpy(s_ctx.held_connect_addr, addr, 6);
+        s_ctx.held_connect_pending = true;
+        return;
+    }
     // Bead pico-link-648: a fresh top-level connect attempt gets its own
     // single retry budget, and supersedes any retry still armed from a
     // previous attempt (e.g. the user backed out and reconnected inside
@@ -4569,7 +4676,11 @@ void pl_a2dp_connect(const uint8_t *addr) {
     // pl_a2dp_ctx_t); nothing branches on its value.
     s_ctx.attempt_live = true;
     s_ctx.attempt_epoch++;
-    s_ctx.cancel_pending = false; // superseded -- a fresh attempt supersedes any stale cancel of a prior one
+    // Review fix-first: this is now dead in practice (the cancel_pending
+    // guard above already returned if it were true), kept only as a
+    // belt-and-suspenders reset for a stale true this function itself
+    // should never be able to observe here.
+    s_ctx.cancel_pending = false;
     pl_a2dp_establish_stream_now(addr);
 }
 
@@ -4593,6 +4704,11 @@ void pl_a2dp_cancel_connect(const uint8_t *addr) {
     if (s_ctx.a2dp_cid != 0) {
         s_ctx.cancel_pending = true;
         memcpy(s_ctx.cancel_addr, s_ctx.pending_addr, 6);
+        // Review fix-first: there is now a real deferred
+        // a2dp_source_disconnect for pl_a2dp_service_cancel to issue --
+        // bound the wait for its RELEASED confirmation (see
+        // cancel_teardown_armed's doc comment on pl_a2dp_ctx_t).
+        pl_a2dp_cancel_teardown_timer_arm();
     }
     // A cancel supersedes the 0x0b retry and wizard-dismiss timers exactly
     // like a fresh connect() does (pl_a2dp_prepare_switch's own reasoning) --
@@ -4610,9 +4726,13 @@ void pl_a2dp_service_cancel(void) {
     }
     if (s_ctx.a2dp_cid == 0) {
         // The session already tore itself down some other way (e.g. the
-        // sink hung up first) between the cancel and this tick -- nothing
-        // left to disconnect.
+        // sink hung up first, or its own establish failed) between the
+        // cancel and this tick -- nothing left to disconnect, and no
+        // RELEASED is coming for a cid that's already gone, so the
+        // teardown-timeout fallback has nothing left to bound either
+        // (review fix-first, pico-link-chc3).
         s_ctx.cancel_pending = false;
+        pl_a2dp_cancel_teardown_timer_cancel();
         return;
     }
     pl_log("a2dp: servicing pending cancel, disconnecting cid=0x%04x\r\n", s_ctx.a2dp_cid);
@@ -4698,10 +4818,15 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // cumulative, never reset. cancels_late_success == 0 proves nothing
     // about whether the design's S5 race exists unless cancels_requested is
     // also nonzero (see a2dp.h's doc comment on pl_a2dp_cancel_connect).
+    // cancel_teardown_timeouts (review fix-first) is the same discipline for
+    // the bounded RELEASED-never-arrived fallback -- it should stay 0 on
+    // healthy hardware.
     pl_log(
-        "a2dp: cancels_requested=%lu cancels_late_success=%lu events_suppressed=%lu attempt_epoch=%lu\r\n",
+        "a2dp: cancels_requested=%lu cancels_late_success=%lu events_suppressed=%lu attempt_epoch=%lu "
+        "cancel_teardown_timeouts=%lu\r\n",
         (unsigned long)s_ctx.cancels_requested, (unsigned long)s_ctx.cancels_late_success,
-        (unsigned long)s_ctx.events_suppressed, (unsigned long)s_ctx.attempt_epoch
+        (unsigned long)s_ctx.events_suppressed, (unsigned long)s_ctx.attempt_epoch,
+        (unsigned long)s_ctx.cancel_teardown_timeouts
     );
     // Bead pico-link-nli.9 (P1): enc_mean_us/enc_win_max_us are WINDOWED --
     // snapshot and reset here, same read-resets-the-window discipline as
