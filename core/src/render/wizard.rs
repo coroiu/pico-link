@@ -46,8 +46,9 @@ use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use crate::app::{
-    is_audio_sink, truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, ModelHandle, ScreenId, WizardPhase,
-    MAX_SCAN_LIST_ITEMS,
+    cancel_connect, cancel_scan, connect, is_audio_sink, start_scan, truncate_device_name, Command, ConnectFailureReason, ConnectInitiator,
+    ConnectStep,
+    DeviceEntry, ModelHandle, ScanOwner, ScreenId, WizardPhase, MAX_SCAN_LIST_ITEMS,
 };
 use crate::input::NavIntent;
 
@@ -251,7 +252,7 @@ struct PairingWizardView {
 impl PairingWizardView {
     fn new(phase: Rc<RefCell<WizardPhase>>, model: ModelHandle, commands: Rc<RefCell<VecDeque<Command>>>) -> Self {
         let list_devices = model.borrow().discovered.clone();
-        let list = build_scan_list(&list_devices, &phase, &commands, None, 0);
+        let list = build_scan_list(&list_devices, &phase, &model, &commands, None, 0);
         Self { phase, model, commands, list: RefCell::new(list), list_devices: RefCell::new(list_devices) }
     }
 
@@ -265,7 +266,7 @@ impl PairingWizardView {
         }
         let prev_key = self.list.borrow().selected_key();
         let prev_index = self.list.borrow().selected_index();
-        let new_list = build_scan_list(&current, &self.phase, &self.commands, prev_key, prev_index);
+        let new_list = build_scan_list(&current, &self.phase, &self.model, &self.commands, prev_key, prev_index);
         *self.list.borrow_mut() = new_list;
         *self.list_devices.borrow_mut() = current;
     }
@@ -299,6 +300,7 @@ impl PairingWizardView {
 fn build_scan_list(
     devices: &[DeviceEntry],
     phase: &Rc<RefCell<WizardPhase>>,
+    model: &ModelHandle,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     prev_key: Option<ListItemKey>,
     prev_index: usize,
@@ -338,13 +340,12 @@ fn build_scan_list(
 
     let devices_snapshot: Vec<DeviceEntry> = capped;
     let phase_for_activate = Rc::clone(phase);
+    let model_for_activate = Rc::clone(model);
     let commands_for_activate = Rc::clone(commands);
     VerticalList::new(items)
         .on_activate_index(Verb::Pair, move |index| {
             if let Some(device) = devices_snapshot.get(index) {
-                commands_for_activate
-                    .borrow_mut()
-                    .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
+                connect(&model_for_activate, &commands_for_activate, device.addr, truncate_device_name(&device.name), ConnectInitiator::Device);
                 *phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
             }
             Action::None
@@ -377,13 +378,12 @@ impl Widget for PairingWizardView {
         let phase = self.phase.borrow().clone();
         match phase {
             WizardPhase::NothingFound => {
-                // Phase 3 -> phase 2 (re-scan). Clearing `model.discovered`
-                // proactively (rather than waiting for C's own
-                // `DevicesCleared` event) avoids a stale-row flash from a
-                // previous scan between this press and that event
-                // arriving.
-                self.model.borrow_mut().discovered.clear();
-                self.commands.borrow_mut().push_back(Command::StartScan);
+                // Phase 3 -> phase 2 (re-scan). `start_scan` clears
+                // `model.discovered` proactively (rather than waiting for
+                // C's own `DevicesCleared` event), avoiding a stale-row
+                // flash from a previous scan between this press and that
+                // event arriving.
+                start_scan(&self.model, &self.commands, ScanOwner::Device);
                 *self.phase.borrow_mut() = WizardPhase::scanning_pending();
                 Action::None
             }
@@ -410,7 +410,7 @@ impl Widget for PairingWizardView {
             // for precisely this side effect, then unconditionally pops
             // regardless of what's returned -- see that arm's doc comment.
             (NavIntent::Back, WizardPhase::Scanning { .. }) => {
-                self.commands.borrow_mut().push_back(Command::CancelScan);
+                cancel_scan(&self.commands);
                 Action::None
             }
             // Code-review fix (post-merge-review of this bead): B was
@@ -424,7 +424,13 @@ impl Widget for PairingWizardView {
             // section 9 phase 4: "B genuinely aborts" -- not "B leaves
             // the screen". Mirrors the `CancelScan` arm above exactly.
             (NavIntent::Back, WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. }) => {
-                self.commands.borrow_mut().push_back(Command::CancelConnect { addr });
+                // Bead pico-link-jyhk.25 review fix: routes through
+                // `radio_actions::cancel_connect` (not a bare `Command::
+                // CancelConnect` push) so `BtModel::attempt`/`last_outcome`
+                // conclude immediately, rather than never -- see that
+                // function's doc comment for why a fire-and-forget C cancel
+                // can't be the thing that concludes them.
+                cancel_connect(&self.model, &self.commands, addr);
                 Action::None
             }
             (NavIntent::Up | NavIntent::Down | NavIntent::JumpBy(_), WizardPhase::Scanning { .. }) => {
@@ -446,12 +452,12 @@ impl Widget for PairingWizardView {
             // erasing it, so a retry can never regress an already-known
             // name to nameless.
             (NavIntent::ShortcutX, WizardPhase::NotResponding { addr, .. }) => {
-                self.commands.borrow_mut().push_back(Command::Connect { addr, name: String::new() });
+                connect(&self.model, &self.commands, addr, String::new(), ConnectInitiator::Device);
                 *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
             (NavIntent::ShortcutX, WizardPhase::Failed { addr, reason }) if reason.retryable() => {
-                self.commands.borrow_mut().push_back(Command::Connect { addr, name: String::new() });
+                connect(&self.model, &self.commands, addr, String::new(), ConnectInitiator::Device);
                 *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
@@ -605,7 +611,9 @@ impl Widget for PairingWizardView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ConnectFailureReason, ConnectStep, DeviceEntry, Event, HomeFace, LinkState, WizardPhase, DEVICES_TITLE};
+    use crate::app::{
+        App, ConnectFailureReason, ConnectOutcomeResult, ConnectStep, DeviceEntry, Event, HomeFace, LinkState, WizardPhase, DEVICES_TITLE,
+    };
     use crate::input::NavIntent;
     use crate::platform::Instant;
 
@@ -1133,6 +1141,80 @@ mod tests {
             app.poll_command(),
             Some(Command::CancelConnect { addr }),
             "B during the connecting phase must queue CancelConnect (design section 9: 'B genuinely aborts') --              leaving the screen without this leaves the abandoned ACL/SSP/AVDTP attempt running in C"
+        );
+    }
+
+    /// Bead pico-link-jyhk.25 review fix: B during `Connecting` must
+    /// conclude `BtModel::attempt` immediately (not just queue
+    /// `Command::CancelConnect` and leave the radio-session record
+    /// dangling) -- a fire-and-forget C cancel only ever echoes back
+    /// `LinkStateChanged(Idle)`, which doesn't conclude an attempt on its
+    /// own (see `App::set_link_state`'s doc comment), so if `radio_actions::
+    /// cancel_connect` didn't conclude it at queue time, `attempt` would
+    /// stay `Some` forever and a future `GET_RADIO` snapshot would report a
+    /// phantom in-flight connect.
+    #[test]
+    fn b_during_connecting_concludes_the_attempt_as_cancelled() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        let addr = [16; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
+        app.handle_input(vec![NavIntent::Select]); // -> Connecting
+        let seq = app.model().attempt.expect("connect() must have recorded an attempt").seq;
+        app.poll_command(); // drain StartScan
+        app.poll_command(); // drain Connect
+
+        app.handle_input(vec![NavIntent::Back]);
+        app.poll_command(); // drain CancelConnect
+
+        assert_eq!(app.model().attempt, None, "cancelling must conclude the attempt, not leave it dangling forever");
+        let outcome = app.model().last_outcome.expect("cancelling must record a last_outcome");
+        assert_eq!(outcome.seq, seq);
+        assert_eq!(outcome.addr, addr);
+        assert_eq!(outcome.result, ConnectOutcomeResult::Cancelled);
+
+        // The only core-visible echo of a cancel C actually sends (see
+        // `radio_actions::cancel_connect`'s doc comment) must not disturb
+        // what the cancel already concluded.
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        assert_eq!(app.model().attempt, None);
+        assert_eq!(app.model().last_outcome.expect("must survive the Idle echo").result, ConnectOutcomeResult::Cancelled);
+    }
+
+    /// ADA DESIGN v2 (bead `pico-link-chc3`): a `ConnectSucceeded` arriving
+    /// after the user cancelled the attempt that requested it is a real,
+    /// new connection -- C's cancel is fire-and-forget and does not
+    /// suppress an outcome already in flight on the wire, so if the link
+    /// genuinely comes up, `core` must report it as connected, not swallow
+    /// it as a stray echo. Supersedes bead `pico-link-jyhk.25`'s
+    /// `stray_connect_succeeded_after_cancel_does_not_resurrect_the_attempt`,
+    /// which asserted the opposite and, by keying suppression on address
+    /// alone, also would have false-dropped a headset-initiated reconnect
+    /// to the same address.
+    #[test]
+    fn connect_succeeded_after_cancel_is_reported_as_a_real_connection() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        let addr = [17; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
+        app.handle_input(vec![NavIntent::Select]); // -> Connecting
+        app.poll_command(); // drain StartScan
+        app.poll_command(); // drain Connect
+
+        app.handle_input(vec![NavIntent::Back]);
+        app.poll_command(); // drain CancelConnect
+        assert_eq!(app.model().attempt, None, "cancelling must conclude the attempt");
+
+        // The link actually came up after the cancel was sent -- C's cancel
+        // doesn't suppress an outcome already in flight on the wire.
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+
+        assert_eq!(app.model().connected_addr, Some(addr), "a genuine post-cancel success must be reported as connected");
+        assert_eq!(app.model().attempt, None, "a concluded success leaves no in-flight attempt");
+        assert_eq!(
+            app.model().last_outcome.expect("must record the new outcome").result,
+            ConnectOutcomeResult::Ok,
+            "the real success must overwrite Cancelled, not be swallowed by it"
         );
     }
 

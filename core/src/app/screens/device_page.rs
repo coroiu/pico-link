@@ -28,7 +28,9 @@ use super::devices::{build_forget_confirm_screen, paired_device_label};
 use super::effects::resolve_effect_name;
 use super::ldac_quality::{build_ldac_quality_picker_screen, ldac_quality_fixed_kbps, LDAC_QUALITY_ADAPTIVE};
 use super::picker::{build_picker_view_screen, PickerOption};
-use super::super::{truncate_device_name, BtModel, Command, DeviceAddr, ModelHandle, PairedDevice, PickerKind, ScreenId};
+use super::super::{
+    connect, disconnect, truncate_device_name, BtModel, Command, ConnectInitiator, DeviceAddr, ModelHandle, PairedDevice, PickerKind, ScreenId,
+};
 
 /// A placeholder for a live value this page cannot honestly report yet --
 /// `core` has no `SetDeviceCodecPref`/`CodecAvailability`/
@@ -430,9 +432,9 @@ impl Widget for DevicePageView {
                 (model.connected_addr == Some(self.addr), model.paired.iter().find(|d| d.addr == self.addr).map(|d| d.name.clone()).unwrap_or_default())
             };
             if connected {
-                self.commands.borrow_mut().push_back(Command::Disconnect);
+                disconnect(&self.commands);
             } else {
-                self.commands.borrow_mut().push_back(Command::Connect { addr: self.addr, name: truncate_device_name(&name) });
+                connect(&self.model, &self.commands, self.addr, truncate_device_name(&name), ConnectInitiator::Device);
             }
             return Action::None;
         }

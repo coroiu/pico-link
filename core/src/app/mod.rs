@@ -53,6 +53,7 @@ mod host_op;
 mod inspect;
 mod library;
 mod model;
+mod radio_actions;
 mod screen_id;
 mod screens;
 mod telemetry;
@@ -67,8 +68,12 @@ mod ui_state;
 pub use events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus, VolumeSource, VolumeState};
 pub use host_op::MAX_OP_STATUS_LEN;
 pub use fault::{FaultEntry, FaultGlyphClass, FaultKey, FaultLog, FaultSeverity, FaultValue};
-pub use model::{BtModel, ConnectedCodec, DeviceAddr, DeviceEntry, LinkState, OutLevelSample, PairedDevice};
+pub use model::{
+    BtModel, ConnectAttempt, ConnectInitiator, ConnectOutcome, ConnectOutcomeResult, ConnectedCodec, DeviceAddr, DeviceEntry, LinkState,
+    OutLevelSample, PairedDevice, ScanOwner,
+};
 pub(crate) use model::{decay_peak, is_audio_sink, truncate_device_name, MAX_SCAN_LIST_ITEMS};
+pub(crate) use radio_actions::{cancel_connect, cancel_scan, connect, disconnect, forget, set_quality, start_scan};
 pub use screen_id::{PickerKind, ScreenId, SettingsPickerKind};
 pub(crate) use screens::device_page::build_device_page_screen;
 pub(crate) use screens::devices::build_devices_screen;

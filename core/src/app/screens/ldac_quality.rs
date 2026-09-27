@@ -9,7 +9,7 @@ use crate::render::theme::palette;
 use crate::render::{Action, ListItemKey};
 
 use super::picker::{build_picker_view_screen, PickerOption};
-use super::super::{BtModel, Command, DeviceAddr, ModelHandle, PickerKind, ScreenId};
+use super::super::{set_quality, BtModel, Command, DeviceAddr, ModelHandle, PickerKind, ScreenId};
 use crate::render::Screen;
 
 /// LDAC's ADAPTIVE identity, 1-based, for [`PairedDevice::ldac_quality`]
@@ -136,7 +136,7 @@ pub(in crate::app) fn build_ldac_quality_picker_screen(model: &ModelHandle, addr
             .iter()
             .position(|k| *k == key)
             .map_or(LDAC_QUALITY_ADAPTIVE, |i| u8::try_from(i + 1).unwrap_or(LDAC_QUALITY_ADAPTIVE));
-        commands_for_pick.borrow_mut().push_back(Command::SetDeviceLdacQuality { addr, ldac_quality });
+        set_quality(&commands_for_pick, addr, ldac_quality);
         // Applies live, no confirm, the picker stays open -- `Action::None`
         // (not `PopView`), per `build_picker_view_screen`'s rule 2. The
         // check itself moves once the model's own echo

@@ -6,7 +6,8 @@ use crate::render::Instant;
 
 use super::events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus, VolumeSource, VolumeState};
 use super::fault::{FaultKey, FaultValue};
-use super::model::{decay_peak, truncate_device_name, DeviceEntry, OutLevelSample, OUT_LEVEL_HOLD_DURATION};
+use super::model::{decay_peak, truncate_device_name, ConnectInitiator, ConnectOutcome, ConnectOutcomeResult, DeviceEntry, OutLevelSample, ScanOwner, OUT_LEVEL_HOLD_DURATION};
+use super::radio_actions;
 use super::screen_id::ScreenId;
 use super::ui_state::{HomeFace, PENDING_TIMESTAMP, WizardPhase};
 use super::{App, ConnectedCodec, DeviceAddr, LinkState, PairedDevice};
@@ -102,6 +103,12 @@ impl App {
     /// right as a retry succeeds); silently ignored otherwise, per
     /// [`Event::ConnectStepChanged`]'s doc comment.
     fn on_connect_step_changed(&mut self, step: ConnectStep) {
+        // Design sec 13.5: the radio-session record is folded regardless
+        // of which screen (if any) is open -- update it alongside
+        // `WizardPhase` below, from the same event.
+        if let Some(attempt) = self.model.borrow_mut().attempt.as_mut() {
+            attempt.step = Some(step);
+        }
         let mut phase = self.wizard_phase.borrow_mut();
         match &*phase {
             // Already `Connecting`: this is the same connect attempt
@@ -128,6 +135,11 @@ impl App {
     /// incrementing its own counter), per [`Event::ConnectRetrying`]'s
     /// doc comment.
     fn on_connect_retrying(&mut self, attempt: u16) {
+        // Same "fold regardless of screen" rule as `on_connect_step_
+        // changed` above.
+        if let Some(session_attempt) = self.model.borrow_mut().attempt.as_mut() {
+            session_attempt.retries = attempt;
+        }
         let mut phase = self.wizard_phase.borrow_mut();
         match &*phase {
             WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. } => {
@@ -150,6 +162,17 @@ impl App {
     /// why that, not `WizardPhase`, is the source of truth: it works
     /// identically for a wizard-driven connect and the `PL_DEBUG_REMOTE`
     /// bypass, which never touches `WizardPhase` at all).
+    ///
+    /// Unconditional even if [`radio_actions::cancel_connect`] already
+    /// concluded `BtModel::attempt` as `Cancelled` for this `addr` -- see
+    /// ADA DESIGN v2 (bead `pico-link-chc3`): C's cancel is fire-and-forget,
+    /// so a `ConnectSucceeded` arriving after it means the link really did
+    /// come up, and that's simply a (new) successful connection, correctly
+    /// overwriting `last_outcome`. An earlier address-keyed guard here
+    /// (bead `pico-link-jyhk.25`) swallowed this real success and also
+    /// false-dropped a headset-initiated reconnect to the same address;
+    /// removed rather than kept until `chc3`'s seq-scoped suppression
+    /// lands.
     fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
         self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
         {
@@ -159,6 +182,20 @@ impl App {
             // comment for why this is a terminal-outcome call site rather
             // than folded generically in `set_link_state`.
             model.connecting = false;
+            // Design sec 13.5: conclude the radio-session record the same
+            // way `WizardPhase` concludes below -- `attempt.take()` both
+            // clears it and hands back the `seq`/`addr` this outcome
+            // concludes (falling back to `addr` itself if, for some
+            // reason, no `attempt` was recorded -- e.g. the `PL_DEBUG_
+            // REMOTE` bypass path, which never calls
+            // `radio_actions::connect`).
+            let seq = model.attempt.take().map_or(0, |a| a.seq);
+            model.last_outcome = Some(ConnectOutcome {
+                seq,
+                addr,
+                result: if degraded { ConnectOutcomeResult::OkDegraded } else { ConnectOutcomeResult::Ok },
+                reason: None,
+            });
         }
         *self.wizard_phase.borrow_mut() = WizardPhase::Succeeded { degraded };
         self.dirty = true;
@@ -185,7 +222,7 @@ impl App {
             model.paired.iter().max_by_key(|d| d.mru_seq).map(|device| (device.addr, truncate_device_name(&device.name)))
         };
         if let Some((addr, name)) = auto_reconnect {
-            self.commands.borrow_mut().push_back(Command::Connect { addr, name });
+            radio_actions::connect(&self.model, &self.commands, addr, name, ConnectInitiator::AutoReconnect);
         }
         self.mark_model_changed();
     }
@@ -318,7 +355,19 @@ impl App {
     /// field: an inquiry does not disconnect A2DP.
     /// [`BtModel::discovering`] has exactly one writer: this method.
     pub fn set_discovering(&mut self, scanning: bool) {
-        self.model.borrow_mut().discovering = scanning;
+        {
+            let mut model = self.model.borrow_mut();
+            model.discovering = scanning;
+            if !scanning {
+                // Design sec 13.5/13.7: the owner claim
+                // (`radio_actions::start_scan`) is only ever valid while an
+                // inquiry is genuinely running -- the moment it ends
+                // (naturally or via `CancelScan`), nobody owns the radio
+                // any more, or a stale `Host`/`Device` claim would block
+                // the *other* side's next `SCAN_START` forever.
+                model.scan_owner = ScanOwner::None;
+            }
+        }
         if !scanning {
             self.on_scan_ended_if_applicable();
         }
@@ -499,7 +548,15 @@ impl App {
     /// `reason.retryable()` off `BtModel::last_connect_failure`, not the
     /// link state.
     pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
-        self.model.borrow_mut().last_connect_failure = Some((addr, reason));
+        {
+            let mut model = self.model.borrow_mut();
+            model.last_connect_failure = Some((addr, reason));
+            // Design sec 13.5: conclude the radio-session record -- same
+            // "take the in-flight attempt's seq, fall back to 0 if there
+            // wasn't one" shape as `on_connect_succeeded`.
+            let seq = model.attempt.take().map_or(0, |a| a.seq);
+            model.last_outcome = Some(ConnectOutcome { seq, addr, result: ConnectOutcomeResult::Failed, reason: Some(reason) });
+        }
         self.set_connecting(false);
         // Phase 4/5 -> phase 6 (failure outcome). Unconditional (not
         // gated on the wizard currently being open/mid-connect): a stray

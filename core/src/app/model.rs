@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use crate::render::Instant;
 
-use super::events::{ConnectFailureReason, StoreStatus, VolumeState};
+use super::events::{ConnectFailureReason, ConnectStep, StoreStatus, VolumeState};
 use super::fault::FaultLog;
 
 /// How many devices the flash store can remember (slots `PL:D:0`..`PL:D:7`).
@@ -253,6 +253,139 @@ pub struct BtModel {
     /// transition -- `core`'s log just reflects whatever C tells it
     /// ("faults are a view, never a second source of truth").
     pub fault_log: FaultLog,
+    /// Who (if anyone) currently owns the running GAP inquiry -- design
+    /// `.planning/design/2026-09-27-iface6-eq-management-protocol.md` sec
+    /// 13.5/13.7: "the person holding the dongle wins", so a web
+    /// `SCAN_START` while the device user is scanning must never restart
+    /// the inquiry, and a web `SCAN_STOP` must never cancel a scan the
+    /// device user started. Set by [`crate::app::radio_actions::start_scan`]
+    /// at the moment `Command::StartScan` is queued (there is no C-side
+    /// "who asked for this" event to fold, so the *queuer* is the only
+    /// source of truth) and reset to [`ScanOwner::None`] the moment the
+    /// inquiry actually ends ([`App::set_discovering`]'s `scanning == false`
+    /// edge) -- never left stale pointing at an owner whose scan is over.
+    pub scan_owner: ScanOwner,
+    /// Monotonic counter bumped once per [`crate::app::radio_actions::start_scan`]
+    /// call -- the wire's `scan_seq` (design sec 13.4). Never reset: a
+    /// `GET_RADIO` poller must be able to tell "the list I already have is
+    /// for a scan that already ended" from "a fresh scan with a new list is
+    /// running" even across a `scan_owner` round-trip back to `None`.
+    pub scan_seq: u16,
+    /// The connect attempt currently in flight, if any -- folded from
+    /// events regardless of which screen (if any) is open, unlike
+    /// [`WizardPhase`], a *presentation* enum the wizard alone owns (design
+    /// sec 13.5: "the web must read model state, not a screen's phase").
+    /// Set by [`crate::app::radio_actions::connect`] at the moment
+    /// `Command::Connect` is queued (same "the queuer knows `addr`/
+    /// `initiator` before C ever echoes anything back" reasoning
+    /// `scan_owner` documents); its `step`/`retries` are updated in place
+    /// by [`App::on_connect_step_changed`]/[`App::on_connect_retrying`];
+    /// cleared to `None` the moment the attempt concludes
+    /// ([`App::on_connect_succeeded`]/[`App::record_connect_failure`]),
+    /// which is also when [`BtModel::last_outcome`] is populated.
+    pub attempt: Option<ConnectAttempt>,
+    /// The most recently concluded connect attempt's outcome, if any --
+    /// the wire's "last outcome" (design sec 13.4), read by a web client to
+    /// learn how an attempt it can no longer see as `attempt` (because it
+    /// already ended) turned out. Never cleared by a later *scan* or a
+    /// later *successful* link drop -- only overwritten by the next
+    /// attempt's own conclusion, so it always answers "what happened to the
+    /// last attempt", not "what happened to the currently connected link".
+    pub last_outcome: Option<ConnectOutcome>,
+    /// Monotonic counter bumped once per [`crate::app::radio_actions::connect`]
+    /// call -- the wire's `attempt_seq` (design sec 13.4). Never reset, for
+    /// the same "tell a stale attempt from a fresh one" reason
+    /// [`BtModel::scan_seq`] documents.
+    pub(crate) attempt_seq_counter: u16,
+}
+
+/// Who currently owns the running GAP inquiry, if anyone -- design sec
+/// 13.4/13.5/13.7. `#[default]` is [`Self::None`]: no inquiry is running at
+/// [`App::new`], the same "absent, never faked" convention every other
+/// `BtModel` field defaults to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanOwner {
+    #[default]
+    None,
+    Device,
+    Host,
+}
+
+/// Who started a connect attempt -- the wire's `initiator` byte (design sec
+/// 13.4, values 1/2/3; value 0 "none" is [`BtModel::attempt`] being `None`,
+/// not a variant here). Distinct from [`ScanOwner`] (which needs its own
+/// "nobody" state to be a plain field) because an attempt's very existence
+/// as `Some` already means "someone started it" -- see [`ConnectAttempt`]'s
+/// doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectInitiator {
+    /// Started from the device's own UI (the devices screen or wizard).
+    Device,
+    /// Started by a web `HOST_OP` `CONNECT`.
+    Host,
+    /// [`App::on_store_loaded`]'s boot-time auto-reconnect policy.
+    AutoReconnect,
+}
+
+/// One connect attempt currently in flight -- see [`BtModel::attempt`]'s
+/// doc comment for the fold/lifecycle rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectAttempt {
+    pub seq: u16,
+    pub addr: DeviceAddr,
+    pub initiator: ConnectInitiator,
+    /// `None` until the first [`Event::ConnectStepChanged`] arrives for
+    /// this attempt (there is a brief window, right after
+    /// [`crate::app::radio_actions::connect`] queues [`Command::Connect`],
+    /// before C's first step report lands).
+    pub step: Option<ConnectStep>,
+    /// How many "still trying" retries [`Event::ConnectRetrying`] has
+    /// reported for this attempt so far.
+    pub retries: u16,
+}
+
+/// How a concluded connect attempt turned out -- the wire's `outcome` byte
+/// (design sec 13.4, values 1/2/3; value 0 "none" is [`BtModel::last_
+/// outcome`] being `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcomeResult {
+    Ok,
+    OkDegraded,
+    Failed,
+    /// The device (or, in future, a web `HOST_OP` client) cancelled the
+    /// attempt before it concluded -- see
+    /// [`crate::app::radio_actions::cancel_connect`].
+    Cancelled,
+}
+
+/// The most recently concluded connect attempt -- see [`BtModel::last_
+/// outcome`]'s doc comment for the fold/lifecycle rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectOutcome {
+    /// The [`ConnectAttempt::seq`] this outcome concludes.
+    pub seq: u16,
+    pub addr: DeviceAddr,
+    pub result: ConnectOutcomeResult,
+    /// Only meaningful when `result == `[`ConnectOutcomeResult::Failed`].
+    pub reason: Option<ConnectFailureReason>,
+}
+
+impl BtModel {
+    /// Bumps and returns [`Self::scan_seq`] -- the one place that counter
+    /// is ever incremented (see its doc comment for why it never resets).
+    pub(crate) fn bump_scan_seq(&mut self) -> u16 {
+        self.scan_seq = self.scan_seq.wrapping_add(1);
+        self.scan_seq
+    }
+
+    /// Bumps and returns [`Self::attempt_seq_counter`] -- the one place
+    /// that counter is ever incremented (see its doc comment for why it
+    /// never resets, and [`Self::attempt`]'s for why the returned value is
+    /// always a *fresh* attempt's `seq`, never reused).
+    pub(crate) fn bump_attempt_seq(&mut self) -> u16 {
+        self.attempt_seq_counter = self.attempt_seq_counter.wrapping_add(1);
+        self.attempt_seq_counter
+    }
 }
 
 /// One [`Event::LevelsChanged`] reading, timestamped and peak-held at the
