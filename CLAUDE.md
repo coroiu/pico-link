@@ -450,7 +450,7 @@ applies.
   `.beads/embeddeddolt/`, which is gitignored — there is nothing to commit before
   a merge, and nothing in git to recover the board from. Back it up with
   `bd dolt push` — this WORKS as of 2026-08-27, pushing `refs/dolt/data` to the PRIVATE repo `coroiu/pico-link-board` (moved 2026-09-27; pico-link is going public — never push the board there) —
-  `coroiu/pico-link`; run it at session close. If it ever fails on a passphrase,
+  run it at session close. If it ever fails on a passphrase,
   `ssh-add` first: Dolt cannot prompt.
   `git branch -d` may balk because beads auto-syncs to branch tips — verify
   `git log main..<branch>` is empty, then `git branch -D`. When dispatching a
