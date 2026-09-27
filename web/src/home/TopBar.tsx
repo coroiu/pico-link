@@ -1,3 +1,4 @@
+import type * as React from "react";
 import type { HomeSnapshot } from "../proto/telemetry";
 import { chromeVolumeText } from "./volume";
 import { useIsCompact } from "./useIsCompact";
@@ -11,6 +12,8 @@ interface TopBarProps {
   onTabChange: (tab: HomeTab) => void;
   /** `null` while no snapshot has arrived yet (mirrors the mock's chrome before first poll). */
   snapshot: HomeSnapshot | null;
+  /** The mini live-codec + meter strip (mock's `#mini`), shown on non-Home tabs only. `null`/omitted on Home. */
+  mini?: React.ReactNode;
 }
 
 /**
@@ -19,7 +22,7 @@ interface TopBarProps {
  * cluster the device's own chrome shows. Design of record: UMA DESIGN on
  * pico-link-jyhk.8 section on the top bar; mock's `renderChrome`.
  */
-export function TopBar({ connected, usbLabel, tab, onTabChange, snapshot }: TopBarProps) {
+export function TopBar({ connected, usbLabel, tab, onTabChange, snapshot, mini }: TopBarProps) {
   const compact = useIsCompact();
   const link = connected && (snapshot?.linkConnected ?? false);
   const vol = snapshot ? chromeVolumeText(snapshot) : { text: "", warn: false };
@@ -58,6 +61,7 @@ export function TopBar({ connected, usbLabel, tab, onTabChange, snapshot }: TopB
         </button>
       </nav>
       <div className="flex-1" />
+      {tab === "fx" && connected ? mini : null}
       {!compact ? (
         <span
           className={`whitespace-nowrap rounded-full border border-border px-2.5 py-0.5 text-xs font-semibold ${connected ? "text-foreground" : "text-muted-foreground"}`}

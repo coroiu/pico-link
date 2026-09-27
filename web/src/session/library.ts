@@ -35,7 +35,9 @@ export type OpOutcome =
   | { kind: "editorOpen" }
   | { kind: "rejected"; error: OpError }
   | { kind: "timeout" }
-  | { kind: "unavailable" };
+  | { kind: "unavailable" }
+  /** `previewStart`/`previewEnd` refused to send because `document.hidden` -- not a real failure, just nothing sent this call. */
+  | { kind: "hidden" };
 
 export type SaveOutcome = Exclude<OpOutcome, { kind: "done" }> | { kind: "queued"; effectId: number; persistedSeq: number; confirmed: boolean };
 
@@ -227,9 +229,26 @@ export class LibraryController {
     return this.runOp((seq) => encodeAssignRequest(seq, addr, effectId));
   }
 
-  /** `effectId: 0` previews an unsaved draft. Arms the keepalive on success (design section 7: coalesced at the caller's own rate, at most ~10/s -- this class does not itself rate-limit calls to `previewStart`, only the background keepalive). */
+  /**
+   * `effectId: 0` previews an unsaved draft. Arms the keepalive on success
+   * (design section 7: coalesced at the caller's own rate, at most ~10/s --
+   * this class does not itself rate-limit calls to `previewStart`, only the
+   * background keepalive).
+   *
+   * While the document is hidden this refuses to send at all -- it records
+   * `activePreview` so a return to the tab can resume it (`onVisibilityChange`),
+   * but issues no `PREVIEW` traffic. This is the single gate every preview
+   * send in the app must go through; a caller running its own resend loop
+   * around this method would bypass it (see `EffectsTab`'s review fix on
+   * this bead -- it used to run a parallel `setInterval` with no visibility
+   * check at all).
+   */
   async previewStart(effectId: number, preset: Preset, bypass: boolean): Promise<OpOutcome> {
     this.activePreview = { effectId, preset, bypass };
+    if (this.isHidden()) {
+      this.stopKeepalive();
+      return { kind: "hidden" };
+    }
     const outcome = await this.sendActivePreview();
     if (outcome.kind === "done" && !this.isHidden()) this.armKeepalive();
     return outcome;
