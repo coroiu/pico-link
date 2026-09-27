@@ -50,10 +50,13 @@ mod events;
 mod fault;
 mod fold;
 mod inspect;
+mod library;
 mod model;
 mod screen_id;
 mod screens;
 mod telemetry;
+#[cfg(test)]
+mod library_fixtures;
 #[cfg(test)]
 mod telemetry_fixtures;
 mod ui_state;
@@ -212,24 +215,34 @@ pub struct App {
     /// connected device's assignment, unchanged). `Some((draft, bypassed))`
     /// while an editor is open: rule 1 (not bypassed) previews `draft`
     /// instantly; rule 2 (bypassed, `X`) previews Off. Deliberately
-    /// separate from the editor's own currently-assigned preset id (which
-    /// names *where a save goes*, not *what plays* -- see
-    /// `screens::effects::EffectEditorView::editor_preset_id`'s doc
-    /// comment; `App` itself holds no field for that any more, since bead
-    /// `pico-link-ryw.14` made it always the real, already-Rust-allocated
-    /// id from the moment the editor opens, with nothing left for `App` to
-    /// adopt from an echo) and from the draft this bead's `EditorState`
-    /// owns inside the pushed `EffectEditorView` itself -- `EditorState`
-    /// cannot be read from here (no path back to a screen buried in the
-    /// `Navigator`'s stack), so the editor widget mirrors its own draft
-    /// into this `App`-owned mailbox on every change, the same "second
-    /// writer reaches into a live pushed screen via a shared mailbox" shape
-    /// `wizard_phase`/`home_face` already use -- except here the pushed
-    /// screen is the writer and `App` is the reader. Updated independently
-    /// of the `SavePreset` round trip: preview must not wait on flash +
-    /// the `PresetLoaded` echo (Andreas's 12:48 ruling: "applies to the
-    /// stream instantly, independent of the save").
-    editor_preview: Rc<RefCell<Option<(Preset, bool)>>>,
+    /// The effect id is carried alongside the draft as of bead
+    /// `pico-link-jyhk.18` (design section 8): it is the one path `App`
+    /// has to the currently-open device editor's effect id, for the page-0
+    /// telemetry append's `device_editor_open`/`device_editor_effect_id`
+    /// fields -- `EditorState` itself cannot be read from here (see
+    /// below), so this mailbox is already the established "second writer
+    /// reaches into `App`'s state" channel and needs no new one.
+    /// Deliberately NOT the editor's own currently-assigned preset id in
+    /// the sense of "where a save goes" (that's still
+    /// `screens::effects::EffectEditorView::editor_preset_id`, which
+    /// `App` holds no field for -- see that field's own doc comment) --
+    /// it is the SAME id, just also mirrored here because `App` needs to
+    /// read it and has no other path to a screen buried in the
+    /// `Navigator`'s stack.
+    ///
+    /// `Option<(u16, Preset, bool)>`, not just `(Preset, bool)`: separate
+    /// from the draft this bead's `EditorState` owns inside the pushed
+    /// `EffectEditorView` itself -- `EditorState` cannot be read from here
+    /// (no path back to a screen buried in the `Navigator`'s stack), so the
+    /// editor widget mirrors its own draft into this `App`-owned mailbox on
+    /// every change, the same "second writer reaches into a live pushed
+    /// screen via a shared mailbox" shape `wizard_phase`/`home_face`
+    /// already use -- except here the pushed screen is the writer and
+    /// `App` is the reader. Updated independently of the `SavePreset`
+    /// round trip: preview must not wait on flash + the `PresetLoaded`
+    /// echo (Andreas's 12:48 ruling: "applies to the stream instantly,
+    /// independent of the save").
+    editor_preview: Rc<RefCell<Option<(u16, Preset, bool)>>>,
     /// In-progress `EQ BEGIN` .. `EQ END` console session (bead
     /// `pico-link-ryw.11`), or `None` between sessions. Plain field, not
     /// `Rc<RefCell<_>>` like `editor_preview`: nothing in the `Navigator`'s
@@ -293,6 +306,36 @@ pub struct App {
     /// `1`, matching the design's "before the first generation... snap_seq
     /// `0`" note.
     telemetry_snap_seq: core::cell::Cell<u32>,
+    /// Per-effect-id "flash truth changed" counter -- bead `pico-link-jyhk.18`,
+    /// design section 3 ("`persisted_seq`: per-id u16 in `App`, bumped when
+    /// a `PresetLoaded` echo for that id is folded"). Because
+    /// [`Self::presets`] only ever changes on a
+    /// [`Event::PresetLoaded`]/[`Event::PresetDeleted`] echo (bead
+    /// `pico-link-ryw.14`'s "the store only changes on echo" contract), a
+    /// bump here means "the flash-backed truth for this id changed since
+    /// the caller last saw it" -- exactly the optimistic-concurrency token
+    /// [`Command::SavePreset`]/[`Command::DeletePreset`]'s future
+    /// `base_seq` check (design section 6) needs. Plain field (not
+    /// `Rc<RefCell<_>>`): nothing in the `Navigator`'s screen stack reads
+    /// this, only [`Self::library_snapshot`] does, from inside `App`
+    /// itself.
+    preset_persisted_seq: alloc::collections::BTreeMap<u16, u16>,
+    /// [`GET_LIBRARY`](library)'s monotonic `library_rev` counter -- bead
+    /// `pico-link-jyhk.18`, design section 3 ("Rust encodes the library and
+    /// compares with the last encoding; rev++ only on a byte difference").
+    /// `Cell`, for the same "`&self`, no caller-visible mutation" reason
+    /// [`Self::telemetry_snap_seq`] is a `Cell` -- see that field's doc
+    /// comment.
+    library_rev: core::cell::Cell<u16>,
+    /// The last [`library::encode_library_snapshot`] output (encoded with a
+    /// placeholder `library_rev` of `0`, so a genuine rev-only "no other
+    /// byte changed" re-poll never falsely looks like a content change) --
+    /// [`Self::library_snapshot`]'s encode-compare state. `RefCell`, not a
+    /// plain field behind `&mut self`, for the same `&self`-API reason
+    /// [`Self::telemetry_snap_seq`] is a `Cell`: this is genuinely mutated
+    /// on every call, but that mutation is invisible to every caller except
+    /// [`Self::library_snapshot`] itself.
+    library_last_bytes: RefCell<Vec<u8>>,
 }
 
 impl App {
@@ -351,6 +394,9 @@ impl App {
             import_focus,
             presets_ready,
             telemetry_snap_seq: core::cell::Cell::new(0),
+            preset_persisted_seq: alloc::collections::BTreeMap::new(),
+            library_rev: core::cell::Cell::new(0),
+            library_last_bytes: RefCell::new(Vec::new()),
         }
         // `editor_preset_id` is not stored on `Self` -- see its local
         // binding above. `App` never reads it back after construction
@@ -530,7 +576,7 @@ impl App {
         if let Some(over) = self.debug_dsp_override.as_ref() {
             return over.to_program(fs_hz);
         }
-        if let Some((draft, bypassed)) = self.editor_preview.borrow().as_ref() {
+        if let Some((_id, draft, bypassed)) = self.editor_preview.borrow().as_ref() {
             return if *bypassed { Program::off(fs_hz) } else { Program::from_preset(draft, fs_hz) };
         }
         let model = self.model.borrow();
@@ -584,12 +630,109 @@ impl App {
         }
         self.telemetry_snap_seq.set(seq);
 
+        // Design section 8: "library generation ... BEFORE the telemetry
+        // step so page 0 carries the fresh rev" -- `current_library_rev`
+        // does that refresh itself (it's the same encode-compare
+        // `Self::library_snapshot` runs), so this call alone satisfies the
+        // ordering rule regardless of whether a `GET_LIBRARY` request has
+        // arrived this poll.
+        let library_rev = self.current_library_rev();
+        let editor = self.editor_preview.borrow();
+        let extras = telemetry::HomeSnapshotExtras {
+            library_rev,
+            // `App` has no `host_preview` field yet -- bead
+            // `pico-link-jyhk.19` (Task 2, HOST_OP/PREVIEW) adds it. Ships
+            // `false` until then, per this bead's scope note ("codec-
+            // fallback byte reserved = 0") applied to the same
+            // not-built-yet reasoning.
+            host_preview_active: false,
+            device_editor_open: editor.is_some(),
+            device_editor_effect_id: editor.as_ref().map_or(0, |(id, _, _)| *id),
+            presets_ready: *self.presets_ready.borrow(),
+            // `BtModel` has no fallback concept yet (design section 8:
+            // "the byte ships as 0 and must be sourced from `BtModel` when
+            // that exists, never from C statics").
+            codec_fallback_reason: 0,
+        };
+        drop(editor);
+
         let now = Instant::from_micros(self.now_us);
         let model = self.model.borrow();
         let presets = self.presets.borrow();
-        let bytes = telemetry::encode_home_snapshot(&model, &presets, now, seq);
+        let bytes = telemetry::encode_home_snapshot(&model, &presets, now, seq, &extras);
         buf[..bytes.len()].copy_from_slice(&bytes);
         bytes.len()
+    }
+
+    /// Encodes the `GET_LIBRARY` snapshot (bead `pico-link-jyhk.18`, "ADA
+    /// DESIGN" comment on `pico-link-jyhk.17`, section 3; wire layout owned
+    /// by [`library::encode_library_snapshot`]) into `buf`. Returns the
+    /// number of bytes written, or `0` (never a partial write) if `buf` is
+    /// too small to hold the whole snapshot -- the same "`0` means don't
+    /// publish this poll" contract [`Self::telemetry_snapshot`] uses.
+    ///
+    /// Takes `&self`, same "read-only from the caller's point of view"
+    /// contract [`Self::telemetry_snapshot`] documents:
+    /// [`Self::library_rev`]/[`Self::library_last_bytes`] are the internal
+    /// state this call advances, via the same `Cell`/`RefCell`-behind-`&self`
+    /// shape [`Self::telemetry_snap_seq`] already uses.
+    #[must_use]
+    pub fn library_snapshot(&self, buf: &mut [u8]) -> usize {
+        let presets = self.presets.borrow();
+        let model = self.model.borrow();
+        let presets_ready = *self.presets_ready.borrow();
+        let mut bytes = library::encode_library_snapshot(&presets, &model.paired, model.connected_addr, presets_ready, &self.preset_persisted_seq, 0);
+        drop(model);
+        drop(presets);
+
+        let rev = self.refresh_library_rev(&bytes);
+        bytes[library::OFF_LIBRARY_REV..library::OFF_LIBRARY_REV + 2].copy_from_slice(&rev.to_le_bytes());
+
+        if bytes.len() > buf.len() {
+            return 0;
+        }
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        bytes.len()
+    }
+
+    /// Encodes the library at the placeholder `library_rev` of `0` (so a
+    /// change to the rev field itself can never look like a content
+    /// change), runs it through [`Self::refresh_library_rev`], and returns
+    /// the up-to-date rev -- the read used by [`Self::telemetry_snapshot`]'s
+    /// page-0 append (design section 8), which needs the fresh rev but not
+    /// the library body itself.
+    fn current_library_rev(&self) -> u16 {
+        let presets = self.presets.borrow();
+        let model = self.model.borrow();
+        let presets_ready = *self.presets_ready.borrow();
+        let bytes = library::encode_library_snapshot(&presets, &model.paired, model.connected_addr, presets_ready, &self.preset_persisted_seq, 0);
+        drop(model);
+        drop(presets);
+        self.refresh_library_rev(&bytes)
+    }
+
+    /// The encode-compare half of [`Self::library_snapshot`]'s rev logic
+    /// (design section 3: "rev++ only on a byte difference"). `body_at_rev_0`
+    /// must be [`library::encode_library_snapshot`]'s output encoded with
+    /// `library_rev` `0` -- comparing at a fixed placeholder rev means a
+    /// caller can run this as often as it likes (e.g. once per
+    /// [`Self::telemetry_snapshot`] poll AND once per actual
+    /// [`Self::library_snapshot`] call) without a rev-only difference ever
+    /// looking like real content changed.
+    fn refresh_library_rev(&self, body_at_rev_0: &[u8]) -> u16 {
+        let mut last = self.library_last_bytes.borrow_mut();
+        if last.as_slice() != body_at_rev_0 {
+            // `0` is not reserved for "not ready" the way
+            // `telemetry_snap_seq` is (`GET_LIBRARY` is always a full,
+            // meaningful read, never a "not ready yet" poll) -- but
+            // `.max(1)` keeps the counter off `0` regardless, so a future
+            // wire consumer can safely treat `0` as "never yet encoded"
+            // without this module promising it either way.
+            let next = self.library_rev.get().wrapping_add(1).max(1);
+            self.library_rev.set(next);
+            *last = body_at_rev_0.to_vec();
+        }
+        self.library_rev.get()
     }
 
     /// `EQ BEGIN`: starts a fresh [`EqApoSession`], discarding any

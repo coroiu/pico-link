@@ -1,0 +1,13 @@
+{
+  "wire_len": 56,
+  "library_rev": 1,
+  "presets_ready": false,
+  "max_effects": 8,
+  "max_devices": 8,
+  "effects": [
+    
+  ],
+  "devices": [
+    {"addr": "94:DB:56:54:7C:03", "preset_id": 0, "connected": false, "name": "€€€€€€€€€€"}
+  ]
+}

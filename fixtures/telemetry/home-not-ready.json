@@ -1,5 +1,5 @@
 {
-  "wire_len": 163,
+  "wire_len": 169,
   "uptime_ms": 500,
   "snap_seq": 0,
   "link_connected": true,
@@ -26,5 +26,11 @@
     null,
     null,
     null
-  ]
+  ],
+  "library_rev": 0,
+  "host_preview_active": false,
+  "device_editor_open": false,
+  "device_editor_effect_id": 0,
+  "presets_ready": false,
+  "codec_fallback_reason": 0
 }

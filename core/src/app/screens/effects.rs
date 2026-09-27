@@ -675,7 +675,7 @@ struct EffectEditorView {
     /// [`Self::sync_preview`] on every mutation; see
     /// [`super::super::App`]'s `editor_preview` doc comment for the full
     /// shape.
-    editor_preview: Rc<RefCell<Option<(Preset, bool)>>>,
+    editor_preview: Rc<RefCell<Option<(u16, Preset, bool)>>>,
     rows_key: PaintKey,
 }
 
@@ -725,7 +725,8 @@ impl EffectEditorView {
     /// trip.
     fn sync_preview(&self) {
         let state = self.state.borrow();
-        *self.editor_preview.borrow_mut() = Some((state.draft.clone(), state.bypassed));
+        let id = self.editor_preset_id.borrow().expect("an open editor always has a real, already-allocated id");
+        *self.editor_preview.borrow_mut() = Some((id, state.draft.clone(), state.bypassed));
     }
 
     /// Queues exactly one `SavePreset` for the draft's current contents,
@@ -928,7 +929,7 @@ fn build_effect_editor_screen(
     presets: &Rc<RefCell<PresetStore>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
-    editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
+    editor_preview: &Rc<RefCell<Option<(u16, Preset, bool)>>>,
 ) -> Screen {
     let state = Rc::new(RefCell::new(EditorState { draft: initial.clone(), band_index: 0, bypassed: false }));
     let rows = editor_rows(&state.borrow());
@@ -936,7 +937,8 @@ fn build_effect_editor_screen(
     // Seed the preview mailbox immediately on push -- design sec 5.1: the
     // stream previews the draft (unbypassed) from the moment the editor
     // opens, not from the first Left/Right press.
-    *editor_preview.borrow_mut() = Some((initial.clone(), false));
+    let id = editor_preset_id.borrow().expect("an open editor always has a real, already-allocated id");
+    *editor_preview.borrow_mut() = Some((id, initial.clone(), false));
     let view = EffectEditorView {
         list,
         state: Rc::clone(&state),
@@ -1189,7 +1191,7 @@ pub(crate) fn build_effects_list_screen(
     presets: &Rc<RefCell<PresetStore>>,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
-    editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
+    editor_preview: &Rc<RefCell<Option<(u16, Preset, bool)>>>,
     import_focus: &Rc<RefCell<Option<ListItemKey>>>,
     presets_ready: &Rc<RefCell<bool>>,
 ) -> Screen {

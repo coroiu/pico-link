@@ -522,6 +522,13 @@ impl App {
         // more -- this echo needs no adoption step, it's simply the truth
         // echo confirming (or, on a refused save, correcting) what flash
         // now holds for `id`.
+        //
+        // Bead `pico-link-jyhk.18` (design section 3): this echo is also
+        // "flash truth changed" for `id`, so it doubles as the
+        // optimistic-concurrency token a future `SAVE`'s `base_seq` check
+        // reads -- see `App::preset_persisted_seq`'s doc comment.
+        let seq = self.preset_persisted_seq.entry(id).or_insert(0);
+        *seq = seq.wrapping_add(1);
         self.mark_model_changed();
     }
 
@@ -534,6 +541,11 @@ impl App {
     /// up-to-8-device rewrite belongs here.
     fn on_preset_deleted(&mut self, id: u16) {
         self.presets.borrow_mut().delete(id);
+        // The id is never reallocated (see `PresetStore::delete`'s doc
+        // comment), so its `persisted_seq` entry is simply dead weight from
+        // here on -- drop it rather than let it accumulate forever for an
+        // id nothing will ever look up again.
+        self.preset_persisted_seq.remove(&id);
         self.mark_model_changed();
     }
 

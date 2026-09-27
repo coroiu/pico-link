@@ -1,0 +1,27 @@
+{
+  "wire_len": 1022,
+  "library_rev": 1,
+  "presets_ready": true,
+  "max_effects": 8,
+  "max_devices": 8,
+  "effects": [
+    {"id": 1, "persisted_seq": 0, "preset_name": "Effect 0"},
+    {"id": 2, "persisted_seq": 0, "preset_name": "Effect 1"},
+    {"id": 3, "persisted_seq": 0, "preset_name": "Effect 2"},
+    {"id": 4, "persisted_seq": 0, "preset_name": "Effect 3"},
+    {"id": 5, "persisted_seq": 0, "preset_name": "Effect 4"},
+    {"id": 6, "persisted_seq": 0, "preset_name": "Effect 5"},
+    {"id": 7, "persisted_seq": 0, "preset_name": "Effect 6"},
+    {"id": 8, "persisted_seq": 0, "preset_name": "Effect 7"}
+  ],
+  "devices": [
+    {"addr": "94:DB:56:54:7C:00", "preset_id": 0, "connected": false, "name": "Buds 0"},
+    {"addr": "94:DB:56:54:7C:01", "preset_id": 0, "connected": false, "name": "Buds 1"},
+    {"addr": "94:DB:56:54:7C:02", "preset_id": 0, "connected": false, "name": "Buds 2"},
+    {"addr": "94:DB:56:54:7C:03", "preset_id": 0, "connected": false, "name": "Buds 3"},
+    {"addr": "94:DB:56:54:7C:04", "preset_id": 0, "connected": false, "name": "Buds 4"},
+    {"addr": "94:DB:56:54:7C:05", "preset_id": 0, "connected": false, "name": "Buds 5"},
+    {"addr": "94:DB:56:54:7C:06", "preset_id": 0, "connected": false, "name": "Buds 6"},
+    {"addr": "94:DB:56:54:7C:07", "preset_id": 0, "connected": false, "name": "Buds 7"}
+  ]
+}

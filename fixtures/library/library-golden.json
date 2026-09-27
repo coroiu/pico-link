@@ -1,0 +1,13 @@
+{
+  "wire_len": 140,
+  "library_rev": 5,
+  "presets_ready": true,
+  "max_effects": 8,
+  "max_devices": 8,
+  "effects": [
+    {"id": 1, "persisted_seq": 2, "preset_name": "Warm"}
+  ],
+  "devices": [
+    {"addr": "94:DB:56:54:7C:F2", "preset_id": 1, "connected": true, "name": "Pixel Buds"}
+  ]
+}

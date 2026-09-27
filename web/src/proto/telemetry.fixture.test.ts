@@ -5,8 +5,8 @@
 // cross-check against what `cargo test` actually generated, per FERN DESIGN
 // section 5 ("core emits, JS asserts").
 import { describe, expect, it } from "vitest";
-import { decodeHomeSnapshot, FAULT_KEYS } from "./telemetry";
-import type { FaultValue, HomeSnapshot, VolumeSource } from "./telemetry";
+import { decodeHomeSnapshot, FAULT_KEYS, HOME_SNAPSHOT_LEN, HOME_SNAPSHOT_FULL_LEN } from "./telemetry";
+import type { FaultValue, HomeSnapshot, HomeSnapshotExtras, VolumeSource } from "./telemetry";
 import { fixtureBytes, fixtureJson, homeSnapshotFixtureNames } from "../test/fixtures";
 
 interface FixtureFault {
@@ -39,6 +39,12 @@ interface FixtureHomeSnapshot {
   rms_r: number;
   received_ms: number;
   faults: Array<FixtureFault | null>;
+  library_rev: number;
+  host_preview_active: boolean;
+  device_editor_open: boolean;
+  device_editor_effect_id: number;
+  presets_ready: boolean;
+  codec_fallback_reason: number;
 }
 
 function faultValueFrom(fixture: FixtureFault): FaultValue {
@@ -60,6 +66,17 @@ function expectedFromFixture(fixture: FixtureHomeSnapshot): HomeSnapshot {
     const entry = fixture.faults[i];
     faults[key] = entry ? { count: entry.count, firstSeenMs: entry.first_seen_ms, lastSeenMs: entry.last_seen_ms, value: faultValueFrom(entry) } : null;
   });
+  const extras: HomeSnapshotExtras | undefined =
+    fixture.wire_len >= HOME_SNAPSHOT_FULL_LEN
+      ? {
+          libraryRev: fixture.library_rev,
+          hostPreviewActive: fixture.host_preview_active,
+          deviceEditorOpen: fixture.device_editor_open,
+          deviceEditorEffectId: fixture.device_editor_effect_id,
+          presetsReady: fixture.presets_ready,
+          codecFallbackReason: fixture.codec_fallback_reason,
+        }
+      : undefined;
   return {
     uptimeMs: fixture.uptime_ms,
     snapSeq: fixture.snap_seq,
@@ -81,6 +98,7 @@ function expectedFromFixture(fixture: FixtureHomeSnapshot): HomeSnapshot {
     receivedMs: fixture.received_ms,
     levelPresent: fixture.level_present,
     faults,
+    extras,
   };
 }
 
@@ -97,10 +115,22 @@ describe("decodeHomeSnapshot vs fixtures/telemetry/home-*.bin+json", () => {
   it.each(names)("%s", (name) => {
     const bytes = fixtureBytes(`${name}.bin`);
     const fixture = fixtureJson<FixtureHomeSnapshot>(`${name}.json`);
-    expect(fixture.wire_len).toBe(163);
+    expect(fixture.wire_len).toBeGreaterThanOrEqual(HOME_SNAPSHOT_LEN); // proto 1 is append-only; 163 is the minimum (jyhk.18 appended 6 bytes)
 
     const decoded = decodeHomeSnapshot(bytes);
     expect(decoded).not.toBeNull();
     expect(decoded).toEqual(expectedFromFixture(fixture));
+  });
+
+  it("still decodes a pre-append 163-byte snapshot, with extras undefined", () => {
+    // Truncates a real fixture to the proto-1 minimum -- simulates older
+    // firmware that predates the jyhk.18 append.
+    const full = fixtureBytes("home-golden.bin");
+    expect(full.byteLength).toBeGreaterThan(HOME_SNAPSHOT_LEN);
+    const truncated = full.slice(0, HOME_SNAPSHOT_LEN);
+
+    const decoded = decodeHomeSnapshot(truncated);
+    expect(decoded).not.toBeNull();
+    expect(decoded!.extras).toBeUndefined();
   });
 });
