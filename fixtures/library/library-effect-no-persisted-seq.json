@@ -1,0 +1,13 @@
+{
+  "wire_len": 98,
+  "library_rev": 1,
+  "presets_ready": false,
+  "max_effects": 8,
+  "max_devices": 8,
+  "effects": [
+    {"id": 1, "persisted_seq": 0, "preset_name": "Bright"}
+  ],
+  "devices": [
+    
+  ]
+}

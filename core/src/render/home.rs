@@ -154,7 +154,7 @@ pub(crate) fn build_home_screen(
     abr_floor: &Rc<RefCell<AbrFloorState>>,
     presets: &Rc<RefCell<PresetStore>>,
     editor_preset_id: &Rc<RefCell<Option<u16>>>,
-    editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
+    editor_preview: &Rc<RefCell<Option<(u16, Preset, bool)>>>,
     import_focus: &Rc<RefCell<Option<ListItemKey>>>,
     presets_ready: &Rc<RefCell<bool>>,
 ) -> Screen {
@@ -383,7 +383,7 @@ impl HomeView {
         abr_floor: &Rc<RefCell<AbrFloorState>>,
         presets: &Rc<RefCell<PresetStore>>,
         editor_preset_id: &Rc<RefCell<Option<u16>>>,
-        editor_preview: &Rc<RefCell<Option<(Preset, bool)>>>,
+        editor_preview: &Rc<RefCell<Option<(u16, Preset, bool)>>>,
         import_focus: &Rc<RefCell<Option<ListItemKey>>>,
         presets_ready: &Rc<RefCell<bool>>,
     ) -> Self {

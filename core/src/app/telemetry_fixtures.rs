@@ -52,7 +52,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::model::{decay_peak, ConnectedCodec, OutLevelSample, PairedDevice, OUT_LEVEL_HOLD_DURATION, RELEASE_RATIO_PER_MS_Q16};
-use super::telemetry::{decode_home_snapshot, encode_home_snapshot, DecodedFault, HomeSnapshot, HOME_SNAPSHOT_LEN, TELEMETRY_PAGE_HOME, TELEMETRY_PROTO};
+use super::telemetry::{decode_home_snapshot, encode_home_snapshot, DecodedFault, HomeSnapshot, HomeSnapshotExtras, HOME_SNAPSHOT_LEN, TELEMETRY_PAGE_HOME, TELEMETRY_PROTO};
 use super::{App, BtModel, FaultKey, FaultValue, VolumeSource, VolumeState};
 use crate::dsp::{Preset, PresetStore};
 use crate::render::hero::{OUT_LEVEL_REFRESH_INTERVAL, OUT_LEVEL_STALE_AFTER};
@@ -185,7 +185,7 @@ fn volume_source_label(source: VolumeSource) -> &'static str {
 fn snapshot_json(bytes: &[u8], snap: &HomeSnapshot) -> String {
     let faults: Vec<String> = snap.faults.iter().map(|f| decoded_fault_json(*f)).collect();
     std::format!(
-        "{{\n  \"wire_len\": {},\n  \"uptime_ms\": {},\n  \"snap_seq\": {},\n  \"link_connected\": {},\n  \"codec_word\": {},\n  \"kbps\": {},\n  \"kbps_adaptive\": {},\n  \"kbps_is_live\": {},\n  \"device_name\": {},\n  \"fx_preset_name\": {},\n  \"volume_present\": {},\n  \"volume_level\": {},\n  \"volume_muted\": {},\n  \"volume_source\": {},\n  \"level_present\": {},\n  \"peak_l\": {},\n  \"peak_r\": {},\n  \"rms_l\": {},\n  \"rms_r\": {},\n  \"received_ms\": {},\n  \"faults\": [\n    {}\n  ]\n}}\n",
+        "{{\n  \"wire_len\": {},\n  \"uptime_ms\": {},\n  \"snap_seq\": {},\n  \"link_connected\": {},\n  \"codec_word\": {},\n  \"kbps\": {},\n  \"kbps_adaptive\": {},\n  \"kbps_is_live\": {},\n  \"device_name\": {},\n  \"fx_preset_name\": {},\n  \"volume_present\": {},\n  \"volume_level\": {},\n  \"volume_muted\": {},\n  \"volume_source\": {},\n  \"level_present\": {},\n  \"peak_l\": {},\n  \"peak_r\": {},\n  \"rms_l\": {},\n  \"rms_r\": {},\n  \"received_ms\": {},\n  \"faults\": [\n    {}\n  ],\n  \"library_rev\": {},\n  \"host_preview_active\": {},\n  \"device_editor_open\": {},\n  \"device_editor_effect_id\": {},\n  \"presets_ready\": {},\n  \"codec_fallback_reason\": {}\n}}\n",
         bytes.len(),
         snap.uptime_ms,
         snap.snap_seq,
@@ -207,15 +207,36 @@ fn snapshot_json(bytes: &[u8], snap: &HomeSnapshot) -> String {
         snap.rms_r,
         snap.received_ms,
         faults.join(",\n    "),
+        snap.library_rev,
+        json_bool(snap.host_preview_active),
+        json_bool(snap.device_editor_open),
+        snap.device_editor_effect_id,
+        json_bool(snap.presets_ready),
+        snap.codec_fallback_reason,
     )
 }
 
-/// Encodes `model`/`presets` at `(now, snap_seq)`, decodes the result back
-/// (asserting the round trip -- a bad fixture must never ship even in
-/// `UPDATE_FIXTURES=1` mode), and checks/writes both halves of one
-/// `home-<name>.bin`/`.json` pair.
+/// A neutral [`HomeSnapshotExtras`] -- every `emit_home_*` fixture below
+/// that isn't specifically about the `163..169` append (bead
+/// `pico-link-jyhk.18`) uses this, so the pre-existing fixtures' bytes stay
+/// stable past offset 163 (all-zero/`false` tail) and only their length
+/// changes (163 -> [`HOME_SNAPSHOT_LEN`], 169).
+fn no_extras() -> HomeSnapshotExtras {
+    HomeSnapshotExtras { library_rev: 0, host_preview_active: false, device_editor_open: false, device_editor_effect_id: 0, presets_ready: false, codec_fallback_reason: 0 }
+}
+
+/// Encodes `model`/`presets` at `(now, snap_seq)` with [`no_extras`],
+/// decodes the result back (asserting the round trip -- a bad fixture must
+/// never ship even in `UPDATE_FIXTURES=1` mode), and checks/writes both
+/// halves of one `home-<name>.bin`/`.json` pair.
 fn emit_snapshot_fixture(name: &str, model: &BtModel, presets: &PresetStore, now: Instant, snap_seq: u32) {
-    let bytes = encode_home_snapshot(model, presets, now, snap_seq);
+    emit_snapshot_fixture_with_extras(name, model, presets, now, snap_seq, &no_extras());
+}
+
+/// Same as [`emit_snapshot_fixture`], but with caller-supplied `extras` --
+/// for fixtures specifically about the `163..169` append.
+fn emit_snapshot_fixture_with_extras(name: &str, model: &BtModel, presets: &PresetStore, now: Instant, snap_seq: u32, extras: &HomeSnapshotExtras) {
+    let bytes = encode_home_snapshot(model, presets, now, snap_seq, extras);
     let snap = decode_home_snapshot(&bytes).expect("a well-formed encode must always decode");
     check_or_write_bytes(&std::format!("home-{name}.bin"), &bytes);
     check_or_write_text(&std::format!("home-{name}.json"), &snapshot_json(&bytes, &snap));
@@ -345,7 +366,7 @@ fn emit_home_trailing_bytes() {
     let presets = PresetStore::new();
     model.volume = Some(VolumeState { level: 10, muted: false, source: VolumeSource::Host });
     let now = Instant::from_micros(7_000_000);
-    let base = encode_home_snapshot(&model, &presets, now, 21);
+    let base = encode_home_snapshot(&model, &presets, now, 21, &no_extras());
     let snap = decode_home_snapshot(&base).expect("a well-formed encode must always decode");
 
     let mut bytes = base.to_vec();
@@ -357,13 +378,27 @@ fn emit_home_trailing_bytes() {
 }
 
 #[test]
+fn emit_home_library_extras() {
+    // The `163..169` append itself (bead `pico-link-jyhk.18`, design
+    // section 8): every `flags2` bit set, a nonzero `library_rev`/
+    // `device_editor_effect_id`, and a placeholder nonzero
+    // `codec_fallback_reason` byte to prove the field round-trips even
+    // though nothing in `App` sources a real one yet (see
+    // `HomeSnapshotExtras::codec_fallback_reason`'s doc comment).
+    let model = BtModel::default();
+    let presets = PresetStore::new();
+    let extras = HomeSnapshotExtras { library_rev: 0xBEEF, host_preview_active: true, device_editor_open: true, device_editor_effect_id: 7, presets_ready: true, codec_fallback_reason: 1 };
+    emit_snapshot_fixture_with_extras("library-extras", &model, &presets, Instant::from_micros(8_000_000), 23, &extras);
+}
+
+#[test]
 fn header_constants_match_this_proto() {
     // Cheap belt-and-braces: the fixtures above are only meaningful if
     // these two constants are what this module's doc comment (and every
     // `home-*.bin`'s first four bytes) assumes.
     assert_eq!(TELEMETRY_PROTO, 1);
     assert_eq!(TELEMETRY_PAGE_HOME, 0);
-    assert_eq!(HOME_SNAPSHOT_LEN, 163);
+    assert_eq!(HOME_SNAPSHOT_LEN, 169);
 }
 
 fn sample_out_level(received_at: Instant) -> OutLevelSample {

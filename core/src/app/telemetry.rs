@@ -63,10 +63,29 @@
 //! | 80..81 | `rms_r` (`u8`) | |
 //! | 81..85 | `received_ms` (`u32`) | Same clock domain as `uptime_ms` |
 //! | 85..163 | 6x fault slot, [`FaultKey::ALL`] order | 13 bytes each, see below |
+//! | 163..165 | `library_rev` (`u16`) | Bead `pico-link-jyhk.18`, design section 8's append |
+//! | 165..166 | `flags2` (`u8`) | bit0 `host_preview_active`, bit1 `device_editor_open`, bit2 `presets_ready` |
+//! | 166..168 | `device_editor_effect_id` (`u16`) | `0` when no device editor is open |
+//! | 168..169 | `codec_fallback_reason` (`u8`) | `0` = none; ships `0` until `BtModel` grows a fallback concept |
 //!
 //! Each fault slot: `count` (`u16`, `0` = absent), `first_seen_ms`
 //! (`u32`), `last_seen_ms` (`u32`), `value_kind` (`u8`: `0` none, `1`
 //! ratio, `2` count, `3` millis), `value` (`u16`).
+//!
+//! ## The `163..169` append (bead `pico-link-jyhk.18`)
+//!
+//! Proto 1 stays proto 1 -- this is a pure append past the original
+//! [`HOME_SNAPSHOT_LEN`] (163) tail, per the append-only versioning rule
+//! this module's doc comment already states ("a future field is added at
+//! the end and `len` grows"). [`HOME_SNAPSHOT_LEN`] itself grows from `163`
+//! to `169` to match -- see [`golden_bytes_layout_is_stable`] for the
+//! locked byte-for-byte proof. `host_preview_active` ships `false` and
+//! `codec_fallback_reason` ships `0` unconditionally today: neither
+//! `App::host_preview` (bead `pico-link-jyhk.19`, Task 2) nor a `BtModel`
+//! fallback concept (design section 8: "the byte ships as 0 ... never from
+//! C statics") exists yet -- see [`super::App::telemetry_snapshot`]'s
+//! [`HomeSnapshotExtras`] construction for exactly where each field of this
+//! append is sourced.
 //!
 //! ## Deviation from the ADA DESIGN comment: `value_kind == 3` (millis)
 //!
@@ -161,10 +180,22 @@ const OFF_RMS_R: usize = OFF_RMS_L + 1;
 const OFF_RECEIVED_MS: usize = OFF_RMS_R + 1;
 const OFF_FAULTS: usize = OFF_RECEIVED_MS + 4;
 
-/// The whole payload's fixed length, in bytes -- `HOME_SNAPSHOT_LEN` bytes
-/// as of proto 1, matching the design's "roughly 160 B" (163, computed
-/// from the layout above, not hand-picked).
-pub(crate) const HOME_SNAPSHOT_LEN: usize = OFF_FAULTS + FAULT_SLOT_COUNT * FAULT_SLOT_LEN;
+/// The original proto-1 payload length (163) -- the tail every offset
+/// below `pico-link-jyhk.18`'s append starts from. Kept as a named
+/// constant (rather than inlining `163`) so the append's own offsets read
+/// as "right after the original payload," not a magic number.
+const HOME_SNAPSHOT_V1_LEN: usize = OFF_FAULTS + FAULT_SLOT_COUNT * FAULT_SLOT_LEN;
+
+const OFF_LIBRARY_REV: usize = HOME_SNAPSHOT_V1_LEN;
+const OFF_FLAGS2: usize = OFF_LIBRARY_REV + 2;
+const OFF_DEVICE_EDITOR_EFFECT_ID: usize = OFF_FLAGS2 + 1;
+const OFF_CODEC_FALLBACK_REASON: usize = OFF_DEVICE_EDITOR_EFFECT_ID + 2;
+
+/// The whole payload's fixed length, in bytes -- `169` as of the
+/// `pico-link-jyhk.18` append (`163` at proto 1's original shape, see
+/// [`HOME_SNAPSHOT_V1_LEN`], plus its 6-byte tail: this module's doc
+/// comment table has the full byte-by-byte layout).
+pub(crate) const HOME_SNAPSHOT_LEN: usize = OFF_CODEC_FALLBACK_REASON + 1;
 
 /// `flags` bit positions (design section 4).
 const FLAG_ADAPTIVE: u8 = 1 << 0;
@@ -172,6 +203,12 @@ const FLAG_KBPS_IS_LIVE: u8 = 1 << 1;
 const FLAG_VOLUME_PRESENT: u8 = 1 << 2;
 const FLAG_MUTED: u8 = 1 << 3;
 const FLAG_LEVEL_PRESENT: u8 = 1 << 4;
+
+/// `flags2` bit positions -- bead `pico-link-jyhk.18`, design section 8's
+/// `163..169` append.
+const FLAG2_HOST_PREVIEW_ACTIVE: u8 = 1 << 0;
+const FLAG2_DEVICE_EDITOR_OPEN: u8 = 1 << 1;
+const FLAG2_PRESETS_READY: u8 = 1 << 2;
 
 /// `value_kind` ordinals -- see this module's doc comment for why `3`
 /// (millis) exists even though the design comment's payload section only
@@ -332,6 +369,52 @@ pub(crate) struct HomeSnapshot {
     pub(crate) level_present: bool,
     /// [`FaultKey::ALL`] order, `None` for a key never raised.
     pub(crate) faults: [Option<DecodedFault>; FAULT_SLOT_COUNT],
+    /// The `163..169` append (bead `pico-link-jyhk.18`) -- see
+    /// [`HomeSnapshotExtras`]'s doc comment for what each field means; this
+    /// is simply that struct's round trip back off the wire.
+    pub(crate) library_rev: u16,
+    pub(crate) host_preview_active: bool,
+    pub(crate) device_editor_open: bool,
+    pub(crate) device_editor_effect_id: u16,
+    pub(crate) presets_ready: bool,
+    pub(crate) codec_fallback_reason: u8,
+}
+
+/// The `163..169` append's inputs -- bead `pico-link-jyhk.18`, design
+/// section 8. Bundled into one struct (rather than four more positional
+/// [`encode_home_snapshot`] parameters) because every field here comes
+/// from a DIFFERENT piece of `App` state (the library encoder, the editor-
+/// preview mailbox, `presets_ready`, a not-yet-modelled codec fallback) --
+/// see [`super::App::telemetry_snapshot`]'s construction of this struct for
+/// exactly where each one is sourced.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HomeSnapshotExtras {
+    /// [`super::library`]'s `GET_LIBRARY` revision counter, at the moment
+    /// this poll ran (design section 8: "page 0 telemetry appends
+    /// `library_rev`; the page polls at 30 Hz already, so it sees any
+    /// change within ~33 ms").
+    pub(crate) library_rev: u16,
+    /// Whether a web-driven host preview (bead `pico-link-jyhk.19`, Task 2)
+    /// is currently overriding playback. Always `false` until `App` grows
+    /// the field that would make this true -- see this module's doc
+    /// comment on the `163..169` append.
+    pub(crate) host_preview_active: bool,
+    /// Whether the on-device DSP effects editor is currently open --
+    /// [`super::App::editor_preview`]`.is_some()`.
+    pub(crate) device_editor_open: bool,
+    /// The open device editor's effect id, or `0` when
+    /// `device_editor_open` is `false` (design section 8's own convention
+    /// for this field -- an absent editor is never faked as effect id `0`
+    /// meaning something else, it simply means "not open").
+    pub(crate) device_editor_effect_id: u16,
+    /// Whether `core` has finished loading C's boot-time preset-store
+    /// high-water mark ([`super::App::presets_ready`]) -- lets the web
+    /// companion gate its own create/import actions the same way the
+    /// on-device Effects list does.
+    pub(crate) presets_ready: bool,
+    /// `0` = none. Ships `0` unconditionally today -- see this module's
+    /// doc comment on the `163..169` append for why.
+    pub(crate) codec_fallback_reason: u8,
 }
 
 /// Builds the page-0 Home snapshot from a live `&BtModel` read plus the
@@ -345,7 +428,7 @@ pub(crate) struct HomeSnapshot {
 /// `dirty`/damage/idle state -- the design's Rust-contract requirement
 /// ("The borrow is read-only").
 #[must_use]
-pub(crate) fn encode_home_snapshot(model: &BtModel, presets: &PresetStore, now: Instant, snap_seq: u32) -> [u8; HOME_SNAPSHOT_LEN] {
+pub(crate) fn encode_home_snapshot(model: &BtModel, presets: &PresetStore, now: Instant, snap_seq: u32, extras: &HomeSnapshotExtras) -> [u8; HOME_SNAPSHOT_LEN] {
     let mut buf = [0u8; HOME_SNAPSHOT_LEN];
 
     buf[OFF_PROTO] = TELEMETRY_PROTO;
@@ -432,6 +515,22 @@ pub(crate) fn encode_home_snapshot(model: &BtModel, presets: &PresetStore, now: 
         // `None` -- no separate "present" flag is needed per slot.
     }
 
+    // Bead `pico-link-jyhk.18`, design section 8: the `163..169` append.
+    buf[OFF_LIBRARY_REV..OFF_LIBRARY_REV + 2].copy_from_slice(&extras.library_rev.to_le_bytes());
+    let mut flags2 = 0u8;
+    if extras.host_preview_active {
+        flags2 |= FLAG2_HOST_PREVIEW_ACTIVE;
+    }
+    if extras.device_editor_open {
+        flags2 |= FLAG2_DEVICE_EDITOR_OPEN;
+    }
+    if extras.presets_ready {
+        flags2 |= FLAG2_PRESETS_READY;
+    }
+    buf[OFF_FLAGS2] = flags2;
+    buf[OFF_DEVICE_EDITOR_EFFECT_ID..OFF_DEVICE_EDITOR_EFFECT_ID + 2].copy_from_slice(&extras.device_editor_effect_id.to_le_bytes());
+    buf[OFF_CODEC_FALLBACK_REASON] = extras.codec_fallback_reason;
+
     buf
 }
 
@@ -485,6 +584,12 @@ pub(crate) fn decode_home_snapshot(bytes: &[u8]) -> Option<HomeSnapshot> {
         *slot = Some(DecodedFault { count, first_seen_ms, last_seen_ms, value: value_from_kind(kind, value) });
     }
 
+    // Bead `pico-link-jyhk.18`, design section 8's `163..169` append.
+    let library_rev = u16::from_le_bytes(bytes[OFF_LIBRARY_REV..OFF_LIBRARY_REV + 2].try_into().ok()?);
+    let flags2 = bytes[OFF_FLAGS2];
+    let device_editor_effect_id = u16::from_le_bytes(bytes[OFF_DEVICE_EDITOR_EFFECT_ID..OFF_DEVICE_EDITOR_EFFECT_ID + 2].try_into().ok()?);
+    let codec_fallback_reason = bytes[OFF_CODEC_FALLBACK_REASON];
+
     Some(HomeSnapshot {
         uptime_ms,
         snap_seq,
@@ -506,6 +611,12 @@ pub(crate) fn decode_home_snapshot(bytes: &[u8]) -> Option<HomeSnapshot> {
         received_ms,
         level_present: flags & FLAG_LEVEL_PRESENT != 0,
         faults,
+        library_rev,
+        host_preview_active: flags2 & FLAG2_HOST_PREVIEW_ACTIVE != 0,
+        device_editor_open: flags2 & FLAG2_DEVICE_EDITOR_OPEN != 0,
+        device_editor_effect_id,
+        presets_ready: flags2 & FLAG2_PRESETS_READY != 0,
+        codec_fallback_reason,
     })
 }
 
@@ -541,6 +652,14 @@ mod tests {
         [0x94, 0xDB, 0x56, 0x54, 0x7C, last_byte]
     }
 
+    /// A neutral [`HomeSnapshotExtras`] for every test in this module that
+    /// isn't specifically about the `163..169` append (bead
+    /// `pico-link-jyhk.18`) -- `telemetry_fixtures` has the same helper,
+    /// under the same name, for the fixture side.
+    fn no_extras() -> HomeSnapshotExtras {
+        HomeSnapshotExtras { library_rev: 0, host_preview_active: false, device_editor_open: false, device_editor_effect_id: 0, presets_ready: false, codec_fallback_reason: 0 }
+    }
+
     // --- Empty model: absent, not faked -------------------------------
 
     #[test]
@@ -549,7 +668,7 @@ mod tests {
         let presets = PresetStore::new();
         let now = Instant::from_micros(1_500_000);
 
-        let bytes = encode_home_snapshot(&model, &presets, now, 0);
+        let bytes = encode_home_snapshot(&model, &presets, now, 0, &no_extras());
         let snap = decode_home_snapshot(&bytes).expect("a well-formed encode must always decode");
 
         assert_eq!(snap.uptime_ms, 1_500);
@@ -580,7 +699,7 @@ mod tests {
         model.ldac_live_kbps = Some(909);
 
         let now = Instant::from_micros(2_000_000);
-        let bytes = encode_home_snapshot(&model, &presets, now, 42);
+        let bytes = encode_home_snapshot(&model, &presets, now, 42, &no_extras());
         let snap = decode_home_snapshot(&bytes).unwrap();
 
         assert!(snap.link_connected);
@@ -607,7 +726,7 @@ mod tests {
         // not depend on that alone.
         model.ldac_live_kbps = Some(909);
 
-        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1);
+        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1, &no_extras());
         let snap = decode_home_snapshot(&bytes).unwrap();
 
         assert_eq!(snap.codec_word, "SBC");
@@ -625,7 +744,7 @@ mod tests {
         model.connected_addr = Some(addr(0x02));
         model.connected_codec = Some(ConnectedCodec { addr: addr(0x02), word: "AAC".to_string(), nominal_bitrate_bps: 256_000 });
 
-        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1);
+        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1, &no_extras());
         let snap = decode_home_snapshot(&bytes).unwrap();
 
         assert_eq!(snap.fx_preset_name, "", "a dangling preset id resolves to Off, encoded as empty, per design section 4");
@@ -639,7 +758,7 @@ mod tests {
         let presets = PresetStore::new();
         model.volume = Some(VolumeState { level: 64, muted: true, source: VolumeSource::Sink });
 
-        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1);
+        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1, &no_extras());
         let snap = decode_home_snapshot(&bytes).unwrap();
 
         assert!(snap.volume_present);
@@ -654,8 +773,8 @@ mod tests {
         let model_zero = BtModel { volume: Some(VolumeState { level: 0, muted: false, source: VolumeSource::Host }), ..Default::default() };
         let presets = PresetStore::new();
 
-        let absent = decode_home_snapshot(&encode_home_snapshot(&model_absent, &presets, Instant::from_micros(0), 1)).unwrap();
-        let zero = decode_home_snapshot(&encode_home_snapshot(&model_zero, &presets, Instant::from_micros(0), 1)).unwrap();
+        let absent = decode_home_snapshot(&encode_home_snapshot(&model_absent, &presets, Instant::from_micros(0), 1, &no_extras())).unwrap();
+        let zero = decode_home_snapshot(&encode_home_snapshot(&model_zero, &presets, Instant::from_micros(0), 1, &no_extras())).unwrap();
 
         assert!(!absent.volume_present);
         assert!(zero.volume_present, "level 0 is a real reading, not absence -- must not collapse to the same wire shape as no reading at all");
@@ -671,7 +790,7 @@ mod tests {
         let received_at = Instant::from_micros(3_250_000);
         model.out_level = Some(sample_out_level(received_at));
 
-        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(3_400_000), 1);
+        let bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(3_400_000), 1, &no_extras());
         let snap = decode_home_snapshot(&bytes).unwrap();
 
         assert!(snap.level_present);
@@ -697,7 +816,7 @@ mod tests {
         model.fault_log.record(FaultKey::EncResync, t2, Some(FaultValue::Count(9)), 9);
         // BufOverflow/AirCongested/AirLinkLost are left never-raised.
 
-        let bytes = encode_home_snapshot(&model, &presets, t2, 1);
+        let bytes = encode_home_snapshot(&model, &presets, t2, 1, &no_extras());
         let snap = decode_home_snapshot(&bytes).unwrap();
 
         let starved = snap.faults[0].expect("BufStarved is index 0 in FaultKey::ALL");
@@ -726,7 +845,7 @@ mod tests {
         let t1 = Instant::from_micros(5_000_000);
         model.fault_log.record(FaultKey::AirLinkLost, t1, None, 2);
 
-        let bytes = encode_home_snapshot(&model, &presets, t1, 1);
+        let bytes = encode_home_snapshot(&model, &presets, t1, 1, &no_extras());
         let snap = decode_home_snapshot(&bytes).unwrap();
 
         let entry = snap.faults[4].expect("AirLinkLost is index 4");
@@ -746,7 +865,7 @@ mod tests {
     fn decode_ignores_trailing_bytes_past_home_snapshot_len() {
         let model = BtModel::default();
         let presets = PresetStore::new();
-        let mut bytes: Vec<u8> = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 7).to_vec();
+        let mut bytes: Vec<u8> = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 7, &no_extras()).to_vec();
         bytes.extend_from_slice(&[0xAA; 16]); // a future proto's appended fields.
 
         let snap = decode_home_snapshot(&bytes).expect("trailing bytes must not fail decode");
@@ -757,7 +876,7 @@ mod tests {
     fn decode_rejects_an_unknown_proto() {
         let model = BtModel::default();
         let presets = PresetStore::new();
-        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1);
+        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1, &no_extras());
         bytes[OFF_PROTO] = 99;
         assert!(decode_home_snapshot(&bytes).is_none());
     }
@@ -766,7 +885,7 @@ mod tests {
     fn decode_rejects_an_unknown_page() {
         let model = BtModel::default();
         let presets = PresetStore::new();
-        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1);
+        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1, &no_extras());
         bytes[OFF_PAGE] = 1; // A future F3 diagnostics page, not Home.
         assert!(decode_home_snapshot(&bytes).is_none());
     }
@@ -776,7 +895,7 @@ mod tests {
         let mut model = BtModel::default();
         let presets = PresetStore::new();
         model.fault_log.record(FaultKey::BufOverflow, Instant::from_micros(0), Some(FaultValue::Count(1)), 1);
-        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1);
+        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1, &no_extras());
 
         let slot_off = OFF_FAULTS + FAULT_SLOT_LEN; // BufOverflow is index 1.
         bytes[slot_off + 10] = 0xFF; // an ordinal no proto has ever defined.
@@ -790,7 +909,7 @@ mod tests {
         let mut model = BtModel::default();
         let presets = PresetStore::new();
         model.volume = Some(VolumeState { level: 50, muted: false, source: VolumeSource::Device });
-        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1);
+        let mut bytes = encode_home_snapshot(&model, &presets, Instant::from_micros(0), 1, &no_extras());
         bytes[OFF_VOL_SOURCE] = 0xFF;
 
         let snap = decode_home_snapshot(&bytes).unwrap();
@@ -823,15 +942,15 @@ mod tests {
         model.fault_log.record(FaultKey::BufStarved, Instant::from_micros(1_000_000), Some(FaultValue::Millis(0)), 3);
 
         let now = Instant::from_micros(20_000_000);
-        let bytes = encode_home_snapshot(&model, &presets, now, 0xDEAD_BEEF);
+        let bytes = encode_home_snapshot(&model, &presets, now, 0xDEAD_BEEF, &no_extras());
 
         assert_eq!(bytes.len(), HOME_SNAPSHOT_LEN);
-        assert_eq!(HOME_SNAPSHOT_LEN, 163, "the layout table in this module's doc comment states 163 -- a change here must update that table too");
+        assert_eq!(HOME_SNAPSHOT_LEN, 169, "the layout table in this module's doc comment states 169 (163 + the 6-byte pico-link-jyhk.18 append) -- a change here must update that table too");
 
         // Header.
         assert_eq!(bytes[0], 1, "proto");
         assert_eq!(bytes[1], 0, "page");
-        assert_eq!(&bytes[2..4], &163u16.to_le_bytes(), "len");
+        assert_eq!(&bytes[2..4], &169u16.to_le_bytes(), "len");
         assert_eq!(&bytes[4..8], &20_000u32.to_le_bytes(), "uptime_ms");
         assert_eq!(&bytes[8..12], &0xDEAD_BEEFu32.to_le_bytes(), "snap_seq");
 
@@ -878,6 +997,13 @@ mod tests {
             let off = OFF_FAULTS + slot_idx * FAULT_SLOT_LEN;
             assert!(bytes[off..off + FAULT_SLOT_LEN].iter().all(|&b| b == 0), "an unraised fault slot must be all-zero");
         }
+
+        // The `163..169` append (bead `pico-link-jyhk.18`), at `no_extras()`:
+        // all-zero/`false`.
+        assert_eq!(&bytes[163..165], &0u16.to_le_bytes(), "library_rev");
+        assert_eq!(bytes[165], 0, "flags2");
+        assert_eq!(&bytes[166..168], &0u16.to_le_bytes(), "device_editor_effect_id");
+        assert_eq!(bytes[168], 0, "codec_fallback_reason");
 
         // Full round trip against the same fixture.
         let snap = decode_home_snapshot(&bytes).unwrap();
