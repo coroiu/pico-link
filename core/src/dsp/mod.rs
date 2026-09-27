@@ -25,6 +25,7 @@ pub mod eqapo;
 pub mod import;
 pub mod preset;
 pub mod store;
+pub mod validate;
 
 #[cfg(test)]
 mod tests;
@@ -35,5 +36,6 @@ pub use coeffs::{
 };
 pub use eqapo::{bw_oct_to_q, EqApoError, EqApoLineError, EqApoOverride, EqApoSession, ParsedDocument, ParsedFilter};
 pub use import::{import as import_preset, ImportError, ImportOutcome, MAX_PRESETS};
-pub use preset::{Band, BandKind, CrossfeedLevel, Preset, BLOB_LEN, MAX_BANDS, MAX_NAME_BYTES};
-pub use store::PresetStore;
+pub use preset::{Band, BandKind, CrossfeedLevel, Preamp, Preset, PresetBlobError, BLOB_LEN, MAX_BANDS, MAX_NAME_BYTES};
+pub use store::{PresetStore, NO_PRESET_ID};
+pub use validate::{validate_preset, ValidateError};

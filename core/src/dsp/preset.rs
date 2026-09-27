@@ -520,6 +520,92 @@ impl Preset {
     }
 }
 
+/// What [`Preset::from_wire_checked`] rejects outright, where
+/// [`Preset::from_wire`]'s tolerant boot-load path instead falls back to an
+/// empty locked preset (design section 4, ADA DESIGN comment on
+/// `pico-link-jyhk.17`: "Host blobs are validated STRICTLY, not via
+/// `Preset::from_wire`'s tolerant path: `from_wire` turns an unknown
+/// version into an empty locked preset -- fine for flash, silently
+/// destructive for input").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetBlobError {
+    /// Anything other than the v2 blob version this build writes (`v1` is
+    /// a legacy *reader*-only format -- host/web input is never expected to
+    /// send it, and accepting it here would let a host silently downgrade a
+    /// stored preset's precision).
+    UnsupportedVersion { version: u8 },
+    /// The flags byte's `band_count` (4 bits, so representable up to `15`)
+    /// exceeded [`MAX_BANDS`] -- wider than a `PlDspProgram`
+    /// (`PL_DSP_MAX_BIQUADS`) can actually hold.
+    TooManyBands { band_count: usize },
+    /// A band's `kind` bits (design's `kind_gain` packing) decoded to a
+    /// value [`BandKind::from_wire`] has no name for (wire values `3`-`7`,
+    /// reserved for a future filter shape). `from_wire`'s tolerant path
+    /// silently rewrites this to `Peak`; strict host input must not
+    /// silently change what the caller asked for.
+    ReservedBandKind { band_index: usize, raw_kind: u8 },
+    /// The name field's bytes up to its first `0` terminator were not valid
+    /// UTF-8 -- `from_wire`'s tolerant path uses
+    /// `String::from_utf8_lossy`, replacing bad bytes rather than
+    /// rejecting; strict host input treats a non-UTF-8 name as invalid
+    /// input (design section 4: "`NAME_INVALID` (empty / not UTF-8)").
+    InvalidNameUtf8,
+}
+
+impl Preset {
+    /// Strictly decodes a `HOST_OP` `SAVE`/`PREVIEW` blob -- design section
+    /// 4's "Host blobs are validated STRICTLY" contract. Unlike
+    /// [`Self::from_wire`], an unrecognised version, an over-wide band
+    /// count, a reserved band `kind`, or a non-UTF-8 name is REJECTED
+    /// outright rather than degraded into an empty locked preset or
+    /// silently corrected -- see [`PresetBlobError`]'s doc comment for why
+    /// each check exists. [`Self::from_wire`] itself is UNCHANGED: the
+    /// boot-load/echo-decode path (`App::on_preset_loaded`) keeps its
+    /// tolerant, never-panics, never-rejects behaviour, because a corrupt
+    /// byte already on flash must degrade gracefully, not brick the whole
+    /// load.
+    ///
+    /// # Errors
+    ///
+    /// The first [`PresetBlobError`] found, in the order: version, band
+    /// count, then each band's `kind` in order, then the name's UTF-8
+    /// validity.
+    pub fn from_wire_checked(raw: &[u8]) -> Result<Self, PresetBlobError> {
+        let version = raw.first().copied().unwrap_or(0);
+        if version != BLOB_VERSION_V2 {
+            return Err(PresetBlobError::UnsupportedVersion { version });
+        }
+
+        let get = |i: usize| -> u8 { raw.get(i).copied().unwrap_or(0) };
+
+        let flags = get(v2_layout::FLAGS_OFF);
+        let band_count = (flags >> FLAGS_BAND_COUNT_SHIFT) as usize;
+        if band_count > MAX_BANDS {
+            return Err(PresetBlobError::TooManyBands { band_count });
+        }
+
+        for i in 0..band_count {
+            let start = v2_layout::BANDS_OFF + i * V2_BAND_RECORD_LEN;
+            let kind_gain = u16::from_le_bytes([get(start), get(start + 1)]);
+            let raw_kind = ((kind_gain >> KIND_GAIN_GAIN_BITS) as u8) & 0x7;
+            if raw_kind > 2 {
+                return Err(PresetBlobError::ReservedBandKind { band_index: i + 1, raw_kind });
+            }
+        }
+
+        let mut name_buf = [0u8; MAX_NAME_BYTES];
+        for (i, b) in name_buf.iter_mut().enumerate() {
+            *b = get(v2_layout::NAME_OFF + i);
+        }
+        let name_len = name_buf.iter().position(|&b| b == 0).unwrap_or(MAX_NAME_BYTES);
+        if core::str::from_utf8(&name_buf[..name_len]).is_err() {
+            return Err(PresetBlobError::InvalidNameUtf8);
+        }
+
+        Ok(Self::from_wire_v2(raw))
+    }
+}
+
 /// Truncates `name` to at most [`MAX_NAME_BYTES`], respecting a UTF-8
 /// character boundary -- same reasoning and same pattern as
 /// `crate::app::model::truncate_device_name`: "Rust owns text; C owns

@@ -202,4 +202,24 @@ impl App {
         *self.home_face.borrow()
     }
 
+    /// Test-only: allocates `preset` directly in the live preset store,
+    /// bypassing `HOST_OP`/the on-device editor entirely -- for
+    /// `pico-link-jyhk.19`'s `host_op` tests that need an already-existing
+    /// effect to update/delete/assign against. Returns the allocated id,
+    /// same as [`crate::dsp::PresetStore::create`]. Not part of the public
+    /// API.
+    #[cfg(test)]
+    pub(crate) fn presets_create_for_test(&mut self, preset: crate::dsp::Preset) -> u16 {
+        self.presets.borrow_mut().create(preset)
+    }
+
+    /// Test-only: sets [`App::editor_preview`] as if the on-device effects
+    /// editor had `id` open with an arbitrary draft -- `pico-link-jyhk.19`'s
+    /// `EDITOR_OPEN` rejection tests need this without driving the real
+    /// editor screen's navigation. Not part of the public API.
+    #[cfg(test)]
+    pub(crate) fn open_editor_for_test(&mut self, id: u16) {
+        let draft = self.presets.borrow().get(id).cloned().unwrap_or_else(|| crate::dsp::Preset::new("Editing"));
+        *self.editor_preview.borrow_mut() = Some((id, draft, false));
+    }
 }

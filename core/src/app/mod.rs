@@ -49,6 +49,7 @@ use crate::render::Screen;
 mod events;
 mod fault;
 mod fold;
+mod host_op;
 mod inspect;
 mod library;
 mod model;
@@ -336,6 +337,30 @@ pub struct App {
     /// on every call, but that mutation is invisible to every caller except
     /// [`Self::library_snapshot`] itself.
     library_last_bytes: RefCell<Vec<u8>>,
+    /// The web companion's live host preview, while a `HOST_OP` `PREVIEW`
+    /// is active and hasn't been ended (`PREVIEW_END`, or C's 2s lease
+    /// timeout via [`Self::host_preview_end`]) -- bead `pico-link-jyhk.19`,
+    /// design section 4/7. `Some((effect_id, preset, bypass))`: `effect_id`
+    /// is carried for [`Self::telemetry_snapshot`]'s
+    /// `host_preview_active`/informational purposes only (`0` means an
+    /// unsaved draft, design section 4's `PREVIEW` body doc) -- resolution
+    /// in [`Self::dsp_program`] uses `preset`/`bypass` exactly like
+    /// [`Self::editor_preview`]'s own `(id, draft, bypassed)` shape, one
+    /// precedence tier below it (design section 7: "debug override >
+    /// device editor preview > host preview > connected device's
+    /// assignment"). Plain field, not `Rc<RefCell<_>>` like
+    /// [`Self::editor_preview`]: nothing in the `Navigator`'s screen stack
+    /// reads or writes this -- only `ui-ffi`'s `pl_ui_host_op`/
+    /// `pl_ui_host_preview_end` reach it, directly through `&mut App`, the
+    /// same shape [`Self::eq_import_session`] already uses for its own
+    /// FFI-only mailbox.
+    host_preview: Option<(u16, Preset, bool)>,
+    /// The last [`host_op::HostOpStatus`] [`Self::host_op`] produced, for
+    /// [`Self::host_op_status`] (`GET_OP_STATUS`) to encode on every poll --
+    /// bead `pico-link-jyhk.19`, design section 4. Starts at
+    /// [`host_op::HostOpStatus::default`]'s all-zero `state == 0` ("none"),
+    /// exactly matching a real boot that has never received a `HOST_OP` yet.
+    host_op_status: host_op::HostOpStatus,
 }
 
 impl App {
@@ -397,6 +422,8 @@ impl App {
             preset_persisted_seq: alloc::collections::BTreeMap::new(),
             library_rev: core::cell::Cell::new(0),
             library_last_bytes: RefCell::new(Vec::new()),
+            host_preview: None,
+            host_op_status: host_op::HostOpStatus::default(),
         }
         // `editor_preset_id` is not stored on `Self` -- see its local
         // binding above. `App` never reads it back after construction
@@ -571,12 +598,23 @@ impl App {
     /// returned early -- the editor's preview always wins over the
     /// connected device's stored assignment while open, independent of
     /// whether the draft has been saved yet.
+    ///
+    /// Bead `pico-link-jyhk.19` (design section 7) inserts one more tier
+    /// between the device editor's preview and the connected device's
+    /// assignment -- the full order is now "debug override, then device
+    /// editor preview, then host preview, then the connected device's
+    /// assignment" -- [`App::host_preview`], same `(preset, bypassed)`
+    /// resolution [`App::editor_preview`] uses one tier up, checked first
+    /// and returned early for the same reason.
     #[must_use]
     pub fn dsp_program(&self, fs_hz: u32) -> Program {
         if let Some(over) = self.debug_dsp_override.as_ref() {
             return over.to_program(fs_hz);
         }
         if let Some((_id, draft, bypassed)) = self.editor_preview.borrow().as_ref() {
+            return if *bypassed { Program::off(fs_hz) } else { Program::from_preset(draft, fs_hz) };
+        }
+        if let Some((_id, draft, bypassed)) = self.host_preview.as_ref() {
             return if *bypassed { Program::off(fs_hz) } else { Program::from_preset(draft, fs_hz) };
         }
         let model = self.model.borrow();
@@ -640,12 +678,8 @@ impl App {
         let editor = self.editor_preview.borrow();
         let extras = telemetry::HomeSnapshotExtras {
             library_rev,
-            // `App` has no `host_preview` field yet -- bead
-            // `pico-link-jyhk.19` (Task 2, HOST_OP/PREVIEW) adds it. Ships
-            // `false` until then, per this bead's scope note ("codec-
-            // fallback byte reserved = 0") applied to the same
-            // not-built-yet reasoning.
-            host_preview_active: false,
+            // Bead `pico-link-jyhk.19` (Task 2, HOST_OP/PREVIEW).
+            host_preview_active: self.host_preview.is_some(),
             device_editor_open: editor.is_some(),
             device_editor_effect_id: editor.as_ref().map_or(0, |(id, _, _)| *id),
             presets_ready: *self.presets_ready.borrow(),
