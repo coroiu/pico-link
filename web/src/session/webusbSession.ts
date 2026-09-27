@@ -82,9 +82,27 @@ export class WebUsbSessionManager {
     }
   }
 
-  /** Shows the chooser (must be called synchronously from a user gesture) and opens whatever the user picks. */
+  /**
+   * Shows the chooser and opens whatever the user picks.
+   *
+   * Review fix-first (pico-link-jyhk.11), third round: this used to enqueue
+   * `() => new WebUsbTransport()` -- a transport whose `open()` calls
+   * `navigator.usb.requestDevice()` itself, *inside* `openChain`. Since every
+   * queued opener waits for `stopCurrentSession()` + `session.start()` of
+   * whatever came before it, an unrelated in-flight open could make the
+   * chooser call happen an arbitrary amount of time after this click
+   * handler returned -- long enough to outlive Chrome's transient user
+   * activation, so `requestDevice()` threw `SecurityError` instead of
+   * showing the chooser. The chooser call MUST run synchronously (no prior
+   * `await`) within the gesture; only the *result* -- opening the
+   * already-chosen device -- goes through the serialized chain. A cancelled
+   * chooser (`NotFoundError`) rejects here, before `enqueueOpen`, so it
+   * never touches `currentSession`/`currentTransport` or the chain.
+   */
   async requestDevice(): Promise<void> {
-    await this.enqueueOpen(() => new WebUsbTransport());
+    if (!isWebUsbSupported()) return;
+    const device = await navigator.usb.requestDevice({ filters: [{ vendorId: PL_USB_VENDOR_ID, productId: PL_USB_PRODUCT_ID }] });
+    await this.enqueueOpen(() => new WebUsbTransport(device));
   }
 
   stop(): void {

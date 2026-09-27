@@ -32,7 +32,7 @@ const DEFAULT_INFO: DeviceInfo = {
  * `watchUsbConnectionEvents`/`WebUsbTransport.underlyingDevice` compare
  * real `USBDevice`s.
  */
-function fakeUsbDevice(): USBDevice {
+function fakeUsbDevice(options: { openDelayMs?: number } = {}): USBDevice {
   let opened = false;
   const snapshot = () => encodeHomeSnapshotForTest({ ...emptyHomeSnapshot(), snapSeq: 1, linkConnected: true });
   return {
@@ -45,6 +45,10 @@ function fakeUsbDevice(): USBDevice {
       return opened;
     },
     async open() {
+      // Optional delay to occupy `openChain` for the length of one open --
+      // used to prove a queued opener does not delay an unrelated
+      // synchronous `navigator.usb.requestDevice()` call.
+      if (options.openDelayMs) await sleep(options.openDelayMs);
       opened = true;
     },
     async close() {
@@ -82,11 +86,25 @@ function fakeNavigatorUsb() {
   const target = new EventTarget();
   const authorized: USBDevice[] = [];
   let nextRequestedDevice: USBDevice | undefined;
+  let nextRequestedRejection: unknown;
+  let requestDeviceCallCount = 0;
   const usb = {
     addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => target.addEventListener(type, listener),
     removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => target.removeEventListener(type, listener),
     getDevices: () => Promise.resolve([...authorized]),
-    requestDevice: () => (nextRequestedDevice ? Promise.resolve(nextRequestedDevice) : Promise.reject(new Error("not used in this test"))),
+    // Increments synchronously, before returning the promise -- callers
+    // check this immediately after invoking `manager.requestDevice()`
+    // (without awaiting) to prove the chooser call itself was not deferred
+    // behind an unrelated in-flight open.
+    requestDevice: () => {
+      requestDeviceCallCount += 1;
+      if (nextRequestedRejection !== undefined) {
+        const err = nextRequestedRejection;
+        nextRequestedRejection = undefined;
+        return Promise.reject(err);
+      }
+      return nextRequestedDevice ? Promise.resolve(nextRequestedDevice) : Promise.reject(new Error("not used in this test"));
+    },
   };
   return {
     usb: usb as unknown as USB,
@@ -95,6 +113,12 @@ function fakeNavigatorUsb() {
     },
     setNextRequestedDevice(device: USBDevice) {
       nextRequestedDevice = device;
+    },
+    rejectNextRequestedDeviceWith(err: unknown) {
+      nextRequestedRejection = err;
+    },
+    get requestDeviceCallCount() {
+      return requestDeviceCallCount;
     },
     dispatchConnect(device: USBDevice) {
       const event = new Event("connect") as USBConnectionEvent;
@@ -289,5 +313,79 @@ describe("WebUsbSessionManager", () => {
     const readySession = sessions.find((s) => s.statusStore.getSnapshot().phase === "ready");
     expect(readySession).toBeDefined();
     expect(manager.session).toBe(readySession);
+  });
+
+  // Review fix-first (pico-link-jyhk.11), third round: `requestDevice()` used
+  // to enqueue `() => new WebUsbTransport()` -- a transport whose `open()`
+  // calls `navigator.usb.requestDevice()` itself, inside `openChain`, so the
+  // chooser call happened only after any in-flight open's
+  // `stopCurrentSession()` + `session.start()` settled. That can outlive
+  // Chrome's transient user activation and throws `SecurityError`. The fix
+  // calls `navigator.usb.requestDevice()` synchronously first and enqueues
+  // only the open of the already-chosen device.
+
+  it("requestDevice calls navigator.usb.requestDevice synchronously, not deferred behind an in-flight open", async () => {
+    const fake = fakeNavigatorUsb();
+    const device = fakeUsbDevice();
+    fake.authorize(device);
+    Object.defineProperty(navigator, "usb", { value: fake.usb, configurable: true });
+
+    const sessions: Session[] = [];
+    const manager = new WebUsbSessionManager({ pollIntervalMs: 5, onSession: (s) => sessions.push(s) });
+    await manager.start();
+    await sleep(15);
+    expect(sessions).toHaveLength(1);
+
+    // Occupy `openChain` with a slow open (a `connect` event for a device
+    // that takes 50ms to open) before the user clicks Connect.
+    const slow = fakeUsbDevice({ openDelayMs: 50 });
+    fake.dispatchConnect(slow);
+
+    const chosen = fakeUsbDevice();
+    fake.setNextRequestedDevice(chosen);
+
+    expect(fake.requestDeviceCallCount).toBe(0);
+    const requestPromise = manager.requestDevice();
+    // Checked immediately, with NO await in between: if this were still
+    // queued behind the slow open, the call would not have happened yet.
+    expect(fake.requestDeviceCallCount).toBe(1);
+
+    await requestPromise;
+    await sleep(70);
+
+    expect(readyCount(sessions)).toBe(1);
+    expect(manager.session?.statusStore.getSnapshot().phase).toBe("ready");
+  });
+
+  it("a cancelled chooser (NotFoundError) leaves the current session untouched and does not enter the chain", async () => {
+    const fake = fakeNavigatorUsb();
+    const device = fakeUsbDevice();
+    fake.authorize(device);
+    Object.defineProperty(navigator, "usb", { value: fake.usb, configurable: true });
+
+    const sessions: Session[] = [];
+    const manager = new WebUsbSessionManager({ pollIntervalMs: 5, onSession: (s) => sessions.push(s) });
+    await manager.start();
+    await sleep(15);
+    expect(sessions).toHaveLength(1);
+    const firstSession = sessions[0];
+    expect(firstSession.statusStore.getSnapshot().phase).toBe("ready");
+
+    fake.rejectNextRequestedDeviceWith(new DOMException("The user cancelled the requestDevice() chooser.", "NotFoundError"));
+    await expect(manager.requestDevice()).rejects.toMatchObject({ name: "NotFoundError" });
+
+    // No new session was ever created, and the current one is unaffected.
+    expect(sessions).toHaveLength(1);
+    expect(manager.session).toBe(firstSession);
+    expect(firstSession.statusStore.getSnapshot().phase).toBe("ready");
+
+    // The chain must not be wedged by the cancellation: a later open still works.
+    const replug = fakeUsbDevice();
+    fake.dispatchConnect(replug);
+    await sleep(15);
+
+    expect(sessions).toHaveLength(2);
+    expect(readyCount(sessions)).toBe(1);
+    expect(manager.session).toBe(sessions[1]);
   });
 });
