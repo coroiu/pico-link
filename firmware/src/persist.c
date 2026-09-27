@@ -1333,8 +1333,26 @@ void pl_persist_service(void) {
             // guards against flooding that queue on every subsequent
             // superloop iteration before the heartbeat (up to 100ms
             // later) actually drains this request.
+            //
+            // Bead pico-link-j5su, review round 2: latch BEFORE the push,
+            // not on its return value. pl_bt_pending_push re-enables
+            // interrupts before it returns, and the drain
+            // (pl_bt_pending_service) runs from IRQ/async_context and can
+            // preempt right there -- if it drains and executes the entry
+            // before push's return reaches us, execute_pending_write clears
+            // the flag first, and THEN our post-latch assignment stomps it
+            // back to true with nothing left in the queue to ever clear it
+            // again (the exact wedge this bead was reopened for). Setting
+            // the flag true up front closes that window: any drain that
+            // runs during or after this push sees (and can correctly
+            // clear) a flag that is already true. Only claw it back to
+            // false if the push reports it dropped the entry (queue full)
+            // -- a drop can't have raced the drain, since nothing was ever
+            // queued for the drain to touch.
             s_write_enqueued = true;
-            pl_bt_enqueue_persist_write();
+            if (!pl_bt_enqueue_persist_write()) {
+                s_write_enqueued = false;
+            }
         }
     }
     if (s_device_settings_pending && !s_device_settings_write_enqueued) {
@@ -1354,8 +1372,13 @@ void pl_persist_service(void) {
         // audio skips when I'm actively interacting with the device."
         // Background/periodic persistence (the write above, and
         // pl_persist_execute_pending_write) keeps the streaming gate.
+        // Bead pico-link-j5su, review round 2: latch true before the push
+        // and only claw back to false on a reported drop -- see the
+        // pl_bt_enqueue_persist_write block above for the full rationale.
         s_device_settings_write_enqueued = true;
-        pl_bt_enqueue_device_settings_write();
+        if (!pl_bt_enqueue_device_settings_write()) {
+            s_device_settings_write_enqueued = false;
+        }
     }
     if (s_preset_stage_len > 0 && !s_preset_op_write_enqueued) {
         // Bead pico-link-ryw.6, design sec 2.5 / Andreas's ryw.6 ruling:
@@ -1367,32 +1390,55 @@ void pl_persist_service(void) {
         // pending-action queue (capacity 8) the pre-ryw.14 two-flag version
         // had, now covering both operation kinds through a single flag
         // since they share one table.
+        // Bead pico-link-j5su, review round 2: latch true before the push
+        // and only claw back to false on a reported drop -- see the
+        // pl_bt_enqueue_persist_write block above for the full rationale.
+        // This is the block Ada flagged: the web companion makes
+        // create/delete-preset traffic routine, which is exactly what
+        // makes the pending-action queue (capacity 8) more likely to fill.
         s_preset_op_write_enqueued = true;
-        pl_bt_enqueue_save_preset_write();
+        if (!pl_bt_enqueue_save_preset_write()) {
+            s_preset_op_write_enqueued = false;
+        }
     }
     if (s_display_pending && !s_display_write_enqueued) {
         // Bead pico-link-qivj.5 (S11), design D11 (Andreas's xcmx ruling,
         // extended to this record): same "just write, no streaming gate"
         // treatment as the per-device-settings block above -- a Settings
         // row pick is a user-initiated write, not background persistence.
+        // Bead pico-link-j5su, review round 2: latch true before the push
+        // and only claw back to false on a reported drop -- see the
+        // pl_bt_enqueue_persist_write block above for the full rationale.
         s_display_write_enqueued = true;
-        pl_bt_enqueue_display_settings_write();
+        if (!pl_bt_enqueue_display_settings_write()) {
+            s_display_write_enqueued = false;
+        }
     }
     if (s_cushion_pending && !s_cushion_write_enqueued) {
         // Bead pico-link-8pp1's design sec 4 / Andreas's 2026-09-24 ruling
         // (D11 precedent): no streaming re-check here, matching the
         // display-settings block above -- this is a user-initiated write
         // that is allowed to skip audio rather than silently delay.
+        // Bead pico-link-j5su, review round 2: latch true before the push
+        // and only claw back to false on a reported drop -- see the
+        // pl_bt_enqueue_persist_write block above for the full rationale.
         s_cushion_write_enqueued = true;
-        pl_bt_enqueue_cushion_policy_write();
+        if (!pl_bt_enqueue_cushion_policy_write()) {
+            s_cushion_write_enqueued = false;
+        }
     }
     if (s_abr_floor_pending && !s_abr_floor_write_enqueued) {
         // Bead pico-link-d42g.3's design sec 2/4 (D11 precedent, same as
         // the cushion-policy block above): no streaming re-check here --
         // this is a user-initiated write that is allowed to skip audio
         // rather than silently delay.
+        // Bead pico-link-j5su, review round 2: latch true before the push
+        // and only claw back to false on a reported drop -- see the
+        // pl_bt_enqueue_persist_write block above for the full rationale.
         s_abr_floor_write_enqueued = true;
-        pl_bt_enqueue_abr_floor_write();
+        if (!pl_bt_enqueue_abr_floor_write()) {
+            s_abr_floor_write_enqueued = false;
+        }
     }
 }
 

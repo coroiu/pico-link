@@ -534,6 +534,17 @@ endif()
 set(PL_FORCED_REPAINT_MS "1000" CACHE STRING "Repaint the panel at least this often, 0 = never")
 target_compile_definitions(pico_link PRIVATE PL_FORCED_REPAINT_MS=${PL_FORCED_REPAINT_MS})
 
+# Bead pico-link-g4l1: firmware version string reported by the config
+# interface's GET_INFO (usb_config_itf.c/.h, PL_FW_VERSION_STRING, default
+# "dev"). CI overrides this from the release tag (e.g.
+# `-DPL_FW_VERSION_STRING=v1.2.3`); local/dev builds keep the "dev" default.
+# A plain CACHE STRING, same pattern as PL_FORCED_REPAINT_MS above, not a
+# CMAKE_C_FLAGS define -- see that variable's own comment for why bare
+# CMAKE_C_FLAGS on the command line replaces pico-sdk's seeded arch flags
+# instead of appending to them.
+set(PL_FW_VERSION_STRING "dev" CACHE STRING "Firmware version string reported over the config interface (GET_INFO)")
+target_compile_definitions(pico_link PRIVATE PL_FW_VERSION_STRING="${PL_FW_VERSION_STRING}")
+
 target_link_libraries(pico_link
     pico_stdlib
     # Bead pico-link-ryw.1: dsp.c's pl_dsp_rt_core1_init() calls the CMSIS

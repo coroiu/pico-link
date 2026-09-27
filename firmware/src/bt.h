@@ -246,7 +246,12 @@ void pl_bt_debug_disconnect(void);
 // thread-context caller. Called from persist.c's pl_persist_service()
 // (thread context, the superloop). See persist.h's module doc
 // ("Reentrancy") for the full rationale.
-void pl_bt_enqueue_persist_write(void);
+// Bead pico-link-j5su: returns true if the request actually landed in the
+// pending-action queue (capacity 8), false if the queue was full and the
+// request was dropped -- the caller (persist.c) must only latch its own
+// *_write_enqueued flag on true, or a drop wedges that write kind until
+// reboot (see persist.h's module doc).
+bool pl_bt_enqueue_persist_write(void);
 
 // Bead pico-link-7jol.5, generalized by pico-link-ryw.6: same idiom as
 // pl_bt_enqueue_persist_write above, for persist.c's field-masked
@@ -255,21 +260,27 @@ void pl_bt_enqueue_persist_write(void);
 // pl_persist_request_device_settings/pl_persist_execute_pending_device_
 // settings_write for the full rationale. Called from persist.c's
 // pl_persist_service() (thread context, the superloop).
-void pl_bt_enqueue_device_settings_write(void);
+// See pl_bt_enqueue_persist_write's doc comment above for the return-value
+// contract (pico-link-j5su).
+bool pl_bt_enqueue_device_settings_write(void);
 
 // Bead pico-link-ryw.6: same idiom as pl_bt_enqueue_persist_write above,
 // for persist.c's PL:P preset-save write -- see persist.h's doc comment on
 // pl_persist_request_save_preset/pl_persist_execute_pending_save_preset_
 // write for the full rationale. Called from persist.c's
 // pl_persist_service() (thread context, the superloop).
-void pl_bt_enqueue_save_preset_write(void);
+// See pl_bt_enqueue_persist_write's doc comment above for the return-value
+// contract (pico-link-j5su).
+bool pl_bt_enqueue_save_preset_write(void);
 
 // Bead pico-link-ryw.6: same idiom as pl_bt_enqueue_persist_write above,
 // for persist.c's PL:P preset-delete write -- see persist.h's doc comment
 // on pl_persist_request_delete_preset/pl_persist_execute_pending_delete_
 // preset_write for the full rationale. Called from persist.c's
 // pl_persist_service() (thread context, the superloop).
-void pl_bt_enqueue_delete_preset_write(void);
+// See pl_bt_enqueue_persist_write's doc comment above for the return-value
+// contract (pico-link-j5su).
+bool pl_bt_enqueue_delete_preset_write(void);
 
 // Bead pico-link-qivj.5 (S11): same idiom as pl_bt_enqueue_persist_write
 // above, for persist.c's PL:S:0 display-settings write -- see persist.h's
@@ -277,7 +288,9 @@ void pl_bt_enqueue_delete_preset_write(void);
 // pl_persist_execute_pending_display_settings_write for the full
 // rationale. Called from persist.c's pl_persist_service() (thread context,
 // the superloop).
-void pl_bt_enqueue_display_settings_write(void);
+// See pl_bt_enqueue_persist_write's doc comment above for the return-value
+// contract (pico-link-j5su).
+bool pl_bt_enqueue_display_settings_write(void);
 
 // Bead pico-link-8pp1.4 (S3): same idiom as pl_bt_enqueue_persist_write
 // above, for persist.c's PL:S:1 cushion-policy write -- see persist.h's
@@ -285,7 +298,9 @@ void pl_bt_enqueue_display_settings_write(void);
 // pl_persist_execute_pending_cushion_policy_write for the full rationale.
 // Called from persist.c's pl_persist_service() (thread context, the
 // superloop).
-void pl_bt_enqueue_cushion_policy_write(void);
+// See pl_bt_enqueue_persist_write's doc comment above for the return-value
+// contract (pico-link-j5su).
+bool pl_bt_enqueue_cushion_policy_write(void);
 
 // Bead pico-link-d42g.3 (F3): same idiom as pl_bt_enqueue_persist_write
 // above, for persist.c's PL:S:2 Adaptive-floor write -- see persist.h's
@@ -293,7 +308,9 @@ void pl_bt_enqueue_cushion_policy_write(void);
 // pl_persist_execute_pending_abr_floor_write for the full rationale.
 // Called from persist.c's pl_persist_service() (thread context, the
 // superloop).
-void pl_bt_enqueue_abr_floor_write(void);
+// See pl_bt_enqueue_persist_write's doc comment above for the return-value
+// contract (pico-link-j5su).
+bool pl_bt_enqueue_abr_floor_write(void);
 
 // Bead pico-link-oevr: current page-scan state and transition count, for
 // a2dp.c's periodic debug report (pl_a2dp_report) to print -- so a

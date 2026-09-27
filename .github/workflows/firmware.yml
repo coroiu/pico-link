@@ -1,0 +1,229 @@
+name: firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "firmware/**"
+      - "core/**"
+      - "ui-ffi/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/firmware.yml"
+  pull_request:
+    paths:
+      - "firmware/**"
+      - "core/**"
+      - "ui-ffi/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/firmware.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string to embed (PL_FW_VERSION_STRING) and, if creating a release, the tag to publish under"
+        required: false
+        default: ""
+      publish_release:
+        description: "Also create/update a GitHub Release for this run (normally only tags do this)"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  PICO_SDK_VERSION: "2.1.1"
+  ARM_TOOLCHAIN_VERSION: "15.2.rel1"
+  ARM_TOOLCHAIN_TRIPLE: "arm-none-eabi"
+  CBINDGEN_VERSION: "0.29.4"
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            debug_remote: "OFF"
+            uf2_name: pico_link.uf2
+          - name: debug
+            debug_remote: "ON"
+            uf2_name: pico_link-debug.uf2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine firmware version string
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
+            V="${{ inputs.version }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            V="${{ github.ref_name }}"
+          else
+            V="dev"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust target (thumbv8m.main-none-eabi)
+        run: rustup target add thumbv8m.main-none-eabi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ui-ffi-thumbv8m
+
+      - name: Cache cbindgen
+        id: cache-cbindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cbindgen
+          key: cbindgen-${{ env.CBINDGEN_VERSION }}-${{ runner.os }}
+
+      - name: Install cbindgen
+        if: steps.cache-cbindgen.outputs.cache-hit != 'true'
+        run: cargo install cbindgen --version ${{ env.CBINDGEN_VERSION }} --locked
+
+      - name: Cache pico-sdk
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.pico-sdk/sdk/${{ env.PICO_SDK_VERSION }}
+          # Keyed on the sdk-patches applier script too: any change there
+          # means the cached, already-patched checkout is stale.
+          key: pico-sdk-${{ env.PICO_SDK_VERSION }}-${{ hashFiles('tools/apply-sdk-patches.sh', '.github/workflows/firmware.yml') }}
+
+      - name: Clone pico-sdk (with submodules, pinned to release tag)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.pico-sdk/sdk"
+          git clone --branch "$PICO_SDK_VERSION" --depth 1 \
+            https://github.com/raspberrypi/pico-sdk.git \
+            "$HOME/.pico-sdk/sdk/$PICO_SDK_VERSION"
+          # lib/lwip is required even though our own code never includes lwIP
+          # headers (CYW43_LWIP=0 below): pico-sdk's own
+          # pico_cyw43_arch/CMakeLists.txt only defines the
+          # pico_cyw43_arch_threadsafe_background target (the one
+          # firmware/CMakeLists.txt links against) inside an
+          # `if (TARGET pico_lwip) ... else()` branch keyed on the lwIP
+          # submodule being present -- without it that target does not
+          # exist and main.c's #include <pico/cyw43_arch.h> fails with
+          # "must specify support pico_cyw43_arch architecture type".
+          # lib/mbedtls is picotool's own optional signing/hashing support
+          # (unused by this project -- it only warns without it) so it is
+          # deliberately left uninitialized here.
+          git -C "$HOME/.pico-sdk/sdk/$PICO_SDK_VERSION" submodule update --init --depth 1 \
+            lib/tinyusb lib/btstack lib/cyw43-driver lib/lwip
+
+      - name: Apply vendored pico-sdk patches
+        env:
+          PICO_SDK_PATH: /home/runner/.pico-sdk/sdk/${{ env.PICO_SDK_VERSION }}
+        run: tools/apply-sdk-patches.sh
+
+      - name: Cache Arm GNU Toolchain
+        id: cache-arm-toolchain
+        uses: actions/cache@v4
+        with:
+          path: /opt/arm-gnu-toolchain
+          key: arm-gnu-toolchain-${{ env.ARM_TOOLCHAIN_VERSION }}-${{ env.ARM_TOOLCHAIN_TRIPLE }}-${{ runner.os }}
+
+      - name: Download Arm GNU Toolchain
+        if: steps.cache-arm-toolchain.outputs.cache-hit != 'true'
+        run: |
+          URL="https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_TOOLCHAIN_VERSION}/binrel/arm-gnu-toolchain-${ARM_TOOLCHAIN_VERSION}-x86_64-${ARM_TOOLCHAIN_TRIPLE}.tar.xz"
+          curl -fL -o /tmp/arm-toolchain.tar.xz "$URL"
+          mkdir -p /opt/arm-gnu-toolchain
+          tar -xJf /tmp/arm-toolchain.tar.xz -C /opt/arm-gnu-toolchain --strip-components=1
+
+      - name: Add Arm GNU Toolchain to PATH
+        run: echo "/opt/arm-gnu-toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Configure (${{ matrix.name }})
+        env:
+          PICO_SDK_PATH: /home/runner/.pico-sdk/sdk/${{ env.PICO_SDK_VERSION }}
+        run: |
+          cmake -S firmware -B firmware/build-${{ matrix.name }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/opt/arm-gnu-toolchain/bin/arm-none-eabi-gcc \
+            -DCMAKE_CXX_COMPILER=/opt/arm-gnu-toolchain/bin/arm-none-eabi-g++ \
+            -DCMAKE_ASM_COMPILER=/opt/arm-gnu-toolchain/bin/arm-none-eabi-gcc \
+            -DPL_DEBUG_REMOTE=${{ matrix.debug_remote }} \
+            -DPL_FW_VERSION_STRING=${{ steps.version.outputs.version }}
+
+      - name: Build (${{ matrix.name }})
+        env:
+          PICO_SDK_PATH: /home/runner/.pico-sdk/sdk/${{ env.PICO_SDK_VERSION }}
+        run: cmake --build firmware/build-${{ matrix.name }} -j"$(nproc)"
+
+      - name: Collect UF2
+        run: |
+          mkdir -p dist
+          cp firmware/build-${{ matrix.name }}/pico_link.uf2 dist/${{ matrix.uf2_name }}
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.uf2_name }}
+          path: dist/${{ matrix.uf2_name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum pico_link.uf2 pico_link-debug.uf2 > SHA256SUMS
+
+      - name: Release notes
+        id: notes
+        run: |
+          {
+            echo "Firmware version: \`${{ steps.tag.outputs.tag }}\`"
+            echo
+            echo "- \`pico_link.uf2\` - release build (PL_DEBUG_REMOTE off)"
+            echo "- \`pico_link-debug.uf2\` - debug build (PL_DEBUG_REMOTE on, adds CDC NavIntent injection for unattended hardware testing)"
+            echo
+            echo "LDAC encoding uses Sony's \`libldac\` (Apache License 2.0); see \`firmware/vendor/libldac/NOTICE\`."
+          } > /tmp/release-notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body_path: /tmp/release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          files: |
+            dist/pico_link.uf2
+            dist/pico_link-debug.uf2
+            dist/SHA256SUMS
