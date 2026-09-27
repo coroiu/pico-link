@@ -1602,3 +1602,148 @@ fn import_before_presets_ready_is_refused_and_the_allocator_then_respects_the_hi
     let (id, _) = app.import_preset(MINIMAL_EQ_APO_TEXT, "fallback").expect("ready now");
     assert!(id >= 7, "the allocator must never hand out an id below C's own high-water mark");
 }
+
+// --- Bead `pico-link-jyhk.25`: the radio-session record (`BtModel::
+// scan_owner`/`scan_seq`/`attempt`/`last_outcome`), folded from events
+// regardless of which screen (if any) is open -- design
+// `.planning/design/2026-09-27-iface6-eq-management-protocol.md` sec 13.5.
+// These exercise the record through the same public entry points
+// (`handle_input`/`handle_event`) the device screens themselves use, so a
+// regression in `radio_actions`'s wiring shows up here even with no screen
+// open to read the record back.
+
+/// `start_scan` (queued by the wizard's "Pair new headphones" row) claims
+/// `ScanOwner::Device` and bumps `scan_seq`; the inquiry actually ending
+/// resets the owner to `None` without touching the seq counter.
+#[test]
+fn start_scan_claims_device_ownership_and_ending_the_scan_releases_it() {
+    let mut app = App::new(240, 240);
+    open_wizard(&mut app); // "Pair new headphones" -> `radio_actions::start_scan`
+
+    assert_eq!(app.model().scan_owner, ScanOwner::Device);
+    let seq_while_scanning = app.model().scan_seq;
+    assert_ne!(seq_while_scanning, 0, "start_scan must bump the counter off its zero default");
+    assert_eq!(app.poll_command(), Some(Command::StartScan), "must queue the exact same command the screen queued before");
+
+    app.handle_event(Event::DiscoveryStateChanged { scanning: false });
+    assert_eq!(app.model().scan_owner, ScanOwner::None, "the inquiry ending must release the owner claim");
+    assert_eq!(app.model().scan_seq, seq_while_scanning, "ending a scan must never roll back the sequence counter");
+}
+
+/// Selecting a paired, not-connected row (`crate::app::screens::devices`'
+/// switch path) records a fresh `ConnectAttempt` with the right `addr`/
+/// `initiator`, and still queues the identical `Command::Connect` the
+/// screen queued before this bead.
+#[test]
+fn connecting_a_paired_device_from_devices_records_a_device_initiated_attempt() {
+    let mut app = App::new(240, 240);
+    let addr = [5, 5, 5, 5, 5, 5];
+    app.handle_event(upsert(addr, "Headphones", 1));
+    open_devices(&mut app);
+
+    app.handle_input(vec![NavIntent::Select]); // the sole paired (not-connected) row
+
+    let attempt = app.model().attempt.expect("connect() must record an attempt");
+    assert_eq!(attempt.addr, addr);
+    assert_eq!(attempt.initiator, ConnectInitiator::Device);
+    assert_eq!(attempt.step, None, "no ConnectStepChanged has arrived yet");
+    assert_ne!(attempt.seq, 0, "connect() must bump the attempt-seq counter off its zero default");
+    assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Headphones") }));
+}
+
+/// `ConnectStepChanged`/`ConnectRetrying` update the in-flight attempt's
+/// `step`/`retries` in place, regardless of whether a wizard is even open
+/// to render them -- the whole point of design sec 13.5's "read model
+/// state, not a screen's phase".
+#[test]
+fn connect_step_and_retry_events_update_the_in_flight_attempt_with_no_screen_open() {
+    let mut app = App::new(240, 240);
+    let addr = [6, 6, 6, 6, 6, 6];
+    app.handle_event(upsert(addr, "Cans", 1));
+    open_devices(&mut app);
+    app.handle_input(vec![NavIntent::Select]); // starts the attempt
+    // Back out of the wizard entirely (queues `Command::CancelConnect`,
+    // irrelevant here) -- the radio-session record must keep folding with
+    // no screen left to render it.
+    app.handle_input(vec![NavIntent::Back, NavIntent::Back]);
+    assert_eq!(app.navigator_depth(), 1, "must be back at Home root with no wizard on screen");
+
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
+    assert_eq!(app.model().attempt.expect("attempt must survive the screen closing").step, Some(ConnectStep::Pairing));
+
+    app.handle_event(Event::ConnectRetrying { attempt: 3 });
+    assert_eq!(app.model().attempt.expect("attempt must still be live").retries, 3);
+}
+
+/// A successful connect concludes the attempt (`attempt` -> `None`) and
+/// records `last_outcome` with the concluded attempt's own `seq`/`addr`,
+/// `Ok` for a plain success and `OkDegraded` for a degraded one.
+#[test]
+fn connect_succeeded_concludes_the_attempt_into_last_outcome() {
+    let mut app = App::new(240, 240);
+    let addr = [7, 7, 7, 7, 7, 7];
+    app.handle_event(upsert(addr, "Cans", 1));
+    open_devices(&mut app);
+    app.handle_input(vec![NavIntent::Select]);
+    let seq = app.model().attempt.expect("attempt recorded").seq;
+
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+
+    assert_eq!(app.model().attempt, None, "a concluded attempt must be cleared");
+    let outcome = app.model().last_outcome.expect("a concluded attempt must record an outcome");
+    assert_eq!(outcome.seq, seq);
+    assert_eq!(outcome.addr, addr);
+    assert_eq!(outcome.result, ConnectOutcomeResult::Ok);
+    assert_eq!(outcome.reason, None);
+}
+
+#[test]
+fn connect_succeeded_degraded_records_ok_degraded() {
+    let mut app = App::new(240, 240);
+    let addr = [8, 8, 8, 8, 8, 8];
+    app.handle_event(upsert(addr, "Cans", 1));
+    open_devices(&mut app);
+    app.handle_input(vec![NavIntent::Select]);
+
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: true });
+
+    assert_eq!(app.model().last_outcome.expect("outcome recorded").result, ConnectOutcomeResult::OkDegraded);
+}
+
+/// A failed connect concludes the attempt the same way a success does, but
+/// records `Failed` with the reason C reported.
+#[test]
+fn connect_failed_concludes_the_attempt_with_the_failure_reason() {
+    let mut app = App::new(240, 240);
+    let addr = [9, 9, 9, 9, 9, 9];
+    app.handle_event(upsert(addr, "Cans", 1));
+    open_devices(&mut app);
+    app.handle_input(vec![NavIntent::Select]);
+    let seq = app.model().attempt.expect("attempt recorded").seq;
+
+    app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout });
+
+    assert_eq!(app.model().attempt, None);
+    let outcome = app.model().last_outcome.expect("a concluded attempt must record an outcome");
+    assert_eq!(outcome.seq, seq);
+    assert_eq!(outcome.result, ConnectOutcomeResult::Failed);
+    assert_eq!(outcome.reason, Some(ConnectFailureReason::Timeout));
+}
+
+/// `App::on_store_loaded`'s boot-time auto-reconnect now goes through the
+/// same shared `radio_actions::connect` helper -- it must still queue the
+/// identical `Command::Connect` it always did, but tagged
+/// `ConnectInitiator::AutoReconnect` in the radio-session record, not
+/// `Device`.
+#[test]
+fn boot_auto_reconnect_records_an_auto_reconnect_initiated_attempt() {
+    let mut app = App::new(240, 240);
+    let addr = [10, 10, 10, 10, 10, 10];
+    app.handle_event(upsert(addr, "Cans", 1));
+    app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
+
+    let attempt = app.model().attempt.expect("on_store_loaded's auto-reconnect must record an attempt");
+    assert_eq!(attempt.addr, addr);
+    assert_eq!(attempt.initiator, ConnectInitiator::AutoReconnect);
+    assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Cans") }));
+}

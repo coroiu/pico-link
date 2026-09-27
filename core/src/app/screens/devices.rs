@@ -23,7 +23,10 @@ use crate::dsp::PresetStore;
 
 use super::device_page::build_device_page_screen;
 use super::super::model::MAX_PAIRED_DEVICES;
-use super::super::{truncate_device_name, BtModel, Command, ConnectStep, DeviceAddr, ModelHandle, PairedDevice, ScreenId, WizardPhase};
+use super::super::{
+    connect, forget, start_scan, truncate_device_name, BtModel, Command, ConnectInitiator, ConnectStep, DeviceAddr, ModelHandle, PairedDevice,
+    ScanOwner, ScreenId, WizardPhase,
+};
 
 /// The devices screen's "Pair new headphones" row's identity key. Not
 /// backed by a `DeviceAddr` (it isn't a device), so it's a fixed sentinel
@@ -116,11 +119,11 @@ pub(crate) fn build_devices_screen(
                 };
                 if under_capacity {
                     *wizard_phase_for_activate.borrow_mut() = WizardPhase::scanning_pending();
-                    // Clear `model.discovered` proactively -- see
+                    // `start_scan` clears `model.discovered` (see
                     // `PairingWizardView::on_focus`'s identical rationale
-                    // for the `NothingFound` re-scan case.
-                    model_for_activate.borrow_mut().discovered.clear();
-                    commands_for_activate.borrow_mut().push_back(Command::StartScan);
+                    // for the `NothingFound` re-scan case) and folds the
+                    // radio-session record alongside queuing the command.
+                    start_scan(&model_for_activate, &commands_for_activate, ScanOwner::Device);
                     let phase = Rc::clone(&wizard_phase_for_activate);
                     let model = Rc::clone(&model_for_activate);
                     let commands = Rc::clone(&commands_for_activate);
@@ -165,9 +168,7 @@ pub(crate) fn build_devices_screen(
             // A on any other paired row: switch to it, reusing the
             // wizard -- `Command::Connect` + pushing straight into
             // `Connecting`, no new phase.
-            commands_for_activate
-                .borrow_mut()
-                .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
+            connect(&model_for_activate, &commands_for_activate, device.addr, truncate_device_name(&device.name), ConnectInitiator::Device);
             *wizard_phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
             let phase = Rc::clone(&wizard_phase_for_activate);
             let model = Rc::clone(&model_for_activate);
@@ -437,7 +438,7 @@ pub(in crate::app) fn build_forget_confirm_screen(addr: DeviceAddr, label: &str,
     let rows = vec![MenuItem::new("Cancel"), MenuItem::new("Forget").with_label_color(palette::STATUS_ERROR)];
     let view = ConfirmView::new(headline, rows).on_activate_index(Verb::Select, move |index| {
         if index == 1 {
-            commands.borrow_mut().push_back(Command::ForgetDevice { addr });
+            forget(&commands, addr);
         }
         Action::PopView
     });

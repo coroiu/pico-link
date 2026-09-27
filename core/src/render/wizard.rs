@@ -46,8 +46,8 @@ use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use crate::app::{
-    is_audio_sink, truncate_device_name, Command, ConnectFailureReason, ConnectStep, DeviceEntry, ModelHandle, ScreenId, WizardPhase,
-    MAX_SCAN_LIST_ITEMS,
+    cancel_scan, connect, is_audio_sink, start_scan, truncate_device_name, Command, ConnectFailureReason, ConnectInitiator, ConnectStep,
+    DeviceEntry, ModelHandle, ScanOwner, ScreenId, WizardPhase, MAX_SCAN_LIST_ITEMS,
 };
 use crate::input::NavIntent;
 
@@ -251,7 +251,7 @@ struct PairingWizardView {
 impl PairingWizardView {
     fn new(phase: Rc<RefCell<WizardPhase>>, model: ModelHandle, commands: Rc<RefCell<VecDeque<Command>>>) -> Self {
         let list_devices = model.borrow().discovered.clone();
-        let list = build_scan_list(&list_devices, &phase, &commands, None, 0);
+        let list = build_scan_list(&list_devices, &phase, &model, &commands, None, 0);
         Self { phase, model, commands, list: RefCell::new(list), list_devices: RefCell::new(list_devices) }
     }
 
@@ -265,7 +265,7 @@ impl PairingWizardView {
         }
         let prev_key = self.list.borrow().selected_key();
         let prev_index = self.list.borrow().selected_index();
-        let new_list = build_scan_list(&current, &self.phase, &self.commands, prev_key, prev_index);
+        let new_list = build_scan_list(&current, &self.phase, &self.model, &self.commands, prev_key, prev_index);
         *self.list.borrow_mut() = new_list;
         *self.list_devices.borrow_mut() = current;
     }
@@ -299,6 +299,7 @@ impl PairingWizardView {
 fn build_scan_list(
     devices: &[DeviceEntry],
     phase: &Rc<RefCell<WizardPhase>>,
+    model: &ModelHandle,
     commands: &Rc<RefCell<VecDeque<Command>>>,
     prev_key: Option<ListItemKey>,
     prev_index: usize,
@@ -338,13 +339,12 @@ fn build_scan_list(
 
     let devices_snapshot: Vec<DeviceEntry> = capped;
     let phase_for_activate = Rc::clone(phase);
+    let model_for_activate = Rc::clone(model);
     let commands_for_activate = Rc::clone(commands);
     VerticalList::new(items)
         .on_activate_index(Verb::Pair, move |index| {
             if let Some(device) = devices_snapshot.get(index) {
-                commands_for_activate
-                    .borrow_mut()
-                    .push_back(Command::Connect { addr: device.addr, name: truncate_device_name(&device.name) });
+                connect(&model_for_activate, &commands_for_activate, device.addr, truncate_device_name(&device.name), ConnectInitiator::Device);
                 *phase_for_activate.borrow_mut() = WizardPhase::connecting_pending(device.addr, ConnectStep::Connecting);
             }
             Action::None
@@ -377,13 +377,12 @@ impl Widget for PairingWizardView {
         let phase = self.phase.borrow().clone();
         match phase {
             WizardPhase::NothingFound => {
-                // Phase 3 -> phase 2 (re-scan). Clearing `model.discovered`
-                // proactively (rather than waiting for C's own
-                // `DevicesCleared` event) avoids a stale-row flash from a
-                // previous scan between this press and that event
-                // arriving.
-                self.model.borrow_mut().discovered.clear();
-                self.commands.borrow_mut().push_back(Command::StartScan);
+                // Phase 3 -> phase 2 (re-scan). `start_scan` clears
+                // `model.discovered` proactively (rather than waiting for
+                // C's own `DevicesCleared` event), avoiding a stale-row
+                // flash from a previous scan between this press and that
+                // event arriving.
+                start_scan(&self.model, &self.commands, ScanOwner::Device);
                 *self.phase.borrow_mut() = WizardPhase::scanning_pending();
                 Action::None
             }
@@ -410,7 +409,7 @@ impl Widget for PairingWizardView {
             // for precisely this side effect, then unconditionally pops
             // regardless of what's returned -- see that arm's doc comment.
             (NavIntent::Back, WizardPhase::Scanning { .. }) => {
-                self.commands.borrow_mut().push_back(Command::CancelScan);
+                cancel_scan(&self.commands);
                 Action::None
             }
             // Code-review fix (post-merge-review of this bead): B was
@@ -446,12 +445,12 @@ impl Widget for PairingWizardView {
             // erasing it, so a retry can never regress an already-known
             // name to nameless.
             (NavIntent::ShortcutX, WizardPhase::NotResponding { addr, .. }) => {
-                self.commands.borrow_mut().push_back(Command::Connect { addr, name: String::new() });
+                connect(&self.model, &self.commands, addr, String::new(), ConnectInitiator::Device);
                 *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
             (NavIntent::ShortcutX, WizardPhase::Failed { addr, reason }) if reason.retryable() => {
-                self.commands.borrow_mut().push_back(Command::Connect { addr, name: String::new() });
+                connect(&self.model, &self.commands, addr, String::new(), ConnectInitiator::Device);
                 *self.phase.borrow_mut() = WizardPhase::connecting_pending(addr, ConnectStep::Connecting);
                 Action::None
             }
