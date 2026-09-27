@@ -643,6 +643,20 @@ int main(void) {
         // NOT gated on PL_DEBUG_REMOTE, unlike the block above: this
         // transport exists in release builds. See usb_config_itf.h.
         pl_config_itf_poll(ui);
+        // Bead pico-link-jyhk.21: drains at most one pending HOST_OP per
+        // iteration (shares the mailbox pl_config_itf_poll above drains
+        // IMPORT_PRESET from -- each call only acts on its own request
+        // kind) and, unconditionally every iteration, ends an idle host
+        // preview lease. Same unconditional/release-build placement as
+        // pl_config_itf_poll just above. Measured under
+        // PL_LOOP_PHASE_EQ_MGMT, same phase the GET_LIBRARY poll further
+        // down (right before the telemetry step, design section 3:
+        // "Generation runs ... BEFORE the telemetry step") records its own
+        // cost into.
+        uint64_t eq_mgmt_start_us = time_us_64();
+        pl_config_itf_poll_host_op(ui);
+        pl_config_itf_poll_preview_lease(ui);
+        pl_loop_prof_record(PL_LOOP_PHASE_EQ_MGMT, time_us_64() - eq_mgmt_start_us);
         // T2 of the media-keys epic (pico-link-47z.2): drains
         // media_keys.c's own ring and runs its 600ms safety-release
         // check. NOT gated behind PL_DEBUG_REMOTE -- T3's AVRCP handler
@@ -743,6 +757,15 @@ int main(void) {
         // display-power/dirty gate below. Internally gated (poll-recency
         // + a min generation interval), so an unattached web page costs
         // this one no-op check, nothing more.
+        // Bead pico-link-jyhk.21, design section 3: "Generation runs ...
+        // BEFORE the telemetry step so page 0 carries the fresh rev." Same
+        // PL_LOOP_PHASE_EQ_MGMT phase as the HOST_OP/preview-lease block
+        // above (pl_loop_prof.h's own comment names this call as living
+        // "further down").
+        uint64_t library_start_us = time_us_64();
+        pl_config_itf_poll_library(ui);
+        pl_loop_prof_record(PL_LOOP_PHASE_EQ_MGMT, time_us_64() - library_start_us);
+
         uint64_t telemetry_start_us = time_us_64();
         pl_config_itf_poll_telemetry(ui);
         pl_loop_prof_record(PL_LOOP_PHASE_TELEMETRY, time_us_64() - telemetry_start_us);
