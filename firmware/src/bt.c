@@ -1196,7 +1196,14 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
 // queue has exactly one producer context, but it still needs the critical
 // section because the consumer (pl_bt_pending_service, IRQ context) can
 // preempt the producer mid read-modify-write of s_bt_pending_head.
-static void pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
+//
+// Bead pico-link-j5su: returns true if the entry was actually queued, false
+// if the queue was full and it was dropped. Every pl_bt_enqueue_*_write
+// wrapper below propagates this so persist.c can decide whether it's safe
+// to latch its own *_write_enqueued flag -- latching on a drop was the bug
+// (Ada, pico-link-ryw.14 review): the flag would stay true forever with no
+// queued entry left to ever clear it, wedging that write kind until reboot.
+static bool pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
     uint32_t irq_state = save_and_disable_interrupts();
     uint8_t head = s_bt_pending_head;
     uint8_t next_head = (uint8_t)((head + 1) % PL_BT_PENDING_CAPACITY);
@@ -1204,7 +1211,7 @@ static void pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
         s_bt_pending_drop_count++;
         restore_interrupts(irq_state);
         pl_log("BT: pending-action queue full, dropped deferred %s\r\n", pl_bt_pending_tag_name(tag));
-        return;
+        return false;
     }
     s_bt_pending[head].tag = tag;
     if (tag == PL_BT_PENDING_CONNECT || tag == PL_BT_PENDING_FORGET_DEVICE) {
@@ -1217,6 +1224,7 @@ static void pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
         "BT: queued deferred %s from thread context (enqueued=%lu)\r\n", pl_bt_pending_tag_name(tag),
         (unsigned long)s_bt_pending_enqueued_count
     );
+    return true;
 }
 
 // Bead pico-link-sfw6, design sec 2: turns a Connect that arrives while an
@@ -1388,36 +1396,36 @@ static void pl_bt_pending_service(void) {
 // runs from pl_bt_pending_service's IRQ/async_context, never from
 // persist.c's own thread-context caller (pl_persist_service, the
 // superloop). See persist.h's module doc for the full rationale.
-void pl_bt_enqueue_persist_write(void) {
-    pl_bt_pending_push(PL_BT_PENDING_PERSIST_WRITE, NULL);
+bool pl_bt_enqueue_persist_write(void) {
+    return pl_bt_pending_push(PL_BT_PENDING_PERSIST_WRITE, NULL);
 }
 
 // Bead pico-link-7jol.5. See bt.h's doc comment.
-void pl_bt_enqueue_device_settings_write(void) {
-    pl_bt_pending_push(PL_BT_PENDING_SET_DEVICE_SETTINGS, NULL);
+bool pl_bt_enqueue_device_settings_write(void) {
+    return pl_bt_pending_push(PL_BT_PENDING_SET_DEVICE_SETTINGS, NULL);
 }
 
-void pl_bt_enqueue_save_preset_write(void) {
-    pl_bt_pending_push(PL_BT_PENDING_SAVE_PRESET, NULL);
+bool pl_bt_enqueue_save_preset_write(void) {
+    return pl_bt_pending_push(PL_BT_PENDING_SAVE_PRESET, NULL);
 }
 
-void pl_bt_enqueue_delete_preset_write(void) {
-    pl_bt_pending_push(PL_BT_PENDING_DELETE_PRESET, NULL);
+bool pl_bt_enqueue_delete_preset_write(void) {
+    return pl_bt_pending_push(PL_BT_PENDING_DELETE_PRESET, NULL);
 }
 
 // Bead pico-link-qivj.5 (S11). See bt.h's doc comment.
-void pl_bt_enqueue_display_settings_write(void) {
-    pl_bt_pending_push(PL_BT_PENDING_SET_DISPLAY_SETTINGS, NULL);
+bool pl_bt_enqueue_display_settings_write(void) {
+    return pl_bt_pending_push(PL_BT_PENDING_SET_DISPLAY_SETTINGS, NULL);
 }
 
 // Bead pico-link-8pp1.4 (S3). See bt.h's doc comment.
-void pl_bt_enqueue_cushion_policy_write(void) {
-    pl_bt_pending_push(PL_BT_PENDING_SET_CUSHION_POLICY, NULL);
+bool pl_bt_enqueue_cushion_policy_write(void) {
+    return pl_bt_pending_push(PL_BT_PENDING_SET_CUSHION_POLICY, NULL);
 }
 
 // Bead pico-link-d42g.3 (F3). See bt.h's doc comment.
-void pl_bt_enqueue_abr_floor_write(void) {
-    pl_bt_pending_push(PL_BT_PENDING_SET_ABR_FLOOR, NULL);
+bool pl_bt_enqueue_abr_floor_write(void) {
+    return pl_bt_pending_push(PL_BT_PENDING_SET_ABR_FLOOR, NULL);
 }
 
 // Bead pico-link-ufh: permanent 100ms btstack_run_loop timer proving the
