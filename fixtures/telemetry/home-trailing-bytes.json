@@ -1,0 +1,30 @@
+{
+  "wire_len": 163,
+  "uptime_ms": 7000,
+  "snap_seq": 21,
+  "link_connected": false,
+  "codec_word": "",
+  "kbps": 0,
+  "kbps_adaptive": false,
+  "kbps_is_live": false,
+  "device_name": "",
+  "fx_preset_name": "",
+  "volume_present": true,
+  "volume_level": 10,
+  "volume_muted": false,
+  "volume_source": "host",
+  "level_present": false,
+  "peak_l": 0,
+  "peak_r": 0,
+  "rms_l": 0,
+  "rms_r": 0,
+  "received_ms": 0,
+  "faults": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ]
+}

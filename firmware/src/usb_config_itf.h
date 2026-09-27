@@ -209,6 +209,16 @@ typedef struct __attribute__((packed)) {
     uint8_t version[32];
 } pl_cfg_info_wire_t;
 
+// Wire-exact size check (bead pico-link-jyhk.9): fixtures/telemetry/info-
+// v1.bin is a hand-written golden of this struct's bytes at today's
+// defaults (info_ver=1, import_proto=1, status_ver=1, telemetry_proto=1,
+// telemetry_page_mask=1, version_len=3, version="dev" then 29 zero bytes)
+// -- 41 bytes total (1+1+1+1+4+1+32, no padding: the struct is packed). A
+// layout change here must also update that fixture (and bump the
+// affected PL_CFG_*_VERSION) or the web companion's GET_INFO decode
+// silently breaks against real hardware.
+_Static_assert(sizeof(pl_cfg_info_wire_t) == 41, "pl_cfg_info_wire_t size changed -- update fixtures/telemetry/info-v1.bin");
+
 // Returns the TinyUSB class driver for ITF_NUM_CONFIG, for
 // usb_reset.c's usbd_app_driver_get_cb to return alongside resetd.
 usbd_class_driver_t const *pl_configd_driver(void);
