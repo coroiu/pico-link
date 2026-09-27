@@ -244,3 +244,9 @@ reboot). Both should land before F1 ships.
 While a host preview plays, the panel shows nothing unusual (Home FX line still
 names the assigned effect). Should the device show a PREVIEW marker? flags2 bit0
 gives the web its own indicator either way.
+
+If the on-device effects editor opens while a host preview is active, the host
+preview mailbox (`App::host_preview`) is kept, not cleared -- the precedence
+rule in section 7 already makes the device editor's own preview win for as
+long as it's open, and the host preview resumes on its own once the editor
+closes and stops shadowing it.

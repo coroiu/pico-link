@@ -15,7 +15,7 @@ use super::coeffs::{
     Program, MAX_BOOST_HEADROOM_DB,
 };
 use super::preset::{
-    nearest_q_index, q_from_index, q_milli_from_index, Band, BandKind, CrossfeedLevel, Preamp, Preset, Q_TABLE, BLOB_LEN,
+    nearest_q_index, q_from_index, q_milli_from_index, Band, BandKind, CrossfeedLevel, Preamp, Preset, PresetBlobError, Q_TABLE, BLOB_LEN,
 };
 use super::store::{PresetStore, NO_PRESET_ID};
 
@@ -577,4 +577,69 @@ fn store_delete_does_not_touch_other_entries() {
     store.delete(id2);
     assert!(store.resolve(id1).is_some());
     assert_eq!(store.len(), 1);
+}
+
+// --- `Preset::from_wire_checked` (strict host-input decode) ------------
+
+#[test]
+fn from_wire_checked_accepts_a_well_formed_v2_blob() {
+    let mut preset = Preset::new("Warm");
+    preset.push_band(Band { kind: BandKind::Peak, freq_half_hz: 2000, gain_cdb: 300, q_milli: 1000 });
+    let wire = preset.to_wire();
+    assert_eq!(Preset::from_wire_checked(&wire), Ok(preset));
+}
+
+#[test]
+fn from_wire_checked_rejects_v1() {
+    let mut raw = [0u8; BLOB_LEN];
+    raw[0] = 1; // BLOB_VERSION_V1
+    assert_eq!(Preset::from_wire_checked(&raw), Err(PresetBlobError::UnsupportedVersion { version: 1 }));
+}
+
+#[test]
+fn from_wire_checked_rejects_an_unknown_version() {
+    let mut raw = [0u8; BLOB_LEN];
+    raw[0] = 99;
+    assert_eq!(Preset::from_wire_checked(&raw), Err(PresetBlobError::UnsupportedVersion { version: 99 }));
+}
+
+#[test]
+fn from_wire_checked_rejects_a_band_count_over_max_bands() {
+    let mut raw = [0u8; BLOB_LEN];
+    raw[0] = 2; // BLOB_VERSION_V2
+    // flags byte: band_count in the top 4 bits -- 15 is the widest value
+    // the field can carry, well past MAX_BANDS (10).
+    raw[17] = 15 << 4;
+    assert_eq!(Preset::from_wire_checked(&raw), Err(PresetBlobError::TooManyBands { band_count: 15 }));
+}
+
+#[test]
+fn from_wire_checked_rejects_a_reserved_band_kind() {
+    let mut preset = Preset::new("X");
+    preset.push_band(Band { kind: BandKind::Peak, freq_half_hz: 2000, gain_cdb: 0, q_milli: 1000 });
+    let mut wire = preset.to_wire();
+    // Band 0's kind_gain low two bytes: force the 3-bit kind field to a
+    // reserved value (5) without touching the gain bits.
+    let band_off = 20; // v2_layout::BANDS_OFF
+    let kind_gain = u16::from_le_bytes([wire[band_off], wire[band_off + 1]]);
+    let reserved_kind_gain = (kind_gain & 0x1FFF) | (5u16 << 13);
+    wire[band_off..band_off + 2].copy_from_slice(&reserved_kind_gain.to_le_bytes());
+    assert_eq!(Preset::from_wire_checked(&wire), Err(PresetBlobError::ReservedBandKind { band_index: 1, raw_kind: 5 }));
+}
+
+#[test]
+fn from_wire_checked_rejects_a_non_utf8_name() {
+    let mut raw = [0u8; BLOB_LEN];
+    raw[0] = 2; // BLOB_VERSION_V2
+    raw[1] = 0xFF; // invalid UTF-8 lead byte, at the name field's start
+    raw[2] = 0x00; // terminate immediately after the bad byte
+    assert_eq!(Preset::from_wire_checked(&raw), Err(PresetBlobError::InvalidNameUtf8));
+}
+
+#[test]
+fn from_wire_checked_never_panics_on_a_short_buffer() {
+    for len in 0..BLOB_LEN {
+        let short = vec![2u8; len]; // claims v2 but is truncated
+        let _ = Preset::from_wire_checked(&short);
+    }
 }

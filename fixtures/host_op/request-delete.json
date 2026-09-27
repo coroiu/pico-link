@@ -1,0 +1,8 @@
+{
+  "op": "DELETE_EFFECT",
+  "op_code": 2,
+  "seq": 3,
+  "flags": 0,
+  "id": 1,
+  "base_seq": 0
+}

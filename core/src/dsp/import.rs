@@ -49,6 +49,7 @@ use alloc::vec::Vec;
 use super::eqapo::{EqApoError, EqApoLineError, EqApoSession, ParsedDocument};
 use super::preset::{Band, CrossfeedLevel, Preamp, Preset, MAX_NAME_BYTES};
 use super::store::PresetStore;
+use super::validate::{validate_band_values, validate_preamp_db, ValidateError};
 
 /// The flash store's slot budget (`PL:P:0`..`PL:P:7`, `firmware/src/persist.h`)
 /// -- the same value as `crate::app::screens::effects::MAX_EFFECTS`, kept as
@@ -56,20 +57,6 @@ use super::store::PresetStore;
 /// FFI-free (see this module's doc comment) and must not depend on
 /// `crate::app`.
 pub const MAX_PRESETS: usize = 8;
-
-/// The accepted gain range, in dB, symmetric (design: `|gain| > 30`
-/// rejects).
-const GAIN_DB_MAX: f32 = 30.0;
-/// The accepted Q range (design: `Q outside 0.1-65`).
-const Q_MIN: f32 = 0.1;
-const Q_MAX: f32 = 65.0;
-/// The accepted center-frequency range, in Hz (design: `Fc outside 10 Hz -
-/// 0.45*44100`).
-const FREQ_HZ_MIN: f32 = 10.0;
-const FREQ_HZ_MAX: f32 = 0.45 * 44_100.0; // 19_845.0
-/// The accepted preamp range, in dB (design: `preamp outside -30..+6`).
-const PREAMP_DB_MIN: f32 = -30.0;
-const PREAMP_DB_MAX: f32 = 6.0;
 
 /// Everything that can reject an import -- a parse failure (with a line
 /// number, when the parser can attribute one), an out-of-range value (with
@@ -170,24 +157,14 @@ fn parse(text: &str) -> Result<ParsedDocument, ImportError> {
 /// store access, so it can be unit-tested (and its error paths exercised)
 /// without a [`PresetStore`] in the loop.
 fn to_preset(doc: &ParsedDocument, host_name: &str) -> Result<Preset, ImportError> {
-    if !(PREAMP_DB_MIN..=PREAMP_DB_MAX).contains(&doc.preamp_db) {
-        return Err(ImportError::PreampOutOfRange { preamp_db: doc.preamp_db });
-    }
-    #[allow(clippy::cast_possible_truncation)] // clamped to the accepted range just above; *100 of [-3000, 600] fits i16 easily
+    validate_preamp_db(doc.preamp_db).map_err(from_validate_error)?;
+    #[allow(clippy::cast_possible_truncation)] // validated to the accepted range just above; *100 of [-3000, 600] fits i16 easily
     let preamp_cdb = libm::roundf(doc.preamp_db * 100.0) as i16;
 
     let mut bands = Vec::with_capacity(doc.bands.len());
     for (i, band) in doc.bands.iter().enumerate() {
         let band_index = i + 1; // 1-based, matching the source `Filter N:` line
-        if !(-GAIN_DB_MAX..=GAIN_DB_MAX).contains(&band.gain_db) {
-            return Err(ImportError::GainOutOfRange { band_index, gain_db: band.gain_db });
-        }
-        if !(FREQ_HZ_MIN..=FREQ_HZ_MAX).contains(&band.freq_hz) {
-            return Err(ImportError::FreqOutOfRange { band_index, freq_hz: band.freq_hz });
-        }
-        if !(Q_MIN..=Q_MAX).contains(&band.q) {
-            return Err(ImportError::QOutOfRange { band_index, q: band.q });
-        }
+        validate_band_values(band_index, band.gain_db, band.freq_hz, band.q).map_err(from_validate_error)?;
 
         #[allow(clippy::cast_possible_truncation)] // gain_db in [-30, 30] => gain_cdb in [-3000, 3000], well within kind_gain's +/-4095
         let gain_cdb = libm::roundf(band.gain_db * 100.0) as i16;
@@ -203,10 +180,53 @@ fn to_preset(doc: &ParsedDocument, host_name: &str) -> Result<Preset, ImportErro
     Ok(Preset { name, crossfeed: CrossfeedLevel::Off, bands, preamp: Preamp::Explicit(preamp_cdb), eq_locked: true })
 }
 
+/// Translates [`super::validate::ValidateError`] into this module's own
+/// [`ImportError`] variants -- [`validate_band_values`]/[`validate_preamp_db`]
+/// are the single shared range check (design section 4); this is the thin
+/// adapter that keeps [`ImportError`]'s existing wire shape/variant names
+/// unchanged for every caller that already matches on them.
+/// [`super::validate::ValidateError::TooManyBands`] never reaches here --
+/// [`validate_band_values`]/[`validate_preamp_db`] never produce it (only
+/// [`super::validate::validate_preset`] checks band count, and `to_preset`
+/// doesn't call that).
+fn from_validate_error(err: ValidateError) -> ImportError {
+    match err {
+        ValidateError::GainOutOfRange { band_index, gain_db } => ImportError::GainOutOfRange { band_index, gain_db },
+        ValidateError::FreqOutOfRange { band_index, freq_hz } => ImportError::FreqOutOfRange { band_index, freq_hz },
+        ValidateError::QOutOfRange { band_index, q } => ImportError::QOutOfRange { band_index, q },
+        ValidateError::PreampOutOfRange { preamp_db } => ImportError::PreampOutOfRange { preamp_db },
+        ValidateError::TooManyBands { .. } => {
+            // Unreachable in practice (see doc comment) -- `TooManyBands`
+            // has no `ImportError` counterpart of its own because the
+            // parser already rejects excess bands earlier
+            // (`EqApoError::TooManyBands`), so folding it into
+            // `ImportError::Session` keeps this a total function without
+            // inventing a variant nothing can ever construct.
+            ImportError::Session(EqApoError::TooManyBands)
+        }
+    }
+}
+
 /// `Name:` line, else `host_name` -- Andreas's ruling -- truncated to
 /// [`MAX_NAME_BYTES`] either way. [`Preset::new`]'s own truncation isn't
 /// reused here because that constructor also resets every other field to
 /// its hand-made defaults, which this caller immediately overwrites.
+/// Parses and converts `text` to a locked, imported [`Preset`] WITHOUT
+/// touching any [`PresetStore`] -- the `HOST_OP` `PARSE_APO` op's job
+/// (design section 4: "`PARSE_APO`: `import.rs` parse + `to_preset` only,
+/// no store mutation"). The caller (`crate::app::host_op`) does its own
+/// name-collision lookup/suffix computation against a live store, since
+/// this function has no store to check against.
+///
+/// # Errors
+///
+/// Same as [`import`], minus [`ImportError::StoreFull`]/[`ImportError::NotReady`]
+/// (there is no store here to be full, and no id-allocation gate to check).
+pub(crate) fn parse_and_convert(text: &str, host_name: &str) -> Result<Preset, ImportError> {
+    let doc = parse(text)?;
+    to_preset(&doc, host_name)
+}
+
 fn resolve_name(doc: &ParsedDocument, host_name: &str) -> String {
     let raw = doc.name.as_deref().unwrap_or(host_name);
     truncate_to_name_bytes(raw)
@@ -257,7 +277,7 @@ fn place(store: &mut PresetStore, candidate: Preset) -> Result<(u16, ImportOutco
     Ok((id, ImportOutcome::Created))
 }
 
-fn find_by_name(store: &PresetStore, name: &str) -> Option<u16> {
+pub(crate) fn find_by_name(store: &PresetStore, name: &str) -> Option<u16> {
     store.iter().find(|(_, preset)| preset.name == name).map(|(id, _)| id)
 }
 
@@ -266,7 +286,7 @@ fn find_by_name(store: &PresetStore, name: &str) -> Option<u16> {
 /// UTF-8 boundary so the whole suffixed name still fits [`MAX_NAME_BYTES`]
 /// (Uma's design sec 3). Starts at 2 (there is no `" 1"` suffix -- the
 /// unsuffixed name is the collision).
-fn lowest_free_suffixed_name(store: &PresetStore, base: &str) -> String {
+pub(crate) fn lowest_free_suffixed_name(store: &PresetStore, base: &str) -> String {
     for n in 2u32.. {
         let suffix = format!(" {n}");
         let candidate = with_suffix(base, &suffix);
