@@ -26,10 +26,10 @@ impl App {
                 self.add_device(device.addr, device.name, device.rssi, device.class_of_device);
             }
             Event::DevicesCleared => self.clear_devices(),
-            Event::ConnectFailed { addr, reason } => self.record_connect_failure(addr, reason),
-            Event::ConnectStepChanged(step) => self.on_connect_step_changed(step),
-            Event::ConnectRetrying { attempt } => self.on_connect_retrying(attempt),
-            Event::ConnectSucceeded { addr, degraded } => self.on_connect_succeeded(addr, degraded),
+            Event::ConnectFailed { addr, reason, seq } => self.record_connect_failure(addr, reason, seq),
+            Event::ConnectStepChanged(step, seq) => self.on_connect_step_changed(step, seq),
+            Event::ConnectRetrying { attempt, seq } => self.on_connect_retrying(attempt, seq),
+            Event::ConnectSucceeded { addr, degraded, seq } => self.on_connect_succeeded(addr, degraded, seq),
             Event::WizardAutoDismiss => self.on_wizard_auto_dismiss(),
             Event::CodecChanged(codec) => self.set_connected_codec(codec),
             Event::StoreLoaded { status } => self.on_store_loaded(status),
@@ -97,12 +97,31 @@ impl App {
         }
     }
 
+    /// ADA DESIGN v2 (bead `pico-link-chc3`) seq-scoped guard shared by
+    /// every connect-lifecycle fold below: `true` iff `seq` is nonzero and
+    /// matches [`BtModel::attempt`]'s own `seq` -- the *only* condition
+    /// under which a `ConnectStepChanged`/`ConnectRetrying`/
+    /// `ConnectFailed` echo is accepted. `seq == 0` (no attempt to match
+    /// against -- a remote session) and a non-matching nonzero `seq` (a
+    /// stale echo of a cancelled or superseded attempt, F7) both return
+    /// `false`; callers that special-case `seq == 0` (`ConnectSucceeded`)
+    /// check it separately before calling this.
+    fn attempt_seq_matches(&self, seq: u16) -> bool {
+        seq != 0 && self.model.borrow().attempt.as_ref().is_some_and(|a| a.seq == seq)
+    }
+
     /// Folds one [`Event::ConnectStepChanged`] into [`WizardPhase`] --
     /// only meaningful while the wizard is mid-connect (`Connecting` or
     /// already surfaced as `NotResponding`, e.g. the step name changing
     /// right as a retry succeeds); silently ignored otherwise, per
-    /// [`Event::ConnectStepChanged`]'s doc comment.
-    fn on_connect_step_changed(&mut self, step: ConnectStep) {
+    /// [`Event::ConnectStepChanged`]'s doc comment. ADA DESIGN v2: also
+    /// silently ignored if `seq` doesn't match the live attempt (see
+    /// [`App::attempt_seq_matches`]) -- a stray echo of a cancelled or
+    /// superseded attempt must not touch the *current* attempt's step.
+    fn on_connect_step_changed(&mut self, step: ConnectStep, seq: u16) {
+        if !self.attempt_seq_matches(seq) {
+            return;
+        }
         // Design sec 13.5: the radio-session record is folded regardless
         // of which screen (if any) is open -- update it alongside
         // `WizardPhase` below, from the same event.
@@ -134,7 +153,10 @@ impl App {
     /// phase 4 -> phase 5 transition (or a further phase-5 retry
     /// incrementing its own counter), per [`Event::ConnectRetrying`]'s
     /// doc comment.
-    fn on_connect_retrying(&mut self, attempt: u16) {
+    fn on_connect_retrying(&mut self, attempt: u16, seq: u16) {
+        if !self.attempt_seq_matches(seq) {
+            return;
+        }
         // Same "fold regardless of screen" rule as `on_connect_step_
         // changed` above.
         if let Some(session_attempt) = self.model.borrow_mut().attempt.as_mut() {
@@ -173,7 +195,28 @@ impl App {
     /// false-dropped a headset-initiated reconnect to the same address;
     /// removed rather than kept until `chc3`'s seq-scoped suppression
     /// lands.
-    fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool) {
+    fn on_connect_succeeded(&mut self, addr: [u8; 6], degraded: bool, seq: u16) {
+        // ADA DESIGN v2 (bead `pico-link-chc3`): `seq == 0` is a session
+        // that genuinely APPEARED -- a headset-initiated reconnect, or the
+        // `PL_DEBUG_REMOTE` bypass, neither of which ever called
+        // `radio_actions::connect` to record a `BtModel::attempt`. Record
+        // the connected address and persist it, exactly as a local
+        // success would, but touch nothing attempt/wizard-shaped: there is
+        // no attempt to conclude, and forcing the wizard to `Succeeded`
+        // here would pop open a success screen the user never asked for.
+        if seq == 0 {
+            self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
+            self.model.borrow_mut().connected_addr = Some(addr);
+            self.mark_model_changed();
+            return;
+        }
+        // A nonzero `seq` not matching the live attempt is a stale echo
+        // (F7: the attempt it belonged to was already cancelled or
+        // superseded) -- drop it entirely, same as `on_connect_step_
+        // changed`/`on_connect_retrying` above.
+        if !self.attempt_seq_matches(seq) {
+            return;
+        }
         self.commands.borrow_mut().push_back(Command::PersistDevice { addr });
         {
             let mut model = self.model.borrow_mut();
@@ -185,13 +228,11 @@ impl App {
             // Design sec 13.5: conclude the radio-session record the same
             // way `WizardPhase` concludes below -- `attempt.take()` both
             // clears it and hands back the `seq`/`addr` this outcome
-            // concludes (falling back to `addr` itself if, for some
-            // reason, no `attempt` was recorded -- e.g. the `PL_DEBUG_
-            // REMOTE` bypass path, which never calls
-            // `radio_actions::connect`).
-            let seq = model.attempt.take().map_or(0, |a| a.seq);
+            // concludes. `attempt_seq_matches` above already proved
+            // `model.attempt` is `Some` with this exact `seq`.
+            let concluded_seq = model.attempt.take().map_or(seq, |a| a.seq);
             model.last_outcome = Some(ConnectOutcome {
-                seq,
+                seq: concluded_seq,
                 addr,
                 result: if degraded { ConnectOutcomeResult::OkDegraded } else { ConnectOutcomeResult::Ok },
                 reason: None,
@@ -547,15 +588,29 @@ impl App {
     /// future screen deciding whether to offer a retry reads
     /// `reason.retryable()` off `BtModel::last_connect_failure`, not the
     /// link state.
-    pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason) {
+    ///
+    /// ADA DESIGN v2 (bead `pico-link-chc3`): `seq` gates `BtModel::attempt`/
+    /// `last_outcome`/the wizard exactly as [`App::on_connect_step_
+    /// changed`]'s does -- `seq == 0` (no core attempt to fail; C logs it,
+    /// `core` has no failure to attribute) and a non-matching nonzero `seq`
+    /// (a stale echo, F7) are both no-ops on those three; `last_connect_
+    /// failure` is set unconditionally regardless of `seq`, since it is
+    /// deliberately not attempt-scoped (see its own doc comment: "a future
+    /// screen deciding whether to offer a retry").
+    pub fn record_connect_failure(&mut self, addr: [u8; 6], reason: ConnectFailureReason, seq: u16) {
+        self.model.borrow_mut().last_connect_failure = Some((addr, reason));
+        if seq != 0 && !self.attempt_seq_matches(seq) {
+            self.mark_model_changed();
+            return;
+        }
         {
             let mut model = self.model.borrow_mut();
-            model.last_connect_failure = Some((addr, reason));
-            // Design sec 13.5: conclude the radio-session record -- same
-            // "take the in-flight attempt's seq, fall back to 0 if there
-            // wasn't one" shape as `on_connect_succeeded`.
-            let seq = model.attempt.take().map_or(0, |a| a.seq);
-            model.last_outcome = Some(ConnectOutcome { seq, addr, result: ConnectOutcomeResult::Failed, reason: Some(reason) });
+            // Design sec 13.5: conclude the radio-session record --
+            // `attempt_seq_matches` above already proved `model.attempt`
+            // is `Some` with this exact `seq` when `seq != 0`; `seq == 0`
+            // falls back to `0` (there was nothing to conclude).
+            let concluded_seq = model.attempt.take().map_or(seq, |a| a.seq);
+            model.last_outcome = Some(ConnectOutcome { seq: concluded_seq, addr, result: ConnectOutcomeResult::Failed, reason: Some(reason) });
         }
         self.set_connecting(false);
         // Phase 4/5 -> phase 6 (failure outcome). Unconditional (not

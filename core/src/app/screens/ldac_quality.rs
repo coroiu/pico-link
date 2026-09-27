@@ -184,7 +184,8 @@ mod tests {
     fn opening_quality_from_the_device_page_pushes_the_picker_and_a_pick_queues_the_command() {
         let mut app = App::new(240, 240);
         let addr = [28; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1032 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1032 });
         app.poll_command(); // drain PersistDevice
         app.handle_event(upsert(addr, "Cans", 1));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));

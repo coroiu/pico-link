@@ -71,7 +71,8 @@ fn main() {
     // drop. ---
     let addr = [0x94, 0xDB, 0x56, 0x54, 0x7C, 0xF2];
     let mut app = App::new(240, 240);
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1009 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1009 });
     app.poll_command(); // drain PersistDevice
     app.handle_event(upsert(addr, "Sony WH-1000XM5", 1));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));

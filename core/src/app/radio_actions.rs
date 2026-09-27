@@ -81,12 +81,13 @@ pub(crate) fn cancel_scan(commands: &Rc<RefCell<VecDeque<Command>>>) {
 /// supplied name -- design sec 13.3's CONNECT semantics), same division of
 /// responsibility as [`start_scan`]'s doc comment describes.
 pub(crate) fn connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Command>>>, addr: DeviceAddr, name: String, initiator: ConnectInitiator) {
-    {
+    let seq = {
         let mut model = model.borrow_mut();
         let seq = model.bump_attempt_seq();
         model.attempt = Some(ConnectAttempt { seq, addr, initiator, step: None, retries: 0 });
-    }
-    commands.borrow_mut().push_back(Command::Connect { addr, name });
+        seq
+    };
+    commands.borrow_mut().push_back(Command::Connect { addr, name, seq });
 }
 
 /// Design sec 13.3's `CANCEL_CONNECT` semantics / the wizard's B-during-
@@ -104,30 +105,34 @@ pub(crate) fn connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Comman
 ///
 /// Records the conclusion in [`BtModel::last_outcome`]
 /// ([`ConnectOutcomeResult::Cancelled`]). A late [`Event::ConnectSucceeded`]
-/// for the attempt just cancelled (C's cancel does not suppress an outcome
-/// already in flight on the wire) is *not* suppressed -- see ADA DESIGN v2
-/// (bead `pico-link-chc3`): if the link genuinely comes up after a cancel,
-/// that's a real, new connection and is reported as such, not swallowed. The
-/// address-keyed `cancelled_attempt` marker this function used to write was
-/// removed for exactly that reason -- it also falsely dropped a
-/// headset-initiated reconnect to the same address arriving after an
-/// unrelated cancel. Seq-scoped suppression (distinguishing a genuinely
-/// stray echo of *this* attempt from a fresh session) lands with `chc3`.
+/// for the attempt just cancelled is genuinely a stray echo of *this*
+/// `seq` and is dropped by `fold.rs`'s seq-scoped guard (ADA DESIGN v2, bead
+/// `pico-link-chc3`) -- distinct from a headset-initiated reconnect to the
+/// same address, which always arrives as `seq == 0` and is never suppressed.
+/// The address-keyed `cancelled_attempt` marker this function used to write
+/// before `chc3` was removed for exactly that ambiguity: it could not tell
+/// the two apart.
 ///
-/// A no-op on `BtModel::attempt`/`last_outcome` if there is no attempt in
-/// flight (e.g. a stray B press after the attempt already concluded on its
-/// own) -- `Command::CancelConnect` is still queued regardless, since C's
-/// own state is the one source of truth for whether there's anything left
-/// to cancel.
+/// `Command::CancelConnect` carries the cancelled attempt's `seq` (`0` if
+/// there was no attempt in flight -- see [`Event::ConnectFailed::seq`]'s
+/// doc comment for why `0` is always a safe no-op on the C side). A no-op
+/// on `BtModel::attempt`/`last_outcome` if there is no attempt in flight
+/// (e.g. a stray B press after the attempt already concluded on its own)
+/// -- `Command::CancelConnect` is still queued regardless, since C's own
+/// state is the one source of truth for whether there's anything left to
+/// cancel.
 pub(crate) fn cancel_connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Command>>>, addr: DeviceAddr) {
-    {
+    let seq = {
         let mut model = model.borrow_mut();
         if let Some(attempt) = model.attempt.take() {
             model.last_outcome =
                 Some(ConnectOutcome { seq: attempt.seq, addr: attempt.addr, result: ConnectOutcomeResult::Cancelled, reason: None });
+            attempt.seq
+        } else {
+            0
         }
-    }
-    commands.borrow_mut().push_back(Command::CancelConnect { addr });
+    };
+    commands.borrow_mut().push_back(Command::CancelConnect { addr, seq });
 }
 
 /// DISCONNECT (design sec 13.3, op 10) / the device page's X on the

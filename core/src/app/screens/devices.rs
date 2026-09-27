@@ -543,7 +543,8 @@ mod tests {
         open_devices(&mut app);
 
         app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1031 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1031 });
         app.poll_command(); // drain PersistDevice
         // C echoes the upsert once the persist write actually lands --
         // this is what actually refreshes the Devices screen's pinned row.
@@ -569,7 +570,7 @@ mod tests {
             matches!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr: a, step: ConnectStep::Connecting, .. } if a == addr),
             "the wizard must enter straight into Connecting for this device"
         );
-        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Headphones") }));
+        app.expect_connect_command_for_test(addr, "Headphones");
     }
 
     #[test]

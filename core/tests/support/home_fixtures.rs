@@ -184,11 +184,13 @@ pub fn generate(out_dir: &Path) {
     let addr_a = [0xAA; 6];
     let addr_b = [0xBB; 6];
     app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr: addr_a, name: String::from("Sony WH-1000XM5"), mru_seq: 1, ldac_quality: 0, preset_id: 0 }));
+    let seq_a = app.seed_connect_attempt_for_test(addr_a);
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false, seq: seq_a });
     app.poll_command();
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_a, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.handle_event(Event::ConnectAttemptStarted);
-    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::RadioError });
+    let seq_b = app.seed_connect_attempt_for_test(addr_b);
+    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::RadioError, seq: seq_b });
     save_zoomed_png(&mut app, out_dir, FIXTURE_NAMES[8]);
 }

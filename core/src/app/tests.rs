@@ -130,7 +130,8 @@ fn a_bluetooth_event_mid_navigation_does_not_reset_the_screen_stack() {
     assert_eq!(app.navigator_depth(), 2, "DevicesCleared must not pop the pushed screen");
     assert_eq!(app.current_screen_title(), "detail");
 
-    app.handle_event(Event::ConnectFailed { addr: [1, 2, 3, 4, 5, 6], reason: ConnectFailureReason::Timeout });
+    let seq_for_test_6 = app.seed_connect_attempt_for_test([1, 2, 3, 4, 5, 6]);
+    app.handle_event(Event::ConnectFailed { addr: [1, 2, 3, 4, 5, 6], reason: ConnectFailureReason::Timeout, seq: seq_for_test_6 });
     assert_eq!(app.navigator_depth(), 2, "ConnectFailed must not pop the pushed screen");
     assert_eq!(app.current_screen_title(), "detail");
 }
@@ -215,14 +216,16 @@ fn failed_switch_keeps_established_link() {
     let addr_b = [2; 6];
 
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    let seq_for_test_7 = app.seed_connect_attempt_for_test(addr_a);
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false, seq: seq_for_test_7 });
     app.poll_command();
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_a, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
     app.handle_event(Event::LdacBitrateChanged { kbps: 660 });
 
     app.handle_event(Event::ConnectAttemptStarted);
-    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::RadioError });
+    let seq_for_test_8 = app.seed_connect_attempt_for_test(addr_b);
+    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::RadioError, seq: seq_for_test_8 });
 
     assert_eq!(app.model().link_state, LinkState::Connected, "A's link must survive a failed attempt at B");
     assert_eq!(app.model().connected_addr, Some(addr_a));
@@ -243,7 +246,8 @@ fn attempt_does_not_touch_link() {
     let mut app = App::new(240, 240);
     let addr_a = [1; 6];
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    let seq_for_test_9 = app.seed_connect_attempt_for_test(addr_a);
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false, seq: seq_for_test_9 });
     app.poll_command();
 
     app.handle_event(Event::ConnectAttemptStarted);
@@ -263,7 +267,8 @@ fn switch_success_follows_new_device() {
     let addr_a = [1; 6];
     let addr_b = [2; 6];
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    let seq_for_test_10 = app.seed_connect_attempt_for_test(addr_a);
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false, seq: seq_for_test_10 });
     app.poll_command();
 
     app.handle_event(Event::ConnectAttemptStarted);
@@ -271,7 +276,8 @@ fn switch_success_follows_new_device() {
     assert_eq!(app.model().connected_addr, None, "A's link dropping must still clear A's connected fields");
     assert!(app.model().connecting, "the attempt at B is still in flight, unaffected by A's drop");
 
-    app.handle_event(Event::ConnectSucceeded { addr: addr_b, degraded: false });
+    let seq_for_test_11 = app.seed_connect_attempt_for_test(addr_b);
+    app.handle_event(Event::ConnectSucceeded { addr: addr_b, degraded: false, seq: seq_for_test_11 });
     app.poll_command();
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_b, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -289,7 +295,8 @@ fn failure_from_idle_stays_idle() {
     let addr = [9, 9, 9, 9, 9, 9];
 
     app.handle_event(Event::ConnectAttemptStarted);
-    app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink });
+    let seq_for_test_1014 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink, seq: seq_for_test_1014 });
 
     assert_eq!(app.model().last_connect_failure, Some((addr, ConnectFailureReason::NoA2dpSink)));
     assert_eq!(app.model().link_state, LinkState::Idle);
@@ -317,7 +324,8 @@ fn switch_success_passes_through_disconnecting() {
     let addr_b = [2; 6];
 
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    let seq_for_test_12 = app.seed_connect_attempt_for_test(addr_a);
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false, seq: seq_for_test_12 });
     app.poll_command(); // drain PersistDevice(A)
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_a, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     assert_eq!(app.model().link_state, LinkState::Connected, "A is up before the switch starts");
@@ -325,7 +333,7 @@ fn switch_success_passes_through_disconnecting() {
     // The switch starts: firmware pushes ConnectAttemptStarted, then the
     // new Disconnecting step, both before A's ACL has actually dropped.
     app.handle_event(Event::ConnectAttemptStarted);
-    app.handle_event(Event::ConnectStepChanged(ConnectStep::Disconnecting));
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Disconnecting, 1));
     assert_eq!(app.model().link_state, LinkState::Connected, "A's link is untouched by the step change alone");
     assert!(app.model().connecting, "the attempt has started");
 
@@ -335,8 +343,9 @@ fn switch_success_passes_through_disconnecting() {
     assert!(app.model().connecting, "the attempt at B is still in flight, unaffected by A's drop (Busy, not idle)");
 
     // B is paged and succeeds.
-    app.handle_event(Event::ConnectStepChanged(ConnectStep::Connecting));
-    app.handle_event(Event::ConnectSucceeded { addr: addr_b, degraded: false });
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Connecting, 1));
+    let seq_for_test_13 = app.seed_connect_attempt_for_test(addr_b);
+    app.handle_event(Event::ConnectSucceeded { addr: addr_b, degraded: false, seq: seq_for_test_13 });
     app.poll_command(); // drain PersistDevice(B)
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr: addr_b, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -358,15 +367,17 @@ fn switch_failure_stays_disconnected_and_never_reconnects_a() {
     let addr_b = [2; 6];
 
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false });
+    let seq_for_test_14 = app.seed_connect_attempt_for_test(addr_a);
+    app.handle_event(Event::ConnectSucceeded { addr: addr_a, degraded: false, seq: seq_for_test_14 });
     app.poll_command(); // drain PersistDevice(A)
 
     app.handle_event(Event::ConnectAttemptStarted);
-    app.handle_event(Event::ConnectStepChanged(ConnectStep::Disconnecting));
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Disconnecting, 1));
     app.handle_event(Event::LinkStateChanged(LinkState::Idle));
     assert!(app.model().connecting, "the attempt at B is still in flight");
 
-    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::Timeout });
+    let seq_for_test_15 = app.seed_connect_attempt_for_test(addr_b);
+    app.handle_event(Event::ConnectFailed { addr: addr_b, reason: ConnectFailureReason::Timeout, seq: seq_for_test_15 });
 
     assert_eq!(app.model().link_state, LinkState::Idle, "no reconnect to A -- the device stays disconnected");
     assert_eq!(app.model().connected_addr, None);
@@ -656,7 +667,8 @@ fn back_from_wizard_success_to_home(degraded: bool) {
     assert_eq!(app.navigator_depth(), 3);
     app.poll_command(); // drain StartScan, queued by opening the wizard
 
-    app.handle_event(Event::ConnectSucceeded { addr: DGX_ADDR, degraded });
+    let seq_for_test_1015 = app.seed_connect_attempt_for_test(DGX_ADDR);
+    app.handle_event(Event::ConnectSucceeded { addr: DGX_ADDR, degraded, seq: seq_for_test_1015 });
     assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded });
     // A real success always queues PersistDevice -- drain exactly that
     // one command rather than asserting the queue is empty.
@@ -759,11 +771,7 @@ fn store_loaded_after_paired_devices_folded_auto_reconnects_to_the_mru_max() {
     app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
 
     assert_eq!(app.model().store_status, Some(StoreStatus::Loaded));
-    assert_eq!(
-        app.poll_command(),
-        Some(Command::Connect { addr: addr_new, name: String::from("New") }),
-        "auto-reconnect must target the highest mru_seq record, using the same Connect command a manual selection uses"
-    );
+    app.expect_connect_command_for_test(addr_new, "New");
     assert_eq!(app.poll_command(), None, "exactly one Connect, nothing else");
 }
 
@@ -782,11 +790,7 @@ fn connect_wire_path_carries_a_utf8_truncated_name_for_a_multibyte_device() {
 
     let expected_name = truncate_device_name(&long_name);
     assert_eq!(expected_name.len(), 30, "sanity: the fixture name must actually need truncating");
-    assert_eq!(
-        app.poll_command(),
-        Some(Command::Connect { addr, name: expected_name }),
-        "the wire-path Connect command must carry the same char-boundary-truncated name, not the raw 33-byte original"
-    );
+    app.expect_connect_command_for_test(addr, &expected_name);
 }
 
 #[test]
@@ -813,7 +817,8 @@ fn connect_succeeded_queues_persist_device_for_the_events_own_address() {
     let mut app = App::new(240, 240);
     let addr = [7, 7, 7, 7, 7, 7];
 
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1016 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1016 });
 
     assert_eq!(
         app.poll_command(),
@@ -833,7 +838,8 @@ fn connect_succeeded_persists_even_with_the_wizard_closed() {
     // path. Persistence must still work.
     let mut app = App::new(240, 240);
     let addr = [42, 42, 42, 42, 42, 42];
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1017 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1017 });
     assert_eq!(app.poll_command(), Some(Command::PersistDevice { addr }));
     assert_eq!(app.poll_command(), None);
 }
@@ -889,7 +895,8 @@ fn prune_stack_keeps_home_and_devices_tagged_with_their_screen_ids() {
 fn forgetting_the_device_shown_by_an_open_device_page_unwinds_the_stack_to_devices() {
     let mut app = App::new(240, 240);
     let addr = [7; 6];
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1018 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1018 });
     app.handle_event(upsert(addr, "Cans", 1));
     open_devices(&mut app);
     app.handle_input(vec![NavIntent::Select]); // connected row -> device page
@@ -940,7 +947,8 @@ fn home_level_event_does_not_damage_the_whole_frame_or_the_title_bar() {
 
     let mut app = App::new(240, 240);
     let addr = [21; 6];
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1019 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1019 });
     app.handle_event(upsert(addr, "Cans", 1));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.tick(1);
@@ -970,7 +978,8 @@ fn home_level_event_does_not_damage_the_whole_frame_or_the_title_bar() {
 fn home_bitrate_line_shows_the_live_number_and_the_adaptive_tag_when_the_device_is_adaptive() {
     let mut app = App::new(240, 240);
     let addr = [32; 6];
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1020 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1020 });
     app.poll_command();
     app.handle_event(upsert_with_quality(addr, "Cans", 1, LDAC_QUALITY_ADAPTIVE));
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -999,7 +1008,8 @@ fn ldac_live_kbps_is_never_snapped_to_the_nominal_ladder() {
 fn ldac_live_kbps_is_cleared_on_disconnect() {
     let mut app = App::new(240, 240);
     let addr = [33; 6];
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1021 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1021 });
     app.poll_command();
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.handle_event(Event::LdacBitrateChanged { kbps: 660 });
@@ -1023,7 +1033,8 @@ fn a_scan_while_connected_does_not_wipe_the_connected_model() {
     let mut app = App::new(240, 240);
     let addr = [7; 6];
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1022 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1022 });
     app.poll_command();
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
@@ -1058,7 +1069,8 @@ fn a_real_disconnect_still_clears_the_connected_model() {
     let mut app = App::new(240, 240);
     let addr = [8; 6];
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1023 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1023 });
     app.poll_command();
     app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
     app.handle_event(Event::LevelsChanged { peak_l: 200, peak_r: 180, rms_l: 120, rms_r: 100 });
@@ -1376,14 +1388,16 @@ fn debug_eq_override_survives_disconnect_and_reconnect() {
 
     let addr: DeviceAddr = [1, 1, 1, 1, 1, 1];
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1024 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1024 });
     assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), overridden, "connecting a device must not disturb the debug override");
 
     app.handle_event(Event::LinkStateChanged(LinkState::Idle));
     assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), overridden, "disconnecting must not disturb the debug override");
 
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1025 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1025 });
     assert_eq!(app.dsp_program(TEST_DSP_FS_HZ), overridden, "reconnecting must not disturb the debug override");
 
     app.debug_eq_off();
@@ -1516,7 +1530,8 @@ fn a_refused_saves_truth_echo_drops_the_preset_and_its_id_is_never_reused() {
         preset_id: n_id,
     }));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1026 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1026 });
     let _ = app.poll_command(); // drain the connect's own PersistDevice, unrelated to this test
 
     // C refuses the save (e.g. rule (e), no free slot) -- its truth echo:
@@ -1648,7 +1663,7 @@ fn connecting_a_paired_device_from_devices_records_a_device_initiated_attempt() 
     assert_eq!(attempt.initiator, ConnectInitiator::Device);
     assert_eq!(attempt.step, None, "no ConnectStepChanged has arrived yet");
     assert_ne!(attempt.seq, 0, "connect() must bump the attempt-seq counter off its zero default");
-    assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Headphones") }));
+    app.expect_connect_command_for_test(addr, "Headphones");
 }
 
 /// `ConnectStepChanged`/`ConnectRetrying` update the in-flight attempt's
@@ -1672,11 +1687,12 @@ fn connect_step_and_retry_events_update_the_in_flight_attempt_with_no_screen_ope
     app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
     assert_eq!(app.navigator_depth(), 1, "auto-reconnect must not navigate anywhere");
     app.poll_command(); // drain the auto-reconnect's Command::Connect
+    let seq = app.model().attempt.expect("auto-reconnect must record an attempt").seq;
 
-    app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
+    app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing, seq));
     assert_eq!(app.model().attempt.expect("attempt must survive the screen closing").step, Some(ConnectStep::Pairing));
 
-    app.handle_event(Event::ConnectRetrying { attempt: 3 });
+    app.handle_event(Event::ConnectRetrying { attempt: 3, seq });
     assert_eq!(app.model().attempt.expect("attempt must still be live").retries, 3);
 }
 
@@ -1692,7 +1708,7 @@ fn connect_succeeded_concludes_the_attempt_into_last_outcome() {
     app.handle_input(vec![NavIntent::Select]);
     let seq = app.model().attempt.expect("attempt recorded").seq;
 
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq });
 
     assert_eq!(app.model().attempt, None, "a concluded attempt must be cleared");
     let outcome = app.model().last_outcome.expect("a concluded attempt must record an outcome");
@@ -1710,7 +1726,8 @@ fn connect_succeeded_degraded_records_ok_degraded() {
     open_devices(&mut app);
     app.handle_input(vec![NavIntent::Select]);
 
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: true });
+    let seq_for_test_1028 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: true, seq: seq_for_test_1028 });
 
     assert_eq!(app.model().last_outcome.expect("outcome recorded").result, ConnectOutcomeResult::OkDegraded);
 }
@@ -1726,13 +1743,120 @@ fn connect_failed_concludes_the_attempt_with_the_failure_reason() {
     app.handle_input(vec![NavIntent::Select]);
     let seq = app.model().attempt.expect("attempt recorded").seq;
 
-    app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout });
+    app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout, seq });
 
     assert_eq!(app.model().attempt, None);
     let outcome = app.model().last_outcome.expect("a concluded attempt must record an outcome");
     assert_eq!(outcome.seq, seq);
     assert_eq!(outcome.result, ConnectOutcomeResult::Failed);
     assert_eq!(outcome.reason, Some(ConnectFailureReason::Timeout));
+}
+
+// --- ADA DESIGN v2 (bead `pico-link-chc3`): seq-scoped connect-lifecycle
+// fold, `.planning/design/2026-08-30-cancel-connect.md`'s "v2" section, R6
+// ---
+
+/// A late `ConnectSucceeded` for an attempt that was already cancelled
+/// (and therefore already concluded, `attempt -> None`) arrives with that
+/// SAME nonzero `seq` -- distinct from `connect_succeeded_after_cancel_
+/// is_reported_as_a_real_connection` (wizard.rs), which covers a *new*
+/// session arriving with a *fresh* seq after a cancel. This is F7's exact
+/// failure mode: a stale echo of the attempt the user already walked away
+/// from must be dropped, not resurrect a connected state.
+#[test]
+fn a_stale_seq_echo_of_a_cancelled_attempt_is_dropped() {
+    let mut app = App::new(240, 240);
+    let addr = [20; 6];
+    let seq = app.seed_connect_attempt_for_test(addr);
+    let cancelled_seq = radio_actions_cancel_connect_for_test(&mut app, addr);
+    assert_eq!(cancelled_seq, seq, "sanity: the cancel concluded the same attempt seeded above");
+    assert_eq!(app.model().attempt, None, "cancel must conclude the attempt");
+
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq });
+
+    assert_eq!(app.model().connected_addr, None, "a stale echo of the cancelled attempt must not resurrect a connection");
+    assert_eq!(app.model().attempt, None);
+    assert_eq!(
+        app.model().last_outcome.expect("cancel's outcome must survive the stale echo").result,
+        ConnectOutcomeResult::Cancelled,
+        "the stale echo must not overwrite Cancelled"
+    );
+}
+
+/// A `seq == 0` success (a headset-initiated reconnect, or the
+/// `PL_DEBUG_REMOTE` bypass) with no attempt in flight at all: sets
+/// `connected_addr` and queues `PersistDevice`, but touches neither
+/// `BtModel::attempt` (there was none) nor the wizard.
+#[test]
+fn seq_zero_success_with_no_attempt_connects_without_touching_attempt_or_wizard() {
+    let mut app = App::new(240, 240);
+    let addr = [21; 6];
+    let phase_before = app.wizard_phase_for_test();
+
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: 0 });
+
+    assert_eq!(app.model().connected_addr, Some(addr), "a seq-0 success must still connect");
+    assert_eq!(app.model().attempt, None, "there was no attempt to conclude");
+    assert_eq!(app.model().last_outcome, None, "a seq-0 session appearing is not an attempt outcome");
+    assert_eq!(app.wizard_phase_for_test(), phase_before, "a remote session must never touch the wizard");
+    assert_eq!(app.poll_command(), Some(Command::PersistDevice { addr }), "a seq-0 success must still be remembered");
+}
+
+/// A `seq == 0` success arriving while a DIFFERENT attempt (a different
+/// device the user is actively connecting to) is in flight must not
+/// conclude that attempt -- a headset paging in on its own must never
+/// look, to `core`, like the user's own in-progress connect just finished.
+#[test]
+fn seq_zero_success_does_not_conclude_an_unrelated_in_flight_attempt() {
+    let mut app = App::new(240, 240);
+    let addr_local = [22; 6];
+    let addr_remote = [23; 6];
+    let local_seq = app.seed_connect_attempt_for_test(addr_local);
+
+    app.handle_event(Event::ConnectSucceeded { addr: addr_remote, degraded: false, seq: 0 });
+
+    assert_eq!(app.model().connected_addr, Some(addr_remote), "the remote session still connects");
+    let attempt = app.model().attempt.expect("the unrelated local attempt must survive a seq-0 remote success");
+    assert_eq!(attempt.seq, local_seq);
+    assert_eq!(attempt.addr, addr_local);
+}
+
+/// Cancel-then-retry-the-same-device, the scenario v1's own rationale
+/// named as "most likely": the OLD seq's late success is a stale echo
+/// (dropped), the NEW seq's success is a real, new connection (applied).
+#[test]
+fn cancel_then_retry_same_addr_drops_the_old_seq_and_applies_the_new_one() {
+    let mut app = App::new(240, 240);
+    let addr = [24; 6];
+    let old_seq = app.seed_connect_attempt_for_test(addr);
+    let _ = radio_actions_cancel_connect_for_test(&mut app, addr);
+    assert_eq!(app.model().attempt, None);
+
+    let new_seq = app.seed_connect_attempt_for_test(addr);
+    assert_ne!(old_seq, new_seq, "sanity: retrying must allocate a fresh seq");
+
+    // The old attempt's late echo must not land.
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: old_seq });
+    assert_eq!(app.model().connected_addr, None, "the stale old-seq echo must be dropped");
+    assert!(app.model().attempt.is_some(), "the new attempt must survive the old attempt's stale echo");
+
+    // The new attempt's own success must apply normally.
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: new_seq });
+    assert_eq!(app.model().connected_addr, Some(addr), "the new attempt's own success must connect");
+    assert_eq!(app.model().attempt, None, "the new attempt must conclude");
+}
+
+/// **Test support only**: cancels `addr`'s in-flight attempt exactly as
+/// `radio_actions::cancel_connect` would (there is no wizard/`NavIntent`
+/// path this bare unit-test module drives), returning the cancelled
+/// attempt's `seq` for the caller to assert against. Reaches `App`'s
+/// private `model`/`commands` fields directly -- sound because this module
+/// (`app::tests`) is a child of `app` itself, same as every other
+/// `_for_test` helper in this crate.
+fn radio_actions_cancel_connect_for_test(app: &mut App, addr: DeviceAddr) -> u16 {
+    let seq_before = app.model().attempt.map(|a| a.seq);
+    cancel_connect(&app.model, &app.commands, addr);
+    seq_before.expect("an attempt must have been in flight to cancel")
 }
 
 /// `App::on_store_loaded`'s boot-time auto-reconnect now goes through the
@@ -1750,5 +1874,5 @@ fn boot_auto_reconnect_records_an_auto_reconnect_initiated_attempt() {
     let attempt = app.model().attempt.expect("on_store_loaded's auto-reconnect must record an attempt");
     assert_eq!(attempt.addr, addr);
     assert_eq!(attempt.initiator, ConnectInitiator::AutoReconnect);
-    assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Cans") }));
+    app.expect_connect_command_for_test(addr, "Cans");
 }
