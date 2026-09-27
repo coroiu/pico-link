@@ -261,7 +261,7 @@ export class FakeTransport implements Transport {
         return;
       }
       default:
-        rejected(OpError.None);
+        rejected(OpError.UnknownOp);
     }
   }
 

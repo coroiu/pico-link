@@ -1,20 +1,12 @@
 // HOST_OP (0x06) request encoders + GET_OP_STATUS (0x07) reply decoder, per
 // ADA DESIGN on pico-link-jyhk.17 (`.planning/design/
-// 2026-09-27-iface6-eq-management-protocol.md` section 4). Firmware does
-// not implement 0x06/0x07 yet (that lands in that design's tasks 2-4), and
-// neither does core's write side (bead pico-link-jyhk.19) -- so unlike
-// `library.ts`/`telemetry.ts`/`info.ts` there is no `fixtures/` directory
-// to assert against here. Every layout in this file is coded directly from
-// the design doc; `ops.test.ts`'s tests are marked "(design-derived)" in
-// their titles for the same reason.
-//
-// FOLLOW-UP (pico-link-jyhk.19, core write side): once core emits fixtures
-// for `HOST_OP`/`GET_OP_STATUS` (the same "core emits, JS asserts" pattern
-// as `library_fixtures.rs`), replace `ops.test.ts`'s hand-computed
-// expectations with a `ops.fixture.test.ts` asserting against them --
-// especially `OpError`'s ordinals, which core owns per the design ("Error
-// enum lives in core and is emitted to fixtures/ as constants") and this
-// file currently only guesses at.
+// 2026-09-27-iface6-eq-management-protocol.md` section 4) and core's write
+// side (bead pico-link-jyhk.19, `core/src/app/host_op.rs`). Every layout
+// and ordinal below is cross-checked against `fixtures/host_op/*` by
+// `ops.fixture.test.ts` -- `OpError`'s values in particular are core's,
+// emitted verbatim into `fixtures/host_op/op-errors.json`
+// (`core/src/app/host_op_fixtures.rs`); do not hand-edit them without
+// re-running that check.
 import { BLOB_LEN } from "./library";
 
 export const OP_PROTO = 1;
@@ -110,28 +102,34 @@ export function encodeParseApoRequest(seq: number, name: string, apoText: string
 export type OpStatusState = "none" | "done" | "rejected";
 
 /**
- * Placeholder ordinals -- design section 4: "Error enum lives in core and
- * is emitted to fixtures/ as constants." Core's write side (jyhk.19) has
- * not landed yet, so these numbers are this file's own guess at a stable
- * ordering, not yet cross-checked against anything core emits. Do not rely
- * on specific values outside this module until the jyhk.19 follow-up
- * replaces this with core-sourced constants.
+ * `core::app::host_op::OpError`'s ordinals verbatim -- design section 4:
+ * "Error enum lives in core and is emitted to fixtures/ as constants".
+ * Cross-checked byte-for-byte against `fixtures/host_op/op-errors.json`
+ * (`core/src/app/host_op_fixtures.rs`) by `ops.fixture.test.ts`; a
+ * renumbering in core fails that test rather than silently drifting here
+ * the way this table once did (bead pico-link-jyhk.22 review finding).
  */
 export const OpError = {
   None: 0,
-  StoreFull: 1,
-  NotFound: 2,
-  Conflict: 3,
-  EditorOpen: 4,
-  NameTaken: 5,
-  NameInvalid: 6,
-  UnknownDevice: 7,
-  BlobVersion: 8,
-  ReservedBandKind: 9,
-  BandCountExceeded: 10,
-  ValueOutOfRange: 11,
-  ApoParseFailed: 12,
-  ApoTooLarge: 13,
+  InvalidRequest: 1,
+  UnknownOp: 2,
+  NotReady: 3,
+  StoreFull: 4,
+  NotFound: 5,
+  Conflict: 6,
+  EditorOpen: 7,
+  NameTaken: 8,
+  NameInvalid: 9,
+  BlobVersion: 10,
+  BandCount: 11,
+  ReservedBandKind: 12,
+  GainRange: 13,
+  FreqRange: 14,
+  QRange: 15,
+  PreampRange: 16,
+  UnknownDevice: 17,
+  ParseError: 18,
+  ApoTooLarge: 19,
 } as const;
 
 export type OpError = (typeof OpError)[keyof typeof OpError];

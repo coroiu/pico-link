@@ -13,6 +13,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES_ROOT = path.resolve(HERE, "../../../fixtures");
 export const FIXTURES_DIR = path.join(FIXTURES_ROOT, "telemetry");
 export const LIBRARY_FIXTURES_DIR = path.join(FIXTURES_ROOT, "library");
+export const HOST_OP_FIXTURES_DIR = path.join(FIXTURES_ROOT, "host_op");
 
 export function fixtureBytes(name: string): Uint8Array {
   return new Uint8Array(readFileSync(path.join(FIXTURES_DIR, name)));
@@ -41,5 +42,27 @@ export function libraryFixtureJson<T>(name: string): T {
 export function libraryFixtureNames(): string[] {
   return readdirSync(LIBRARY_FIXTURES_DIR)
     .filter((f) => f.startsWith("library-") && f.endsWith(".bin"))
+    .map((f) => f.slice(0, -".bin".length));
+}
+
+export function hostOpFixtureBytes(name: string): Uint8Array {
+  return new Uint8Array(readFileSync(path.join(HOST_OP_FIXTURES_DIR, name)));
+}
+
+export function hostOpFixtureJson<T>(name: string): T {
+  return JSON.parse(readFileSync(path.join(HOST_OP_FIXTURES_DIR, name), "utf-8")) as T;
+}
+
+/** Every `request-*.bin` fixture's base name (without extension), each paired with a same-named `.json`. */
+export function hostOpRequestFixtureNames(): string[] {
+  return readdirSync(HOST_OP_FIXTURES_DIR)
+    .filter((f) => f.startsWith("request-") && f.endsWith(".bin"))
+    .map((f) => f.slice(0, -".bin".length));
+}
+
+/** Every `status-*.bin` fixture's base name (without extension), each paired with a same-named `.json`. */
+export function hostOpStatusFixtureNames(): string[] {
+  return readdirSync(HOST_OP_FIXTURES_DIR)
+    .filter((f) => f.startsWith("status-") && f.endsWith(".bin"))
     .map((f) => f.slice(0, -".bin".length));
 }
