@@ -1,0 +1,13 @@
+Required Notice: Copyright (c) 2026 Andreas Coroiu (https://github.com/coroiu)
+
+Pico Link is licensed under the PolyForm Noncommercial License 1.0.0
+(see LICENSE.md). Personal, non-commercial use, including building and
+flashing it onto your own hardware, is permitted. Commercial use requires
+separate permission from the copyright holder.
+
+Third-party components keep their own licences:
+  - libldac (Sony, via AOSP): Apache-2.0; see its NOTICE and PROVENANCE.md.
+    LDAC's NOTICE requires Sony certification to ship LDAC in a product.
+  - TinyUSB patches: MIT, per the original file headers.
+  - pico-sdk, BTstack and cyw43-driver are fetched at build time, not
+    vendored here, and are governed by their own licences.
