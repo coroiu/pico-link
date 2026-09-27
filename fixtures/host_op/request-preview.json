@@ -1,0 +1,9 @@
+{
+  "op": "PREVIEW",
+  "op_code": 4,
+  "seq": 5,
+  "flags": 0,
+  "bypass": false,
+  "effect_id": 0,
+  "blob_len": 80
+}

@@ -1,0 +1,36 @@
+{
+  "op_proto": 1,
+  "errors": {
+    "NONE": 0,
+    "INVALID_REQUEST": 1,
+    "UNKNOWN_OP": 2,
+    "NOT_READY": 3,
+    "STORE_FULL": 4,
+    "NOT_FOUND": 5,
+    "CONFLICT": 6,
+    "EDITOR_OPEN": 7,
+    "NAME_TAKEN": 8,
+    "NAME_INVALID": 9,
+    "BLOB_VERSION": 10,
+    "BAND_COUNT": 11,
+    "RESERVED_BAND_KIND": 12,
+    "GAIN_RANGE": 13,
+    "FREQ_RANGE": 14,
+    "Q_RANGE": 15,
+    "PREAMP_RANGE": 16,
+    "UNKNOWN_DEVICE": 17,
+    "PARSE_ERROR": 18,
+    "APO_TOO_LARGE": 19
+  },
+  "ops": {
+    "SAVE_EFFECT": 1,
+    "DELETE_EFFECT": 2,
+    "ASSIGN": 3,
+    "PREVIEW": 4,
+    "PREVIEW_END": 5,
+    "PARSE_APO": 6
+  },
+  "flags": {
+    "BYPASS": 1
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "op": "ASSIGN",
+  "op_code": 3,
+  "seq": 4,
+  "flags": 0,
+  "addr": "94:DB:56:54:7C:F2",
+  "effect_id": 1
+}

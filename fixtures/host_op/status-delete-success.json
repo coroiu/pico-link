@@ -1,0 +1,15 @@
+{
+  "op_proto": 1,
+  "op": "DELETE_EFFECT",
+  "op_code": 2,
+  "seq": 1,
+  "state": 1,
+  "error": 0,
+  "effect_id": 1,
+  "library_rev": 1,
+  "persisted_seq": 0,
+  "line": 0,
+  "band": 0,
+  "value": 0,
+  "payload_len": 0
+}

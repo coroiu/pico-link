@@ -1,0 +1,9 @@
+{
+  "op": "PARSE_APO",
+  "op_code": 6,
+  "seq": 9,
+  "flags": 0,
+  "name_len": 8,
+  "name": "Fallback",
+  "apo_text": "Preamp: -1 dB\nFilter 1: ON PK Fc 1000 Hz Gain 2 dB Q 1"
+}
