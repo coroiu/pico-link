@@ -1,15 +1,17 @@
 import { ThemeProvider } from "./theme/ThemeProvider";
 import { DevPage } from "./dev/DevPage";
+import { HomeApp } from "./home/HomeApp";
 
-// This scaffold's only route is the dev page (FakeTransport + theme
-// switcher + debug readout). Home/EQ views land on jyhk.12+, once Uma's
-// design exists (pico-link-jyhk.10's description: "no Home visuals yet").
+// The app's real entry point is `HomeApp` (pico-link-jyhk.12). `?dev` keeps
+// the pre-jyhk.12 debug scaffold (`FakeTransport`/theme switcher/raw
+// readout) reachable, per the FERN DESIGN note that dev/prod share one app
+// distinguished by a query string.
+function isDevMode(): boolean {
+  return typeof window !== "undefined" && new URLSearchParams(window.location.search).has("dev");
+}
+
 function App() {
-  return (
-    <ThemeProvider>
-      <DevPage />
-    </ThemeProvider>
-  );
+  return <ThemeProvider>{isDevMode() ? <DevPage /> : <HomeApp />}</ThemeProvider>;
 }
 
 export default App;
