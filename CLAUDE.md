@@ -449,7 +449,7 @@ applies.
 - **Beads/worktree hygiene.** The board lives in the embedded Dolt DB at
   `.beads/embeddeddolt/`, which is gitignored — there is nothing to commit before
   a merge, and nothing in git to recover the board from. Back it up with
-  `bd dolt push` — this WORKS as of 2026-08-27, pushing `refs/dolt/data` to
+  `bd dolt push` — this WORKS as of 2026-08-27, pushing `refs/dolt/data` to the PRIVATE repo `coroiu/pico-link-board` (moved 2026-09-27; pico-link is going public — never push the board there) —
   `coroiu/pico-link`; run it at session close. If it ever fails on a passphrase,
   `ssh-add` first: Dolt cannot prompt.
   `git branch -d` may balk because beads auto-syncs to branch tips — verify
@@ -519,7 +519,7 @@ applies.
   fails seconds later — measure with a loop, don't conclude from one probe.
 - **The beads board has a remote backup as of 2026-08-27.** It lives in
   `.beads/embeddeddolt/` (gitignored) and `bd dolt push` replicates it to
-  `refs/dolt/data` on `coroiu/pico-link`. `bd` keeps its **own** remote list,
+  `refs/dolt/data` on the private `coroiu/pico-link-board` (NOT pico-link, since 2026-09-27). `bd` keeps its **own** remote list,
   separate from git's — inspect with `bd dolt remote list`; changing
   `git remote` does not change it. Verify a push landed with
   `git ls-remote origin | grep dolt`.
