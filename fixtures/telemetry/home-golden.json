@@ -1,0 +1,30 @@
+{
+  "wire_len": 163,
+  "uptime_ms": 20000,
+  "snap_seq": 3735928559,
+  "link_connected": true,
+  "codec_word": "LDAC",
+  "kbps": 909,
+  "kbps_adaptive": true,
+  "kbps_is_live": true,
+  "device_name": "Pixel Buds",
+  "fx_preset_name": "Warm",
+  "volume_present": true,
+  "volume_level": 100,
+  "volume_muted": false,
+  "volume_source": "host",
+  "level_present": true,
+  "peak_l": 200,
+  "peak_r": 190,
+  "rms_l": 120,
+  "rms_r": 110,
+  "received_ms": 12345,
+  "faults": [
+    {"count": 3, "first_seen_ms": 1000, "last_seen_ms": 1000, "value_kind": "millis", "value": 0},
+    null,
+    null,
+    null,
+    null,
+    null
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "_comment": "Named constants a host-side ballistics/decode port must use verbatim rather than retype (bead pico-link-jyhk.9, FERN DESIGN section 5). Regenerate with UPDATE_FIXTURES=1.",
+  "TELEMETRY_PROTO": 1,
+  "HOME_SNAPSHOT_LEN": 163,
+  "OUT_LEVEL_STALE_AFTER_MS": 200,
+  "OUT_LEVEL_REFRESH_INTERVAL_MS": 250,
+  "OUT_LEVEL_HOLD_DURATION_MS": 1500,
+  "RELEASE_RATIO_PER_MS_Q16": 65384,
+  "FAULT_LIVE_WINDOW_MS": 20000,
+  "FAULT_RETIRE_MS": 120000,
+  "FAULT_KEY_ORDER": ["BUF STARVED", "BUF OVERFLOW", "USB SUPPLY LOW", "AIR CONGESTED", "AIR LINK LOST", "ENC RESYNC"],
+  "VOLUME_PERCENT_SAMPLES": [
+    {"level": 0, "percent": 0},
+    {"level": 1, "percent": 1},
+    {"level": 32, "percent": 25},
+    {"level": 63, "percent": 50},
+    {"level": 64, "percent": 50},
+    {"level": 65, "percent": 51},
+    {"level": 100, "percent": 79},
+    {"level": 126, "percent": 99},
+    {"level": 127, "percent": 100}
+  ]
+}

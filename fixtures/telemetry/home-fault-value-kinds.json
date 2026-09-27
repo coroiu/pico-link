@@ -1,0 +1,30 @@
+{
+  "wire_len": 163,
+  "uptime_ms": 4000,
+  "snap_seq": 13,
+  "link_connected": false,
+  "codec_word": "",
+  "kbps": 0,
+  "kbps_adaptive": false,
+  "kbps_is_live": false,
+  "device_name": "",
+  "fx_preset_name": "",
+  "volume_present": false,
+  "volume_level": 0,
+  "volume_muted": false,
+  "volume_source": "host",
+  "level_present": false,
+  "peak_l": 0,
+  "peak_r": 0,
+  "rms_l": 0,
+  "rms_r": 0,
+  "received_ms": 0,
+  "faults": [
+    {"count": 3, "first_seen_ms": 1000, "last_seen_ms": 1000, "value_kind": "millis", "value": 120},
+    null,
+    {"count": 1, "first_seen_ms": 4000, "last_seen_ms": 4000, "value_kind": "ratio", "value": 200},
+    null,
+    {"count": 2, "first_seen_ms": 4000, "last_seen_ms": 4000, "value_kind": "none", "value": 0},
+    {"count": 9, "first_seen_ms": 4000, "last_seen_ms": 4000, "value_kind": "count", "value": 9}
+  ]
+}

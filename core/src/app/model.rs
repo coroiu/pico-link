@@ -306,7 +306,7 @@ pub struct OutLevelSample {
 /// (same constraint [`crate::render::theme::VERTICAL_METER_DBFS_THRESHOLDS`]
 /// documents), so [`decay_peak`] raises this ratio to the elapsed
 /// millisecond count via integer exponentiation-by-squaring instead.
-const RELEASE_RATIO_PER_MS_Q16: u32 = 65384;
+pub(crate) const RELEASE_RATIO_PER_MS_Q16: u32 = 65384;
 
 /// Multiplies two Q16.16 fixed-point values, truncating the low bits
 /// (consistent rounding-down bias, negligible at these magnitudes).

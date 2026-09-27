@@ -54,6 +54,8 @@ mod model;
 mod screen_id;
 mod screens;
 mod telemetry;
+#[cfg(test)]
+mod telemetry_fixtures;
 mod ui_state;
 
 pub use events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus, VolumeSource, VolumeState};

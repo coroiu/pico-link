@@ -1,0 +1,30 @@
+{
+  "wire_len": 163,
+  "uptime_ms": 3000,
+  "snap_seq": 11,
+  "link_connected": true,
+  "codec_word": "SBC",
+  "kbps": 328,
+  "kbps_adaptive": false,
+  "kbps_is_live": false,
+  "device_name": "SBC Buds",
+  "fx_preset_name": "Flat",
+  "volume_present": false,
+  "volume_level": 0,
+  "volume_muted": false,
+  "volume_source": "host",
+  "level_present": false,
+  "peak_l": 0,
+  "peak_r": 0,
+  "rms_l": 0,
+  "rms_r": 0,
+  "received_ms": 0,
+  "faults": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ]
+}

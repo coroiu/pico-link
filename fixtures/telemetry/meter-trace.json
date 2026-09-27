@@ -1,0 +1,22 @@
+{
+  "_comment": "Scripted App::on_levels_changed timeline + render-time decay_peak queries (bead pico-link-jyhk.9). samples[] are fed to on_levels_changed in order via App::tick(at_ms*1000); queries[] read the OutLevelSample last folded at or before their at_ms and recompute exactly what crate::render::hero::HeroStatusView's ballistics would show if it rendered at that instant -- displayed_peak_* is decay_peak(attack_peak_*, now - attack_peak_*_at), stale is (now - received_ms) >= OUT_LEVEL_STALE_AFTER_MS, hold_* is the raw peak-hold cap (never itself decayed). Deliberately NOT a segment/zone count: the vertical meter's segment count and colour zones are about to change (bead pico-link-5ful), so this fixture sticks to the stable ballistics contract. A host port must match every displayed_peak_*/hold_* bit-exactly -- see constants.json's RELEASE_RATIO_PER_MS_Q16.",
+  "samples": [
+    {"at_ms": 0, "peak_l": 50, "peak_r": 40, "rms_l": 30, "rms_r": 25},
+    {"at_ms": 100, "peak_l": 200, "peak_r": 180, "rms_l": 150, "rms_r": 140},
+    {"at_ms": 250, "peak_l": 30, "peak_r": 170, "rms_l": 20, "rms_r": 130},
+    {"at_ms": 600, "peak_l": 10, "peak_r": 10, "rms_l": 5, "rms_r": 5},
+    {"at_ms": 2000, "peak_l": 5, "peak_r": 5, "rms_l": 2, "rms_r": 2}
+  ],
+  "queries": [
+    {"at_ms": 0, "received_ms": 0, "stale": false, "displayed_peak_l": 50, "displayed_peak_r": 40, "hold_l": 50, "hold_r": 40},
+    {"at_ms": 50, "received_ms": 0, "stale": false, "displayed_peak_l": 44, "displayed_peak_r": 35, "hold_l": 50, "hold_r": 40},
+    {"at_ms": 150, "received_ms": 100, "stale": false, "displayed_peak_l": 178, "displayed_peak_r": 160, "hold_l": 200, "hold_r": 180},
+    {"at_ms": 260, "received_ms": 250, "stale": false, "displayed_peak_l": 137, "displayed_peak_r": 166, "hold_l": 200, "hold_r": 180},
+    {"at_ms": 400, "received_ms": 250, "stale": false, "displayed_peak_l": 99, "displayed_peak_r": 119, "hold_l": 200, "hold_r": 180},
+    {"at_ms": 700, "received_ms": 600, "stale": false, "displayed_peak_l": 49, "displayed_peak_r": 59, "hold_l": 200, "hold_r": 180},
+    {"at_ms": 900, "received_ms": 600, "stale": true, "displayed_peak_l": 31, "displayed_peak_r": 37, "hold_l": 200, "hold_r": 180},
+    {"at_ms": 2000, "received_ms": 2000, "stale": false, "displayed_peak_l": 5, "displayed_peak_r": 5, "hold_l": 5, "hold_r": 5},
+    {"at_ms": 2100, "received_ms": 2000, "stale": false, "displayed_peak_l": 3, "displayed_peak_r": 3, "hold_l": 5, "hold_r": 5},
+    {"at_ms": 2300, "received_ms": 2000, "stale": true, "displayed_peak_l": 2, "displayed_peak_r": 2, "hold_l": 5, "hold_r": 5}
+  ]
+}
