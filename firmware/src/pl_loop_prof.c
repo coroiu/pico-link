@@ -48,6 +48,7 @@ static const char *const kPhaseCodes[PL_LOOP_PHASE_COUNT] = {
     "log",  // PL_LOOP_PHASE_LOG_DRAIN
     "wdt",  // PL_LOOP_PHASE_WDT_SERVICE
     "tel",  // PL_LOOP_PHASE_TELEMETRY
+    "eqm",  // PL_LOOP_PHASE_EQ_MGMT
     "slp",  // PL_LOOP_PHASE_SLEEP
     "tot",  // PL_LOOP_PHASE_TOTAL
 };

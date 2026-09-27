@@ -73,6 +73,13 @@ typedef enum {
     // recency check), and one pl_ui_telemetry encode's cost at most once
     // every 20ms while a page is polling.
     PL_LOOP_PHASE_TELEMETRY,
+    // pl_config_itf_poll_library + pl_config_itf_poll_host_op +
+    // pl_config_itf_poll_preview_lease (bead pico-link-jyhk.21, GET_LIBRARY/
+    // HOST_OP/GET_OP_STATUS). Same "~0 when unattended" shape as
+    // PL_LOOP_PHASE_TELEMETRY: library generation is poll-recency gated,
+    // HOST_OP only costs anything the iteration a request actually landed,
+    // and the preview lease check is a timestamp compare.
+    PL_LOOP_PHASE_EQ_MGMT,
     // The pacing sleep_us() at the bottom of the loop (expected to be ~0
     // whenever the body already exceeds frame_budget_us).
     PL_LOOP_PHASE_SLEEP,
