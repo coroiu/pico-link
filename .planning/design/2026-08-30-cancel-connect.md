@@ -224,3 +224,251 @@ gives a silent-success bug worse than today.
 - **V1 — hardware verification, blocked.** Cancel at each of S1-S5; capture the
   `a2dp:` report lines. Open **[measure]** items: S3 bonding side-effect; S5
   late-establish frequency; heartbeat latency perceptibility.
+
+---
+
+## v2 (2026-09-27, Ada) -- attempt identity, incoming connections, the cid=0 timeouts
+
+Supersedes C1-C4 above where they conflict. Keeps: bookkeeping-only cancel
+(D4), heartbeat-deferred disconnect, held-connect reissue, bounded 3 s
+fallback, debug CANCELCONNECT, the C6 counters. Line refs are branch
+`bd-pico-link-chc3` @ `827fba3` unless marked `main:`.
+
+### Findings
+
+**F1 -- incoming connections are real, on main, today.** The jyhk.25 reviewer's
+claim is wrong. `pl_bt_connection_filter` (`bt.c:880-900`, identical on main)
+accepts ANY inbound ACL whose addr is in the persist store AND has a link key;
+it has no reference to the 0x0b retry or any attempt. `pl_bt_update_scan_mode`
+(`bt.c:805-819`) sets connectable whenever no ACL is up and no switch is
+running. BTstack then accepts inbound AVDTP signaling
+(`avdtp.c:1664` registers PSM; `avdtp.c:904-951` accepts unless an outgoing
+signaling to the same addr is active). So a bonded headset powering on pages
+us, and `A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED` fires with no local
+attempt. With v1, `attempt_live == false` then kills it at the D3 guards
+(`a2dp.c:3167`, `:3871`, `:4123`) and suppresses every emit (`:3113-3150`).
+Two windows: cold boot before core's auto-reconnect, and permanently after any
+cancel (`attempt_live` is only set at `:4677`).
+
+**F2 -- `attempt_live` is never concluded.** It stays true after success or
+failure; only a cancel clears it (`:4702`). A stale/duplicate CancelConnect
+arriving at any later time tears down whatever session is live, including one
+the user is happily streaming on.
+
+**F3 -- why 3/3 cancels hit the timeout with cid=0x0000.** Tess cancelled
+50-150 ms after CONNECT, i.e. during SDP query / L2CAP connect (S1/S2), before
+signaling OPENED. Trace:
+1. `pl_a2dp_cancel_connect` sees `a2dp_cid != 0` (written synchronously by
+   `a2dp_source_establish_stream`'s out-param, `a2dp.c:3290` ->
+   `a2dp_source.c:167`), arms the timer (`:4711`).
+2. `pl_a2dp_service_cancel` calls `a2dp_source_disconnect` (`:4739`).
+3. `avdtp_disconnect` (`avdtp.c:1128-1133`), for a connection not yet OPENED,
+   does NOT close L2CAP: it synchronously emits
+   `SIGNALING_CONNECTION_ESTABLISHED(status=0x1f)` and finalizes. BTstack's
+   a2dp layer forwards it and cascades a `STREAM_ESTABLISHED` failure
+   (`classic/a2dp.c:507-514`). **No `SIGNALING_CONNECTION_RELEASED` is ever
+   emitted for a pre-OPEN connection.**
+4. Our ESTABLISHED-failure branch sets `a2dp_cid = 0` (`a2dp.c:3484`) but never
+   disarms the cancel timer or reissues a held connect -- only RELEASED does
+   (`:4399-4418`). Timer fires 3 s later, logs `cid=0x0000` (`:3442-3445`).
+The timer can only fire if `service_cancel` took the disconnect branch (its
+`cid == 0` branch disarms it, `:4727-4736`), so the missing
+"servicing pending cancel" lines were console loss, not a skipped path -- the
+"cancel_connect -- attempt_epoch" line (`:4701`) was also missing while
+`cancels_requested` incremented. Lesson for the test plan: read counters, not
+log lines. Not a cid confusion: BTstack's a2dp cid IS the avdtp cid.
+
+**F4 -- `held_connect_*` is not attempt-scoped.** Cancel never clears it
+(`:4692-4718`), so a cancelled held attempt is reissued on the next RELEASED
+or timeout (`:3447-3453`, `:4412-4418`).
+
+**F5 -- incoming sessions report the wrong address (pre-existing, main).**
+ESTABLISHED success copies `pending_addr` into `connect_addr` (`a2dp.c:3521`)
+-- the last *local* attempt's addr, all-zero at cold boot -- and calls
+`avrcp_connect(connect_addr)` (`:3547`). The event carries the real addr
+(`a2dp_subevent_signaling_connection_established_get_bd_addr`).
+
+**F6 -- a Connect to an already-connected device tears it down (pre-existing,
+main).** `pl_bt_connect_or_switch` (`bt.c:1255-1283`) treats any ACL-up as a
+switch. At cold boot, a headset that paged us first is disconnected and
+re-paged by core's auto-reconnect.
+
+**F7 -- core's addr-keyed marker is the same bug one layer up.**
+jyhk.25's `cancelled_attempt: (seq, addr)` drops a `ConnectSucceeded` for that
+addr while `attempt` is None -- which is exactly what a headset-initiated
+reconnect after a cancel looks like. And if C does not actually tear down (main
+today, where CancelConnect has no C handler), it drops the only success for a
+live stream.
+
+### Decision: core-allocated attempt `seq`, echoed by C
+
+v1 rejected core-side filtering because events carried no identity and "only C
+knows what an attempt is". jyhk.25 changed the premise: core now allocates
+`ConnectAttempt::seq` (u16) at `radio_actions::connect`. The sustainable model
+is one identity shared by both layers:
+
+- **Core allocates, C echoes.** `Command::Connect { addr, name, seq }`,
+  `Command::CancelConnect { addr, seq }`. C tags every connect-lifecycle event
+  (`ConnectStepChanged`, `ConnectRetrying`, `ConnectSucceeded`,
+  `ConnectFailed`) with the `seq` of the attempt that owns it.
+- **`seq == 0` means "not core's attempt"**: a remote-initiated session, or the
+  PL_DEBUG_REMOTE CONNECT bypass. Core's counter skips 0 and 0xFFFF on wrap.
+  `0xFFFF` is `PL_SEQ_ANY`, used only by debug CANCELCONNECT ("cancel whatever
+  is in flight").
+- **Suppression is scoped to the cancelled cid, never global.** C remembers
+  `cancel_cid` (sticky until the next cancel); an event is suppressed / D3
+  torn down iff its own `a2dp_cid == cancel_cid`. Any other cid -- including
+  every incoming session -- is untouched.
+- **Incoming connections are always accepted and always reported.** C emits
+  `LinkStateChanged(Connected)`, `CodecChanged`, and `ConnectSucceeded{seq:0}`
+  for them exactly as for a local session. Core treats `seq:0` success as a
+  session appearing: set connected addr, PersistDevice (MRU bump), never touch
+  `attempt`/`WizardPhase`.
+- **Why a seq and not an initiator flag:** a flag says "remote" but cannot tell
+  cancelled-attempt-N's late echo from attempt-N+1 to the same addr
+  (cancel-then-retry, the most likely sequence -- v1's own argument). The seq
+  does both; `seq == 0` IS the initiator flag.
+
+Rejected: keeping C-only suppression with a global flag plus special-casing
+incoming (quick fix -- it keeps F2 and F4 and needs a new hack for every new
+attempt source, e.g. the web HOST_OP connect). Rejected: core-only filtering by
+addr (F7).
+
+### C state (a2dp.c `pl_a2dp_ctx_t`)
+
+Replace `attempt_live`, `cancel_addr`, `held_connect_pending/addr` with:
+
+    struct { uint16_t seq; bd_addr_t addr; uint16_t cid;
+             enum { ATT_NONE, ATT_HELD, ATT_IN_FLIGHT } phase; } attempt;
+    uint16_t session_seq;      // seq owning the live a2dp_cid; 0 = remote/none
+    uint16_t cancel_cid;       // sticky; 0 = none
+    bool     cancel_disconnect_pending;   // was cancel_pending
+    // attempt_epoch stays as the instrumentation counter
+
+Rules:
+1. `pl_a2dp_connect(addr, seq)`: if a cancel teardown is outstanding ->
+   `phase = HELD` (replacing any older held attempt; last press wins). Else
+   `phase = IN_FLIGHT`, `attempt.cid` = establish_stream's out-param. The
+   COMMAND_DISALLOWED branch (`:3291`) also goes to HELD.
+2. **Adopt rule** (fixes F6), in `pl_bt_connect_or_switch` before the switch
+   branch: if a session to the same addr is up (`a2dp_cid != 0 &&
+   connect_addr == addr`), set `session_seq = seq`; if the stream is already
+   established emit `ConnectSucceeded{seq}` now, else the normal success emit
+   will carry it. No disconnect.
+3. ESTABLISHED success (`:3479`): `connect_addr` = event bd_addr (F5). If
+   `attempt.phase == IN_FLIGHT && (cid == attempt.cid || addr == attempt.addr)`
+   -> `session_seq = attempt.seq`; else `session_seq = 0` (remote). If
+   `cid == cancel_cid` -> disconnect, suppress (defensive; should not occur).
+4. Every emit wrapper takes the event's cid: suppress iff `cid == cancel_cid`;
+   otherwise tag with `session_seq` (post-signaling) or `attempt.seq`
+   (pre-signaling failures and bt.c's switch steps). The D3 guards at
+   `:3167`, `:3871`, `:4123` use the same `cid == cancel_cid` predicate.
+   STREAM_STARTED also fires on every resume after a pause (`:3100`), which is
+   why a global predicate there was doubly wrong.
+5. **Conclusion:** emitting `ConnectSucceeded` or `ConnectFailed` for
+   `attempt.seq` sets `attempt.phase = ATT_NONE` (session_seq keeps the seq).
+6. `pl_a2dp_cancel_connect(seq)`; `seq == 0` -> ignore. Match in order:
+   - `attempt.seq` (or ANY) with `phase == HELD` -> drop it (fixes F4), conclude.
+     Also cancel a matching 0x0b retry timer (retry has `a2dp_cid == 0`).
+   - `attempt.seq` with `phase == IN_FLIGHT` -> `cancel_cid = attempt.cid`,
+     arm teardown, conclude.
+   - `session_seq == seq && a2dp_cid != 0` -> the S5 late success core has not
+     seen yet: `cancel_cid = a2dp_cid`, arm teardown (D3).
+   - else no-op (stale/duplicate; counted).
+   bt.c's switch reset on cancel (`bt.c:1411-1424`) stays, but only when the
+   switch target's seq matches.
+7. **Teardown completion** `pl_a2dp_cancel_teardown_done()`: disarm timer,
+   reissue HELD attempt. Called from RELEASED when `cid == cancel_cid`, **from
+   the ESTABLISHED-failure branch when `cid == cancel_cid` (the F3 fix)**, and
+   from `service_cancel` when `a2dp_source_disconnect` returns non-success
+   (`ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER`: already gone). The 3 s timer
+   stays as the fallback; `cancel_teardown_timeouts` must now read 0.
+8. Counters to add: `cancel_done_released`, `cancel_done_prefail`
+   (pre-OPEN path), `cancels_stale`, `remote_sessions`. These are what the
+   hardware plan reads.
+
+### FFI (ui-ffi/src/lib.rs)
+
+- `PlConnectPayload` (`:2717`) + `seq: u16`. CancelConnect moves off
+  `PlAddrPayload` to its own `PlCancelConnectPayload { addr, seq }`.
+  `PL_COMMAND_ABI_VERSION` 4 -> 5 (`:2862`).
+- `PlConnectStepChangedPayload`, `PlConnectRetryingPayload`,
+  `PlConnectSucceededPayload`, `PlConnectFailedPayload` (`:1339-1384`)
+  + `seq: u16`. `PL_EVENT_ABI_VERSION` 7 -> 8 (`:2117`).
+- bt.c pending queue entry carries `seq` alongside `addr` for CONNECT and
+  CANCEL_CONNECT; `pl_bt_debug_connect` passes 0, debug CANCELCONNECT passes
+  `PL_SEQ_ANY`.
+
+### Core fold (jyhk.25's fold.rs/model.rs)
+
+- Delete `cancelled_attempt` and both addr-keyed guards.
+- For step/retry/succeeded/failed with `seq != 0`: apply iff
+  `attempt.is_some_and(|a| a.seq == seq)`; otherwise drop (stale echo of a
+  cancelled or superseded attempt). This is the only guard.
+- `seq == 0`: succeeded -> session appeared (connected addr, PersistDevice,
+  `last_outcome` untouched, wizard untouched); step/retry -> ignore;
+  failed -> ignore for attempt/wizard (log only).
+- The PL_DEBUG_REMOTE bypass relies on seq-0 success still updating the
+  connected state -- covered by the seq-0 rule.
+- `bump_attempt_seq` skips 0 and 0xFFFF.
+
+### Landing order
+
+The ABI bumps force C, ui-ffi and core to land in one branch. jyhk.25 should
+merge first **with the `cancelled_attempt` marker removed** (on main, C does
+not act on CancelConnect, so the honest behaviour is to let a real success
+land). Then chc3 v2 rebases on main and carries C + ui-ffi + the core fold
+change together.
+
+### Tasks (Ruby)
+
+- **R1 (jyhk.25, before merge):** remove `cancelled_attempt` and its two
+  guards; make `bump_attempt_seq` skip 0/0xFFFF. Update the tests that assert
+  the marker.
+- **R2 (chc3 v2, rebased on main after R1) -- FFI:** seq fields and ABI bumps
+  above; `pl_command_from` / event decode; cbindgen header regenerated.
+- **R3 -- C a2dp.c:** attempt struct, `session_seq`, `cancel_cid`,
+  cid-scoped emit wrappers and D3 guards, conclusion rule, cancel match order,
+  `pl_a2dp_cancel_teardown_done` called from RELEASED + ESTABLISHED-failure +
+  disconnect-error, ESTABLISHED uses event bd_addr, new counters.
+- **R4 -- C bt.c:** seq through the pending queue, adopt rule in
+  `pl_bt_connect_or_switch`, switch reset only on matching seq, debug
+  CONNECT seq 0 / CANCELCONNECT `PL_SEQ_ANY`.
+- **R5 -- core fold:** seq rules above.
+- **R6 -- tests (core/ui-ffi):** stale seq dropped; seq-0 success sets
+  connected with no attempt and leaves wizard alone; seq-0 success while an
+  attempt for another seq is in flight does not conclude it; cancel then
+  retry same addr: old-seq success dropped, new-seq success applied; ABI
+  round-trip of every new field. C has no unit harness -- R3/R4 are proven by
+  the hardware plan.
+
+### Hardware plan (Tess, headless via cdc_sender/cdc_reader)
+
+Read the `a2dp:` report counters before and after each case; log lines are
+lossy (F3) and are supporting evidence only. Start each case from Idle
+(`--disconnect`, wait for `link_state` Idle).
+
+- **H1 S1/S2 cancel:** `--connect <addr> --delay 0.05 --cancel-connect`.
+  Pass: `cancel_done_prefail` +1, `cancel_teardown_timeouts` +0,
+  `scan_connectable=1` within 5 s, next `--connect` reaches LDAC.
+- **H2 S5 cancel:** same with `--delay 1.5` (after STREAM_ESTABLISHED).
+  Pass: `cancels_late_success` or `cancel_done_released` +1, timeouts +0,
+  link ends Idle, no audio packets after.
+- **H3 cancel-then-retry:** `--connect --delay 0.05 --cancel-connect` then
+  `--connect` immediately. Pass: exactly one new session reaches LDAC,
+  timeouts +0, held reissue logged or counted.
+- **H4 stale cancel:** connect to LDAC, wait 5 s, send `--cancel-connect`.
+  Pass: `cancels_stale` +1, stream still up (proves F2 is fixed).
+- **H5 headset-initiated reconnect -- NEEDS ANDREAS:** with the board Idle
+  and connectable, Andreas power-cycles the headphones (94:DB:56:54:7C:F2).
+  Pass: `remote_sessions` +1, report shows LDAC streaming, link Connected,
+  Home shows the headset. Repeat once right after an H1 cancel (the v1
+  permanent-refusal window) -- same pass criteria.
+- **H6 cold boot race -- NEEDS ANDREAS:** Andreas replugs the board and
+  powers the headphones on at the same moment. Whichever side wins, pass is one
+  session reaching LDAC with no disconnect/re-page (adopt rule); count
+  `remote_sessions` to see which won.
+
+Note on H4: debug CANCELCONNECT uses `PL_SEQ_ANY`, which by rule 6 matches
+only a HELD/IN_FLIGHT attempt, never a concluded session -- so H4 must be a
+no-op. `PL_SEQ_ANY` never matches `session_seq`.
