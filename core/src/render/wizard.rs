@@ -46,7 +46,8 @@ use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use crate::app::{
-    cancel_scan, connect, is_audio_sink, start_scan, truncate_device_name, Command, ConnectFailureReason, ConnectInitiator, ConnectStep,
+    cancel_connect, cancel_scan, connect, is_audio_sink, start_scan, truncate_device_name, Command, ConnectFailureReason, ConnectInitiator,
+    ConnectStep,
     DeviceEntry, ModelHandle, ScanOwner, ScreenId, WizardPhase, MAX_SCAN_LIST_ITEMS,
 };
 use crate::input::NavIntent;
@@ -423,7 +424,13 @@ impl Widget for PairingWizardView {
             // section 9 phase 4: "B genuinely aborts" -- not "B leaves
             // the screen". Mirrors the `CancelScan` arm above exactly.
             (NavIntent::Back, WizardPhase::Connecting { addr, .. } | WizardPhase::NotResponding { addr, .. }) => {
-                self.commands.borrow_mut().push_back(Command::CancelConnect { addr });
+                // Bead pico-link-jyhk.25 review fix: routes through
+                // `radio_actions::cancel_connect` (not a bare `Command::
+                // CancelConnect` push) so `BtModel::attempt`/`last_outcome`
+                // conclude immediately, rather than never -- see that
+                // function's doc comment for why a fire-and-forget C cancel
+                // can't be the thing that concludes them.
+                cancel_connect(&self.model, &self.commands, addr);
                 Action::None
             }
             (NavIntent::Up | NavIntent::Down | NavIntent::JumpBy(_), WizardPhase::Scanning { .. }) => {
@@ -604,7 +611,9 @@ impl Widget for PairingWizardView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ConnectFailureReason, ConnectStep, DeviceEntry, Event, HomeFace, LinkState, WizardPhase, DEVICES_TITLE};
+    use crate::app::{
+        App, ConnectFailureReason, ConnectOutcomeResult, ConnectStep, DeviceEntry, Event, HomeFace, LinkState, WizardPhase, DEVICES_TITLE,
+    };
     use crate::input::NavIntent;
     use crate::platform::Instant;
 
@@ -1132,6 +1141,73 @@ mod tests {
             app.poll_command(),
             Some(Command::CancelConnect { addr }),
             "B during the connecting phase must queue CancelConnect (design section 9: 'B genuinely aborts') --              leaving the screen without this leaves the abandoned ACL/SSP/AVDTP attempt running in C"
+        );
+    }
+
+    /// Bead pico-link-jyhk.25 review fix: B during `Connecting` must
+    /// conclude `BtModel::attempt` immediately (not just queue
+    /// `Command::CancelConnect` and leave the radio-session record
+    /// dangling) -- a fire-and-forget C cancel only ever echoes back
+    /// `LinkStateChanged(Idle)`, which doesn't conclude an attempt on its
+    /// own (see `App::set_link_state`'s doc comment), so if `radio_actions::
+    /// cancel_connect` didn't conclude it at queue time, `attempt` would
+    /// stay `Some` forever and a future `GET_RADIO` snapshot would report a
+    /// phantom in-flight connect.
+    #[test]
+    fn b_during_connecting_concludes_the_attempt_as_cancelled() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        let addr = [16; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
+        app.handle_input(vec![NavIntent::Select]); // -> Connecting
+        let seq = app.model().attempt.expect("connect() must have recorded an attempt").seq;
+        app.poll_command(); // drain StartScan
+        app.poll_command(); // drain Connect
+
+        app.handle_input(vec![NavIntent::Back]);
+        app.poll_command(); // drain CancelConnect
+
+        assert_eq!(app.model().attempt, None, "cancelling must conclude the attempt, not leave it dangling forever");
+        let outcome = app.model().last_outcome.expect("cancelling must record a last_outcome");
+        assert_eq!(outcome.seq, seq);
+        assert_eq!(outcome.addr, addr);
+        assert_eq!(outcome.result, ConnectOutcomeResult::Cancelled);
+
+        // The only core-visible echo of a cancel C actually sends (see
+        // `radio_actions::cancel_connect`'s doc comment) must not disturb
+        // what the cancel already concluded.
+        app.handle_event(Event::LinkStateChanged(LinkState::Idle));
+        assert_eq!(app.model().attempt, None);
+        assert_eq!(app.model().last_outcome.expect("must survive the Idle echo").result, ConnectOutcomeResult::Cancelled);
+    }
+
+    /// A stray, late `ConnectSucceeded` for the exact attempt just cancelled
+    /// (C's cancel does not suppress an outcome already in flight on the
+    /// wire) must not resurrect `attempt`/`connected_addr`, nor flip
+    /// `last_outcome` back from `Cancelled` to `Ok` -- see
+    /// `App::on_connect_succeeded`'s stray-echo guard.
+    #[test]
+    fn stray_connect_succeeded_after_cancel_does_not_resurrect_the_attempt() {
+        let mut app = App::new(240, 240);
+        open_wizard(&mut app);
+        let addr = [17; 6];
+        app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
+        app.handle_input(vec![NavIntent::Select]); // -> Connecting
+        app.poll_command(); // drain StartScan
+        app.poll_command(); // drain Connect
+
+        app.handle_input(vec![NavIntent::Back]);
+        app.poll_command(); // drain CancelConnect
+
+        // The stray echo of the attempt that just got cancelled.
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+
+        assert_eq!(app.model().attempt, None, "a stray success must not recreate the attempt");
+        assert_eq!(app.model().connected_addr, None, "a stray success must not resurrect connected_addr either");
+        assert_eq!(
+            app.model().last_outcome.expect("Cancelled must survive the stray echo").result,
+            ConnectOutcomeResult::Cancelled,
+            "a stray success for a cancelled attempt must not flip last_outcome back to Ok"
         );
     }
 

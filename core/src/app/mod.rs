@@ -73,7 +73,7 @@ pub use model::{
     OutLevelSample, PairedDevice, ScanOwner,
 };
 pub(crate) use model::{decay_peak, is_audio_sink, truncate_device_name, MAX_SCAN_LIST_ITEMS};
-pub(crate) use radio_actions::{cancel_scan, connect, disconnect, forget, set_quality, start_scan};
+pub(crate) use radio_actions::{cancel_connect, cancel_scan, connect, disconnect, forget, set_quality, start_scan};
 pub use screen_id::{PickerKind, ScreenId, SettingsPickerKind};
 pub(crate) use screens::device_page::build_device_page_screen;
 pub(crate) use screens::devices::build_devices_screen;

@@ -30,7 +30,7 @@ use alloc::string::String;
 use core::cell::RefCell;
 
 use super::events::Command;
-use super::model::{ConnectAttempt, ConnectInitiator, ScanOwner};
+use super::model::{ConnectAttempt, ConnectInitiator, ConnectOutcome, ConnectOutcomeResult, ScanOwner};
 use super::{DeviceAddr, ModelHandle};
 
 /// SCAN_START (design sec 13.3, op 7). Clears the previous scan's results,
@@ -85,8 +85,55 @@ pub(crate) fn connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Comman
         let mut model = model.borrow_mut();
         let seq = model.bump_attempt_seq();
         model.attempt = Some(ConnectAttempt { seq, addr, initiator, step: None, retries: 0 });
+        // A fresh attempt supersedes any earlier cancel marker -- see
+        // `BtModel::cancelled_attempt`'s doc comment. Without this, a stray
+        // late echo of the *cancelled* attempt could still be misidentified
+        // once this new attempt for the same `addr` is also underway (the
+        // guard in `App::on_connect_succeeded`/`record_connect_failure`
+        // only fires while `attempt` is `None`, so this is belt-and-braces
+        // rather than load-bearing, but leaving a stale marker around is a
+        // trap for the next reader).
+        model.cancelled_attempt = None;
     }
     commands.borrow_mut().push_back(Command::Connect { addr, name });
+}
+
+/// Design sec 13.3's `CANCEL_CONNECT` semantics / the wizard's B-during-
+/// `Connecting`/`NotResponding` cancel (mirrors [`cancel_scan`]'s doc
+/// comment shape). Unlike `cancel_scan`, this concludes
+/// [`BtModel::attempt`] *immediately*, rather than waiting for a C echo:
+/// `Command::CancelConnect` is fire-and-forget (firmware `bt.c`'s
+/// `PL_COMMAND_TAG_CANCEL_CONNECT` handler, branch `bd-pico-link-chc3`, only
+/// pushes `LinkStateChanged(Idle)` back, which [`App::set_link_state`]
+/// doesn't treat as an attempt-concluding signal -- it's a *third*,
+/// independent axis, see that method's doc comment) -- so if `core` waited
+/// for a C echo to conclude the attempt, a cancelled attempt would sit in
+/// `BtModel::attempt` forever and a `GET_RADIO` snapshot would report a
+/// phantom in-flight connect indefinitely.
+///
+/// Records the conclusion in both [`BtModel::last_outcome`]
+/// ([`ConnectOutcomeResult::Cancelled`]) and [`BtModel::cancelled_attempt`]
+/// -- the latter so a late [`Event::ConnectSucceeded`]/[`Event::
+/// ConnectFailed`] for the attempt just cancelled (C's cancel does not
+/// suppress an outcome already in flight on the wire) doesn't overwrite
+/// `Cancelled` back to `Ok`/`Failed`; see
+/// [`App::on_connect_succeeded`]/[`App::record_connect_failure`]'s guard.
+///
+/// A no-op on `BtModel::attempt`/`last_outcome` if there is no attempt in
+/// flight (e.g. a stray B press after the attempt already concluded on its
+/// own) -- `Command::CancelConnect` is still queued regardless, since C's
+/// own state is the one source of truth for whether there's anything left
+/// to cancel.
+pub(crate) fn cancel_connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Command>>>, addr: DeviceAddr) {
+    {
+        let mut model = model.borrow_mut();
+        if let Some(attempt) = model.attempt.take() {
+            model.cancelled_attempt = Some((attempt.seq, attempt.addr));
+            model.last_outcome =
+                Some(ConnectOutcome { seq: attempt.seq, addr: attempt.addr, result: ConnectOutcomeResult::Cancelled, reason: None });
+        }
+    }
+    commands.borrow_mut().push_back(Command::CancelConnect { addr });
 }
 
 /// DISCONNECT (design sec 13.3, op 10) / the device page's X on the

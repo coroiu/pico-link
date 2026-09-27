@@ -1660,13 +1660,18 @@ fn connect_step_and_retry_events_update_the_in_flight_attempt_with_no_screen_ope
     let mut app = App::new(240, 240);
     let addr = [6, 6, 6, 6, 6, 6];
     app.handle_event(upsert(addr, "Cans", 1));
-    open_devices(&mut app);
-    app.handle_input(vec![NavIntent::Select]); // starts the attempt
-    // Back out of the wizard entirely (queues `Command::CancelConnect`,
-    // irrelevant here) -- the radio-session record must keep folding with
-    // no screen left to render it.
-    app.handle_input(vec![NavIntent::Back, NavIntent::Back]);
-    assert_eq!(app.navigator_depth(), 1, "must be back at Home root with no wizard on screen");
+    // Bead `pico-link-jyhk.25` review fix: this used to open the wizard via
+    // `open_devices` + Select, then `Back, Back` out of it -- but a `Back`
+    // during `Connecting` now genuinely concludes the attempt (that's the
+    // whole point of the fix; see `radio_actions::cancel_connect`'s doc
+    // comment), so that route no longer demonstrates "the record folds with
+    // no screen open". `on_store_loaded`'s boot-time auto-reconnect
+    // (exercised standalone by `boot_auto_reconnect_records_an_auto_
+    // reconnect_initiated_attempt` below) never pushes any screen at all,
+    // which is a cleaner vehicle for the same point.
+    app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
+    assert_eq!(app.navigator_depth(), 1, "auto-reconnect must not navigate anywhere");
+    app.poll_command(); // drain the auto-reconnect's Command::Connect
 
     app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
     assert_eq!(app.model().attempt.expect("attempt must survive the screen closing").step, Some(ConnectStep::Pairing));

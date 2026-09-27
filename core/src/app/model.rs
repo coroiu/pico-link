@@ -297,6 +297,23 @@ pub struct BtModel {
     /// the same "tell a stale attempt from a fresh one" reason
     /// [`BtModel::scan_seq`] documents.
     pub(crate) attempt_seq_counter: u16,
+    /// `(seq, addr)` of the most recently *cancelled* attempt (bead
+    /// `pico-link-jyhk.25` review fix), set by
+    /// [`crate::app::radio_actions::cancel_connect`] the moment it concludes
+    /// `attempt` and cleared either by [`crate::app::radio_actions::connect`]
+    /// starting a fresh attempt or by the one-shot consume in
+    /// [`App::on_connect_succeeded`]/[`App::record_connect_failure`]. Exists
+    /// solely so a *stray* late `ConnectSucceeded`/`ConnectFailed` for an
+    /// attempt the user already cancelled -- C's cancel is fire-and-forget,
+    /// and a late echo can still arrive -- doesn't resurrect `last_outcome`
+    /// (or, worse, `connected_addr`) after the cancel already recorded
+    /// [`ConnectOutcomeResult::Cancelled`]. `attempt` alone can't carry this:
+    /// it's already `None` by the time the stray event lands, same as it
+    /// would be after a genuine conclusion, so a distinct marker is the only
+    /// way to tell "this echoes the attempt we already cancelled" from "this
+    /// is a legitimate zero-`attempt` conclusion" (e.g. the `PL_DEBUG_REMOTE`
+    /// bypass, which never calls `radio_actions::connect` at all).
+    pub(crate) cancelled_attempt: Option<(u16, DeviceAddr)>,
 }
 
 /// Who currently owns the running GAP inquiry, if anyone -- design sec
@@ -352,6 +369,10 @@ pub enum ConnectOutcomeResult {
     Ok,
     OkDegraded,
     Failed,
+    /// The device (or, in future, a web `HOST_OP` client) cancelled the
+    /// attempt before it concluded -- see
+    /// [`crate::app::radio_actions::cancel_connect`].
+    Cancelled,
 }
 
 /// The most recently concluded connect attempt -- see [`BtModel::last_
