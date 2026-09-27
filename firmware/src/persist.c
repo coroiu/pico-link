@@ -150,6 +150,15 @@ typedef struct __attribute__((packed)) {
 // rather than its own bespoke read/write pair.
 #define PL_PERSIST_ABR_FLOOR_VERSION 1u
 
+// Bead pico-link-ryw.15: PL:S:3, the durable preset-id high-water mark.
+// Own version byte, SEPARATE from every other PL:S:<i> version above, same
+// independent-versioning discipline. Unlike the 1-byte PL:S:<i> records
+// above, this is a u16 (`next_id` can legitimately exceed 255 once more
+// than 255 presets have ever been created, even though only
+// PL_PERSIST_PRESET_SLOTS can be occupied at once) -- see
+// pl_persist_preset_next_id_record_t below.
+#define PL_PERSIST_PRESET_NEXT_ID_VERSION 1u
+
 // Bead pico-link-ryw.6, design `.planning/design/2026-09-25-dsp-effects-
 // stage.md` sec 2.2: PL:P:<slot>, one DSP-preset record. `blob` is entirely
 // OPAQUE to C -- Rust owns the wire format (to_wire/from_wire, its own
@@ -239,6 +248,64 @@ static void pl_persist_store_u8_setting(uint8_t index, uint8_t version, uint8_t 
     pl_persist_u8_setting_record_t rec = {.version = version, .value = value, .crc16 = 0};
     rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_u8_setting_record_t, crc16));
     s_tlv_impl->store_tag(&s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, index), (const uint8_t *)&rec, sizeof(rec));
+}
+
+// Bead pico-link-ryw.15: PL:S:3 wire shape -- {u8 version; u16 next_id; u16
+// crc16}, a widened sibling of pl_persist_u8_setting_record_t above (this
+// value needs more than a byte, see PL_PERSIST_PRESET_NEXT_ID_VERSION's doc
+// comment).
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint16_t next_id;
+    uint16_t crc16;
+} pl_persist_preset_next_id_record_t;
+
+// Returns false, leaving `*out_next_id` untouched, on any of: absent
+// record, wrong length, wrong version, bad CRC -- same "no migration, just
+// fall back to the caller's default" contract as pl_persist_load_u8_setting
+// above. Callers treat false as "no durable high-water mark yet -- trust
+// the slot-derived computation" (see pl_persist_init's preset-loading
+// block).
+static bool pl_persist_load_preset_next_id(uint16_t *out_next_id) {
+    pl_persist_preset_next_id_record_t rec;
+    int rec_len = s_tlv_impl->get_tag(
+        &s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, PL_PERSIST_INDEX_PRESET_NEXT_ID), (uint8_t *)&rec, sizeof(rec)
+    );
+    if (rec_len != (int)sizeof(rec)) {
+        pl_log("persist: no PL:S:%u preset_next_id record -- trusting slot-derived value\r\n", (unsigned)PL_PERSIST_INDEX_PRESET_NEXT_ID);
+        return false;
+    }
+    if (rec.version != PL_PERSIST_PRESET_NEXT_ID_VERSION) {
+        pl_log(
+            "persist: PL:S:%u preset_next_id version mismatch (got %u, expected %u) -- trusting slot-derived value\r\n",
+            (unsigned)PL_PERSIST_INDEX_PRESET_NEXT_ID, (unsigned)rec.version, (unsigned)PL_PERSIST_PRESET_NEXT_ID_VERSION
+        );
+        return false;
+    }
+    uint16_t crc = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_preset_next_id_record_t, crc16));
+    if (crc != rec.crc16) {
+        pl_log(
+            "persist: PL:S:%u preset_next_id CRC mismatch (got 0x%04x, computed 0x%04x) -- trusting slot-derived value\r\n",
+            (unsigned)PL_PERSIST_INDEX_PRESET_NEXT_ID, rec.crc16, crc
+        );
+        return false;
+    }
+    *out_next_id = rec.next_id;
+    pl_log("persist: loaded PL:S:%u preset_next_id=%u\r\n", (unsigned)PL_PERSIST_INDEX_PRESET_NEXT_ID, (unsigned)rec.next_id);
+    return true;
+}
+
+// Persists the current high-water mark. Called synchronously from
+// pl_persist_drain_preset_stage_head's rule (b) branch, in the same
+// async_context call that already performs a flash write for the newly
+// claimed preset slot -- see persist.h's PL_PERSIST_INDEX_PRESET_NEXT_ID
+// doc comment for why this record must exist at all.
+static void pl_persist_store_preset_next_id(uint16_t next_id) {
+    pl_persist_preset_next_id_record_t rec = {.version = PL_PERSIST_PRESET_NEXT_ID_VERSION, .next_id = next_id, .crc16 = 0};
+    rec.crc16 = pl_persist_crc16((const uint8_t *)&rec, offsetof(pl_persist_preset_next_id_record_t, crc16));
+    s_tlv_impl->store_tag(
+        &s_tlv_context, pl_persist_tag(PL_PERSIST_KIND_SETTINGS, PL_PERSIST_INDEX_PRESET_NEXT_ID), (const uint8_t *)&rec, sizeof(rec)
+    );
 }
 
 static pl_persist_status_t s_boot_status = PL_PERSIST_STATUS_FIRST_BOOT;
@@ -723,6 +790,16 @@ void pl_persist_init(void) {
         pl_log("persist: loaded preset slot=%u id=%u blob_len=%u\r\n", slot, rec.preset_id, rec.blob_len);
     }
     s_next_preset_id = (uint16_t)(max_preset_id + 1);
+    // Bead pico-link-ryw.15: take the max of the slot-derived value above
+    // and PL:S:3's durable high-water mark. The durable mark can exceed
+    // the slot-derived one whenever the highest-id preset was since
+    // deleted -- without this, its id would be handed out again. An
+    // absent/corrupt PL:S:3 record (e.g. a pre-ryw.15 flash image) simply
+    // leaves the slot-derived value in place, same as before this bead.
+    uint16_t persisted_next_id;
+    if (pl_persist_load_preset_next_id(&persisted_next_id) && persisted_next_id > s_next_preset_id) {
+        s_next_preset_id = persisted_next_id;
+    }
     s_preset_boot_status = any_preset_corrupt ? PL_PERSIST_STATUS_RECORD_CORRUPT : PL_PERSIST_STATUS_LOADED;
     if (!any_preset_loaded) {
         pl_log("persist: marker present but no preset records -- valid store, no presets yet\r\n");
@@ -1678,6 +1755,11 @@ static void pl_persist_drain_preset_stage_head(void) {
         // Rule (b): claim the free slot and raise the high-water mark past
         // this id -- ids are monotonic and never reused (design sec 2.2).
         s_next_preset_id = (uint16_t)(entry.id + 1u);
+        // Bead pico-link-ryw.15: persist the raised mark immediately (this
+        // async_context call is already about to perform a flash write for
+        // the slot below) so a later delete of THIS preset can never make
+        // the mark appear to retreat on the next boot.
+        pl_persist_store_preset_next_id(s_next_preset_id);
     }
     // Rule (a) (an existing slot already held `entry.id`) falls straight
     // through to the same write below -- an upsert writes identically
