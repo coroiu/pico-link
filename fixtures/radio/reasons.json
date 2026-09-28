@@ -1,0 +1,9 @@
+{
+  "reasons": {
+    "TIMEOUT": {"wire": 1, "retryable": true, "text": "No response"},
+    "REJECTED": {"wire": 2, "retryable": true, "text": "Pairing refused"},
+    "NO_A2DP_SINK": {"wire": 3, "retryable": false, "text": "Can't play audio"},
+    "NEEDS_PIN": {"wire": 4, "retryable": false, "text": "Needs a PIN"},
+    "RADIO_ERROR": {"wire": 5, "retryable": true, "text": "Bluetooth error"}
+  }
+}

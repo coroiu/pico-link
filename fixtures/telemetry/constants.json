@@ -1,7 +1,7 @@
 {
   "_comment": "Named constants a host-side ballistics/decode port must use verbatim rather than retype (bead pico-link-jyhk.9, FERN DESIGN section 5). Regenerate with UPDATE_FIXTURES=1.",
   "TELEMETRY_PROTO": 1,
-  "HOME_SNAPSHOT_LEN": 169,
+  "HOME_SNAPSHOT_LEN": 171,
   "OUT_LEVEL_STALE_AFTER_MS": 200,
   "OUT_LEVEL_REFRESH_INTERVAL_MS": 250,
   "OUT_LEVEL_HOLD_DURATION_MS": 1500,

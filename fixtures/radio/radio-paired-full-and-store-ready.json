@@ -1,0 +1,17 @@
+{
+  "wire_len": 36,
+  "radio_rev": 9,
+  "discovering": false,
+  "connecting": false,
+  "device_wizard_open": false,
+  "paired_full": true,
+  "store_ready": true,
+  "scan_owner": "none",
+  "scan_seq": 0,
+  "attempt": null,
+  "last_outcome": null,
+  "scan_total_audio": 0,
+  "scan": [
+    
+  ]
+}

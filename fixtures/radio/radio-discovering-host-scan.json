@@ -1,0 +1,17 @@
+{
+  "wire_len": 78,
+  "radio_rev": 2,
+  "discovering": true,
+  "connecting": false,
+  "device_wizard_open": false,
+  "paired_full": false,
+  "store_ready": false,
+  "scan_owner": "host",
+  "scan_seq": 4,
+  "attempt": null,
+  "last_outcome": null,
+  "scan_total_audio": 1,
+  "scan": [
+    {"addr": "94:DB:56:54:7C:10", "bars": 4, "already_paired": false, "name": "Cans"}
+  ]
+}

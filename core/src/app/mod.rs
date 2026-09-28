@@ -53,6 +53,7 @@ mod host_op;
 mod inspect;
 mod library;
 mod model;
+mod radio;
 mod radio_actions;
 mod screen_id;
 mod screens;
@@ -61,6 +62,8 @@ mod telemetry;
 mod host_op_fixtures;
 #[cfg(test)]
 mod library_fixtures;
+#[cfg(test)]
+mod radio_fixtures;
 #[cfg(test)]
 mod telemetry_fixtures;
 mod ui_state;
@@ -73,7 +76,7 @@ pub use model::{
     BtModel, ConnectAttempt, ConnectInitiator, ConnectOutcome, ConnectOutcomeResult, ConnectedCodec, DeviceAddr, DeviceEntry, LinkState,
     OutLevelSample, PairedDevice, ScanOwner,
 };
-pub(crate) use model::{decay_peak, is_audio_sink, truncate_device_name, MAX_SCAN_LIST_ITEMS};
+pub(crate) use model::{decay_peak, scan_list_view, signal_bar_level, truncate_device_name, MAX_SCAN_LIST_ITEMS};
 pub(crate) use radio_actions::{cancel_connect, cancel_scan, connect, disconnect, forget, set_quality, start_scan};
 pub use screen_id::{PickerKind, ScreenId, SettingsPickerKind};
 pub(crate) use screens::device_page::build_device_page_screen;
@@ -346,6 +349,18 @@ pub struct App {
     /// on every call, but that mutation is invisible to every caller except
     /// [`Self::library_snapshot`] itself.
     library_last_bytes: RefCell<Vec<u8>>,
+    /// [`GET_RADIO`](radio)'s monotonic `radio_rev` counter -- design
+    /// `.planning/design/2026-09-27-iface6-eq-management-protocol.md` sec
+    /// 13.4 ("Rust encodes-compares, rev++ only on a byte difference"),
+    /// bead `pico-link-jyhk.27`. `Cell`, for the same "`&self`, no
+    /// caller-visible mutation" reason [`Self::library_rev`] is a `Cell` --
+    /// see that field's doc comment.
+    radio_rev: core::cell::Cell<u16>,
+    /// The last [`radio::encode_radio_snapshot`] output (encoded with a
+    /// placeholder `radio_rev` of `0`, same reason
+    /// [`Self::library_last_bytes`]'s own doc comment gives) --
+    /// [`Self::radio_snapshot`]'s encode-compare state.
+    radio_last_bytes: RefCell<Vec<u8>>,
     /// The web companion's live host preview, while a `HOST_OP` `PREVIEW`
     /// is active and hasn't been ended (`PREVIEW_END`, or C's 2s lease
     /// timeout via [`Self::host_preview_end`]) -- bead `pico-link-jyhk.19`,
@@ -431,6 +446,8 @@ impl App {
             preset_persisted_seq: alloc::collections::BTreeMap::new(),
             library_rev: core::cell::Cell::new(0),
             library_last_bytes: RefCell::new(Vec::new()),
+            radio_rev: core::cell::Cell::new(0),
+            radio_last_bytes: RefCell::new(Vec::new()),
             host_preview: None,
             host_op_status: host_op::HostOpStatus::default(),
         }
@@ -684,9 +701,14 @@ impl App {
         // ordering rule regardless of whether a `GET_LIBRARY` request has
         // arrived this poll.
         let library_rev = self.current_library_rev();
+        // Design sec 13.4's own append-ordering rule, mirroring
+        // `current_library_rev`'s comment just above: refresh the radio
+        // rev before building page 0 so it always carries a fresh value.
+        let radio_rev = self.current_radio_rev();
         let editor = self.editor_preview.borrow();
         let extras = telemetry::HomeSnapshotExtras {
             library_rev,
+            radio_rev,
             // Bead `pico-link-jyhk.19` (Task 2, HOST_OP/PREVIEW).
             host_preview_active: self.host_preview.is_some(),
             device_editor_open: editor.is_some(),
@@ -776,6 +798,76 @@ impl App {
             *last = body_at_rev_0.to_vec();
         }
         self.library_rev.get()
+    }
+
+    /// Whether the pairing wizard is currently the top of the
+    /// [`Navigator`]'s stack -- design sec 13.5's "device wizard open is a
+    /// navigator query" ([`ScreenId::PairingWizard`], `render::wizard`'s
+    /// `build_wizard_screen`). Used by [`Self::radio_snapshot`]'s
+    /// `device_wizard_open` flag (design sec 13.7: "device wizard open ...
+    /// every radio op returns `DEVICE_BUSY`") -- same `id_at(depth - 1)`
+    /// shape [`Self::prune_stack`] already uses to read the stack's top id.
+    #[must_use]
+    fn device_wizard_open(&self) -> bool {
+        let depth = self.navigator.depth();
+        depth > 0 && self.navigator.id_at(depth - 1) == Some(ScreenId::PairingWizard)
+    }
+
+    /// Encodes the `GET_RADIO` snapshot (design sec 13.4, bead
+    /// `pico-link-jyhk.27`; wire layout owned by
+    /// [`radio::encode_radio_snapshot`]) into `buf`. Returns the number of
+    /// bytes written, or `0` (never a partial write) if `buf` is too small
+    /// to hold the whole snapshot -- the same "`0` means don't publish this
+    /// poll" contract [`Self::library_snapshot`]/[`Self::telemetry_snapshot`]
+    /// use.
+    ///
+    /// Takes `&self`, same "read-only from the caller's point of view"
+    /// contract those two methods document: [`Self::radio_rev`]/
+    /// [`Self::radio_last_bytes`] are the internal state this call
+    /// advances, via the same `Cell`/`RefCell`-behind-`&self` shape.
+    #[must_use]
+    pub fn radio_snapshot(&self, buf: &mut [u8]) -> usize {
+        let model = self.model.borrow();
+        let device_wizard_open = self.device_wizard_open();
+        let mut bytes = radio::encode_radio_snapshot(&model, device_wizard_open, 0);
+        drop(model);
+
+        let rev = self.refresh_radio_rev(&bytes);
+        bytes[radio::OFF_RADIO_REV..radio::OFF_RADIO_REV + 2].copy_from_slice(&rev.to_le_bytes());
+
+        if bytes.len() > buf.len() {
+            return 0;
+        }
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        bytes.len()
+    }
+
+    /// Encodes the radio snapshot at the placeholder `radio_rev` of `0`,
+    /// runs it through [`Self::refresh_radio_rev`], and returns the
+    /// up-to-date rev -- the read [`Self::telemetry_snapshot`]'s page-0
+    /// append uses (design sec 13.4: "Telemetry page 0 appends `radio_rev`
+    /// ... the page polls at 30 Hz already, so it sees any change within
+    /// ~33 ms"), same shape [`Self::current_library_rev`] uses for its own
+    /// append.
+    fn current_radio_rev(&self) -> u16 {
+        let model = self.model.borrow();
+        let device_wizard_open = self.device_wizard_open();
+        let bytes = radio::encode_radio_snapshot(&model, device_wizard_open, 0);
+        drop(model);
+        self.refresh_radio_rev(&bytes)
+    }
+
+    /// The encode-compare half of [`Self::radio_snapshot`]'s rev logic --
+    /// same shape and same "compare at a fixed placeholder rev" reasoning
+    /// as [`Self::refresh_library_rev`]'s doc comment.
+    fn refresh_radio_rev(&self, body_at_rev_0: &[u8]) -> u16 {
+        let mut last = self.radio_last_bytes.borrow_mut();
+        if last.as_slice() != body_at_rev_0 {
+            let next = self.radio_rev.get().wrapping_add(1).max(1);
+            self.radio_rev.set(next);
+            *last = body_at_rev_0.to_vec();
+        }
+        self.radio_rev.get()
     }
 
     /// `EQ BEGIN`: starts a fresh [`EqApoSession`], discarding any

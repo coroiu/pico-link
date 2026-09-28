@@ -185,7 +185,7 @@ fn volume_source_label(source: VolumeSource) -> &'static str {
 fn snapshot_json(bytes: &[u8], snap: &HomeSnapshot) -> String {
     let faults: Vec<String> = snap.faults.iter().map(|f| decoded_fault_json(*f)).collect();
     std::format!(
-        "{{\n  \"wire_len\": {},\n  \"uptime_ms\": {},\n  \"snap_seq\": {},\n  \"link_connected\": {},\n  \"codec_word\": {},\n  \"kbps\": {},\n  \"kbps_adaptive\": {},\n  \"kbps_is_live\": {},\n  \"device_name\": {},\n  \"fx_preset_name\": {},\n  \"volume_present\": {},\n  \"volume_level\": {},\n  \"volume_muted\": {},\n  \"volume_source\": {},\n  \"level_present\": {},\n  \"peak_l\": {},\n  \"peak_r\": {},\n  \"rms_l\": {},\n  \"rms_r\": {},\n  \"received_ms\": {},\n  \"faults\": [\n    {}\n  ],\n  \"library_rev\": {},\n  \"host_preview_active\": {},\n  \"device_editor_open\": {},\n  \"device_editor_effect_id\": {},\n  \"presets_ready\": {},\n  \"codec_fallback_reason\": {}\n}}\n",
+        "{{\n  \"wire_len\": {},\n  \"uptime_ms\": {},\n  \"snap_seq\": {},\n  \"link_connected\": {},\n  \"codec_word\": {},\n  \"kbps\": {},\n  \"kbps_adaptive\": {},\n  \"kbps_is_live\": {},\n  \"device_name\": {},\n  \"fx_preset_name\": {},\n  \"volume_present\": {},\n  \"volume_level\": {},\n  \"volume_muted\": {},\n  \"volume_source\": {},\n  \"level_present\": {},\n  \"peak_l\": {},\n  \"peak_r\": {},\n  \"rms_l\": {},\n  \"rms_r\": {},\n  \"received_ms\": {},\n  \"faults\": [\n    {}\n  ],\n  \"library_rev\": {},\n  \"host_preview_active\": {},\n  \"device_editor_open\": {},\n  \"device_editor_effect_id\": {},\n  \"presets_ready\": {},\n  \"codec_fallback_reason\": {},\n  \"radio_rev\": {}\n}}\n",
         bytes.len(),
         snap.uptime_ms,
         snap.snap_seq,
@@ -213,6 +213,7 @@ fn snapshot_json(bytes: &[u8], snap: &HomeSnapshot) -> String {
         snap.device_editor_effect_id,
         json_bool(snap.presets_ready),
         snap.codec_fallback_reason,
+        snap.radio_rev,
     )
 }
 
@@ -222,7 +223,7 @@ fn snapshot_json(bytes: &[u8], snap: &HomeSnapshot) -> String {
 /// stable past offset 163 (all-zero/`false` tail) and only their length
 /// changes (163 -> [`HOME_SNAPSHOT_LEN`], 169).
 fn no_extras() -> HomeSnapshotExtras {
-    HomeSnapshotExtras { library_rev: 0, host_preview_active: false, device_editor_open: false, device_editor_effect_id: 0, presets_ready: false, codec_fallback_reason: 0 }
+    HomeSnapshotExtras { library_rev: 0, host_preview_active: false, device_editor_open: false, device_editor_effect_id: 0, presets_ready: false, codec_fallback_reason: 0, radio_rev: 0 }
 }
 
 /// Encodes `model`/`presets` at `(now, snap_seq)` with [`no_extras`],
@@ -387,7 +388,7 @@ fn emit_home_library_extras() {
     // `HomeSnapshotExtras::codec_fallback_reason`'s doc comment).
     let model = BtModel::default();
     let presets = PresetStore::new();
-    let extras = HomeSnapshotExtras { library_rev: 0xBEEF, host_preview_active: true, device_editor_open: true, device_editor_effect_id: 7, presets_ready: true, codec_fallback_reason: 1 };
+    let extras = HomeSnapshotExtras { library_rev: 0xBEEF, host_preview_active: true, device_editor_open: true, device_editor_effect_id: 7, presets_ready: true, codec_fallback_reason: 1, radio_rev: 0xCAFE };
     emit_snapshot_fixture_with_extras("library-extras", &model, &presets, Instant::from_micros(8_000_000), 23, &extras);
 }
 
@@ -398,7 +399,7 @@ fn header_constants_match_this_proto() {
     // `home-*.bin`'s first four bytes) assumes.
     assert_eq!(TELEMETRY_PROTO, 1);
     assert_eq!(TELEMETRY_PAGE_HOME, 0);
-    assert_eq!(HOME_SNAPSHOT_LEN, 169);
+    assert_eq!(HOME_SNAPSHOT_LEN, 171);
 }
 
 fn sample_out_level(received_at: Instant) -> OutLevelSample {

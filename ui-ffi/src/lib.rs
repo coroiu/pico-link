@@ -1259,7 +1259,7 @@ pub const PL_DSP_PRESET_BLOB_LEN: usize = 80;
 /// every build, so any future append to `core`'s layout that doesn't also
 /// update this literal fails `cargo build`/`cargo test` for this crate,
 /// not silently at the C header.
-pub const PL_HOME_SNAPSHOT_LEN: usize = 169;
+pub const PL_HOME_SNAPSHOT_LEN: usize = 171;
 
 /// Compile-time proof that [`PL_HOME_SNAPSHOT_LEN`] has not drifted from
 /// [`pico_link_core::app::HOME_SNAPSHOT_LEN`] -- see that constant's doc
