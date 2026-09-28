@@ -145,6 +145,10 @@ fn emit_op_errors() {
         ("UNKNOWN_DEVICE", OpError::UnknownDevice as u8),
         ("PARSE_ERROR", OpError::ParseError as u8),
         ("APO_TOO_LARGE", OpError::ApoTooLarge as u8),
+        ("DEVICE_BUSY", OpError::DeviceBusy as u8),
+        ("RADIO_BUSY", OpError::RadioBusy as u8),
+        ("NOT_CONNECTED", OpError::NotConnected as u8),
+        ("PAIRED_FULL", OpError::PairedFull as u8),
     ];
     let ops = [
         ("SAVE_EFFECT", HostOpCode::SaveEffect.wire()),
@@ -153,6 +157,15 @@ fn emit_op_errors() {
         ("PREVIEW", HostOpCode::Preview.wire()),
         ("PREVIEW_END", HostOpCode::PreviewEnd.wire()),
         ("PARSE_APO", HostOpCode::ParseApo.wire()),
+        // Design sec 13.3 (bead `pico-link-jyhk.26`): device-management ops,
+        // dispatched from `host_op_radio.rs`, sharing this same op-code space.
+        ("SCAN_START", HostOpCode::ScanStart.wire()),
+        ("SCAN_STOP", HostOpCode::ScanStop.wire()),
+        ("CONNECT", HostOpCode::Connect.wire()),
+        ("DISCONNECT", HostOpCode::Disconnect.wire()),
+        ("FORGET", HostOpCode::Forget.wire()),
+        ("SET_DEVICE_QUALITY", HostOpCode::SetDeviceQuality.wire()),
+        ("CONNECT_CANCEL", HostOpCode::ConnectCancel.wire()),
     ];
     let flags = [("BYPASS", FLAG_BYPASS)];
 
