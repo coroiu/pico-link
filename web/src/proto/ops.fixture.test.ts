@@ -45,9 +45,9 @@ describe("fixtures/host_op/op-errors.json vs ops.ts's tables", () => {
     expect(OP_PROTO).toBe(opErrors.op_proto);
   });
 
-  it("every OpError name/ordinal matches core's fixture exactly (all 20 values)", () => {
+  it("every OpError name/ordinal matches core's fixture exactly (all 24 values)", () => {
     const expectedNames = Object.keys(opErrors.errors);
-    expect(expectedNames).toHaveLength(20);
+    expect(expectedNames).toHaveLength(24);
     for (const name of expectedNames) {
       const camel = name
         .toLowerCase()
@@ -58,7 +58,7 @@ describe("fixtures/host_op/op-errors.json vs ops.ts's tables", () => {
       expect((OpError as Record<string, number>)[camel]).toBe(opErrors.errors[name]);
     }
     // No extra values on our side either.
-    expect(Object.keys(OpError)).toHaveLength(20);
+    expect(Object.keys(OpError)).toHaveLength(24);
   });
 
   it("op codes match", () => {
