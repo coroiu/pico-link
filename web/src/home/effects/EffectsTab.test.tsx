@@ -225,7 +225,7 @@ describe("EffectsTab live preview", () => {
     expect(previewEndSpy).toHaveBeenCalled();
   });
 
-  it("ends the preview on Save", async () => {
+  it("keeps previewing with the saved values after Save, since the editor stays open", async () => {
     const { controller, transport } = await setup({ library: libraryWith([{ id: 1, persistedSeq: 1, preset: WARM }], [CONNECTED_DEVICE]) });
     const controlOutSpy = vi.spyOn(transport, "controlOut");
     render(<EffectsTab library={controller} connectedAddr={CONNECTED_DEVICE.addr} />);
@@ -236,11 +236,19 @@ describe("EffectsTab live preview", () => {
 
     fireEvent.change(nameInput, { target: { value: "Cozy" } });
     const previewEndSpy = vi.spyOn(controller, "previewEnd");
+    const previewStartSpy = vi.spyOn(controller, "previewStart");
     const saveButton = await screen.findByTestId("save-button");
     await waitFor(() => expect(saveButton).not.toBeDisabled());
     fireEvent.click(saveButton);
     await waitFor(() => expect(screen.getByTestId("effect-status")).toHaveTextContent("Saved"), { timeout: 3000 });
-    expect(previewEndSpy).toHaveBeenCalled();
+
+    // Save does not end the preview: the editor is still open (still shows
+    // "Previewing on Cans"), so no PREVIEW_END is sent...
+    expect(previewEndSpy).not.toHaveBeenCalled();
+    expect(screen.getByTestId("effect-status")).toHaveTextContent(/previewing on cans/i);
+    // ...and the preview effect resends with the now-persisted effect id and
+    // the saved (renamed) values, once the debounce settles.
+    await waitFor(() => expect(previewStartSpy).toHaveBeenCalledWith(1, expect.objectContaining({ name: "Cozy" }), false), { timeout: 1000 });
   });
 });
 
