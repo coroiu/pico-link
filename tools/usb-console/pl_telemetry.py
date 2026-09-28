@@ -191,9 +191,48 @@ def get_telemetry_raw(dev, page: int = TELEMETRY_PAGE_HOME) -> bytes:
     return bytes(dev.ctrl_transfer(BM_REQUEST_TYPE_IN, REQ_GET_TELEMETRY, page, ITF_NUM_CONFIG, HOME_SNAPSHOT_LEN))
 
 
+def _not_ready_snapshot(raw_len: int) -> dict:
+    """A too-short (possibly zero-byte) GET_TELEMETRY reply, decoded as
+    "not ready" rather than raised as an error (bead `pico-link-s6hh`).
+
+    As of that bead, healthy firmware always replies at least
+    HOME_SNAPSHOT_LEN bytes (a synthesized snap_seq-0 header before the
+    first real snapshot) -- see usb_config_itf.c's configd_init. A reply
+    shorter than that only happens against OLDER firmware that still
+    replies zero bytes pre-boot-settle, so this is a same-shaped fallback
+    dict (snap_seq 0, everything else zeroed/empty) rather than a second
+    error path callers must special-case.
+    """
+    return {
+        "proto": 0,
+        "page": 0,
+        "len": raw_len,
+        "uptime_ms": 0,
+        "snap_seq": 0,
+        "link_connected": False,
+        "adaptive": False,
+        "kbps_is_live": False,
+        "volume_present": False,
+        "muted": False,
+        "level_present": False,
+        "kbps": 0,
+        "codec_word": "",
+        "device_name": "",
+        "fx_preset_name": "",
+        "volume_level": 0,
+        "volume_source": "unknown(0)",
+        "peak_l": 0,
+        "peak_r": 0,
+        "rms_l": 0,
+        "rms_r": 0,
+        "received_ms": 0,
+        "faults": [],
+    }
+
+
 def decode_home_snapshot(raw: bytes) -> dict:
     if len(raw) < HOME_SNAPSHOT_LEN:
-        raise ValueError(f"short telemetry reply: {len(raw)} < {HOME_SNAPSHOT_LEN}")
+        return _not_ready_snapshot(len(raw))
 
     (
         proto, page, length, uptime_ms, snap_seq,
