@@ -346,6 +346,17 @@ pub struct PlUi {
     /// "never published" sentinel: `App::refresh_library_rev`'s own doc
     /// comment guarantees a real rev is never `0`.
     last_library_rev: core::cell::Cell<u16>,
+    /// The `radio_rev` [`pl_ui_radio`] last returned a nonzero-length
+    /// encode for, or `0` if it has never yet published one -- same
+    /// "returns 0 when unchanged" bookkeeping as [`PlUi::last_library_rev`]
+    /// (design section 13.8, bead `pico-link-jyhk.28`), one call above
+    /// [`pico_link_core::app::App::radio_snapshot`], which -- like
+    /// `library_snapshot` -- always fully re-encodes on every call and has
+    /// no such signal of its own. `Cell`, not a plain field, for the same
+    /// reason as `last_library_rev`: [`pl_ui_radio`] takes `*const PlUi`.
+    /// `0` is a safe "never published" sentinel: `App::refresh_radio_rev`'s
+    /// `.max(1)` guarantees a real rev is never `0`.
+    last_radio_rev: core::cell::Cell<u16>,
 }
 
 /// Creates a new UI instance rendering into a `width`x`height` framebuffer,
@@ -402,6 +413,7 @@ pub extern "C" fn pl_ui_create(width: u32, height: u32) -> *mut PlUi {
         last_damage_rects: [PlDamageRect { x: 0, y: 0, w: 0, h: 0 }; 1],
         last_dsp_program: None,
         last_library_rev: core::cell::Cell::new(0),
+        last_radio_rev: core::cell::Cell::new(0),
     };
     Box::into_raw(Box::new(ui))
 }
@@ -3443,6 +3455,67 @@ pub unsafe extern "C" fn pl_ui_library(ui: *const PlUi, buf: *mut u8, cap: usize
     written
 }
 
+/// Encodes the `GET_RADIO` (0x08) snapshot into `buf` (design section 13.8;
+/// wire layout owned by `pico_link_core::app::radio`, not duplicated
+/// here) -- `ui-ffi`'s wrapper over
+/// [`pico_link_core::app::App::radio_snapshot`]. C is expected to call this
+/// from the superloop on a real `GET_RADIO` SETUP, same publish pattern as
+/// `GET_LIBRARY`/`GET_TELEMETRY`.
+///
+/// Returns the number of bytes written -- `0` if `ui`/`buf` is null, `cap`
+/// is too small to hold the whole snapshot (never a partial write, same
+/// contract as [`pl_ui_library`]), OR the freshly encoded snapshot's
+/// `radio_rev` is unchanged from the last snapshot THIS `PlUi` handed back
+/// through this function (same "returns 0 when unchanged" contract as
+/// [`pl_ui_library`], mirrored here per bead `pico-link-jyhk.28`'s
+/// investigation). That third case is this function's own bookkeeping
+/// ([`PlUi::last_radio_rev`]) layered on top of `radio_snapshot`, which
+/// always fully re-encodes on every call and has no such signal of its
+/// own -- see that method's doc comment. The `radio_rev` field lives at
+/// wire offset 4 (same header shape as `GET_LIBRARY`), read directly out
+/// of the freshly written `buf` rather than re-deriving it, so this can
+/// never drift from what C actually receives.
+///
+/// A caller that always wants the bytes regardless of change should
+/// compare its own last-seen `radio_rev` from a previous successful call
+/// instead of relying on `0` meaning "nothing to see" -- `0` here also
+/// covers the ordinary too-small-buffer failure, exactly as
+/// [`pl_ui_library`]'s `0` does.
+///
+/// `ui` is `*const`, not `*mut`, matching `radio_snapshot`'s own `&self`
+/// contract -- same shape [`pl_ui_library`] uses.
+///
+/// # Safety
+///
+/// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
+/// destroyed. `buf`, if non-null, must point to at least `cap` bytes of
+/// valid, writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_radio(ui: *const PlUi, buf: *mut u8, cap: usize) -> usize {
+    if ui.is_null() || buf.is_null() {
+        return 0;
+    }
+    // SAFETY: caller contract above.
+    let ui = unsafe { &*ui };
+    // SAFETY: `buf` is non-null and, per the caller contract, points to at
+    // least `cap` bytes of valid, writable storage.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
+    let written = ui.app.radio_snapshot(out);
+    if written < 6 {
+        // Too small to hold even the header's `radio_rev` field (offset
+        // 4..6) -- `radio_snapshot` already returned `0` for "buffer too
+        // small", but guard defensively rather than reading past what was
+        // actually written.
+        return written;
+    }
+    let rev = u16::from_le_bytes([out[4], out[5]]);
+    if rev == ui.last_radio_rev.get() {
+        return 0;
+    }
+    ui.last_radio_rev.set(rev);
+    written
+}
+
 /// Runs one `HOST_OP` (0x06) request through `ui`'s [`App`], then
 /// immediately encodes the resulting `GET_OP_STATUS` (0x07) reply into
 /// `out` -- `ui-ffi`'s wrapper over
@@ -3525,12 +3598,12 @@ pub unsafe extern "C" fn pl_ui_host_op(ui: *mut PlUi, request: *const u8, in_len
     ui.app.host_op_status(out)
 }
 
-/// Clears any active host preview (`ui-ffi`'s wrapper over
-/// [`pico_link_core::app::App::host_preview_end`]) -- called by C after
+/// Clears any active host preview/scan lease (`ui-ffi`'s wrapper over
+/// [`pico_link_core::app::App::host_lease_expired`]) -- called by C after
 /// ~2s with no `iface-6` SETUP traffic (design section 7's lease), NOT by
 /// the `PREVIEW_END` op itself (`op 5`, handled inside [`pl_ui_host_op`]
 /// via `App::host_op`'s own dispatch). A no-op if there was no active
-/// preview.
+/// preview/scan.
 ///
 /// Does nothing if `ui` is null.
 ///
@@ -3539,13 +3612,29 @@ pub unsafe extern "C" fn pl_ui_host_op(ui: *mut PlUi, request: *const u8, in_len
 /// `ui` must be null or a live pointer from [`pl_ui_create`] not yet
 /// destroyed.
 #[no_mangle]
-pub unsafe extern "C" fn pl_ui_host_preview_end(ui: *mut PlUi) {
+pub unsafe extern "C" fn pl_ui_host_lease_expired(ui: *mut PlUi) {
     if ui.is_null() {
         return;
     }
     // SAFETY: caller contract above.
     let ui = unsafe { &mut *ui };
-    ui.app.host_preview_end();
+    ui.app.host_lease_expired();
+}
+
+/// Deprecated alias for [`pl_ui_host_lease_expired`], kept so the existing
+/// firmware call site keeps building until bead `pico-link-jyhk.29`
+/// switches it over -- `App::host_lease_expired` was generalised (bead
+/// `pico-link-jyhk.26`) to also cover an expired web scan lease (design
+/// section 13.8, R4), not just a host device-wizard preview, so the name
+/// `pl_ui_host_preview_end` no longer describes everything it now does.
+///
+/// # Safety
+///
+/// Same contract as [`pl_ui_host_lease_expired`].
+#[no_mangle]
+pub unsafe extern "C" fn pl_ui_host_preview_end(ui: *mut PlUi) {
+    // SAFETY: caller contract above, forwarded unchanged.
+    unsafe { pl_ui_host_lease_expired(ui) }
 }
 
 // --- Bead pico-link-ryw.11: debug-only EQ import over the PL_DEBUG_REMOTE
@@ -6142,6 +6231,83 @@ mod tests {
             assert_eq!(fourth, 0, "unchanged again after the settled state must return 0");
 
             pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_radio_null_or_too_small_returns_zero() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+            let mut buf = [0u8; 2048];
+
+            let n = pl_ui_radio(core::ptr::null(), buf.as_mut_ptr(), buf.len());
+            assert_eq!(n, 0, "null ui must return 0");
+
+            let n = pl_ui_radio(ui, core::ptr::null_mut(), buf.len());
+            assert_eq!(n, 0, "null buf must return 0");
+
+            let n = pl_ui_radio(ui, buf.as_mut_ptr(), 2);
+            assert_eq!(n, 0, "a buffer too small for even the header must return 0");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    /// Bead `pico-link-jyhk.28`: a second call with nothing changed must
+    /// return `0` (this crate's own [`PlUi::last_radio_rev`] bookkeeping,
+    /// layered on top of `App::radio_snapshot`'s always-re-encode behaviour
+    /// -- see [`pl_ui_radio`]'s doc comment), and a real mutation (a scan
+    /// start via [`pl_ui_host_op`], op 7 -- design sec 13.3) must make the
+    /// next call publish again with a strictly greater `radio_rev`.
+    #[test]
+    fn pl_ui_radio_returns_zero_when_unchanged_and_republishes_after_a_real_change() {
+        let ui = new_ui();
+        unsafe {
+            ready_ui(ui);
+            let mut buf = [0u8; 2048];
+
+            let first = pl_ui_radio(ui, buf.as_mut_ptr(), buf.len());
+            assert!(first >= 6, "first call must publish a real snapshot");
+            let first_rev = u16::from_le_bytes([buf[4], buf[5]]);
+            assert_ne!(first_rev, 0, "App::refresh_radio_rev never yields 0");
+
+            let second = pl_ui_radio(ui, buf.as_mut_ptr(), buf.len());
+            assert_eq!(second, 0, "an unchanged radio snapshot must return 0 on the second call");
+
+            // SCAN_START's `NOT_READY` gate reads `BtModel::store_status`
+            // (folded from `PlEventTag::StoreLoaded`), a different flag
+            // from `ready_ui`'s `PresetStoreLoaded` (the DSP preset
+            // store's own readiness) -- see `host_op_radio.rs` test
+            // helper `ready`'s doc comment for the same distinction.
+            let store_loaded_event = PlEvent {
+                version: PL_EVENT_ABI_VERSION,
+                tag: PlEventTag::StoreLoaded as u32,
+                payload: PlEventPayload { store_loaded: PlStoreLoadedPayload { status: PlStoreStatus::FirstBoot as u8, count: 0 } },
+            };
+            pl_ui_push_event(ui, store_loaded_event);
+
+            let mut op_out = [0u8; 200];
+            let request: [u8; 4] = [1, 7, 1, 0]; // OP_PROTO=1 (matches REQUEST_SAVE_CREATE above), op 7 (SCAN_START), seq 1, no body.
+            let _ = pl_ui_host_op(ui, request.as_ptr(), request.len(), op_out.as_mut_ptr(), op_out.len());
+            assert_eq!(op_out[3], 1, "the scan start must be accepted (state DONE)");
+
+            let third = pl_ui_radio(ui, buf.as_mut_ptr(), buf.len());
+            assert!(third >= 6, "a real content change must publish again");
+            let third_rev = u16::from_le_bytes([buf[4], buf[5]]);
+            assert_ne!(third_rev, first_rev, "radio_rev must change after a real scan start");
+
+            let fourth = pl_ui_radio(ui, buf.as_mut_ptr(), buf.len());
+            assert_eq!(fourth, 0, "unchanged again after the settled state must return 0");
+
+            pl_ui_destroy(ui);
+        }
+    }
+
+    #[test]
+    fn pl_ui_host_lease_expired_null_is_a_no_op() {
+        unsafe {
+            pl_ui_host_lease_expired(core::ptr::null_mut());
         }
     }
 }
