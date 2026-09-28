@@ -2,13 +2,57 @@ use core::cell::Ref;
 
 #[cfg(test)]
 use super::ui_state::{HomeFace, WizardPhase};
-use super::{App, BtModel};
+use super::{radio_actions, App, BtModel, ConnectInitiator, DeviceAddr};
 #[cfg(test)]
 use super::Command;
 #[cfg(test)]
 use crate::render::Screen;
 
 impl App {
+    /// **Test/example support only** (bead `pico-link-chc3`, ADA DESIGN v2
+    /// R6): seeds [`BtModel::attempt`] exactly as
+    /// [`crate::app::radio_actions::connect`] would for `addr` and returns
+    /// the freshly allocated `seq`, WITHOUT queuing the `Command::Connect`
+    /// this normally also queues (popped and discarded here) -- so a test
+    /// or example that injects `Event::ConnectSucceeded`/`ConnectFailed`/
+    /// `ConnectStepChanged`/`ConnectRetrying` directly (bypassing the
+    /// wizard/`radio_actions::connect` flow those normally ride on, e.g.
+    /// `core/examples/wizard_screenshots.rs` or the plain `handle_event`
+    /// unit tests throughout `core/src/app/tests.rs`) can construct an
+    /// event whose `seq` the seq-scoped fold (`fold.rs`) will actually
+    /// accept, rather than silently dropping it as a stale echo of an
+    /// attempt that (from `core`'s point of view) never existed.
+    pub fn seed_connect_attempt_for_test(&mut self, addr: DeviceAddr) -> u16 {
+        radio_actions::connect(&self.model, &self.commands, addr, alloc::string::String::new(), ConnectInitiator::Device);
+        self.commands.borrow_mut().pop_back();
+        self.model.borrow().attempt.as_ref().map_or(0, |a| a.seq)
+    }
+
+    /// **Test support only** (bead `pico-link-chc3`, ADA DESIGN v2 R6):
+    /// pops the oldest queued command and asserts it's `Command::Connect`
+    /// for `addr`/`name`, ignoring its `seq` -- since `chc3`, `seq` is a
+    /// freshly allocated, non-reproducible value (`BtModel::
+    /// attempt_seq_counter` bumped by [`crate::app::radio_actions::connect`]),
+    /// so a plain `assert_eq!` against a literal `Command::Connect` can no
+    /// longer be written at every call site that only cares about
+    /// `addr`/`name`. `pub(crate)`, not `pub`, because every call site is a
+    /// unit test elsewhere in this crate (`core/src/app/tests.rs`,
+    /// `core/src/render/wizard.rs`, `core/src/app/screens/*.rs`), never an
+    /// example (which link against `core` as an external crate).
+    ///
+    /// # Panics
+    ///
+    /// If the popped command isn't `Some(Command::Connect { addr, name, .. })`
+    /// matching both fields.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn expect_connect_command_for_test(&mut self, addr: DeviceAddr, name: &str) {
+        match self.poll_command() {
+            Some(Command::Connect { addr: got_addr, name: got_name, .. }) if got_addr == addr && got_name == name => {}
+            other => panic!("expected Command::Connect {{ addr: {addr:?}, name: {name:?}, .. }}, got {other:?}"),
+        }
+    }
+
     /// Read-only access to the live Bluetooth model, for tests/diagnostics
     /// and for any future FFI accessor that needs to read it back. Returns
     /// a [`Ref`] rather than `&BtModel` (`self.model` is a [`ModelHandle`])

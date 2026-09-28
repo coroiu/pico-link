@@ -18,7 +18,17 @@ pub enum Command {
     /// no name of their own): C's read-modify-write persist path treats an
     /// empty name as "keep whatever name the record already has", so this
     /// never regresses an already-known name.
-    Connect { addr: [u8; 6], name: String },
+    ///
+    /// `seq` is [`super::model::ConnectAttempt::seq`] -- ADA DESIGN v2
+    /// (bead `pico-link-chc3`): `core` allocates it at
+    /// [`super::radio_actions::connect`] and C echoes it on every
+    /// connect-lifecycle event ([`Event::ConnectStepChanged`]/
+    /// [`Event::ConnectRetrying`]/[`Event::ConnectSucceeded`]/
+    /// [`Event::ConnectFailed`]) so a late echo of a cancelled or
+    /// superseded attempt can be told apart from the attempt this `seq`
+    /// actually belongs to. Never `0` (see [`super::model::BtModel::
+    /// bump_attempt_seq`]'s doc comment).
+    Connect { addr: [u8; 6], name: String, seq: u16 },
     /// User-initiated: stop an in-flight inquiry scan. Needed because the
     /// inquiry scan runs a fixed 10.24s with nothing else to interrupt it:
     /// without this, B does nothing during that window and, in the
@@ -30,7 +40,14 @@ pub enum Command {
     /// `Connecting` or phase 5 `NotResponding`). Whether C actually
     /// implements the abort (real ACL/AVDTP teardown) or this stays
     /// plumbed-but-unhandled is a separate, C-side decision.
-    CancelConnect { addr: [u8; 6] },
+    ///
+    /// `seq` is the [`super::model::ConnectAttempt::seq`] being cancelled
+    /// (`0` if there was no attempt in flight to cancel -- see
+    /// [`super::radio_actions::cancel_connect`]'s doc comment). ADA DESIGN
+    /// v2: C scopes the abort to the cid owned by this `seq`, never
+    /// globally -- a debug-only `PL_SEQ_ANY` ("cancel whatever is in
+    /// flight") exists on the C side only and is never produced here.
+    CancelConnect { addr: [u8; 6], seq: u16 },
     /// `core`'s auto-reconnect/remember-this-device policy output: "please
     /// persist `addr` as the last-used device." Queued by
     /// [`App::on_connect_succeeded`] once a connect attempt actually
@@ -257,7 +274,15 @@ pub enum Event {
     ConnectAttemptStarted,
     DeviceDiscovered(DeviceEntry),
     DevicesCleared,
-    ConnectFailed { addr: [u8; 6], reason: ConnectFailureReason },
+    /// `seq` is ADA DESIGN v2's (bead `pico-link-chc3`) attempt identity --
+    /// see [`Command::Connect::seq`]'s doc comment. `0` means "not core's
+    /// attempt" (a remote-initiated session, or the `PL_DEBUG_REMOTE`
+    /// bypass): [`App::record_connect_failure`] logs it but touches
+    /// neither [`BtModel::attempt`] nor the wizard for a `0` `seq`.
+    /// Nonzero: applied iff it matches [`BtModel::attempt`]'s `seq`,
+    /// dropped otherwise (a stale echo of a cancelled or superseded
+    /// attempt) -- see that method's doc comment.
+    ConnectFailed { addr: [u8; 6], reason: ConnectFailureReason, seq: u16 },
     /// One of phase 4's four named sub-steps has begun (ACL connect,
     /// SSP/link-key pairing, AVDTP stream setup, then codec negotiation --
     /// see [`ConnectStep`]). Only meaningful while the wizard's phase is
@@ -265,13 +290,18 @@ pub enum Event {
     /// stray event outside that window -- e.g. arriving after the user
     /// backed out -- is silently ignored; see
     /// [`App::on_connect_step_changed`]).
-    ConnectStepChanged(ConnectStep),
+    ///
+    /// `seq`: same identity/gating rule as [`Event::ConnectFailed::seq`],
+    /// except a `0` `seq` here is simply ignored (ADA DESIGN v2) -- a
+    /// remote session has no wizard step sequence to report against.
+    ConnectStepChanged(ConnectStep, u16),
     /// C is about to retry the in-flight connect attempt after the ~6s
     /// "not responding" surfacing point -- carries the attempt number so
     /// the wizard's "Still trying (N)" counter has something to increment.
     /// Like [`Event::ConnectStepChanged`], a no-op outside the
-    /// `Connecting`/`NotResponding` phases.
-    ConnectRetrying { attempt: u16 },
+    /// `Connecting`/`NotResponding` phases, and outside its own matching
+    /// `seq` (same rule as [`Event::ConnectStepChanged::seq`]).
+    ConnectRetrying { attempt: u16, seq: u16 },
     /// The in-flight connect attempt succeeded. `degraded` distinguishes
     /// plain success (auto-dismisses) from degraded success (does not --
     /// see [`Event::WizardAutoDismiss`]'s doc comment for why that
@@ -283,7 +313,19 @@ pub enum Event {
     /// wizard (which separately tracks `addr` on [`WizardPhase`]) or the
     /// `PL_DEBUG_REMOTE` bypass path (which does not touch the wizard at
     /// all).
-    ConnectSucceeded { addr: [u8; 6], degraded: bool },
+    ///
+    /// `seq`: ADA DESIGN v2's attempt identity (same rule as
+    /// [`Event::ConnectFailed::seq`]) -- EXCEPT `0` here means a session
+    /// genuinely *appeared* (a headset-initiated reconnect, or the
+    /// `PL_DEBUG_REMOTE` bypass): [`App::on_connect_succeeded`] still sets
+    /// [`BtModel::connected_addr`] and queues [`Command::PersistDevice`]
+    /// for it, but leaves [`BtModel::attempt`]/`last_outcome`/the wizard
+    /// untouched, so it can never resurrect or conclude an attempt it
+    /// didn't start. A nonzero `seq` not matching the live attempt is
+    /// dropped entirely (F7: a late success for an attempt the user
+    /// already cancelled is a stray echo of *that* attempt, not a new
+    /// session).
+    ConnectSucceeded { addr: [u8; 6], degraded: bool, seq: u16 },
     /// C's own ~2s timer firing -- explicitly *not* a core-owned clock
     /// feature, see [`crate::app`]'s `now_us`/`tick` doc comments for why
     /// timers stay on the C side of this seam. Pops the wizard back to

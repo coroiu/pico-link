@@ -723,7 +723,7 @@ mod tests {
         app.handle_input(vec![NavIntent::Select]); // activate the (only) row
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
         assert_eq!(app.poll_command(), Some(Command::StartScan));
-        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::from("Cans") }));
+        app.expect_connect_command_for_test(addr, "Cans");
     }
 
     #[test]
@@ -755,11 +755,7 @@ mod tests {
 
         app.handle_input(vec![NavIntent::Select]); // activate whatever landed at index 0
         assert_eq!(app.poll_command(), Some(Command::StartScan));
-        assert_eq!(
-            app.poll_command(),
-            Some(Command::Connect { addr: headphones_addr, name: String::from("Cans") }),
-            "the phone must have been filtered out, leaving the headphones as the only (and therefore default-selected) row"
-        );
+        app.expect_connect_command_for_test(headphones_addr, "Cans");
     }
 
     #[test]
@@ -781,11 +777,7 @@ mod tests {
         }));
         app.handle_input(vec![NavIntent::Select]);
         assert_eq!(app.poll_command(), Some(Command::StartScan));
-        assert_eq!(
-            app.poll_command(),
-            Some(Command::Connect { addr, name: String::from("Mystery Cans") }),
-            "an unreported Class-of-Device must not hide a device from the scan list"
-        );
+        app.expect_connect_command_for_test(addr, "Mystery Cans");
     }
 
     #[test]
@@ -810,11 +802,7 @@ mod tests {
         app.handle_input(vec![NavIntent::Down; 11]);
         app.handle_input(vec![NavIntent::Select]);
         assert_eq!(app.poll_command(), Some(Command::StartScan));
-        assert_eq!(
-            app.poll_command(),
-            Some(Command::Connect { addr: [12; 6], name: String::from("Device 12") }),
-            "the 12th device must still be present and connectable at the cap boundary"
-        );
+        app.expect_connect_command_for_test([12; 6], "Device 12");
     }
 
     #[test]
@@ -916,10 +904,10 @@ mod tests {
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
-        app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
+        app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing, 1));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Pairing, started: untimed() });
 
-        app.handle_event(Event::ConnectStepChanged(ConnectStep::SettingUpAudio));
+        app.handle_event(Event::ConnectStepChanged(ConnectStep::SettingUpAudio, 1));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::SettingUpAudio, started: untimed() });
     }
 
@@ -927,7 +915,7 @@ mod tests {
     fn connect_step_changed_is_ignored_outside_the_connecting_phases() {
         let mut app = App::new(240, 240);
         // Wizard not even open -- default phase is NothingFound.
-        app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
+        app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing, 1));
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::NothingFound);
     }
 
@@ -939,10 +927,10 @@ mod tests {
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
-        app.handle_event(Event::ConnectRetrying { attempt: 1 });
+        app.handle_event(Event::ConnectRetrying { attempt: 1, seq: 1 });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::NotResponding { addr, attempt: 1 });
 
-        app.handle_event(Event::ConnectRetrying { attempt: 2 });
+        app.handle_event(Event::ConnectRetrying { attempt: 2, seq: 1 });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::NotResponding { addr, attempt: 2 });
     }
 
@@ -953,13 +941,13 @@ mod tests {
         let addr = [6; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
-        app.handle_event(Event::ConnectRetrying { attempt: 1 });
+        app.handle_event(Event::ConnectRetrying { attempt: 1, seq: 1 });
         app.poll_command(); // drain StartScan
         app.poll_command(); // drain the first Connect
 
         app.handle_input(vec![NavIntent::ShortcutX]);
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
-        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::new() }));
+        app.expect_connect_command_for_test(addr, "");
     }
 
     #[test]
@@ -970,7 +958,8 @@ mod tests {
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1041 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1041 });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded: false });
     }
 
@@ -983,7 +972,8 @@ mod tests {
         let addr = [8; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1042 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1042 });
         assert_eq!(app.navigator_depth(), 3);
 
         app.handle_event(Event::WizardAutoDismiss);
@@ -1013,12 +1003,35 @@ mod tests {
         assert_eq!(app.navigator_depth(), 2, "sitting on Devices, not the wizard");
 
         let addr = [10; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1043 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1043 });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Succeeded { degraded: false }, "C sets this regardless of screen");
 
         app.handle_event(Event::WizardAutoDismiss);
         assert_eq!(app.navigator_depth(), 2, "a connect success must not pop a screen the wizard didn't push");
         assert_eq!(app.home_face_for_test(), HomeFace::Menu, "must not force Home's face either when the wizard isn't on top");
+    }
+
+    #[test]
+    fn seq_zero_connect_failed_does_not_touch_attempt_or_wizard() {
+        // Code review on bead `pico-link-chc3`: `record_connect_failure`
+        // did not special-case `seq == 0` the way `on_connect_succeeded`
+        // does, so a remote-initiated or `PL_DEBUG_REMOTE`-bypass
+        // `ConnectFailed { seq: 0 }` unconditionally forced `wizard_phase`
+        // to `Failed` even with no attempt in flight and no wizard open.
+        // Mirrors `background_connect_success_does_not_navigate_away_
+        // from_another_screen`'s shape, but for the failure path.
+        let mut app = App::new(240, 240);
+        app.handle_input(vec![NavIntent::Select]); // Home status -> menu face
+        app.handle_input(vec![NavIntent::Select]); // Bluetooth row -> pushes Devices
+        assert_eq!(app.navigator_depth(), 2, "sitting on Devices, no wizard open, no attempt in flight");
+
+        let phase_before = app.wizard_phase_for_test();
+        let addr = [13; 6];
+        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout, seq: 0 });
+
+        assert_eq!(app.wizard_phase_for_test(), phase_before, "seq == 0 must not touch wizard_phase -- there is no attempt to fail");
+        assert_eq!(app.navigator_depth(), 2, "seq == 0 must not navigate anywhere");
     }
 
     #[test]
@@ -1028,7 +1041,8 @@ mod tests {
         let addr = [9; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: true });
+        let seq_for_test_1044 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: true, seq: seq_for_test_1044 });
 
         app.handle_event(Event::WizardAutoDismiss);
         assert_eq!(app.navigator_depth(), 3, "degraded success must require acknowledgement, never auto-dismiss");
@@ -1043,7 +1057,8 @@ mod tests {
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
 
-        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink });
+        let seq_for_test_1045 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink, seq: seq_for_test_1045 });
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Failed { addr, reason: ConnectFailureReason::NoA2dpSink });
     }
 
@@ -1054,7 +1069,8 @@ mod tests {
         let addr = [11; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
-        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink });
+        let seq_for_test_1046 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::NoA2dpSink, seq: seq_for_test_1046 });
         app.poll_command(); // drain StartScan
         app.poll_command(); // drain Connect
 
@@ -1071,13 +1087,14 @@ mod tests {
         let addr = [12; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]);
-        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout });
+        let seq_for_test_1047 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectFailed { addr, reason: ConnectFailureReason::Timeout, seq: seq_for_test_1047 });
         app.poll_command();
         app.poll_command();
 
         app.handle_input(vec![NavIntent::ShortcutX]);
         assert_eq!(app.wizard_phase_for_test(), WizardPhase::Connecting { addr, step: ConnectStep::Connecting, started: untimed() });
-        assert_eq!(app.poll_command(), Some(Command::Connect { addr, name: String::new() }));
+        app.expect_connect_command_for_test(addr, "");
     }
 
     // --- B always aborts the whole flow, from every phase (design section 9) ---
@@ -1139,7 +1156,7 @@ mod tests {
         assert_eq!(app.navigator_depth(), 2, "B must pop the wizard back to Devices");
         assert_eq!(
             app.poll_command(),
-            Some(Command::CancelConnect { addr }),
+            Some(Command::CancelConnect { addr, seq: 1 }),
             "B during the connecting phase must queue CancelConnect (design section 9: 'B genuinely aborts') --              leaving the screen without this leaves the abandoned ACL/SSP/AVDTP attempt running in C"
         );
     }
@@ -1207,7 +1224,8 @@ mod tests {
 
         // The link actually came up after the cancel was sent -- C's cancel
         // doesn't suppress an outcome already in flight on the wire.
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1048 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1048 });
 
         assert_eq!(app.model().connected_addr, Some(addr), "a genuine post-cancel success must be reported as connected");
         assert_eq!(app.model().attempt, None, "a concluded success leaves no in-flight attempt");
@@ -1225,7 +1243,7 @@ mod tests {
         let addr = [14; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::new(), rssi: -40, class_of_device: 0 }));
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
-        app.handle_event(Event::ConnectRetrying { attempt: 1 }); // -> NotResponding
+        app.handle_event(Event::ConnectRetrying { attempt: 1, seq: 1 }); // -> NotResponding
         app.poll_command(); // drain StartScan
         app.poll_command(); // drain Connect
 
@@ -1233,7 +1251,7 @@ mod tests {
         assert_eq!(app.navigator_depth(), 2, "B must pop the wizard back to Devices");
         assert_eq!(
             app.poll_command(),
-            Some(Command::CancelConnect { addr }),
+            Some(Command::CancelConnect { addr, seq: 1 }),
             "B during the not-responding phase must queue CancelConnect, same as the connecting phase"
         );
     }
@@ -1243,7 +1261,8 @@ mod tests {
         assert_back_aborts_from(|app| {
             app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [15; 6], name: String::new(), rssi: -40, class_of_device: 0 }));
             app.handle_input(vec![NavIntent::Select]);
-            app.handle_event(Event::ConnectSucceeded { addr: [15; 6], degraded: true });
+            let seq_for_test_17 = app.seed_connect_attempt_for_test([15; 6]);
+            app.handle_event(Event::ConnectSucceeded { addr: [15; 6], degraded: true, seq: seq_for_test_17 });
         });
     }
 
@@ -1252,7 +1271,8 @@ mod tests {
         assert_back_aborts_from(|app| {
             app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [16; 6], name: String::new(), rssi: -40, class_of_device: 0 }));
             app.handle_input(vec![NavIntent::Select]);
-            app.handle_event(Event::ConnectFailed { addr: [16; 6], reason: ConnectFailureReason::RadioError });
+            let seq_for_test_18 = app.seed_connect_attempt_for_test([16; 6]);
+            app.handle_event(Event::ConnectFailed { addr: [16; 6], reason: ConnectFailureReason::RadioError, seq: seq_for_test_18 });
         });
     }
 
@@ -1271,11 +1291,12 @@ mod tests {
         assert_eq!(app.navigator_depth(), 3);
         app.handle_input(vec![NavIntent::Select]); // -> Connecting
         assert_eq!(app.navigator_depth(), 3);
-        app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing));
+        app.handle_event(Event::ConnectStepChanged(ConnectStep::Pairing, 1));
         assert_eq!(app.navigator_depth(), 3);
-        app.handle_event(Event::ConnectRetrying { attempt: 1 });
+        app.handle_event(Event::ConnectRetrying { attempt: 1, seq: 1 });
         assert_eq!(app.navigator_depth(), 3);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1049 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1049 });
         assert_eq!(app.navigator_depth(), 3);
         app.handle_event(Event::WizardAutoDismiss);
         assert_eq!(app.navigator_depth(), 1, "auto-dismiss returns all the way to Home (pico-link-4vb.2: no more Back-Back-Back)");

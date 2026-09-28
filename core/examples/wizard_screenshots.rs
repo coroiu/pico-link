@@ -193,7 +193,7 @@ fn main() {
         open_wizard(&mut app);
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [1; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
         select_device(&mut app);
-        app.handle_event(Event::ConnectStepChanged(step));
+        app.handle_event(Event::ConnectStepChanged(step, 1));
         save_zoomed_png(&mut app, &out_dir, name);
     }
 
@@ -202,8 +202,8 @@ fn main() {
     open_wizard(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [2; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
     select_device(&mut app);
-    app.handle_event(Event::ConnectRetrying { attempt: 1 });
-    app.handle_event(Event::ConnectRetrying { attempt: 2 });
+    app.handle_event(Event::ConnectRetrying { attempt: 1, seq: 1 });
+    app.handle_event(Event::ConnectRetrying { attempt: 2, seq: 1 });
     save_zoomed_png(&mut app, &out_dir, "05_not_responding_still_trying_2");
 
     // --- Phase 6: each of the five named failures ---
@@ -220,7 +220,8 @@ fn main() {
         let addr = [3; 6];
         app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr, name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
         select_device(&mut app);
-        app.handle_event(Event::ConnectFailed { addr, reason });
+        let seq_for_test_1011 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectFailed { addr, reason, seq: seq_for_test_1011 });
         save_zoomed_png(&mut app, &out_dir, name);
     }
 
@@ -229,7 +230,8 @@ fn main() {
     open_wizard(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [4; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
     select_device(&mut app);
-    app.handle_event(Event::ConnectSucceeded { addr: [4; 6], degraded: false });
+    let seq_for_test_2 = app.seed_connect_attempt_for_test([4; 6]);
+    app.handle_event(Event::ConnectSucceeded { addr: [4; 6], degraded: false, seq: seq_for_test_2 });
     save_zoomed_png(&mut app, &out_dir, "06f_succeeded_plain");
 
     // --- Phase 6: degraded success ---
@@ -237,7 +239,8 @@ fn main() {
     open_wizard(&mut app);
     app.handle_event(Event::DeviceDiscovered(DeviceEntry { addr: [5; 6], name: String::from("Cans"), rssi: -50, class_of_device: 0 }));
     select_device(&mut app);
-    app.handle_event(Event::ConnectSucceeded { addr: [5; 6], degraded: true });
+    let seq_for_test_3 = app.seed_connect_attempt_for_test([5; 6]);
+    app.handle_event(Event::ConnectSucceeded { addr: [5; 6], degraded: true, seq: seq_for_test_3 });
     save_zoomed_png(&mut app, &out_dir, "06g_succeeded_degraded");
 
     println!("done -- {} PNGs written to {}", 1 + 1 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 1 + 1, out_dir.display());

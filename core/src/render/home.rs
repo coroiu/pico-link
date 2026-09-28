@@ -1132,7 +1132,8 @@ mod tests {
         // an unassigned connected device renders cleanly.
         let mut app = crate::app::App::new(240, 240);
         let addr = [50; 6];
-        app.handle_event(crate::app::Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1039 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(crate::app::Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1039 });
         app.poll_command();
         app.handle_event(crate::app::Event::PairedDeviceUpserted(crate::app::PairedDevice {
             addr,
@@ -1181,7 +1182,8 @@ mod tests {
         // line.
         let mut app = crate::app::App::new(240, 240);
         let addr = [51; 6];
-        app.handle_event(crate::app::Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1040 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(crate::app::Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1040 });
         app.poll_command();
         app.handle_event(crate::app::Event::PairedDeviceUpserted(crate::app::PairedDevice {
             addr,

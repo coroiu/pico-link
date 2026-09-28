@@ -1361,27 +1361,44 @@ pub struct PlDeviceDiscoveredPayload {
 /// `reason` is a plain `u32`, not [`PlFailureReason`] -- same reason and
 /// same fix as [`PlLinkStateChangedPayload::state`]; see that field's doc
 /// comment (pico-link-ptu).
+///
+/// `seq` added by ADA DESIGN v2 (bead `pico-link-chc3`), [`PL_EVENT_ABI_
+/// VERSION`] bumped 7 -> 8: the `seq` of the attempt this failure belongs
+/// to (`0` if C has none to attribute -- see [`pico_link_core::app::
+/// Event::ConnectFailed`]'s doc comment for the full seq-scoping rule
+/// `core`'s fold applies).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectFailedPayload {
     pub addr: [u8; 6],
     pub reason: u32,
+    pub seq: u16,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectStepChanged`.
 /// `step` is a plain `u32`, not [`PlConnectStep`] -- same reason as
 /// [`PlLinkStateChangedPayload::state`]; see that field's doc comment.
+///
+/// `seq` added by ADA DESIGN v2 (bead `pico-link-chc3`), [`PL_EVENT_ABI_
+/// VERSION`] bumped 7 -> 8 -- see [`PlConnectFailedPayload::seq`]'s doc
+/// comment for the shared rule.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectStepChangedPayload {
     pub step: u32,
+    pub seq: u16,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectRetrying`.
+///
+/// `seq` added by ADA DESIGN v2 (bead `pico-link-chc3`), [`PL_EVENT_ABI_
+/// VERSION`] bumped 7 -> 8 -- see [`PlConnectFailedPayload::seq`]'s doc
+/// comment for the shared rule.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectRetryingPayload {
     pub attempt: u16,
+    pub seq: u16,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::ConnectSucceeded`.
@@ -1403,11 +1420,18 @@ pub struct PlConnectRetryingPayload {
 /// directly here means auto-reconnect persistence (design point 7) works
 /// identically whether the connection was driven by a real d-pad press or
 /// the debug bypass.
+///
+/// `seq` added by ADA DESIGN v2 (bead `pico-link-chc3`), [`PL_EVENT_ABI_
+/// VERSION`] bumped 7 -> 8: `0` means the session genuinely APPEARED (a
+/// headset-initiated reconnect, or the `PL_DEBUG_REMOTE` bypass) -- see
+/// [`pico_link_core::app::Event::ConnectSucceeded`]'s doc comment for the
+/// full rule `core`'s fold applies to it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectSucceededPayload {
     pub addr: [u8; 6],
     pub degraded: u8,
+    pub seq: u16,
 }
 
 /// [`PlEvent`]'s payload when `tag == PlEventTag::CodecChanged`.
@@ -2141,7 +2165,17 @@ pub union PlEventPayload {
 // 7. `PlPresetStoreLoadedPayload` gained `next_id` -- a non-additive shape
 // change to an existing tag's payload, same class of bump as every one
 // above.
-pub const PL_EVENT_ABI_VERSION: u32 = 7;
+//
+// ADA DESIGN v2 (bead `pico-link-chc3`): bumped 7 -> 8.
+// `PlConnectStepChangedPayload`/`PlConnectRetryingPayload`/
+// `PlConnectSucceededPayload`/`PlConnectFailedPayload` all gained `seq` --
+// a non-additive shape change to four existing tags' payloads at once, same
+// class of bump as every one above. `seq` is the attempt identity `core`
+// allocates ([`pico_link_core::app::ConnectAttempt::seq`]) and C echoes back
+// on every connect-lifecycle event, so a late echo of a cancelled or
+// superseded attempt can be told apart from the attempt it actually belongs
+// to (see `.planning/design/2026-08-30-cancel-connect.md`'s "v2" section).
+pub const PL_EVENT_ABI_VERSION: u32 = 8;
 
 /// One inbound Bluetooth-domain event, C -> Rust -- the single entry point
 /// replacing the old `pl_ui_set_link_state`/`pl_ui_add_device`/
@@ -2244,7 +2278,7 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                     return;
                 }
             };
-            Event::ConnectFailed { addr: payload.addr, reason: reason.into() }
+            Event::ConnectFailed { addr: payload.addr, reason: reason.into(), seq: payload.seq }
         }
         PlEventTag::ConnectStepChanged => {
             // SAFETY: `tag` says this union currently holds `connect_step_changed`.
@@ -2256,21 +2290,21 @@ pub unsafe extern "C" fn pl_ui_push_event(ui: *mut PlUi, event: PlEvent) {
                     return;
                 }
             };
-            Event::ConnectStepChanged(step.into())
+            Event::ConnectStepChanged(step.into(), payload.seq)
         }
         PlEventTag::ConnectRetrying => {
             // SAFETY: `tag` says this union currently holds `connect_retrying`.
             // Reading it is sound regardless of `attempt`'s value -- it's a
             // plain `u16` with no validity invariant to violate.
             let payload = unsafe { event.payload.connect_retrying };
-            Event::ConnectRetrying { attempt: payload.attempt }
+            Event::ConnectRetrying { attempt: payload.attempt, seq: payload.seq }
         }
         PlEventTag::ConnectSucceeded => {
             // SAFETY: `tag` says this union currently holds `connect_succeeded`.
             // Reading it is sound regardless of `degraded`'s value -- see
             // `PlConnectSucceededPayload`'s doc comment.
             let payload = unsafe { event.payload.connect_succeeded };
-            Event::ConnectSucceeded { addr: payload.addr, degraded: payload.degraded != 0 }
+            Event::ConnectSucceeded { addr: payload.addr, degraded: payload.degraded != 0, seq: payload.seq }
         }
         PlEventTag::WizardAutoDismiss => Event::WizardAutoDismiss,
         PlEventTag::CodecChanged => {
@@ -2605,21 +2639,22 @@ pub enum PlCommandTag {
     /// pico-link-znb.7 code-review fix: user-initiated abort of an
     /// in-flight connect attempt (the wizard's phase 4/5, design section
     /// 9 -- "B genuinely aborts", not just leaves the screen). Carries
-    /// the target `addr` via the same `connect` payload member
-    /// `PlCommandTag::Connect` uses. **Plumbed through this FFI surface
-    /// but deliberately left unhandled on the C side by this bead** --
-    /// real abort semantics (tearing down an in-flight ACL/SSP/AVDTP
-    /// attempt) is real BT work beyond this bead's scope, the same way
-    /// `CancelScan`'s C-side handling needed its own follow-up bead
-    /// (pico-link-znb.2). See this bead's completion report for the
-    /// explicit callout; file the C-side bead against this tag.
+    /// its own [`PlCancelConnectPayload`] (ADA DESIGN v2, bead
+    /// `pico-link-chc3` -- moved off the shared [`PlAddrPayload`] the
+    /// instant a second field, `seq`, was needed). The real abort
+    /// semantics (tearing down an in-flight ACL/SSP/AVDTP attempt) are
+    /// implemented on the C side as of `chc3`; see that bead's design
+    /// (`.planning/design/2026-08-30-cancel-connect.md`) for the full
+    /// cid-scoped teardown/reissue protocol.
     CancelConnect = 4,
     /// Bead pico-link-cz0.6 (M5 persistence), design point 7: `core`'s
     /// auto-reconnect/remember-this-device POLICY output. Carries the
     /// target `addr` via the [`PlAddrPayload`] union member (bead
-    /// pico-link-4vb.6 moved this and [`CancelConnect`](Self::CancelConnect)
-    /// off `.connect` onto `.addr` -- see [`PlCommandPayload`]'s doc
-    /// comment; a *source*-only change, no wire byte moves for either).
+    /// pico-link-4vb.6 moved this off `.connect` onto `.addr` -- see
+    /// [`PlCommandPayload`]'s doc comment; a *source*-only change, no wire
+    /// byte moves. `chc3` later gave [`CancelConnect`](Self::CancelConnect)
+    /// its own payload instead, once it needed a `seq` field this one
+    /// still doesn't.).
     PersistDevice = 5,
     /// Bead pico-link-4vb.6 (T2), design
     /// `.planning/design/2026-09-01-remembered-devices.md` section 5.3:
@@ -2739,28 +2774,56 @@ pub enum PlCommandTag {
 /// [`PlCommandTag::ForgetDevice`]'s doc comment); [`pl_command_from`]
 /// zero-fills both today. Added now so the wire shape and the
 /// [`PL_COMMAND_ABI_VERSION`] bump land together with the rest of T2.
+///
+/// `seq` added by ADA DESIGN v2 (bead `pico-link-chc3`), [`PL_COMMAND_ABI_
+/// VERSION`] bumped 4 -> 5: the [`pico_link_core::app::ConnectAttempt::seq`]
+/// `core` allocated for this attempt, echoed back by C on every
+/// connect-lifecycle event -- see [`PlCancelConnectPayload`]'s doc comment
+/// for the shared rationale.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlConnectPayload {
     pub addr: [u8; 6],
     pub name: [u8; 32],
     pub name_len: u8,
+    pub seq: u16,
 }
 
 /// [`PlCommand`]'s payload for every tag that carries nothing but a target
-/// address -- [`PlCommandTag::CancelConnect`], [`PlCommandTag::PersistDevice`]
-/// and [`PlCommandTag::ForgetDevice`] (bead pico-link-4vb.6, T2, design
-/// section 5.3). Introduced as its own type, rather than continuing to
-/// reuse [`PlConnectPayload`] the way those first two tags did before this
-/// bead, because `PlConnectPayload` now also carries `name`/`name_len` --
-/// fields meaningless for a cancel/persist/forget command. Both structs
-/// still start with `addr: [u8; 6]` at the same offset, so this is a
-/// *source*-only change for the two pre-existing tags: no wire byte moves
-/// for either (see [`PlCommandPayload`]'s doc comment).
+/// address -- [`PlCommandTag::PersistDevice`] and
+/// [`PlCommandTag::ForgetDevice`] (bead pico-link-4vb.6, T2, design section
+/// 5.3; [`PlCommandTag::CancelConnect`] moved off this shared payload onto
+/// its own [`PlCancelConnectPayload`] with `chc3`, see that struct's doc
+/// comment). Introduced as its own type, rather than continuing to reuse
+/// [`PlConnectPayload`] the way those tags did before pico-link-4vb.6,
+/// because `PlConnectPayload` also carries `name`/`name_len`/`seq` --
+/// fields meaningless for a persist/forget command. Both structs still
+/// start with `addr: [u8; 6]` at the same offset, so moving a tag onto this
+/// payload is a *source*-only change: no wire byte moves (see
+/// [`PlCommandPayload`]'s doc comment).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlAddrPayload {
     pub addr: [u8; 6],
+}
+
+/// [`PlCommand`]'s payload when `tag == PlCommandTag::CancelConnect`.
+/// Introduced by ADA DESIGN v2 (bead `pico-link-chc3`), replacing the
+/// shared [`PlAddrPayload`] this tag used before -- `seq` is the second
+/// field a cancel needs and `PlAddrPayload` has no room to grow it without
+/// also handing it, meaninglessly, to `PersistDevice`/`ForgetDevice`.
+///
+/// `seq` is the [`pico_link_core::app::ConnectAttempt::seq`] being
+/// cancelled (`0` if there was no attempt in flight -- see
+/// [`pico_link_core::app::Command::CancelConnect`]'s doc comment). C scopes
+/// the abort to the cid owned by this `seq`, never globally; a debug-only
+/// `PL_SEQ_ANY` ("cancel whatever is in flight") exists on the C side only
+/// and is never produced by `core`/this crate.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PlCancelConnectPayload {
+    pub addr: [u8; 6],
+    pub seq: u16,
 }
 
 /// [`PlCommand`]'s payload when `tag == PlCommandTag::SetDeviceLdacQuality`
@@ -2835,6 +2898,8 @@ pub union PlCommandPayload {
     pub connect: PlConnectPayload,
     /// See [`PlAddrPayload`]'s doc comment. Bead pico-link-4vb.6 (T2).
     pub addr: PlAddrPayload,
+    /// See [`PlCancelConnectPayload`]'s doc comment. Bead `pico-link-chc3`.
+    pub cancel_connect: PlCancelConnectPayload,
     /// See [`PlSetDeviceLdacQualityPayload`]'s doc comment. Bead
     /// pico-link-7jol.5.
     pub set_device_ldac_quality: PlSetDeviceLdacQualityPayload,
@@ -2886,7 +2951,13 @@ pub union PlCommandPayload {
 // under the old allocate-on-0 rule (refusing every creation under rule (c)/
 // (d) of the new contract) -- bumping this constant turns that into a loud
 // version mismatch instead.
-pub const PL_COMMAND_ABI_VERSION: u32 = 4;
+//
+// ADA DESIGN v2 (bead `pico-link-chc3`): bumped 4 -> 5. `PlConnectPayload`
+// gained `seq`, and `PlCommandTag::CancelConnect` moved off the shared
+// `PlAddrPayload` onto its own `PlCancelConnectPayload { addr, seq }` -- two
+// non-additive shape changes landing together, same class of bump as every
+// one above.
+pub const PL_COMMAND_ABI_VERSION: u32 = 5;
 
 /// One user-initiated command, Rust -> C. See [`PlCommandPayload`]'s doc
 /// comment for the extensibility rationale and [`PL_COMMAND_ABI_VERSION`]
@@ -2906,7 +2977,7 @@ fn pl_command_none() -> PlCommand {
     PlCommand {
         version: PL_COMMAND_ABI_VERSION,
         tag: PlCommandTag::None,
-        payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+        payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0, seq: 0 } },
     }
 }
 
@@ -2923,9 +2994,9 @@ fn pl_command_from(command: Command) -> PlCommand {
         Command::StartScan => PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::StartScan,
-            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0, seq: 0 } },
         },
-        Command::Connect { addr, name } => {
+        Command::Connect { addr, name, seq } => {
             // `core` is the sole producer of `Command` values and already
             // truncated `name` to at most 32 bytes on a UTF-8 character
             // boundary before constructing this variant (bead
@@ -2940,22 +3011,22 @@ fn pl_command_from(command: Command) -> PlCommand {
             PlCommand {
                 version: PL_COMMAND_ABI_VERSION,
                 tag: PlCommandTag::Connect,
-                payload: PlCommandPayload { connect: PlConnectPayload { addr, name: name_buf, name_len } },
+                payload: PlCommandPayload { connect: PlConnectPayload { addr, name: name_buf, name_len, seq } },
             }
         }
         Command::CancelScan => PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::CancelScan,
-            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0, seq: 0 } },
         },
-        // Bead pico-link-4vb.6 (T2): moved off `.connect` onto `.addr`
-        // (`PlAddrPayload`) -- see that struct's doc comment. Source-only
-        // change: both payload shapes start with `addr: [u8; 6]` at offset
-        // 0, so no wire byte moves.
-        Command::CancelConnect { addr } => PlCommand {
+        // ADA DESIGN v2 (bead `pico-link-chc3`): its own
+        // `PlCancelConnectPayload` -- see that struct's doc comment for why
+        // this moved off the shared `PlAddrPayload` pico-link-4vb.6 put it
+        // on.
+        Command::CancelConnect { addr, seq } => PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::CancelConnect,
-            payload: PlCommandPayload { addr: PlAddrPayload { addr } },
+            payload: PlCommandPayload { cancel_connect: PlCancelConnectPayload { addr, seq } },
         },
         Command::PersistDevice { addr } => PlCommand {
             version: PL_COMMAND_ABI_VERSION,
@@ -2976,7 +3047,7 @@ fn pl_command_from(command: Command) -> PlCommand {
         Command::Disconnect => PlCommand {
             version: PL_COMMAND_ABI_VERSION,
             tag: PlCommandTag::Disconnect,
-            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0 } },
+            payload: PlCommandPayload { connect: PlConnectPayload { addr: [0; 6], name: [0; 32], name_len: 0, seq: 0 } },
         },
         Command::SetDeviceLdacQuality { addr, ldac_quality } => PlCommand {
             version: PL_COMMAND_ABI_VERSION,
@@ -4155,22 +4226,22 @@ mod tests {
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::ConnectStepChanged as u32,
-                payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: PlConnectStep::Pairing as u32 } },
+                payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: PlConnectStep::Pairing as u32, seq: 1 } },
             },
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::ConnectRetrying as u32,
-                payload: PlEventPayload { connect_retrying: PlConnectRetryingPayload { attempt: 3 } },
+                payload: PlEventPayload { connect_retrying: PlConnectRetryingPayload { attempt: 3, seq: 1 } },
             },
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::ConnectSucceeded as u32,
-                payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { addr: [0; 6], degraded: 1 } },
+                payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { addr: [0; 6], degraded: 1, seq: 1 } },
             },
             PlEvent {
                 version: PL_EVENT_ABI_VERSION,
                 tag: PlEventTag::WizardAutoDismiss as u32,
-                payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 0 } },
+                payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 0, seq: 1 } },
             },
         ];
         unsafe {
@@ -4671,7 +4742,7 @@ mod tests {
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::ConnectStepChanged as u32,
-            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 99 } },
+            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 99, seq: 1 } },
         };
         unsafe {
             pl_ui_push_event(ui, bad_event);
@@ -4691,12 +4762,12 @@ mod tests {
         let disconnecting_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::ConnectStepChanged as u32,
-            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 4 } },
+            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 4, seq: 1 } },
         };
         let unknown_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::ConnectStepChanged as u32,
-            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 5 } },
+            payload: PlEventPayload { connect_step_changed: PlConnectStepChangedPayload { step: 5, seq: 1 } },
         };
         unsafe {
             pl_ui_push_event(ui, disconnecting_event);
@@ -4877,7 +4948,7 @@ mod tests {
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::ConnectFailed as u32,
-            payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0xAA; 6], reason: 255 } },
+            payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0xAA; 6], reason: 255, seq: 1 } },
         };
         unsafe {
             pl_ui_push_event(ui, bad_event);
@@ -4893,7 +4964,7 @@ mod tests {
         let bad_event = PlEvent {
             version: PL_EVENT_ABI_VERSION,
             tag: PlEventTag::ConnectFailed as u32,
-            payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0xAA; 6], reason: 0xDEAD_BEEF } },
+            payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0xAA; 6], reason: 0xDEAD_BEEF, seq: 1 } },
         };
         unsafe {
             pl_ui_push_event(ui, bad_event);
@@ -4925,7 +4996,7 @@ mod tests {
                 let event = PlEvent {
                     version: PL_EVENT_ABI_VERSION,
                     tag: PlEventTag::ConnectFailed as u32,
-                    payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0; 6], reason: reason as u32 } },
+                    payload: PlEventPayload { connect_failed: PlConnectFailedPayload { addr: [0; 6], reason: reason as u32, seq: 1 } },
                 };
                 pl_ui_push_event(ui, event);
             }
@@ -5092,23 +5163,23 @@ mod tests {
     }
 
     #[test]
-    fn cancel_connect_command_maps_to_the_cancel_connect_tag_and_carries_the_addr() {
+    fn cancel_connect_command_maps_to_the_cancel_connect_tag_and_carries_the_addr_and_seq() {
         // pico-link-znb.7's code-review fix: B during the wizard's
         // connecting/not-responding phases now queues this instead of
-        // silently leaving the abandoned attempt running in C. Plumbed
-        // through the FFI surface by this bead; left unhandled C-side
-        // (see `PlCommandTag::CancelConnect`'s doc comment).
+        // silently leaving the abandoned attempt running in C.
         //
-        // Bead pico-link-4vb.6 (T2): reads `.addr.addr` now, not
-        // `.connect.addr` -- `pl_command_from` moved this tag onto
-        // `PlAddrPayload` (see that struct's doc comment). Source-only
-        // change: both members start with `addr: [u8; 6]` at offset 0.
+        // ADA DESIGN v2 (bead `pico-link-chc3`): this now reads
+        // `.cancel_connect.{addr,seq}`, not `.addr.addr` -- `pl_command_from`
+        // moved this tag onto its own `PlCancelConnectPayload` the instant
+        // it needed a second field (see that struct's doc comment).
         let addr = [0xAA; 6];
-        let wire = pl_command_from(Command::CancelConnect { addr });
+        let wire = pl_command_from(Command::CancelConnect { addr, seq: 42 });
         assert_eq!(wire.version, PL_COMMAND_ABI_VERSION);
         assert_eq!(wire.tag as u32, PlCommandTag::CancelConnect as u32);
-        // SAFETY: `wire.tag` above confirms the union currently holds `addr`.
-        assert_eq!(unsafe { wire.payload.addr.addr }, addr);
+        // SAFETY: `wire.tag` above confirms the union currently holds `cancel_connect`.
+        let payload = unsafe { wire.payload.cancel_connect };
+        assert_eq!(payload.addr, addr);
+        assert_eq!(payload.seq, 42);
     }
 
     #[test]
@@ -5133,7 +5204,7 @@ mod tests {
         assert_eq!(start.tag as u32, PlCommandTag::StartScan as u32);
 
         let addr = [1, 2, 3, 4, 5, 6];
-        let connect = pl_command_from(Command::Connect { addr, name: String::new() });
+        let connect = pl_command_from(Command::Connect { addr, name: String::new(), seq: 7 });
         assert_eq!(connect.tag as u32, PlCommandTag::Connect as u32);
         // SAFETY: `connect.tag` above confirms the union currently holds `connect`.
         let payload = unsafe { connect.payload.connect };
@@ -5141,6 +5212,39 @@ mod tests {
         // An empty `core`-side name still zero-fills the wire buffer.
         assert_eq!(payload.name_len, 0);
         assert_eq!(payload.name, [0u8; 32]);
+        // ADA DESIGN v2 (bead `pico-link-chc3`): `seq` round-trips too.
+        assert_eq!(payload.seq, 7);
+    }
+
+    #[test]
+    fn chc3_seq_round_trips_on_every_connect_lifecycle_event_and_command() {
+        // ADA DESIGN v2 (bead `pico-link-chc3`): `seq` was added to
+        // `PlConnectPayload`, `PlCancelConnectPayload`, and all four
+        // connect-lifecycle event payloads at once (the ABI 4->5 / 7->8
+        // bumps this test's sibling `preset_store_loaded_next_id_round_
+        // trips_and_the_abi_bumps_are_pinned` pins). This test proves the
+        // full round trip for the event side (the command side is covered
+        // by `start_scan_and_connect_still_map_to_their_own_tags` and
+        // `cancel_connect_command_maps_to_the_cancel_connect_tag_and_
+        // carries_the_addr_and_seq` above).
+        let ui = new_ui();
+        let addr = [3, 3, 3, 3, 3, 3];
+        unsafe {
+            pl_ui_push_event(
+                ui,
+                PlEvent {
+                    version: PL_EVENT_ABI_VERSION,
+                    tag: PlEventTag::ConnectFailed as u32,
+                    payload: PlEventPayload {
+                        connect_failed: PlConnectFailedPayload { addr, reason: PlFailureReason::Timeout as u32, seq: 5 },
+                    },
+                },
+            );
+        }
+        unsafe {
+            assert_eq!(pl_ui_malformed_tag_count(ui), 0, "a real seq must not be rejected as malformed");
+            pl_ui_destroy(ui);
+        }
     }
 
     #[test]
@@ -5149,7 +5253,7 @@ mod tests {
         // already truncated by `core` -- this crate copies it byte-for-byte
         // into the fixed wire buffer.
         let addr = [9, 9, 9, 9, 9, 9];
-        let connect = pl_command_from(Command::Connect { addr, name: String::from("Sony WH-1000XM5") });
+        let connect = pl_command_from(Command::Connect { addr, name: String::from("Sony WH-1000XM5"), seq: 1 });
         assert_eq!(connect.tag as u32, PlCommandTag::Connect as u32);
         // SAFETY: `connect.tag` above confirms the union currently holds `connect`.
         let payload = unsafe { connect.payload.connect };
@@ -5411,8 +5515,8 @@ mod tests {
     /// not just that the field exists on the wire struct.
     #[test]
     fn preset_store_loaded_next_id_round_trips_and_the_abi_bumps_are_pinned() {
-        assert_eq!(PL_EVENT_ABI_VERSION, 7, "bumped 6 -> 7 for PlPresetStoreLoadedPayload::next_id");
-        assert_eq!(PL_COMMAND_ABI_VERSION, 4, "bumped 3 -> 4 for the SavePreset preset_id==0 semantics change");
+        assert_eq!(PL_EVENT_ABI_VERSION, 8, "bumped 6 -> 7 for PlPresetStoreLoadedPayload::next_id, then 7 -> 8 for chc3's seq fields");
+        assert_eq!(PL_COMMAND_ABI_VERSION, 5, "bumped 3 -> 4 for the SavePreset preset_id==0 semantics change, then 4 -> 5 for chc3's seq fields");
 
         let ui = new_ui();
         unsafe {
@@ -5582,7 +5686,7 @@ mod tests {
                 PlEvent {
                     version: PL_EVENT_ABI_VERSION,
                     tag: PlEventTag::ConnectSucceeded as u32,
-                    payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { addr, degraded: 0 } },
+                    payload: PlEventPayload { connect_succeeded: PlConnectSucceededPayload { addr, degraded: 0, seq: 0 } },
                 },
             );
             assert_eq!(pl_ui_malformed_tag_count(ui), 0);

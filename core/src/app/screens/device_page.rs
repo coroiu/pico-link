@@ -577,7 +577,8 @@ mod tests {
     fn the_connected_devices_page_x_binding_is_drop() {
         let mut app = App::new(240, 240);
         let addr = [8; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1033 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1033 });
         app.poll_command(); // drain PersistDevice, queued by ConnectSucceeded
         app.handle_event(upsert(addr, "Cans", 1));
         open_devices(&mut app);
@@ -595,7 +596,8 @@ mod tests {
         // therefore the X binding) live, no screen rebuild involved.
         let mut app = App::new(240, 240);
         let addr = [9; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1034 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1034 });
         app.poll_command(); // drain PersistDevice, queued by ConnectSucceeded
         app.handle_event(upsert(addr, "Cans", 1));
         open_devices(&mut app);
@@ -603,18 +605,15 @@ mod tests {
         app.handle_event(Event::LinkStateChanged(LinkState::Idle)); // drops -- the live model read must catch up in place
 
         app.handle_input(vec![NavIntent::ShortcutX]);
-        assert_eq!(
-            app.poll_command(),
-            Some(Command::Connect { addr, name: String::from("Cans") }),
-            "X on a disconnected device's page must queue a reconnect, not Disconnect"
-        );
+        app.expect_connect_command_for_test(addr, "Cans");
     }
 
     #[test]
     fn device_page_scroll_and_selection_survive_a_live_refresh() {
         let mut app = App::new(240, 240);
         let addr = [10; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1035 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1035 });
         app.handle_event(upsert(addr, "Cans", 1));
         open_devices(&mut app);
         app.handle_input(vec![NavIntent::Select]); // -> device page
@@ -729,7 +728,8 @@ mod tests {
     fn the_quality_pickers_check_follows_the_stored_echo_not_the_press() {
         let mut app = App::new(240, 240);
         let addr = [29; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1036 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1036 });
         app.poll_command();
         app.handle_event(upsert(addr, "Cans", 1));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -813,7 +813,8 @@ mod tests {
     fn opening_effect_from_the_device_page_pushes_the_picker_and_a_pick_queues_assign_preset() {
         let mut app = App::new(240, 240);
         let addr = [43; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1037 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1037 });
         app.poll_command(); // drain PersistDevice
         app.handle_event(upsert(addr, "Cans", 1));
         app.handle_event(Event::PresetLoaded { id: 1, blob: crate::dsp::Preset::new("Relaxed").to_wire().to_vec() });
@@ -839,7 +840,8 @@ mod tests {
 
         let mut app = App::new(240, 240);
         let addr = [44; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1038 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1038 });
         app.poll_command();
         app.handle_event(upsert_with_quality(addr, "Sony WH-1000XM5", 1, 0));
         app.handle_event(Event::PresetLoaded { id: 1, blob: crate::dsp::Preset::new("Relaxed").to_wire().to_vec() });

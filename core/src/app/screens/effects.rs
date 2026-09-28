@@ -1758,7 +1758,8 @@ mod tests {
         // The list, populated with a few effects, one assigned+connected
         // (check gutter visible).
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr: [7; 6], degraded: false });
+        let seq_for_test_16 = app.seed_connect_attempt_for_test([7; 6]);
+        app.handle_event(Event::ConnectSucceeded { addr: [7; 6], degraded: false, seq: seq_for_test_16 });
         let _ = app.poll_command();
         app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr: [7; 6], name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: 1 }));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr: [7; 6], word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -1824,7 +1825,8 @@ mod tests {
         // 4. The device-page effect picker -- a hand-made option and a
         //    padlocked imported option.
         let addr = [7; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1030 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1030 });
         let _ = app.poll_command();
         app.handle_event(Event::PairedDeviceUpserted(PairedDevice { addr, name: String::from("Cans"), mru_seq: 1, ldac_quality: 0, preset_id: id }));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));

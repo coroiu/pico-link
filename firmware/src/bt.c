@@ -146,6 +146,13 @@ typedef enum {
 
 static pl_bt_switch_state_t s_switch_state;
 static bd_addr_t s_switch_target;
+// Bead pico-link-chc3, ADA DESIGN v2: the seq of the Connect command that
+// started (or last overwrote) this switch attempt -- threaded into every
+// connect-lifecycle event bt.c itself pushes for the switch's pre-signaling
+// steps (PL_CONNECT_STEP_DISCONNECTING/_CONNECTING, and the ACL-down
+// deadline's own ConnectFailed). 0 for the PL_DEBUG_REMOTE bypass, same
+// convention as everywhere else in this design.
+static uint16_t s_switch_target_seq;
 static uint64_t s_switch_deadline_us;
 
 // Forward declarations: pl_bt_push_connect_succeeded/_failed (below) hook
@@ -381,20 +388,20 @@ void pl_bt_push_link_state_disconnected(void) {
     pl_bt_push_link_state(PL_LINK_STATE_IDLE);
 }
 
-void pl_bt_push_connect_step(uint32_t step) {
+void pl_bt_push_connect_step(uint32_t step, uint16_t seq) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_CONNECT_STEP_CHANGED,
-        .payload = {.connect_step_changed = {.step = step}},
+        .payload = {.connect_step_changed = {.step = step, .seq = seq}},
     };
     pl_bt_ring_push(event, NULL, 0);
 }
 
-void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded) {
+void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded, uint16_t seq) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_CONNECT_SUCCEEDED,
-        .payload = {.connect_succeeded = {.degraded = degraded ? 1 : 0}},
+        .payload = {.connect_succeeded = {.degraded = degraded ? 1 : 0, .seq = seq}},
     };
     memcpy(event.payload.connect_succeeded.addr, addr, 6);
     pl_bt_ring_push(event, NULL, 0);
@@ -410,11 +417,11 @@ void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded) {
     }
 }
 
-void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason) {
+void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason, uint16_t seq) {
     struct PlEvent event = {
         .version = PL_EVENT_ABI_VERSION,
         .tag = PL_EVENT_TAG_CONNECT_FAILED,
-        .payload = {.connect_failed = {.reason = reason}},
+        .payload = {.connect_failed = {.reason = reason, .seq = seq}},
     };
     memcpy(event.payload.connect_failed.addr, addr, 6);
     pl_bt_ring_push(event, NULL, 0);
@@ -1142,11 +1149,32 @@ typedef enum {
     // addr -- persist.c already has the pending record staged in its own
     // s_abr_floor_pending_floor.
     PL_BT_PENDING_SET_ABR_FLOOR,
+    // Bead pico-link-chc3, design C3: reuses this exact queue/heartbeat
+    // idiom for PL_COMMAND_TAG_CANCEL_CONNECT -- pl_a2dp_cancel_connect
+    // itself does no BTstack call (D4), but it does write a2dp.c's shared
+    // s_ctx bookkeeping fields, which the packet handler's IRQ context also
+    // reads/writes; deferring onto this queue's single IRQ-context consumer
+    // avoids a thread-vs-IRQ race on that state, same reason every other
+    // a2dp.c mutator in this table is deferred rather than called inline
+    // from pl_bt_poll_commands. Carries the target addr, same as
+    // PL_BT_PENDING_CONNECT/PL_BT_PENDING_FORGET_DEVICE (unused today --
+    // see a2dp.h's doc comment on pl_a2dp_cancel_connect for why -- but
+    // carried for symmetry and in case a future address-scoped cancel needs
+    // it).
+    PL_BT_PENDING_CANCEL_CONNECT,
 } pl_bt_pending_tag_t;
 
 typedef struct {
     pl_bt_pending_tag_t tag;
     bd_addr_t addr; // meaningful for PL_BT_PENDING_CONNECT and PL_BT_PENDING_FORGET_DEVICE
+    // Bead pico-link-chc3, ADA DESIGN v2: meaningful for PL_BT_PENDING_CONNECT
+    // and PL_BT_PENDING_CANCEL_CONNECT only -- the core-allocated
+    // ConnectAttempt::seq (or PL_SEQ_ANY for the debug CANCELCONNECT
+    // bypass), latched here at enqueue time (thread context) so
+    // pl_bt_pending_service (IRQ context) has it without touching core
+    // again -- same "latch before push" discipline pico-link-j5su's own
+    // *_write_enqueued flags use.
+    uint16_t seq;
 } pl_bt_pending_entry_t;
 
 static pl_bt_pending_entry_t s_bt_pending[PL_BT_PENDING_CAPACITY];
@@ -1186,6 +1214,8 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
             return "SET_CUSHION_POLICY";
         case PL_BT_PENDING_SET_ABR_FLOOR:
             return "SET_ABR_FLOOR";
+        case PL_BT_PENDING_CANCEL_CONNECT:
+            return "CANCEL_CONNECT";
         default:
             return "?";
     }
@@ -1203,7 +1233,12 @@ static const char *pl_bt_pending_tag_name(pl_bt_pending_tag_t tag) {
 // to latch its own *_write_enqueued flag -- latching on a drop was the bug
 // (Ada, pico-link-ryw.14 review): the flag would stay true forever with no
 // queued entry left to ever clear it, wedging that write kind until reboot.
-static bool pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
+// Bead pico-link-chc3, ADA DESIGN v2: the real implementation, now taking
+// `seq` -- latched into the entry for PL_BT_PENDING_CONNECT/
+// PL_BT_PENDING_CANCEL_CONNECT only (see pl_bt_pending_entry_t's doc
+// comment). pl_bt_pending_push below is every other call site's
+// seq-less convenience wrapper (seq = 0, meaningless for those tags anyway).
+static bool pl_bt_pending_push_seq(pl_bt_pending_tag_t tag, const uint8_t *addr, uint16_t seq) {
     uint32_t irq_state = save_and_disable_interrupts();
     uint8_t head = s_bt_pending_head;
     uint8_t next_head = (uint8_t)((head + 1) % PL_BT_PENDING_CAPACITY);
@@ -1214,8 +1249,11 @@ static bool pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
         return false;
     }
     s_bt_pending[head].tag = tag;
-    if (tag == PL_BT_PENDING_CONNECT || tag == PL_BT_PENDING_FORGET_DEVICE) {
+    if (tag == PL_BT_PENDING_CONNECT || tag == PL_BT_PENDING_FORGET_DEVICE || tag == PL_BT_PENDING_CANCEL_CONNECT) {
         memcpy(s_bt_pending[head].addr, addr, sizeof(bd_addr_t));
+    }
+    if (tag == PL_BT_PENDING_CONNECT || tag == PL_BT_PENDING_CANCEL_CONNECT) {
+        s_bt_pending[head].seq = seq;
     }
     s_bt_pending_head = next_head;
     s_bt_pending_enqueued_count++;
@@ -1227,17 +1265,34 @@ static bool pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
     return true;
 }
 
+// Convenience wrapper for every call site that doesn't carry a seq (every
+// tag but PL_BT_PENDING_CONNECT/PL_BT_PENDING_CANCEL_CONNECT).
+static bool pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
+    return pl_bt_pending_push_seq(tag, addr, 0);
+}
+
 // Bead pico-link-sfw6, design sec 2: turns a Connect that arrives while an
 // ACL is up into a break-before-make switch. Called from
 // pl_bt_pending_service's PL_BT_PENDING_CONNECT case below (run-loop/IRQ
 // context) instead of calling pl_a2dp_connect directly -- state, the
 // prepare-switch cancels, pl_bt_update_scan_mode and gap_disconnect all
-// require that context (pico-link-ouw).
-static void pl_bt_connect_or_switch(const uint8_t *addr) {
+// require that context (pico-link-ouw). `seq` (ADA DESIGN v2, bead
+// pico-link-chc3) is the core-allocated attempt seq riding this Connect.
+static void pl_bt_connect_or_switch(const uint8_t *addr, uint16_t seq) {
+    // ADA DESIGN v2 rule 2 (fixes F6): a Connect to the device we're
+    // ALREADY connected to must adopt the live session, not tear it down
+    // and re-page it -- pl_bt_connect_or_switch used to treat any ACL-up as
+    // a switch unconditionally, which is what disconnected and re-paged a
+    // headset that paged US first (cold boot, before core's own
+    // auto-reconnect ran). No disconnect, no switch state touched.
+    if (pl_a2dp_adopt_if_connected(addr, seq)) {
+        return;
+    }
     if (s_switch_state == PL_BT_SWITCH_WAIT_ACL_DOWN) {
         // A second Connect while still waiting for A's slot to free:
         // last press wins, same attempt otherwise unchanged.
         memcpy(s_switch_target, addr, sizeof(bd_addr_t));
+        s_switch_target_seq = seq;
         pl_log(
             "BT: switch target overwritten target=%02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2],
             addr[3], addr[4], addr[5]
@@ -1250,19 +1305,20 @@ static void pl_bt_connect_or_switch(const uint8_t *addr) {
         // below, same as state == NONE -- both keep today's behaviour
         // (today's instant 0x56 failure for the in-flight case).
         memcpy(s_switch_target, addr, sizeof(bd_addr_t));
+        s_switch_target_seq = seq;
         s_switch_state = PL_BT_SWITCH_WAIT_ACL_DOWN;
         s_switch_deadline_us = time_us_64() + PL_BT_SWITCH_DEADLINE_US;
         pl_log(
             "BT: switch start target=%02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4],
             addr[5]
         );
-        pl_bt_push_connect_step(PL_CONNECT_STEP_DISCONNECTING);
+        pl_bt_push_connect_step(PL_CONNECT_STEP_DISCONNECTING, seq);
         pl_a2dp_prepare_switch();
         pl_bt_update_scan_mode();
         pl_bt_disconnect_all_open_acl();
         return;
     }
-    pl_a2dp_connect(addr);
+    pl_a2dp_connect(addr, seq);
 }
 
 // Bead pico-link-sfw6, design sec 2: the switch state machine's other
@@ -1281,13 +1337,13 @@ static void pl_bt_switch_service(void) {
             "BT: switch ACL down, paging %02x:%02x:%02x:%02x:%02x:%02x\r\n", s_switch_target[0], s_switch_target[1],
             s_switch_target[2], s_switch_target[3], s_switch_target[4], s_switch_target[5]
         );
-        pl_bt_push_connect_step(PL_CONNECT_STEP_CONNECTING);
-        pl_a2dp_connect(s_switch_target);
+        pl_bt_push_connect_step(PL_CONNECT_STEP_CONNECTING, s_switch_target_seq);
+        pl_a2dp_connect(s_switch_target, s_switch_target_seq);
         return;
     }
     if (time_us_64() >= s_switch_deadline_us) {
         pl_log("BT: switch timeout waiting for ACL down\r\n");
-        pl_bt_push_connect_failed(s_switch_target, PL_FAILURE_REASON_RADIO_ERROR);
+        pl_bt_push_connect_failed(s_switch_target, PL_FAILURE_REASON_RADIO_ERROR, s_switch_target_seq);
         // Andreas's ruling: B failing leaves the device disconnected, no
         // reconnect-A fallback. state = NONE here (not PAGING) is exactly
         // why pl_bt_push_connect_failed's own hook doesn't already do this
@@ -1324,7 +1380,7 @@ static void pl_bt_pending_service(void) {
                 // now routed through the switch decision (a plain connect
                 // from idle still ends up calling pl_a2dp_connect exactly
                 // as before).
-                pl_bt_connect_or_switch(entry.addr);
+                pl_bt_connect_or_switch(entry.addr, entry.seq);
                 break;
             case PL_BT_PENDING_DISCONNECT:
                 // Bead pico-link-sfw6, design sec 6: pl_a2dp_disconnect
@@ -1384,6 +1440,33 @@ static void pl_bt_pending_service(void) {
                 // Bead pico-link-d42g.3 (F3): same reentrancy contract as
                 // PL_BT_PENDING_PERSIST_WRITE above.
                 pl_persist_execute_pending_abr_floor_write();
+                break;
+            case PL_BT_PENDING_CANCEL_CONNECT:
+                // Bead pico-link-chc3, design C3, ADA DESIGN v2: bookkeeping-
+                // only (D4) -- pl_a2dp_cancel_connect makes no BTstack call
+                // itself, it just flips a2dp.c's attempt state from the
+                // same IRQ/run-loop context every other a2dp.c mutator in
+                // this table runs from.
+                pl_a2dp_cancel_connect(entry.addr, entry.seq);
+                // Bead pico-link-chc3, ADA DESIGN v2: if this cancel landed
+                // mid-switch (design sec 2's break-before-make -- B during
+                // the DISCONNECTING/PAGING steps of a device switch, not
+                // just a plain from-idle connect) AND targets this switch's
+                // own attempt (seq match, or PL_SEQ_ANY) -- the switch state
+                // machine's own terminal hooks
+                // (pl_bt_push_connect_succeeded/_failed) will never fire for
+                // this attempt now that a2dp.c has concluded it, so without
+                // this reset s_switch_state would stay PAGING/WAIT_ACL_DOWN
+                // forever and wedge every future switch/connect behind a
+                // dead in-flight marker. Same reset pl_bt_switch_service's
+                // own timeout path already does. Seq-scoped (v1 reset
+                // unconditionally on ANY cancel, which could reset a switch
+                // a stale/unrelated cancel had nothing to do with).
+                if ((s_switch_state == PL_BT_SWITCH_PAGING || s_switch_state == PL_BT_SWITCH_WAIT_ACL_DOWN) &&
+                    (entry.seq == PL_SEQ_ANY || entry.seq == s_switch_target_seq)) {
+                    s_switch_state = PL_BT_SWITCH_NONE;
+                    pl_bt_update_scan_mode();
+                }
                 break;
         }
     }
@@ -1449,6 +1532,11 @@ static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
     // pl_bt_pending_service so a switch that just started this same tick
     // (via PL_BT_PENDING_CONNECT above) is observed starting next tick.
     pl_bt_switch_service();
+    // Bead pico-link-chc3, design C4: services any cancel armed this tick
+    // (or an earlier one) by PL_BT_PENDING_CANCEL_CONNECT's servicing below
+    // -- same "no BTstack call from thread context" reasoning as
+    // pl_bt_switch_service, same 100ms period.
+    pl_a2dp_service_cancel();
     // T3 (pico-link-4v2.3), design sec 9: the "-> pl_bt_wdt_heartbeat_handler
     // (0xFF) -> avrcp_controller_set_absolute_volume" hop. Same context as
     // pl_bt_pending_service above, so it's safe to call a2dp.c's AVRCP API
@@ -1596,7 +1684,12 @@ void pl_bt_poll_commands(struct PlUi *ui) {
             pl_bt_set_connect_target(addr, command.payload.connect.name, command.payload.connect.name_len);
             pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
             pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_A2DP);
-            pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
+            // Bead pico-link-chc3, ADA DESIGN v2: `seq` is core's
+            // ConnectAttempt::seq for this attempt -- latched into the
+            // pending-queue entry here (thread context) so
+            // pl_bt_pending_service (IRQ context) has it without touching
+            // core again.
+            pl_bt_pending_push_seq(PL_BT_PENDING_CONNECT, addr, command.payload.connect.seq);
             pl_wdt_mark(PL_WDT_CP_CMD_CONNECT_RET);
             break;
         }
@@ -1652,6 +1745,29 @@ void pl_bt_poll_commands(struct PlUi *ui) {
                 addr[5]
             );
             pl_bt_pending_push(PL_BT_PENDING_FORGET_DEVICE, addr);
+            break;
+        }
+
+        case PL_COMMAND_TAG_CANCEL_CONNECT: {
+            // Bead pico-link-chc3, design .planning/design/2026-08-30-
+            // cancel-connect.md (D3/D4/D6, ADA DESIGN v2): PL_COMMAND_TAG_
+            // CANCEL_CONNECT was plumbed all the way from wizard.rs's B
+            // handler (pico-link-znb.7) and fell into `default:` here ever
+            // since -- this is the fix. D6: the observable effect is
+            // LinkStateChanged(Idle) pushed IMMEDIATELY, inline, same as
+            // every other UI-event push in this switch (only the BTstack
+            // call itself is deferred -- see the pending-queue case this
+            // enqueues into). v2: payload moved off the shared PlAddrPayload
+            // onto its own PlCancelConnectPayload{addr, seq} -- `seq` is the
+            // attempt core wants cancelled.
+            const uint8_t *addr = command.payload.cancel_connect.addr;
+            uint16_t seq = command.payload.cancel_connect.seq;
+            pl_log(
+                "BT: PL_CMD_CANCEL_CONNECT %02x:%02x:%02x:%02x:%02x:%02x seq=%u\r\n", addr[0], addr[1], addr[2],
+                addr[3], addr[4], addr[5], (unsigned)seq
+            );
+            pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+            pl_bt_pending_push_seq(PL_BT_PENDING_CANCEL_CONNECT, addr, seq);
             break;
         }
 
@@ -1814,10 +1930,26 @@ void pl_bt_poll_commands(struct PlUi *ui) {
 // debug_remote.h's module doc), so this has the exact same pico-link-ouw
 // hazard as PL_COMMAND_TAG_CONNECT and gets the same fix: defer the actual
 // BTstack call to the heartbeat handler.
+// Bead pico-link-chc3, code review 2026-09-27, testability follow-up:
+// allocates a real, distinct seq for each debug CONNECT from a2dp.h's
+// PL_A2DP_DEBUG_SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX range -- a C-only range
+// core's own bump_attempt_seq is documented to never allocate into (see
+// that function's doc comment), so a debug session's seq is never
+// confusable with a real core-driven attempt's. Wraps within the range
+// (never emits 0 or strays into PL_SEQ_ANY/0xFFFF); thread-context only,
+// same caller as pl_bt_debug_connect below.
+static uint16_t pl_bt_debug_next_seq(void) {
+    static uint16_t s_next = PL_A2DP_DEBUG_SEQ_MIN;
+    uint16_t seq = s_next;
+    s_next = (s_next >= PL_A2DP_DEBUG_SEQ_MAX) ? PL_A2DP_DEBUG_SEQ_MIN : (uint16_t)(s_next + 1);
+    return seq;
+}
+
 void pl_bt_debug_connect(const uint8_t *addr) {
+    uint16_t seq = pl_bt_debug_next_seq();
     pl_log(
-        "BT: debug-remote CONNECT %02x:%02x:%02x:%02x:%02x:%02x (bypassing inquiry)\r\n",
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
+        "BT: debug-remote CONNECT %02x:%02x:%02x:%02x:%02x:%02x (bypassing inquiry) seq=%u\r\n",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], (unsigned)seq
     );
     // Bead pico-link-4vb.7 (T3): no name available here (this bypasses
     // inquiry entirely) -- name_len = 0 caches "no name", which
@@ -1825,7 +1957,7 @@ void pl_bt_debug_connect(const uint8_t *addr) {
     // already on record" when the write actually happens.
     pl_bt_set_connect_target(addr, NULL, 0);
     pl_bt_push_link_state(PL_LINK_STATE_CONNECTING);
-    pl_bt_pending_push(PL_BT_PENDING_CONNECT, addr);
+    pl_bt_pending_push_seq(PL_BT_PENDING_CONNECT, addr, seq);
 }
 
 // Bead pico-link-nb6: debug-only disconnect, letting an unattended hardware
@@ -1839,5 +1971,40 @@ void pl_bt_debug_connect(const uint8_t *addr) {
 void pl_bt_debug_disconnect(void) {
     pl_log("BT: debug-remote DISCONNECT\r\n");
     pl_bt_pending_push(PL_BT_PENDING_DISCONNECT, NULL);
+}
+
+// Bead pico-link-chc3, testability follow-up, ADA DESIGN v2 -- see bt.h's
+// doc comment. Body is deliberately identical to PL_COMMAND_TAG_CANCEL_
+// CONNECT's real handler above (push LinkState(Idle) inline, defer the
+// actual pl_a2dp_cancel_connect bookkeeping call through the pending
+// queue), minus the PlCommand indirection -- same relationship
+// pl_bt_debug_connect has to PL_COMMAND_TAG_CONNECT. Passes `PL_SEQ_ANY`
+// (there is no real core-allocated seq to target from this bypass) --
+// matches whatever is HELD/IN_FLIGHT (a2dp.h's pl_a2dp_cancel_connect match
+// rules), never a live `session_seq` (H4's note in the design doc). The
+// pending-queue entry needs SOME addr buffer (pl_bt_pending_push_seq's
+// memcpy for this tag), but pl_a2dp_cancel_connect ignores it (see its own
+// doc comment on why), so an all-zero placeholder is fine -- unlike
+// pl_bt_debug_connect's addr, this one is never a real BD_ADDR and is never
+// compared against one.
+void pl_bt_debug_cancel_connect(void) {
+    static const bd_addr_t zero_addr = {0, 0, 0, 0, 0, 0};
+    pl_log("BT: debug-remote CANCEL_CONNECT (seq=ANY)\r\n");
+    pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+    pl_bt_pending_push_seq(PL_BT_PENDING_CANCEL_CONNECT, zero_addr, PL_SEQ_ANY);
+}
+
+// Bead pico-link-chc3, code review 2026-09-27, testability follow-up -- see
+// bt.h's doc comment. Identical to pl_bt_debug_cancel_connect above except
+// for the seq it targets: the caller supplies it explicitly (from
+// cdc_sender.py's --cancel-connect --seq N, echoing the seq a prior debug
+// CONNECT logged), so this can hit Match 3 in pl_a2dp_cancel_connect (a live
+// session via `session_seq`) instead of only ever matching HELD/IN_FLIGHT
+// via PL_SEQ_ANY.
+void pl_bt_debug_cancel_connect_seq(uint16_t seq) {
+    static const bd_addr_t zero_addr = {0, 0, 0, 0, 0, 0};
+    pl_log("BT: debug-remote CANCEL_CONNECT (seq=%u)\r\n", (unsigned)seq);
+    pl_bt_push_link_state(PL_LINK_STATE_IDLE);
+    pl_bt_pending_push_seq(PL_BT_PENDING_CANCEL_CONNECT, zero_addr, seq);
 }
 #endif

@@ -66,7 +66,8 @@ fn main() {
     // checked, design §7), connected and streaming LDAC. ---
     {
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1001 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1001 });
         app.poll_command();
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 1, 0));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -79,7 +80,8 @@ fn main() {
     // form (design §4.2 amendment 2). ---
     {
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1002 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1002 });
         app.poll_command();
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 1, 4));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -94,7 +96,8 @@ fn main() {
     // row must never claim a live figure it doesn't have). ---
     {
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1003 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1003 });
         app.poll_command();
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 1, 4));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -111,7 +114,8 @@ fn main() {
     // link state" (design §4.2). ---
     {
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1004 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1004 });
         app.poll_command();
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 1, 3));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -134,7 +138,8 @@ fn main() {
     fn open_picker(ldac_quality: u8, adaptive_live_kbps: Option<u32>, connected: bool) -> App {
         let addr = [0x94, 0xDB, 0x56, 0x54, 0x7C, 0xF2];
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1005 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1005 });
         app.poll_command();
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 1, ldac_quality));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -179,7 +184,8 @@ fn main() {
     // anchored at the same x fixed mode uses. ---
     {
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1006 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1006 });
         app.poll_command();
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 1, 4));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
@@ -190,7 +196,8 @@ fn main() {
     // --- 11. Fixed 990, for contrast: identical number position, no tag. ---
     {
         let mut app = App::new(240, 240);
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1007 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1007 });
         app.poll_command();
         app.handle_event(upsert(addr, "Sony WH-1000XM5", 1, 1));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));

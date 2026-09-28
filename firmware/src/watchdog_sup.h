@@ -176,7 +176,7 @@ typedef enum {
     PL_WDT_CP_CMD_CONNECT_RET,
     PL_WDT_CP_CMD_CANCEL_SCAN_CALL,
     PL_WDT_CP_CMD_CANCEL_SCAN_RET,
-    PL_WDT_CP_CMD_OTHER,           // a tag with no case (e.g. CANCEL_CONNECT=4)
+    PL_WDT_CP_CMD_OTHER,           // a tag with no case (bead pico-link-chc3: CANCEL_CONNECT=4 now has one)
     // Round 4, second finding: PL_WDT_CP_REPORT existed in this enum and in
     // the name table but had NO call site, so the ~80 lines between
     // pl_bt_poll_commands() returning and pl_wdt_mark(WDT_SERVICE) were

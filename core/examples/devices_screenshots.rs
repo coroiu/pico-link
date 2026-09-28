@@ -102,7 +102,8 @@ fn main() {
     app.handle_event(upsert([2, 2, 2, 2, 2, 2], "Older Pair", 2));
     app.handle_event(upsert([3, 3, 3, 3, 3, 3], "Newer Pair", 3));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr: connected_addr, degraded: false });
+    let seq_for_test_1 = app.seed_connect_attempt_for_test(connected_addr);
+    app.handle_event(Event::ConnectSucceeded { addr: connected_addr, degraded: false, seq: seq_for_test_1 });
     app.poll_command(); // drain PersistDevice -- irrelevant to rendering
     // C echoes the upsert once the persist write actually lands (design
     // section 7's hazard 4) -- this is what actually refreshes the pinned
@@ -149,7 +150,8 @@ fn main() {
     let addr = [4, 4, 4, 4, 4, 4];
     app.handle_event(upsert(addr, "Connected Cans", 1));
     app.handle_event(Event::LinkStateChanged(LinkState::Connected));
-    app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+    let seq_for_test_1010 = app.seed_connect_attempt_for_test(addr);
+    app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1010 });
     app.poll_command();
     app.handle_event(upsert(addr, "Connected Cans", 2));
     open_devices(&mut app);

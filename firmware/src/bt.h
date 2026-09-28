@@ -80,22 +80,27 @@ void pl_bt_push_link_state_disconnected(void);
 // NegotiatingCodec=3 -- see ui-ffi/src/lib.rs; cbindgen does not emit
 // C constants for this enum because no FFI struct field is typed as it,
 // only as a plain u32, so a2dp.c/a2dp.h define their own PL_CONNECT_STEP_*
-// constants matching those discriminants exactly).
-void pl_bt_push_connect_step(uint32_t step);
+// constants matching those discriminants exactly). `seq` (ADA DESIGN v2,
+// bead pico-link-chc3) is the attempt this step belongs to -- see
+// a2dp.h's PL_SEQ_ANY doc comment for the shared seq convention.
+void pl_bt_push_connect_step(uint32_t step, uint16_t seq);
 
-// Pushes Event::ConnectSucceeded{addr, degraded}. `addr` added by bead
+// Pushes Event::ConnectSucceeded{addr, degraded, seq}. `addr` added by bead
 // pico-link-cz0.6 (M5 persistence, PL_EVENT_ABI_VERSION bumped 1 -> 2) so
 // core's auto-reconnect persistence policy always knows which device
 // succeeded, including via the PL_DEBUG_REMOTE bypass path (which never
 // drives the wizard, core's only other source for this) -- see
-// PlConnectSucceededPayload's doc comment in ui-ffi/src/lib.rs.
-void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded);
+// PlConnectSucceededPayload's doc comment in ui-ffi/src/lib.rs. `seq`
+// (ADA DESIGN v2) is 0 for a session core did not initiate (remote/
+// PL_DEBUG_REMOTE), else the owning attempt's seq.
+void pl_bt_push_connect_succeeded(const uint8_t *addr, bool degraded, uint16_t seq);
 
-// Pushes Event::ConnectFailed{addr, reason}. `reason` is the raw wire
+// Pushes Event::ConnectFailed{addr, reason, seq}. `reason` is the raw wire
 // value of ui-ffi's PlFailureReason (PL_FAILURE_REASON_* constants,
 // generated into pico_link_ui.h since PlConnectFailedPayload::reason IS a
-// real FFI field of that numeric type).
-void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason);
+// real FFI field of that numeric type). `seq` (ADA DESIGN v2) is the
+// owning attempt's seq, 0 if none.
+void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason, uint16_t seq);
 
 // Pushes Event::CodecChanged{addr, word, nominal_bitrate_bps} (bead
 // pico-link-1v5: the Home hero's live codec/bitrate). `name`/`name_len`
@@ -227,6 +232,17 @@ void pl_bt_push_preset_store_loaded(uint32_t status, uint16_t count, uint16_t ne
 // pl_debug_remote_poll, same convention as the normal command path via
 // pl_bt_poll_commands). Compiled only when PL_DEBUG_REMOTE is set (see
 // firmware/CMakeLists.txt) -- entirely absent from a shipping build.
+//
+// Testability follow-up (bead pico-link-chc3, code review 2026-09-27): this
+// now allocates a real, distinct seq from a2dp.h's
+// `PL_A2DP_DEBUG_SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX` C-only range (bt.c's
+// static counter, wrapping within the range) instead of the seq-less
+// `0` it used to pass -- `0` collided with core's "not core's attempt"
+// sentinel, and every debug-established session's seq was previously
+// tagged with `PL_SEQ_ANY` further downstream, which is what made H4 (a
+// stale cancel against an already-live debug session) untestable: the
+// cancel and the session shared the exact same sentinel. Logged so a
+// capture can read back which seq a given debug CONNECT got.
 void pl_bt_debug_connect(const uint8_t *addr);
 
 // Bead pico-link-nb6: debug-only direct disconnect of the current A2DP
@@ -236,6 +252,37 @@ void pl_bt_debug_connect(const uint8_t *addr);
 // Compiled only when PL_DEBUG_REMOTE is set; entirely absent from a
 // shipping build.
 void pl_bt_debug_disconnect(void);
+
+// Bead pico-link-chc3, testability follow-up: debug-only injection of
+// Command::CancelConnect exactly as core/src/render/wizard.rs's own
+// NavIntent::Back handler produces it -- lets an unattended hardware test
+// drive cancel-at-stage S1-S5 (design .planning/design/2026-08-30-cancel-
+// connect.md) without a human at the d-pad mid-Connecting, which the
+// debug-remote CONNECT path alone could never reach (it bypasses the
+// wizard screen entirely, so NAV BACK right after a debug CONNECT is a
+// no-op -- see this bead's own hardware-round comment on the board). No
+// address needed: mirrors the real PL_COMMAND_TAG_CANCEL_CONNECT handler's
+// own addr (ignored by pl_a2dp_cancel_connect -- see its doc comment), and
+// pl_bt_debug_disconnect's "there is only ever one" convention. Same
+// context discipline as pl_bt_debug_connect/pl_bt_debug_disconnect above.
+// Compiled only when PL_DEBUG_REMOTE is set; entirely absent from a
+// shipping build.
+void pl_bt_debug_cancel_connect(void);
+
+// Bead pico-link-chc3, code review 2026-09-27, testability follow-up:
+// CANCELCONNECT variant taking an explicit `seq` instead of always passing
+// `PL_SEQ_ANY` -- lets a hardware test target the real seq a debug CONNECT
+// (see pl_bt_debug_connect above) was allocated, so H4 (a stale cancel
+// against an already-live session, S5's late-success race) can be driven
+// headlessly: `--cancel-connect --seq N` targets a specific debug session's
+// `session_seq` via `pl_a2dp_cancel_connect`'s Match 3, instead of `PL_SEQ_
+// ANY` (which deliberately never matches a live session -- see that
+// function's doc comment). `pl_bt_debug_cancel_connect()` above (no seq,
+// PL_SEQ_ANY) is unchanged and still the right tool for "cancel whatever is
+// HELD/IN_FLIGHT" with no live session in play. Same context discipline as
+// every other debug entry point in this block. Compiled only when
+// PL_DEBUG_REMOTE is set; entirely absent from a shipping build.
+void pl_bt_debug_cancel_connect_seq(uint16_t seq);
 #endif
 
 // Bead pico-link-cz0.6 (M5 persistence), code-review finding 1: enqueues a

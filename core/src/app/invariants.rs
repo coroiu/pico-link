@@ -110,19 +110,22 @@ fn freshness_cases() -> Vec<FreshnessCase> {
     }
     fn wizard_not_responding() -> App {
         let mut app = wizard_connecting();
-        app.handle_event(Event::ConnectRetrying { attempt: 1 });
+        let seq = app.model().attempt.expect("wizard_connecting must record an attempt").seq;
+        app.handle_event(Event::ConnectRetrying { attempt: 1, seq });
         app
     }
     fn wizard_succeeded() -> App {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_event(Event::ConnectSucceeded { addr: [3; 6], degraded: false });
+        let seq_for_test_4 = app.seed_connect_attempt_for_test([3; 6]);
+        app.handle_event(Event::ConnectSucceeded { addr: [3; 6], degraded: false, seq: seq_for_test_4 });
         app
     }
     fn wizard_failed() -> App {
         let mut app = App::new(240, 240);
         open_wizard(&mut app);
-        app.handle_event(Event::ConnectFailed { addr: [4; 6], reason: ConnectFailureReason::Timeout });
+        let seq_for_test_5 = app.seed_connect_attempt_for_test([4; 6]);
+        app.handle_event(Event::ConnectFailed { addr: [4; 6], reason: ConnectFailureReason::Timeout, seq: seq_for_test_5 });
         app
     }
     fn forget_picker() -> App {
@@ -156,7 +159,8 @@ fn freshness_cases() -> Vec<FreshnessCase> {
         // always sees the current `connected_addr` regardless of event
         // order. Kept in this order anyway (it's also the order a real
         // successful pairing fires in).
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1012 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1012 });
         app.handle_event(upsert(addr, "Cans", 1));
         open_devices(&mut app);
         app.handle_input(vec![NavIntent::Select]); // the connected (pinned-first) row -> device detail
@@ -180,7 +184,8 @@ fn freshness_cases() -> Vec<FreshnessCase> {
     fn home_connected_with_out_level() -> App {
         let mut app = App::new(240, 240);
         let addr = [7; 6];
-        app.handle_event(Event::ConnectSucceeded { addr, degraded: false });
+        let seq_for_test_1013 = app.seed_connect_attempt_for_test(addr);
+        app.handle_event(Event::ConnectSucceeded { addr, degraded: false, seq: seq_for_test_1013 });
         app.handle_event(upsert(addr, "Cans", 1));
         app.handle_event(Event::CodecChanged(ConnectedCodec { addr, word: String::from("LDAC"), nominal_bitrate_bps: 990_000 }));
         app.tick(1);
