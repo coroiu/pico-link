@@ -654,16 +654,25 @@ impl App {
         bytes.len()
     }
 
-    /// Clears any active host preview -- `ui-ffi`'s `pl_ui_host_preview_end`,
-    /// called by C after ~2 s with no `iface-6` traffic (design section 7's
-    /// lease: "C stamps `s_last_host_setup_us` on EVERY `iface-6` SETUP ...
-    /// if a host preview may be active and nothing arrived for 2 s, call
+    /// `ui-ffi`'s current `pl_ui_host_preview_end` binding, called by C
+    /// after ~2 s with no `iface-6` traffic (design section 7's lease: "C
+    /// stamps `s_last_host_setup_us` on EVERY `iface-6` SETUP ... if a host
+    /// preview may be active and nothing arrived for 2 s, call
     /// `pl_ui_host_preview_end`"). Distinct from the `PREVIEW_END` op
     /// ([`Self::host_op`] with `op` `5`): this is the timeout path, so it
     /// has no request `seq` to answer and does not touch
     /// [`Self::host_op_status`].
+    ///
+    /// A thin alias for [`Self::host_lease_expired`] (design section 13.6:
+    /// "`pl_ui_host_preview_end` becomes `pl_ui_host_lease_expired`, ...
+    /// keep the old symbol as an alias until C switches") -- kept under
+    /// this name only because `ui-ffi` still binds it; `host_lease_expired`
+    /// is where the real (now generalised) behaviour lives, in
+    /// `host_op_radio.rs` (it needs `BtModel::scan_owner`/`radio_actions::
+    /// cancel_scan`, both radio-side concerns this module has no other
+    /// reason to import).
     pub fn host_preview_end(&mut self) {
-        self.host_preview = None;
+        self.host_lease_expired();
     }
 }
 

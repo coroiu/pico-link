@@ -99,6 +99,33 @@ impl App {
         self.model.borrow().attempt.is_some()
     }
 
+    /// Design sec 13.6's generalised host lease: "Sec 7's 2 s SETUP-recency
+    /// lease generalises: `pl_ui_host_preview_end` becomes `pl_ui_host_
+    /// lease_expired` ... which ends a host preview AND, if `scan_owner ==
+    /// Host` and discovering, queues `CancelScan`." Replaces the body
+    /// [`super::host_op::App::host_preview_end`] used to have directly --
+    /// that method is now a thin alias kept for the current `ui-ffi`
+    /// binding name (`pl_ui_host_preview_end`) until C switches to the new
+    /// one (beads `pico-link-jyhk.28`/`.29`).
+    ///
+    /// Deliberately does NOT touch [`super::model::BtModel::attempt`] --
+    /// design sec 13.6: "Connect needs no lease (bounded, and a
+    /// half-finished pairing the user asked for should complete and
+    /// persist -- memory: save the pairing at pairing time)." A `CONNECT`
+    /// in flight (host- or device-owned) survives a lease expiry
+    /// untouched, same as it survives everything except its own
+    /// conclusion or an explicit `CONNECT_CANCEL`.
+    pub fn host_lease_expired(&mut self) {
+        self.host_preview = None;
+        let host_scan_running = {
+            let model = self.model.borrow();
+            model.discovering && model.scan_owner == ScanOwner::Host
+        };
+        if host_scan_running {
+            cancel_scan(&self.commands);
+        }
+    }
+
     /// `SCAN_START` (design sec 13.3, op 7).
     pub(super) fn host_op_scan_start(&mut self, seq: u8, op: u8) -> HostOpStatus {
         if self.model.borrow().store_status.is_none() {
@@ -455,6 +482,72 @@ mod tests {
         let (_, state, _, _) = run(&mut app, &req(8, 2, &[]));
         assert_eq!(state, 1);
         assert_eq!(app.poll_command(), Some(Command::CancelScan));
+    }
+
+    // --- host_lease_expired (design sec 13.6) -----------------------------
+
+    #[test]
+    fn lease_expiry_cancels_a_host_owned_scan() {
+        let mut app = App::new(240, 240);
+        ready(&mut app);
+        let _ = run(&mut app, &req(7, 1, &[])); // SCAN_START -> scan_owner = Host
+        let _ = app.poll_command(); // drain StartScan
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
+
+        app.host_lease_expired();
+
+        assert_eq!(app.poll_command(), Some(Command::CancelScan));
+    }
+
+    #[test]
+    fn lease_expiry_leaves_a_device_owned_scan_alone() {
+        let mut app = App::new(240, 240);
+        ready(&mut app);
+        open_wizard(&mut app); // scan_owner = Device
+        let _ = app.poll_command(); // drain the wizard's own StartScan
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
+
+        app.host_lease_expired();
+
+        assert!(app.poll_command().is_none(), "a device-owned scan is never a web lease's business");
+    }
+
+    #[test]
+    fn lease_expiry_is_a_no_op_with_no_scan_running() {
+        let mut app = App::new(240, 240);
+        ready(&mut app);
+
+        app.host_lease_expired();
+
+        assert!(app.poll_command().is_none());
+    }
+
+    #[test]
+    fn lease_expiry_does_not_cancel_an_in_flight_connect() {
+        let mut app = App::new(240, 240);
+        ready(&mut app);
+        upsert(&mut app, ADDR_A, "Headphones", 1);
+        let _ = run(&mut app, &req(9, 1, &ADDR_A)); // CONNECT (Host-initiated)
+        let _ = app.poll_command(); // drain the Connect command itself
+        assert!(app.model().attempt.is_some());
+
+        app.host_lease_expired();
+
+        assert!(app.model().attempt.is_some(), "design sec 13.6: connect needs no lease");
+        assert!(app.poll_command().is_none(), "must not queue CancelConnect either");
+    }
+
+    #[test]
+    fn host_preview_end_is_an_alias_for_host_lease_expired() {
+        let mut app = App::new(240, 240);
+        ready(&mut app);
+        let _ = run(&mut app, &req(7, 1, &[]));
+        let _ = app.poll_command();
+        app.handle_event(Event::DiscoveryStateChanged { scanning: true });
+
+        app.host_preview_end();
+
+        assert_eq!(app.poll_command(), Some(Command::CancelScan), "the current ui-ffi binding name must keep the new behaviour");
     }
 
     // --- CONNECT (op 9) --------------------------------------------------
