@@ -50,6 +50,7 @@ mod events;
 mod fault;
 mod fold;
 mod host_op;
+mod host_op_radio;
 mod inspect;
 mod library;
 mod model;

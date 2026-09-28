@@ -20,7 +20,11 @@
     "PREAMP_RANGE": 16,
     "UNKNOWN_DEVICE": 17,
     "PARSE_ERROR": 18,
-    "APO_TOO_LARGE": 19
+    "APO_TOO_LARGE": 19,
+    "DEVICE_BUSY": 20,
+    "RADIO_BUSY": 21,
+    "NOT_CONNECTED": 22,
+    "PAIRED_FULL": 23
   },
   "ops": {
     "SAVE_EFFECT": 1,
@@ -28,7 +32,14 @@
     "ASSIGN": 3,
     "PREVIEW": 4,
     "PREVIEW_END": 5,
-    "PARSE_APO": 6
+    "PARSE_APO": 6,
+    "SCAN_START": 7,
+    "SCAN_STOP": 8,
+    "CONNECT": 9,
+    "DISCONNECT": 10,
+    "FORGET": 11,
+    "SET_DEVICE_QUALITY": 12,
+    "CONNECT_CANCEL": 13
   },
   "flags": {
     "BYPASS": 1

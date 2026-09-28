@@ -136,6 +136,23 @@ pub(crate) enum HostOpCode {
     Preview = 4,
     PreviewEnd = 5,
     ParseApo = 6,
+    /// Design sec 13.3, op 7 -- `core/src/app/host_op_radio.rs`.
+    ScanStart = 7,
+    /// Design sec 13.3, op 8.
+    ScanStop = 8,
+    /// Design sec 13.3, op 9.
+    Connect = 9,
+    /// Design sec 13.3, op 10.
+    Disconnect = 10,
+    /// Design sec 13.3, op 11.
+    Forget = 11,
+    /// Design sec 13.3, op 12.
+    SetDeviceQuality = 12,
+    /// Design sec 13.3, op 13 -- reserved until C's `PL_COMMAND_TAG_CANCEL_CONNECT`
+    /// ships its `op_mask` bit (bead `pico-link-chc3` merged the C side;
+    /// the mask bit itself is a later bead). Implemented in core now so the
+    /// dispatcher and its tests exist ahead of that bit being set.
+    ConnectCancel = 13,
 }
 
 impl HostOpCode {
@@ -147,6 +164,13 @@ impl HostOpCode {
             4 => Some(Self::Preview),
             5 => Some(Self::PreviewEnd),
             6 => Some(Self::ParseApo),
+            7 => Some(Self::ScanStart),
+            8 => Some(Self::ScanStop),
+            9 => Some(Self::Connect),
+            10 => Some(Self::Disconnect),
+            11 => Some(Self::Forget),
+            12 => Some(Self::SetDeviceQuality),
+            13 => Some(Self::ConnectCancel),
             _ => None,
         }
     }
@@ -209,6 +233,23 @@ pub(crate) enum OpError {
     ParseError = 18,
     /// A `PARSE_APO` document's text exceeded [`MAX_APO_TEXT_LEN`].
     ApoTooLarge = 19,
+    /// Design sec 13.3: the device wizard is open, or a device-/
+    /// auto-reconnect-initiated attempt is in flight -- "the person
+    /// holding the dongle wins" (sec 13.7). Also `FORGET`'s guard against
+    /// forgetting a device with a connect attempt in flight for it.
+    DeviceBusy = 20,
+    /// Design sec 13.3: `CONNECT`/`SCAN_START` while a connect attempt is
+    /// already in flight (distinct from [`Self::DeviceBusy`]'s "someone
+    /// else has the radio" -- this is "the radio itself is busy
+    /// connecting", which blocks a fresh scan or connect regardless of who
+    /// owns the in-flight attempt).
+    RadioBusy = 21,
+    /// A `DISCONNECT` whose `addr` doesn't equal [`super::model::BtModel::connected_addr`].
+    NotConnected = 22,
+    /// A `CONNECT`/`SCAN_START`'s pairing would exceed
+    /// [`super::model::MAX_PAIRED_DEVICES`] (design sec 13.3, same gate as
+    /// `devices.rs`'s capacity check).
+    PairedFull = 23,
 }
 
 /// Translates a strict-decode failure ([`crate::dsp::Preset::from_wire_checked`])
@@ -264,7 +305,12 @@ pub(crate) struct HostOpStatus {
 }
 
 impl HostOpStatus {
-    fn rejected(seq: u8, op: u8, error: OpError) -> Self {
+    /// `pub(super)`, not `pub(crate)`: every constructor here needs to be
+    /// reachable from `host_op_radio.rs` (design sec 13.3's ops 7..13,
+    /// bead `pico-link-jyhk.26`), a sibling module under `app` -- `pub(super)`
+    /// grants visibility to `app` and everything beneath it, which is
+    /// exactly that module, without opening these up crate-wide.
+    pub(super) fn rejected(seq: u8, op: u8, error: OpError) -> Self {
         Self { seq, op, state: STATE_REJECTED, error: error as u8, ..Self::default() }
     }
 
@@ -276,7 +322,7 @@ impl HostOpStatus {
         Self { seq, op, state: STATE_REJECTED, error: error as u8, line, band, value, ..Self::default() }
     }
 
-    fn done(seq: u8, op: u8) -> Self {
+    pub(super) fn done(seq: u8, op: u8) -> Self {
         Self { seq, op, state: STATE_DONE, ..Self::default() }
     }
 
@@ -286,6 +332,16 @@ impl HostOpStatus {
 
     fn done_payload(seq: u8, op: u8, payload: Vec<u8>) -> Self {
         Self { seq, op, state: STATE_DONE, payload, ..Self::default() }
+    }
+
+    /// Design sec 13.3's `SCAN_START`/`CONNECT` result payloads (`u16
+    /// scan_seq`/`u16 attempt_seq`) -- reuses the `effect_id` wire slot as a
+    /// generic "the one `u16` result this op returns" word, the same way
+    /// `ASSIGN`'s `done_effect` already overloads it with an unrelated
+    /// meaning per op. Does not change [`OP_STATUS_HEADER_LEN`]'s wire
+    /// layout, only which op populates which already-generic field.
+    pub(super) fn done_word(seq: u8, op: u8, word: u16) -> Self {
+        Self { seq, op, state: STATE_DONE, effect_id: word, ..Self::default() }
     }
 }
 
@@ -385,6 +441,13 @@ impl App {
             HostOpCode::Preview => self.host_op_preview(seq, op_byte, flags, body),
             HostOpCode::PreviewEnd => self.host_op_preview_end_request(seq, op_byte),
             HostOpCode::ParseApo => self.host_op_parse_apo(seq, op_byte, body),
+            HostOpCode::ScanStart => self.host_op_scan_start(seq, op_byte),
+            HostOpCode::ScanStop => self.host_op_scan_stop(seq, op_byte),
+            HostOpCode::Connect => self.host_op_connect(seq, op_byte, body),
+            HostOpCode::Disconnect => self.host_op_disconnect(seq, op_byte, body),
+            HostOpCode::Forget => self.host_op_forget(seq, op_byte, body),
+            HostOpCode::SetDeviceQuality => self.host_op_set_device_quality(seq, op_byte, body),
+            HostOpCode::ConnectCancel => self.host_op_connect_cancel(seq, op_byte, body),
         }
     }
 
@@ -591,16 +654,25 @@ impl App {
         bytes.len()
     }
 
-    /// Clears any active host preview -- `ui-ffi`'s `pl_ui_host_preview_end`,
-    /// called by C after ~2 s with no `iface-6` traffic (design section 7's
-    /// lease: "C stamps `s_last_host_setup_us` on EVERY `iface-6` SETUP ...
-    /// if a host preview may be active and nothing arrived for 2 s, call
+    /// `ui-ffi`'s current `pl_ui_host_preview_end` binding, called by C
+    /// after ~2 s with no `iface-6` traffic (design section 7's lease: "C
+    /// stamps `s_last_host_setup_us` on EVERY `iface-6` SETUP ... if a host
+    /// preview may be active and nothing arrived for 2 s, call
     /// `pl_ui_host_preview_end`"). Distinct from the `PREVIEW_END` op
     /// ([`Self::host_op`] with `op` `5`): this is the timeout path, so it
     /// has no request `seq` to answer and does not touch
     /// [`Self::host_op_status`].
+    ///
+    /// A thin alias for [`Self::host_lease_expired`] (design section 13.6:
+    /// "`pl_ui_host_preview_end` becomes `pl_ui_host_lease_expired`, ...
+    /// keep the old symbol as an alias until C switches") -- kept under
+    /// this name only because `ui-ffi` still binds it; `host_lease_expired`
+    /// is where the real (now generalised) behaviour lives, in
+    /// `host_op_radio.rs` (it needs `BtModel::scan_owner`/`radio_actions::
+    /// cancel_scan`, both radio-side concerns this module has no other
+    /// reason to import).
     pub fn host_preview_end(&mut self) {
-        self.host_preview = None;
+        self.host_lease_expired();
     }
 }
 
