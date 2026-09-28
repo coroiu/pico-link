@@ -11,7 +11,7 @@ import { OpError } from "../proto/ops";
 const WARM: Preset = { name: "Warm", crossfeed: "off", bands: [], preamp: { kind: "auto" }, eqLocked: false };
 
 function snapshotWithLibraryRev(rev: number): HomeSnapshot {
-  return { ...emptyHomeSnapshot(), snapSeq: 1, extras: { libraryRev: rev, hostPreviewActive: false, deviceEditorOpen: false, deviceEditorEffectId: 0, presetsReady: true, codecFallbackReason: 0 } };
+  return { ...emptyHomeSnapshot(), snapSeq: 1, extras: { libraryRev: rev, hostPreviewActive: false, deviceEditorOpen: false, deviceEditorEffectId: 0, presetsReady: true, codecFallbackReason: 0, radioRev: 0 } };
 }
 
 async function startedSession(fakeOpts: FakeTransportOptions = {}): Promise<{ session: Session; transport: FakeTransport }> {

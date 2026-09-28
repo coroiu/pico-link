@@ -23,7 +23,7 @@ function libraryWith(effects: LibrarySnapshot["effects"] = [{ id: 1, persistedSe
 }
 
 function snapshotFor(lib: LibrarySnapshot): HomeSnapshot {
-  return { ...emptyHomeSnapshot(), snapSeq: 1, extras: { libraryRev: lib.libraryRev, hostPreviewActive: false, deviceEditorOpen: false, deviceEditorEffectId: 0, presetsReady: true, codecFallbackReason: 0 } };
+  return { ...emptyHomeSnapshot(), snapSeq: 1, extras: { libraryRev: lib.libraryRev, hostPreviewActive: false, deviceEditorOpen: false, deviceEditorEffectId: 0, presetsReady: true, codecFallbackReason: 0, radioRev: 0 } };
 }
 
 let activeSessions: Session[] = [];
