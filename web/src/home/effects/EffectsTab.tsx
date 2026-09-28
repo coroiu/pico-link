@@ -95,9 +95,13 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
   const [pasteText, setPasteText] = React.useState("");
 
   // Auto-select the first effect once the library loads, if nothing is open.
+  // Depends on `effects[0]?.id`/`effects.length`, not `effects` itself --
+  // `effects` is a fresh array on every snapshot even when its first id is
+  // unchanged, which was tripping exhaustive-deps for no behavioural reason.
+  const firstEffectId = effects[0]?.id;
   React.useEffect(() => {
-    if (selectedId === null && !isNew && effects.length > 0) setSelectedId(effects[0].id);
-  }, [effects, selectedId, isNew]);
+    if (selectedId === null && !isNew && firstEffectId !== undefined) setSelectedId(firstEffectId);
+  }, [firstEffectId, selectedId, isNew]);
 
   // Load/refresh the draft when the selection changes, without clobbering in-progress edits.
   React.useEffect(() => {
@@ -265,12 +269,10 @@ export function EffectsTab({ library, connectedAddr }: EffectsTabProps) {
     const outcome = await library.saveEffect(toSave, existing);
     setSaving(false);
     if (outcome.kind === "queued") {
-      // Design decision on this bead's review: Save ends the host preview --
-      // the device's own persisted/assigned playback takes over from here.
-      if (previewActiveRef.current) {
-        previewActiveRef.current = false;
-        void library.previewEnd();
-      }
+      // Save does not end the host preview -- the editor stays open, so the
+      // preview effect below keeps running. Changing `selectedId`/`dirty`
+      // here just makes it resend with the persisted effect id instead of
+      // the "unsaved draft" id 0, using the same (now-persisted) values.
       setIsNew(false);
       setSelectedId(outcome.effectId);
       loadedIdRef.current = null;
