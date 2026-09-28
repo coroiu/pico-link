@@ -41,6 +41,7 @@ include = [
     "PlDeviceDiscoveredPayload",
     "PlConnectFailedPayload",
     "PlCodecChangedPayload",
+    "PL_HOME_SNAPSHOT_LEN",
     "PlLevelsChangedPayload",
     "PlVolumeChangedPayload",
     "PlEventTag",

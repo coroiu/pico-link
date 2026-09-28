@@ -1241,6 +1241,33 @@ pub struct PlAbrFloorPayload {
 /// [`PlPairedDeviceUpsertedPayload::name`] already uses.
 pub const PL_DSP_PRESET_BLOB_LEN: usize = 80;
 
+/// The page-0 Home telemetry snapshot's fixed wire length, in bytes --
+/// mirrors [`pico_link_core::app::HOME_SNAPSHOT_LEN`] (bead `pico-link-5adh`)
+/// so cbindgen emits it into `pico_link_ui.h`'s `PL_HOME_SNAPSHOT_LEN`,
+/// replacing the hand-copied `#define PL_CFG_HOME_SNAPSHOT_LEN 169` that
+/// used to live in `firmware/src/usb_config_itf.h` with no link back to
+/// `core` at all.
+///
+/// A literal, not `pico_link_core::app::HOME_SNAPSHOT_LEN` directly: that
+/// constant is itself `OFF_CODEC_FALLBACK_REASON + 1`, a chain of
+/// crate-private offset constants, and cbindgen (0.29) cannot evaluate a
+/// path expression into another crate -- confirmed by running it against
+/// this exact item, which it silently dropped from the header rather than
+/// erroring (both with and without `parse.parse_deps`). The
+/// [`HOME_SNAPSHOT_LEN_MATCHES_CORE`] assertion below is what makes this
+/// literal safe: it is a real `const` expression checked by `rustc` on
+/// every build, so any future append to `core`'s layout that doesn't also
+/// update this literal fails `cargo build`/`cargo test` for this crate,
+/// not silently at the C header.
+pub const PL_HOME_SNAPSHOT_LEN: usize = 169;
+
+/// Compile-time proof that [`PL_HOME_SNAPSHOT_LEN`] has not drifted from
+/// [`pico_link_core::app::HOME_SNAPSHOT_LEN`] -- see that constant's doc
+/// comment for why the value can't be derived directly.
+#[allow(dead_code)]
+const HOME_SNAPSHOT_LEN_MATCHES_CORE: () =
+    assert!(PL_HOME_SNAPSHOT_LEN == pico_link_core::app::HOME_SNAPSHOT_LEN);
+
 /// [`PlEvent`]'s payload when `tag == PlEventTag::PresetLoaded` (bead
 /// `pico-link-ryw.5`, design sec 2.2/3.2). Pushed either at boot (C's
 /// `count` x this event ahead of [`PlEventTag::PresetStoreLoaded`]) or as
