@@ -7,6 +7,9 @@ import { emptyHomeSnapshot } from "../proto/telemetry";
 import type { HomeSnapshot } from "../proto/telemetry";
 import type { Preset } from "../proto/library";
 import { OpError } from "../proto/ops";
+import { decodeDeviceInfo } from "../proto/info";
+import type { DeviceInfoInput } from "../proto/info";
+import { fixtureBytes } from "../test/fixtures";
 
 const WARM: Preset = { name: "Warm", crossfeed: "off", bands: [], preamp: { kind: "auto" }, eqLocked: false };
 
@@ -31,6 +34,29 @@ describe("LibraryController.opsAvailable", () => {
 
   it("is true once GET_INFO reports v2 with the library bits set", async () => {
     const { session } = await startedSession();
+    const controller = new LibraryController(session);
+    expect(controller.opsAvailable()).toBe(true);
+    await session.stop();
+  });
+
+  // Regression for bead pico-link-q28y: opsAvailable() used to check op_mask
+  // bits 5/6/7 as if they were the GET_LIBRARY/HOST_OP/GET_OP_STATUS control
+  // request codes. Real firmware's PL_CFG_OP_MASK (usb_config_itf.h) never
+  // sets those bits -- it sets bits 1..6, one per HOST_OP op -- so every real
+  // dongle read opsAvailable() as false and Effects showed "needs newer
+  // firmware" always. This decodes fixtures/telemetry/info-v2.bin, a
+  // firmware-derived fixture (op_mask 0x7e = bits 1..6), not a hand-typed
+  // mask, so it would have caught the bug the old FakeTransport's own
+  // (also-wrong) bits-5-7 mask could not.
+  it("is true against the real firmware GET_INFO v2 fixture (info-v2.bin)", async () => {
+    const decoded = decodeDeviceInfo(fixtureBytes("info-v2.bin"));
+    expect(decoded).not.toBeNull();
+    expect(decoded!.v2).toBeDefined();
+    // Sanity: the fixture encodes firmware's real op_mask, not a
+    // stand-in -- bits 1..6 (SAVE_EFFECT..PARSE_APO), not 5/6/7.
+    expect(decoded!.v2!.opMask).toBe(0x7e);
+
+    const { session } = await startedSession({ info: decoded as DeviceInfoInput });
     const controller = new LibraryController(session);
     expect(controller.opsAvailable()).toBe(true);
     await session.stop();
