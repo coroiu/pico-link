@@ -216,17 +216,21 @@ void pl_config_itf_poll_host_op(struct PlUi *ui) {
 // save_and_disable_interrupts and read directly by
 // configd_control_xfer_cb's GET_TELEMETRY SETUP handler (IRQ context) --
 // the same "writer excludes the IRQ, IRQ needs no lock" pattern as
-// s_status/set_status above. Both are zero-initialized by static storage
-// duration, which is exactly the pre-first-generation "not ready" state
-// (core's snap_seq field reads 0 until the first successful encode --
-// see App::telemetry_snapshot's doc comment): the reply is simply
-// however-many-bytes (possibly zero) have ever been published, with no
-// separate "reset to not-ready after further idle" step. That is a
-// deliberate simplification of design section 3 flow (c) -- once a page
-// has attached at least once, serving its last real (if stale) snapshot
-// rather than a synthesized not-ready header matches the design's own
-// "self-heals, not a delta log" philosophy (section 2) more closely than
-// inventing a second not-ready representation would.
+// s_status/set_status above. configd_init (below) seeds both with a
+// synthesized proto-1, snap_seq-0 "not ready" header at the full current
+// wire length -- NOT the zero-length reply plain static zero-init would
+// give (bead pico-link-s6hh: a 0-byte reply looked like a short/malformed
+// transfer to the web companion for the ~10s before the first real
+// snapshot, rather than the documented not-ready state; core's snap_seq
+// field reads 0 until the first successful encode -- see
+// App::telemetry_snapshot's doc comment). After that seed, the reply is
+// simply however-many-bytes have ever been published, with no separate
+// "reset to not-ready after further idle" step -- a deliberate
+// simplification of design section 3 flow (c): once a page has attached
+// at least once, serving its last real (if stale) snapshot rather than
+// re-synthesizing not-ready matches the design's own "self-heals, not a
+// delta log" philosophy (section 2) more closely than inventing a second
+// not-ready representation would.
 #define PL_TELEMETRY_POLL_RECENCY_US (1000ull * 1000ull) // 1s, design sec 3 flow (b)
 #define PL_TELEMETRY_GEN_INTERVAL_US (20ull * 1000ull)   // 20ms, design sec 3 flow (b)
 
@@ -374,11 +378,31 @@ void pl_config_itf_poll_preview_lease(struct PlUi *ui) {
     }
 }
 
+// Builds the "not ready" GET_TELEMETRY reply -- a proto-1 header
+// (proto/page/len) with snap_seq (and everything after it) zeroed, at the
+// full current wire length. Published by configd_init below in place of
+// s_telemetry_len == 0 (bead pico-link-s6hh: replying zero bytes for ~10s
+// after boot looked like a short/malformed reply to the web companion
+// rather than the documented "not ready" state -- ADA DESIGN comment on
+// pico-link-jyhk.1, core/src/app/telemetry.rs's module doc: "snap_seq ...
+// `0` means not ready"). No Rust call: this is plain bytes, matching the
+// same "C only copies opaque bytes" discipline the SETUP handler itself
+// already follows.
+static void publish_telemetry_not_ready(void) {
+    uint8_t tmp[PL_CFG_HOME_SNAPSHOT_LEN];
+    memset(tmp, 0, sizeof(tmp));
+    tmp[PL_CFG_TELEMETRY_OFF_PROTO] = PL_CFG_TELEMETRY_PROTO_VERSION;
+    tmp[PL_CFG_TELEMETRY_OFF_PAGE] = PL_TELEMETRY_PAGE_HOME;
+    tmp[PL_CFG_TELEMETRY_OFF_LEN] = (uint8_t)(PL_CFG_HOME_SNAPSHOT_LEN & 0xFFu);
+    tmp[PL_CFG_TELEMETRY_OFF_LEN + 1] = (uint8_t)((PL_CFG_HOME_SNAPSHOT_LEN >> 8) & 0xFFu);
+    publish_telemetry(tmp, sizeof(tmp));
+}
+
 static void configd_init(void) {
     s_mailbox_pending = false;
     s_mailbox_len = 0;
     set_status((pl_cfg_status_wire_t){ .state = PL_CFG_STATE_IDLE });
-    s_telemetry_len = 0;
+    publish_telemetry_not_ready();
     s_telemetry_last_poll_us = 0;
     s_telemetry_last_gen_us = 0;
     s_telemetry_requested_page = PL_TELEMETRY_PAGE_HOME;

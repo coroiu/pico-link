@@ -216,6 +216,30 @@ typedef struct __attribute__((packed)) {
 // returns 0 rather than overflow this buffer.
 #define PL_CONFIG_TELEMETRY_BUF_LEN 256
 
+// The full current wire length of a page-0 Home snapshot -- mirrors
+// `pico_link_core::app::telemetry::HOME_SNAPSHOT_LEN` (169 as of the
+// pico-link-jyhk.18 append; see that constant's own doc comment for the
+// byte-by-byte layout). Duplicated here (not exposed through cbindgen)
+// so `configd_init` (bead pico-link-s6hh) can synthesize a proto-1,
+// snap_seq-0 "not ready" header of the CORRECT length before the first
+// real snapshot is ever published, without calling into Rust from C
+// static-init. A drift between this and core's constant only changes the
+// not-ready reply's trailing zero-padding length, never its meaning
+// (`snap_seq == 0` is what the web session actually keys "not ready" on) --
+// see core/src/app/telemetry.rs's `golden_bytes_layout_is_stable` test for
+// the value that must stay in sync.
+#define PL_CFG_HOME_SNAPSHOT_LEN 169
+
+// Byte offsets of the three header fields every telemetry page shares
+// (design section 4) -- mirrors core/src/app/telemetry.rs's
+// OFF_PROTO/OFF_PAGE/OFF_LEN. Only these three are populated in the
+// synthesized not-ready header below; snap_seq (offset 8) and everything
+// after it is left zeroed by the buffer's static storage duration, which
+// is exactly what "not ready" (snap_seq == 0) requires.
+#define PL_CFG_TELEMETRY_OFF_PROTO 0
+#define PL_CFG_TELEMETRY_OFF_PAGE  1
+#define PL_CFG_TELEMETRY_OFF_LEN   2
+
 // --- GET_LIBRARY (0x05) -- bead pico-link-jyhk.21 ---
 
 // Working/publish buffer size for a GET_LIBRARY snapshot. The design's own

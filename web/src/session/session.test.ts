@@ -91,6 +91,61 @@ describe("Session", () => {
     expect(session.statusStore.getSnapshot().phase).toBe("idle");
   });
 
+  // bead pico-link-s6hh: GET_TELEMETRY replies snap_seq 0 ("not ready", the
+  // documented pre-first-snapshot state) for up to ~10s after boot, not a
+  // 0-byte reply -- FakeTransport's default (no `snapshot` option) is
+  // exactly that not-ready snapshot.
+  it("stays ready and keeps polling on a snap_seq-0 (not ready) snapshot", async () => {
+    const transport = new FakeTransport({});
+    const session = new Session(transport, { pollIntervalMs: 5, visibilityDocument: undefined });
+
+    await session.start();
+    expect(session.statusStore.getSnapshot().phase).toBe("ready");
+
+    await sleep(40);
+    expect(session.statusStore.getSnapshot().phase).toBe("ready");
+    expect(session.snapshotRef.current).not.toBeNull();
+    expect(session.snapshotRef.current!.snapSeq).toBe(0);
+    expect(session.snapshotRef.current!.linkConnected).toBe(false);
+
+    await session.stop();
+  });
+
+  // Older firmware (pre pico-link-s6hh) replied a genuine 0-byte transfer
+  // instead of a not-ready header. That must be a soft "ignore this tick"
+  // retry, not a hard error/incompatible -- pollOnce's `!snapshot` branch.
+  it("tolerates a 0-length GET_TELEMETRY reply as a retry, not an error", async () => {
+    const inner = new FakeTransport({ snapshot: () => goldenSnapshot() });
+    let telemetryCalls = 0;
+    const transport: Transport = {
+      open: () => inner.open(),
+      controlOut: (bReq, wValue, bytes) => inner.controlOut(bReq, wValue, bytes),
+      close: () => inner.close(),
+      onDisconnect: (cb) => inner.onDisconnect(cb),
+      async controlIn(bReq, wValue, length) {
+        if (bReq === PL_CFG_REQ_GET_TELEMETRY) {
+          telemetryCalls += 1;
+          if (telemetryCalls === 1) {
+            return new DataView(new ArrayBuffer(0));
+          }
+        }
+        return inner.controlIn(bReq, wValue, length);
+      },
+    };
+    const session = new Session(transport, { pollIntervalMs: 5, visibilityDocument: undefined });
+
+    await session.start();
+    expect(session.statusStore.getSnapshot().phase).toBe("ready");
+
+    await sleep(60);
+    expect(session.statusStore.getSnapshot().phase).toBe("ready");
+    expect(telemetryCalls).toBeGreaterThan(1);
+    expect(session.snapshotRef.current).not.toBeNull();
+    expect(session.snapshotRef.current!.snapSeq).toBeGreaterThan(0);
+
+    await session.stop();
+  });
+
   it("goes incompatible on an unknown telemetry proto and never polls", async () => {
     const transport = new FakeTransport({ info: { infoVer: 1, importProto: 1, statusVer: 1, telemetryProto: 99, telemetryPageMask: 1, version: "dev" } });
     const { transport: tracked, calls } = trackingTransport(transport);
