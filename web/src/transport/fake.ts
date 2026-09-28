@@ -4,9 +4,27 @@ import { encodeDeviceInfoForTest } from "../proto/info";
 import type { DeviceInfoInput } from "../proto/info";
 import { decodePresetBlob, emptyLibrarySnapshot, encodeLibrarySnapshotForTest, encodePresetBlob } from "../proto/library";
 import type { LibraryDevice, LibraryEffect, LibrarySnapshot, Preset } from "../proto/library";
-import { encodeOpStatusForTest, encodeParseApoResultForTest, HOST_OP_ASSIGN, HOST_OP_DELETE_EFFECT, HOST_OP_PARSE_APO, HOST_OP_PREVIEW, HOST_OP_PREVIEW_END, HOST_OP_SAVE_EFFECT, OpError } from "../proto/ops";
+import {
+  encodeOpStatusForTest,
+  encodeParseApoResultForTest,
+  HOST_OP_ASSIGN,
+  HOST_OP_CONNECT,
+  HOST_OP_DELETE_EFFECT,
+  HOST_OP_DISCONNECT,
+  HOST_OP_FORGET,
+  HOST_OP_PARSE_APO,
+  HOST_OP_PREVIEW,
+  HOST_OP_PREVIEW_END,
+  HOST_OP_SAVE_EFFECT,
+  HOST_OP_SCAN_START,
+  HOST_OP_SCAN_STOP,
+  HOST_OP_SET_DEVICE_QUALITY,
+  OpError,
+} from "../proto/ops";
 import type { OpStatus } from "../proto/ops";
-import { PL_CFG_REQ_GET_INFO, PL_CFG_REQ_GET_LIBRARY, PL_CFG_REQ_GET_OP_STATUS, PL_CFG_REQ_GET_TELEMETRY, PL_CFG_REQ_HOST_OP, TransportError } from "./types";
+import { emptyRadioSnapshot, encodeRadioSnapshotForTest } from "../proto/radio";
+import type { ConnectFailureReason, ConnectOutcomeResult, RadioScanEntry, RadioSnapshot } from "../proto/radio";
+import { PL_CFG_REQ_GET_INFO, PL_CFG_REQ_GET_LIBRARY, PL_CFG_REQ_GET_OP_STATUS, PL_CFG_REQ_GET_RADIO, PL_CFG_REQ_GET_TELEMETRY, PL_CFG_REQ_HOST_OP, TransportError } from "./types";
 import type { Transport, Unsubscribe } from "./types";
 
 const DEFAULT_INFO: DeviceInfoInput = {
@@ -20,6 +38,12 @@ const DEFAULT_INFO: DeviceInfoInput = {
 
 /** Bits 5-7 of `op_mask` (`GET_LIBRARY`/`HOST_OP`/`GET_OP_STATUS`) -- what `enableLibrary: true` advertises via `GET_INFO` v2. */
 const LIBRARY_OP_MASK = (1 << 5) | (1 << 6) | (1 << 7);
+
+/** Bits 7-12 of `op_mask` (`SCAN_START`..`SET_DEVICE_QUALITY`, design sec 13.3) -- what `enableRadio: true` advertises via `GET_INFO` v2. */
+const RADIO_OP_MASK = (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12);
+
+const LDAC_QUALITY_MIN = 1;
+const LDAC_QUALITY_MAX = 4;
 
 export interface FakeTransportOptions {
   /** Called each time GET_TELEMETRY page 0 is polled; return the live snapshot. */
@@ -39,6 +63,14 @@ export interface FakeTransportOptions {
   enableLibrary?: boolean;
   /** Seeds the emulated library (only meaningful with `enableLibrary: true`). Defaults to an empty, `presetsReady: true` library. */
   library?: LibrarySnapshot;
+  /**
+   * DEMO: turns on the `GET_RADIO`/`HOST_OP` ops 7..12 (0x08 +
+   * `SCAN_START`..`SET_DEVICE_QUALITY`) emulation, design sec 13 (bead
+   * pico-link-jyhk.24/.30) -- same shape as `enableLibrary`, advertised via
+   * `GET_INFO`'s v2 `op_mask`. `RadioController` (`session/radio.ts`) is
+   * the intended caller.
+   */
+  enableRadio?: boolean;
   /** Injected reply latency in ms (design section 3: "injectable latency"). */
   latencyMs?: number;
   /** If true, every controlIn/controlOut rejects with a stall (design: "stalls"). */
@@ -70,10 +102,18 @@ export class FakeTransport implements Transport {
   private lastStatus: OpStatus | null = null;
   private hostPreview: HostPreview | null = null;
 
+  // --- Radio/ops emulation state (only touched when `enableRadio`). ------
+  private radio: RadioSnapshot;
+  private nextScanSeq = 0;
+  private nextAttemptSeq = 0;
+  private scanCandidates: RadioScanEntry[] = [];
+  private connectedAddr: string | null = null;
+
   constructor(options: FakeTransportOptions = {}) {
     this.options = options;
     this.library = options.library ?? { ...emptyLibrarySnapshot(1), presetsReady: true };
     this.nextEffectId = 1 + this.library.effects.reduce((max, e) => Math.max(max, e.id), 0);
+    this.radio = { ...emptyRadioSnapshot(1), storeReady: true };
   }
 
   async open(): Promise<void> {
@@ -107,6 +147,50 @@ export class FakeTransport implements Transport {
     return this.hostPreview;
   }
 
+  /** Test/dev-page hook: seeds what a subsequent `SCAN_START` reveals (design sec 13.4's scan list). */
+  setScanCandidates(entries: RadioScanEntry[]): void {
+    this.scanCandidates = entries;
+  }
+
+  /** Test hook: the live emulated `GET_LIBRARY` state, for radio ops (`FORGET`/`SET_DEVICE_QUALITY`) that mutate `library.devices` without a `LibraryController` in the test. */
+  currentLibrarySnapshotForTest(): LibrarySnapshot {
+    return this.library;
+  }
+
+  /** Test/dev-page hook: the live radio snapshot state, for assertions that don't want to round-trip `GET_RADIO`'s wire bytes. */
+  currentRadioSnapshot(): RadioSnapshot {
+    return this.radio;
+  }
+
+  /**
+   * Test/dev-page hook: resolves the in-flight `attempt` (if any) the way a
+   * real device's `ConnectSucceeded`/`ConnectFailed`/cancel echo would --
+   * this fake has no BTstack timing to simulate that on its own. On `"ok"`/
+   * `"okDegraded"` also sets `connectedAddr` and marks the matching
+   * `library.devices` entry (if any) `connected`, mirroring what a real
+   * device's `PairedDeviceUpserted`/telemetry echo would surface through
+   * `GET_LIBRARY`.
+   */
+  resolveConnectAttempt(result: ConnectOutcomeResult, reason?: ConnectFailureReason): void {
+    const attempt = this.radio.attempt;
+    if (!attempt) return;
+    this.bumpRadioRev();
+    this.radio = {
+      ...this.radio,
+      connecting: false,
+      attempt: undefined,
+      lastOutcome: { seq: attempt.seq, addr: attempt.addr, result, reason: result === "failed" ? reason : undefined },
+    };
+    if (result === "ok" || result === "okDegraded") {
+      this.connectedAddr = attempt.addr;
+      this.library = { ...this.library, devices: this.library.devices.map((d) => ({ ...d, connected: d.addr === attempt.addr })) };
+    }
+  }
+
+  private bumpRadioRev(): void {
+    this.radio = { ...this.radio, radioRev: this.radio.radioRev + 1 };
+  }
+
   async controlIn(bRequest: number, wValue: number, length: number): Promise<DataView> {
     await this.delay();
     if (!this.opened) {
@@ -132,9 +216,14 @@ export class FakeTransport implements Transport {
       return sliceView(bytes, length);
     }
 
-    if (bRequest === PL_CFG_REQ_GET_OP_STATUS && this.options.enableLibrary) {
+    if (bRequest === PL_CFG_REQ_GET_OP_STATUS && (this.options.enableLibrary || this.options.enableRadio)) {
       const status: OpStatus = this.lastStatus ?? { opProto: 1, seq: 0, op: 0, state: "none", error: OpError.None, effectId: 0, libraryRev: this.library.libraryRev, persistedSeq: 0, line: 0, band: 0, value: 0, payload: new Uint8Array(0) };
       const bytes = encodeOpStatusForTest(status);
+      return sliceView(bytes, length);
+    }
+
+    if (bRequest === PL_CFG_REQ_GET_RADIO && this.options.enableRadio) {
+      const bytes = encodeRadioSnapshotForTest(this.radio);
       return sliceView(bytes, length);
     }
 
@@ -150,7 +239,7 @@ export class FakeTransport implements Transport {
       throw new TransportError("stall (fake)");
     }
 
-    if (bRequest === PL_CFG_REQ_HOST_OP && this.options.enableLibrary) {
+    if (bRequest === PL_CFG_REQ_HOST_OP && (this.options.enableLibrary || this.options.enableRadio)) {
       this.handleHostOp(bytes);
       return;
     }
@@ -159,8 +248,9 @@ export class FakeTransport implements Transport {
 
   private infoInput(): DeviceInfoInput {
     const info = this.options.info ?? DEFAULT_INFO;
-    if (!this.options.enableLibrary || info.v2) return info;
-    return { ...info, v2: { libProto: 1, opProto: 1, mailboxLen: 1024, opMask: LIBRARY_OP_MASK, libraryMaxLen: 1536 } };
+    if ((!this.options.enableLibrary && !this.options.enableRadio) || info.v2) return info;
+    const opMask = (this.options.enableLibrary ? LIBRARY_OP_MASK : 0) | (this.options.enableRadio ? RADIO_OP_MASK : 0);
+    return { ...info, v2: { libProto: 1, opProto: 1, mailboxLen: 1024, opMask, libraryMaxLen: 1536 } };
   }
 
   /** Emulates the device's `HOST_OP` handling (design section 4) -- bumps `libraryRev` on any mutation, publishes a `GET_OP_STATUS` result `lastStatus` polls immediately (this fake has no async ACK/BUSY window). */
@@ -258,6 +348,92 @@ export class FakeTransport implements Transport {
         const collidesWith = this.library.effects.find((e) => e.preset.name === name)?.id ?? 0;
         const payload = encodeParseApoResultForTest({ blob: encodePresetBlob(preset), collidesWith, copyName: collidesWith ? `${name} 2` : "" });
         done({ payload });
+        return;
+      }
+      case HOST_OP_SCAN_START: {
+        if (this.radio.attempt) {
+          rejected(OpError.RadioBusy);
+          return;
+        }
+        if (this.radio.discovering && this.radio.scanOwner === "host") {
+          done({ effectId: this.radio.scanSeq }); // idempotent, design sec 13.3
+          return;
+        }
+        this.nextScanSeq = (this.nextScanSeq + 1) & 0xffff;
+        this.bumpRadioRev();
+        this.radio = { ...this.radio, discovering: true, scanOwner: "host", scanSeq: this.nextScanSeq, scan: this.scanCandidates, scanTotalAudio: this.scanCandidates.length };
+        done({ effectId: this.nextScanSeq });
+        return;
+      }
+      case HOST_OP_SCAN_STOP: {
+        if (!this.radio.discovering) {
+          done();
+          return;
+        }
+        this.bumpRadioRev();
+        this.radio = { ...this.radio, discovering: false, scanOwner: "none", scan: [], scanTotalAudio: 0 };
+        done();
+        return;
+      }
+      case HOST_OP_CONNECT: {
+        const addr = formatAddrForFake(req.subarray(4, 10));
+        if (addr === this.connectedAddr) {
+          done({ effectId: 0 }); // no-op, design sec 13.3
+          return;
+        }
+        if (this.radio.attempt) {
+          rejected(OpError.RadioBusy);
+          return;
+        }
+        const known = this.library.devices.some((d) => d.addr === addr) || this.scanCandidates.some((c) => c.addr === addr);
+        if (!known) {
+          rejected(OpError.UnknownDevice);
+          return;
+        }
+        this.nextAttemptSeq = (this.nextAttemptSeq + 1) & 0xffff;
+        this.bumpRadioRev();
+        this.radio = { ...this.radio, connecting: true, discovering: false, scanOwner: "none", attempt: { seq: this.nextAttemptSeq, addr, initiator: "host", step: undefined, retries: 0 } };
+        done({ effectId: this.nextAttemptSeq });
+        return;
+      }
+      case HOST_OP_DISCONNECT: {
+        const addr = formatAddrForFake(req.subarray(4, 10));
+        if (addr !== this.connectedAddr) {
+          rejected(OpError.NotConnected);
+          return;
+        }
+        this.connectedAddr = null;
+        this.library = { ...this.library, devices: this.library.devices.map((d) => (d.addr === addr ? { ...d, connected: false } : d)) };
+        done();
+        return;
+      }
+      case HOST_OP_FORGET: {
+        const addr = formatAddrForFake(req.subarray(4, 10));
+        if (!this.library.devices.some((d) => d.addr === addr)) {
+          rejected(OpError.UnknownDevice);
+          return;
+        }
+        if (this.radio.attempt?.addr === addr) {
+          rejected(OpError.DeviceBusy);
+          return;
+        }
+        this.library = { ...this.library, devices: this.library.devices.filter((d) => d.addr !== addr) };
+        bumpRev();
+        done();
+        return;
+      }
+      case HOST_OP_SET_DEVICE_QUALITY: {
+        const addr = formatAddrForFake(req.subarray(4, 10));
+        const ldacQuality = req[10];
+        if (!this.library.devices.some((d) => d.addr === addr)) {
+          rejected(OpError.UnknownDevice);
+          return;
+        }
+        if (ldacQuality < LDAC_QUALITY_MIN || ldacQuality > LDAC_QUALITY_MAX) {
+          rejected(OpError.InvalidRequest);
+          return;
+        }
+        done();
         return;
       }
       default:

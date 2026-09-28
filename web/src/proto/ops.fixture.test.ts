@@ -9,17 +9,29 @@ import { describe, expect, it } from "vitest";
 import {
   decodeOpStatus,
   encodeAssignRequest,
+  encodeConnectRequest,
   encodeDeleteEffectRequest,
+  encodeDisconnectRequest,
+  encodeForgetRequest,
   encodeParseApoRequest,
   encodePreviewEndRequest,
   encodePreviewRequest,
   encodeSaveEffectRequest,
+  encodeScanStartRequest,
+  encodeScanStopRequest,
+  encodeSetDeviceQualityRequest,
   HOST_OP_ASSIGN,
+  HOST_OP_CONNECT,
   HOST_OP_DELETE_EFFECT,
+  HOST_OP_DISCONNECT,
+  HOST_OP_FORGET,
   HOST_OP_PARSE_APO,
   HOST_OP_PREVIEW,
   HOST_OP_PREVIEW_END,
   HOST_OP_SAVE_EFFECT,
+  HOST_OP_SCAN_START,
+  HOST_OP_SCAN_STOP,
+  HOST_OP_SET_DEVICE_QUALITY,
   OP_PROTO,
   OpError,
 } from "./ops";
@@ -68,6 +80,12 @@ describe("fixtures/host_op/op-errors.json vs ops.ts's tables", () => {
     expect(HOST_OP_PREVIEW).toBe(opErrors.ops.PREVIEW);
     expect(HOST_OP_PREVIEW_END).toBe(opErrors.ops.PREVIEW_END);
     expect(HOST_OP_PARSE_APO).toBe(opErrors.ops.PARSE_APO);
+    expect(HOST_OP_SCAN_START).toBe(opErrors.ops.SCAN_START);
+    expect(HOST_OP_SCAN_STOP).toBe(opErrors.ops.SCAN_STOP);
+    expect(HOST_OP_CONNECT).toBe(opErrors.ops.CONNECT);
+    expect(HOST_OP_DISCONNECT).toBe(opErrors.ops.DISCONNECT);
+    expect(HOST_OP_FORGET).toBe(opErrors.ops.FORGET);
+    expect(HOST_OP_SET_DEVICE_QUALITY).toBe(opErrors.ops.SET_DEVICE_QUALITY);
   });
 
   it("flags match", () => {
@@ -155,6 +173,44 @@ describe("HOST_OP request encoders vs fixtures/host_op/request-*.bin+json", () =
     const bytes = hostOpFixtureBytes("request-parse-apo.bin");
     const req = encodeParseApoRequest(fixture.seq, fixture.name, fixture.apo_text);
     expect(req).toEqual(bytes);
+  });
+});
+
+// No fixtures/host_op/request-*.bin+json exist yet for ops 7..12 (core's
+// `host_op_fixtures.rs` only emits SAVE/DELETE/ASSIGN/PREVIEW/PARSE_APO
+// requests) -- these assert the wire layout directly against
+// `core/src/app/host_op_radio.rs`'s documented body shapes (`decode_addr`'s
+// `ADDR_BODY_LEN` = 6, `SET_QUALITY_BODY_LEN` = 7) instead of a fixture.
+describe("radio HOST_OP request encoders (ops 7..12) vs core/src/app/host_op_radio.rs's body shapes", () => {
+  const ADDR = "94:DB:56:54:7C:F2";
+  const ADDR_BYTES = new Uint8Array([0x94, 0xdb, 0x56, 0x54, 0x7c, 0xf2]);
+
+  it("SCAN_START/SCAN_STOP have no body (header only, 4 bytes)", () => {
+    expect(encodeScanStartRequest(5)).toEqual(new Uint8Array([OP_PROTO, HOST_OP_SCAN_START, 5, 0]));
+    expect(encodeScanStopRequest(6)).toEqual(new Uint8Array([OP_PROTO, HOST_OP_SCAN_STOP, 6, 0]));
+  });
+
+  it("CONNECT/DISCONNECT/FORGET carry addr[6] after the header", () => {
+    const connect = encodeConnectRequest(1, ADDR);
+    expect(connect.length).toBe(10);
+    expect(connect.subarray(0, 4)).toEqual(new Uint8Array([OP_PROTO, HOST_OP_CONNECT, 1, 0]));
+    expect(connect.subarray(4, 10)).toEqual(ADDR_BYTES);
+
+    const disconnect = encodeDisconnectRequest(2, ADDR);
+    expect(disconnect.subarray(0, 4)).toEqual(new Uint8Array([OP_PROTO, HOST_OP_DISCONNECT, 2, 0]));
+    expect(disconnect.subarray(4, 10)).toEqual(ADDR_BYTES);
+
+    const forget = encodeForgetRequest(3, ADDR);
+    expect(forget.subarray(0, 4)).toEqual(new Uint8Array([OP_PROTO, HOST_OP_FORGET, 3, 0]));
+    expect(forget.subarray(4, 10)).toEqual(ADDR_BYTES);
+  });
+
+  it("SET_DEVICE_QUALITY carries addr[6], u8 ldac_quality", () => {
+    const req = encodeSetDeviceQualityRequest(4, ADDR, 4);
+    expect(req.length).toBe(11);
+    expect(req.subarray(0, 4)).toEqual(new Uint8Array([OP_PROTO, HOST_OP_SET_DEVICE_QUALITY, 4, 0]));
+    expect(req.subarray(4, 10)).toEqual(ADDR_BYTES);
+    expect(req[10]).toBe(4);
   });
 });
 

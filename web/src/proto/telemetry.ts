@@ -345,6 +345,13 @@ export function encodeHomeSnapshotForTest(input: HomeSnapshot): Uint8Array {
     view.setUint8(OFF_FLAGS2, flags2);
     view.setUint16(OFF_DEVICE_EDITOR_EFFECT_ID, input.extras.deviceEditorEffectId, true);
     view.setUint8(OFF_CODEC_FALLBACK_REASON, input.extras.codecFallbackReason);
+    // Bug found on pico-link-jyhk.30: this write was missing entirely --
+    // `encodeHomeSnapshotForTest` always emitted `radio_rev` as `0`
+    // regardless of `input.extras.radioRev`, silently defeating every
+    // radio_rev-driven refresh test (`RadioController.checkForRadioChange`)
+    // built against `FakeTransport`. `decodeHomeSnapshot`'s read side
+    // (`OFF_RADIO_REV`) was already correct.
+    view.setUint16(OFF_RADIO_REV, input.extras.radioRev, true);
   }
 
   return u8;

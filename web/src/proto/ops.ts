@@ -18,6 +18,21 @@ export const HOST_OP_PREVIEW = 4;
 export const HOST_OP_PREVIEW_END = 5;
 export const HOST_OP_PARSE_APO = 6;
 
+/**
+ * Ops 7..12 -- design section 13.3's device-management table
+ * (`core/src/app/host_op_radio.rs`, bead pico-link-jyhk.26). Op 13
+ * (`CONNECT_CANCEL`) is implemented in core but stays unexposed here: its
+ * `op_mask` bit is not set by C yet (design sec 13.3's table note; see
+ * `core/src/app/host_op.rs`'s `HostOpCode::ConnectCancel` doc comment) --
+ * a future bead adds its encoder once that lands.
+ */
+export const HOST_OP_SCAN_START = 7;
+export const HOST_OP_SCAN_STOP = 8;
+export const HOST_OP_CONNECT = 9;
+export const HOST_OP_DISCONNECT = 10;
+export const HOST_OP_FORGET = 11;
+export const HOST_OP_SET_DEVICE_QUALITY = 12;
+
 const FLAG_PREVIEW_BYPASS = 1 << 0;
 
 const REQ_HEADER_LEN = 4; // op_proto, op, seq, flags
@@ -94,6 +109,50 @@ export function encodeParseApoRequest(seq: number, name: string, apoText: string
   out[4] = nameBytes.length;
   out.set(nameBytes, 5);
   out.set(textBytes, 5 + nameBytes.length);
+  return out;
+}
+
+export function encodeScanStartRequest(seq: number): Uint8Array {
+  const out = new Uint8Array(REQ_HEADER_LEN);
+  writeReqHeader(out, HOST_OP_SCAN_START, seq, 0);
+  return out;
+}
+
+export function encodeScanStopRequest(seq: number): Uint8Array {
+  const out = new Uint8Array(REQ_HEADER_LEN);
+  writeReqHeader(out, HOST_OP_SCAN_STOP, seq, 0);
+  return out;
+}
+
+/** `addr` resolved by core against `paired`/the scan list -- design sec 13.3's `CONNECT` semantics. Result payload (`OpStatus.effectId`) carries `attempt_seq`. */
+export function encodeConnectRequest(seq: number, addr: string): Uint8Array {
+  const out = new Uint8Array(REQ_HEADER_LEN + 6);
+  writeReqHeader(out, HOST_OP_CONNECT, seq, 0);
+  out.set(parseAddr(addr), REQ_HEADER_LEN);
+  return out;
+}
+
+/** `addr` is an intent guard only -- design sec 13.3: core rejects `NOT_CONNECTED` unless it equals `connected_addr`. */
+export function encodeDisconnectRequest(seq: number, addr: string): Uint8Array {
+  const out = new Uint8Array(REQ_HEADER_LEN + 6);
+  writeReqHeader(out, HOST_OP_DISCONNECT, seq, 0);
+  out.set(parseAddr(addr), REQ_HEADER_LEN);
+  return out;
+}
+
+export function encodeForgetRequest(seq: number, addr: string): Uint8Array {
+  const out = new Uint8Array(REQ_HEADER_LEN + 6);
+  writeReqHeader(out, HOST_OP_FORGET, seq, 0);
+  out.set(parseAddr(addr), REQ_HEADER_LEN);
+  return out;
+}
+
+/** `ldacQuality`: 1..3, `4` = Adaptive -- design sec 13.3. `0` ("never chosen") is a stored-only value; a host can never request it (rejected `INVALID_REQUEST`). */
+export function encodeSetDeviceQualityRequest(seq: number, addr: string, ldacQuality: number): Uint8Array {
+  const out = new Uint8Array(REQ_HEADER_LEN + 7);
+  writeReqHeader(out, HOST_OP_SET_DEVICE_QUALITY, seq, 0);
+  out.set(parseAddr(addr), REQ_HEADER_LEN);
+  out[REQ_HEADER_LEN + 6] = ldacQuality;
   return out;
 }
 

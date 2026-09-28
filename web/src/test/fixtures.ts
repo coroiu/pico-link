@@ -14,6 +14,7 @@ const FIXTURES_ROOT = path.resolve(HERE, "../../../fixtures");
 export const FIXTURES_DIR = path.join(FIXTURES_ROOT, "telemetry");
 export const LIBRARY_FIXTURES_DIR = path.join(FIXTURES_ROOT, "library");
 export const HOST_OP_FIXTURES_DIR = path.join(FIXTURES_ROOT, "host_op");
+export const RADIO_FIXTURES_DIR = path.join(FIXTURES_ROOT, "radio");
 
 export function fixtureBytes(name: string): Uint8Array {
   return new Uint8Array(readFileSync(path.join(FIXTURES_DIR, name)));
@@ -64,5 +65,20 @@ export function hostOpRequestFixtureNames(): string[] {
 export function hostOpStatusFixtureNames(): string[] {
   return readdirSync(HOST_OP_FIXTURES_DIR)
     .filter((f) => f.startsWith("status-") && f.endsWith(".bin"))
+    .map((f) => f.slice(0, -".bin".length));
+}
+
+export function radioFixtureBytes(name: string): Uint8Array {
+  return new Uint8Array(readFileSync(path.join(RADIO_FIXTURES_DIR, name)));
+}
+
+export function radioFixtureJson<T>(name: string): T {
+  return JSON.parse(readFileSync(path.join(RADIO_FIXTURES_DIR, name), "utf-8")) as T;
+}
+
+/** Every `radio-*.bin` fixture's base name (without extension), each paired with a same-named `.json`. */
+export function radioFixtureNames(): string[] {
+  return readdirSync(RADIO_FIXTURES_DIR)
+    .filter((f) => f.startsWith("radio-") && f.endsWith(".bin"))
     .map((f) => f.slice(0, -".bin".length));
 }

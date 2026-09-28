@@ -15,6 +15,10 @@
 // must gate on `DeviceInfo.opMask`/`libProto`/`opProto` (design section 8)
 // before ever issuing them against real hardware. `FakeTransport` emulates
 // them for tests and the dev page.
+//
+// 0x08 GET_RADIO (in) is section 13.4's device-management radio snapshot
+// (bead pico-link-jyhk.24/.27/.30) -- same "gate on op_mask/radio_proto,
+// FakeTransport emulates it" caveat as the ops above.
 
 export const PL_CFG_REQ_IMPORT_PRESET = 0x01;
 export const PL_CFG_REQ_GET_STATUS = 0x02;
@@ -23,6 +27,7 @@ export const PL_CFG_REQ_GET_INFO = 0x04;
 export const PL_CFG_REQ_GET_LIBRARY = 0x05;
 export const PL_CFG_REQ_HOST_OP = 0x06;
 export const PL_CFG_REQ_GET_OP_STATUS = 0x07;
+export const PL_CFG_REQ_GET_RADIO = 0x08;
 
 /** Unregisters a callback previously passed to `Transport.onDisconnect`. */
 export type Unsubscribe = () => void;
