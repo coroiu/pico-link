@@ -128,6 +128,57 @@ pub(crate) fn is_audio_sink(class_of_device: u32) -> bool {
 /// navigation failure, not a scrolling inconvenience.
 pub(crate) const MAX_SCAN_LIST_ITEMS: usize = 12;
 
+/// `rssi` (BTstack's raw inquiry-result dBm reading) coarsened to a 0..4
+/// signal-bar glyph -- shared by [`crate::render::wizard`]'s phase-2 scan
+/// row and [`crate::app::radio::encode_radio_snapshot`]'s `GET_RADIO` scan
+/// records (design `.planning/design/2026-09-27-iface6-eq-management-
+/// protocol.md` sec 13.4: "Bars, not raw RSSI ... factored into one core fn
+/// both call"). Moved here from `render::wizard` (bead `pico-link-jyhk.27`)
+/// rather than duplicated, so the web's list can never silently drift from
+/// what the device itself shows for the same device at the same moment.
+///
+/// The thresholds themselves are an unchanged, unscientific coarse
+/// bucketing (not calibrated against real hardware RSSI distributions) --
+/// carried over from the stand-in this replaces. Good enough for "glance
+/// at four bars", not for anything quantitative; a real per-device dBm
+/// value stays available in the underlying [`DeviceEntry`], this glyph
+/// never claims otherwise.
+#[must_use]
+pub(crate) fn signal_bar_level(rssi: i8) -> u8 {
+    match rssi {
+        r if r >= -50 => 4,
+        r if r >= -60 => 3,
+        r if r >= -70 => 2,
+        r if r >= -80 => 1,
+        _ => 0,
+    }
+}
+
+/// Filters `devices` (`BtModel::discovered`, unfiltered raw inquiry
+/// results) down to audio sinks via [`is_audio_sink`], then caps the
+/// result at [`MAX_SCAN_LIST_ITEMS`] -- the exact "what the wizard shows"
+/// projection design sec 13.4 requires `GET_RADIO`'s scan list to match
+/// byte-for-byte ("The list is EXACTLY what the wizard shows ... factored
+/// into one core fn both call"). Shared by [`crate::render::wizard`]'s
+/// `build_scan_list` and [`crate::app::radio::encode_radio_snapshot`] --
+/// moved here (bead `pico-link-jyhk.27`) from a wizard-only free function so
+/// neither caller can drift from the other's filter/cap rule.
+///
+/// Stable first-seen order falls out for free: `devices`' own order is
+/// never touched, only filtered and truncated.
+///
+/// Returns `(capped_list, total_audio_count)` -- `total_audio_count` is
+/// the audio-sink count BEFORE the [`MAX_SCAN_LIST_ITEMS`] cap, for a
+/// "showing 12 of N" readout (the wizard's own backstop row, and
+/// `GET_RADIO`'s `scan_total_audio` byte).
+#[must_use]
+pub(crate) fn scan_list_view(devices: &[DeviceEntry]) -> (Vec<DeviceEntry>, usize) {
+    let audio_devices: Vec<DeviceEntry> = devices.iter().filter(|d| is_audio_sink(d.class_of_device)).cloned().collect();
+    let total_audio = audio_devices.len();
+    let capped: Vec<DeviceEntry> = audio_devices.into_iter().take(MAX_SCAN_LIST_ITEMS).collect();
+    (capped, total_audio)
+}
+
 /// How long a channel's OUT-meter peak-hold cap stays pinned at its
 /// highest recent reading before a lower peak is allowed to replace it.
 /// 1.5s is the conventional VU-meter hold time -- long enough to actually

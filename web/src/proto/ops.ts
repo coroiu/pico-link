@@ -130,6 +130,10 @@ export const OpError = {
   UnknownDevice: 17,
   ParseError: 18,
   ApoTooLarge: 19,
+  DeviceBusy: 20,
+  RadioBusy: 21,
+  NotConnected: 22,
+  PairedFull: 23,
 } as const;
 
 export type OpError = (typeof OpError)[keyof typeof OpError];

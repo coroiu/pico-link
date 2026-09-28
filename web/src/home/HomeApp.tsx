@@ -49,7 +49,7 @@ function goldenSnapshot(uptimeMs: number): HomeSnapshot {
     // `extras` must be present (with a `libraryRev` matching `goldenLibrary()`)
     // for `LibraryController.checkForLibraryChange` to ever fetch -- without
     // it the fake Effects tab never loads (found while screenshotting).
-    extras: { libraryRev: GOLDEN_LIBRARY_REV, hostPreviewActive: false, deviceEditorOpen: false, deviceEditorEffectId: 0, presetsReady: true, codecFallbackReason: 0 },
+    extras: { libraryRev: GOLDEN_LIBRARY_REV, hostPreviewActive: false, deviceEditorOpen: false, deviceEditorEffectId: 0, presetsReady: true, codecFallbackReason: 0, radioRev: 0 },
   };
 }
 

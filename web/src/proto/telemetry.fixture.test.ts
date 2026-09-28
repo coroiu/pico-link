@@ -45,6 +45,7 @@ interface FixtureHomeSnapshot {
   device_editor_effect_id: number;
   presets_ready: boolean;
   codec_fallback_reason: number;
+  radio_rev: number;
 }
 
 function faultValueFrom(fixture: FixtureFault): FaultValue {
@@ -75,6 +76,7 @@ function expectedFromFixture(fixture: FixtureHomeSnapshot): HomeSnapshot {
           deviceEditorEffectId: fixture.device_editor_effect_id,
           presetsReady: fixture.presets_ready,
           codecFallbackReason: fixture.codec_fallback_reason,
+          radioRev: fixture.radio_rev,
         }
       : undefined;
   return {

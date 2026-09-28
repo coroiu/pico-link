@@ -21,14 +21,15 @@ export const TELEMETRY_PAGE_HOME = 0;
  */
 export const HOME_SNAPSHOT_LEN = 163;
 /**
- * The current full page-0 length as of the `pico-link-jyhk.18` append
- * (library revision, preview/editor-open flags, editor effect id, codec-
- * fallback byte -- `core/src/app/telemetry.rs`'s `163..169` table). Checked
- * against `fixtures/telemetry/constants.json`'s `HOME_SNAPSHOT_LEN` in
+ * The current full page-0 length: the `pico-link-jyhk.18` append (library
+ * revision, preview/editor-open flags, editor effect id, codec-fallback
+ * byte -- `core/src/app/telemetry.rs`'s `163..169` table) plus the
+ * `pico-link-jyhk.27` append (`radio_rev`, `169..171`). Checked against
+ * `fixtures/telemetry/constants.json`'s `HOME_SNAPSHOT_LEN` in
  * `constants.fixture.test.ts`. A snapshot shorter than this but at least
  * `HOME_SNAPSHOT_LEN` still decodes -- `extras` is `undefined` on it.
  */
-export const HOME_SNAPSHOT_FULL_LEN = 169;
+export const HOME_SNAPSHOT_FULL_LEN = 171;
 
 const CODEC_WORD_CAP = 8;
 const DEVICE_NAME_CAP = 32;
@@ -62,6 +63,12 @@ const OFF_LIBRARY_REV = OFF_FAULTS + FAULT_SLOT_COUNT * FAULT_SLOT_LEN; // 163
 const OFF_FLAGS2 = OFF_LIBRARY_REV + 2;
 const OFF_DEVICE_EDITOR_EFFECT_ID = OFF_FLAGS2 + 1;
 const OFF_CODEC_FALLBACK_REASON = OFF_DEVICE_EDITOR_EFFECT_ID + 2;
+// The `pico-link-jyhk.27` append (design sec 13.4): `GET_RADIO`'s
+// `radio_rev` counter, mirrored here so the page can react to a radio
+// session change (a scan, a connect attempt) within one telemetry poll
+// without a separate `GET_RADIO` round trip -- see core/src/app/
+// telemetry.rs's `169..171` table.
+const OFF_RADIO_REV = OFF_CODEC_FALLBACK_REASON + 1;
 
 const FLAG2_HOST_PREVIEW_ACTIVE = 1 << 0;
 const FLAG2_DEVICE_EDITOR_OPEN = 1 << 1;
@@ -135,6 +142,13 @@ export interface HomeSnapshotExtras {
   presetsReady: boolean;
   /** `0` = none. */
   codecFallbackReason: number;
+  /**
+   * `GET_RADIO`'s revision counter, as of the `pico-link-jyhk.27`
+   * `169..171` append. `0` on a snapshot exactly `HOME_SNAPSHOT_FULL_LEN`
+   * bytes long that predates this append is indistinguishable from "never
+   * encoded" -- same convention `libraryRev` follows.
+   */
+  radioRev: number;
 }
 
 export interface HomeSnapshot {
@@ -232,6 +246,10 @@ export function decodeHomeSnapshot(bytes: ArrayBuffer | Uint8Array): HomeSnapsho
       deviceEditorEffectId: view.getUint16(OFF_DEVICE_EDITOR_EFFECT_ID, true),
       presetsReady: (flags2 & FLAG2_PRESETS_READY) !== 0,
       codecFallbackReason: view.getUint8(OFF_CODEC_FALLBACK_REASON),
+      // `HOME_SNAPSHOT_FULL_LEN` (171) already equals `OFF_RADIO_REV + 2`,
+      // so this branch (gated on `u8.byteLength >= HOME_SNAPSHOT_FULL_LEN`
+      // above) always has the bytes for this field.
+      radioRev: view.getUint16(OFF_RADIO_REV, true),
     };
   }
 

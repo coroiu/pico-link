@@ -67,6 +67,7 @@
 //! | 165..166 | `flags2` (`u8`) | bit0 `host_preview_active`, bit1 `device_editor_open`, bit2 `presets_ready` |
 //! | 166..168 | `device_editor_effect_id` (`u16`) | `0` when no device editor is open |
 //! | 168..169 | `codec_fallback_reason` (`u8`) | `0` = none; ships `0` until `BtModel` grows a fallback concept |
+//! | 169..171 | `radio_rev` (`u16`) | Bead `pico-link-jyhk.27`, design section 13.4's append |
 //!
 //! Each fault slot: `count` (`u16`, `0` = absent), `first_seen_ms`
 //! (`u32`), `last_seen_ms` (`u32`), `value_kind` (`u8`: `0` none, `1`
@@ -86,6 +87,15 @@
 //! C statics") exists yet -- see [`super::App::telemetry_snapshot`]'s
 //! [`HomeSnapshotExtras`] construction for exactly where each field of this
 //! append is sourced.
+//!
+//! ## The `169..171` append (bead `pico-link-jyhk.27`)
+//!
+//! A second, later append past the `163..169` one above -- same "pure
+//! append, proto 1 stays proto 1" rule. [`HOME_SNAPSHOT_LEN`] grows from
+//! `169` to `171`: `radio_rev` is [`super::radio`]'s `GET_RADIO` revision
+//! counter, sourced by [`super::App::telemetry_snapshot`] the same way it
+//! already sources `library_rev` (design sec 13.4: "the page polls at 30 Hz
+//! already, so it sees any [radio] change within ~33 ms").
 //!
 //! ## Deviation from the ADA DESIGN comment: `value_kind == 3` (millis)
 //!
@@ -190,6 +200,9 @@ const OFF_LIBRARY_REV: usize = HOME_SNAPSHOT_V1_LEN;
 const OFF_FLAGS2: usize = OFF_LIBRARY_REV + 2;
 const OFF_DEVICE_EDITOR_EFFECT_ID: usize = OFF_FLAGS2 + 1;
 const OFF_CODEC_FALLBACK_REASON: usize = OFF_DEVICE_EDITOR_EFFECT_ID + 2;
+/// Bead `pico-link-jyhk.27`, design sec 13.4's `169..171` append: "Telemetry
+/// page 0 appends `u16 radio_rev` at `169..171` (len 171, proto stays 1)".
+const OFF_RADIO_REV: usize = OFF_CODEC_FALLBACK_REASON + 1;
 
 /// The whole payload's fixed length, in bytes -- `169` as of the
 /// `pico-link-jyhk.18` append (`163` at proto 1's original shape, see
@@ -201,7 +214,7 @@ const OFF_CODEC_FALLBACK_REASON: usize = OFF_DEVICE_EDITOR_EFFECT_ID + 2;
 /// to emit into `pico_link_ui.h` -- the single source of truth for the C
 /// side's `PL_CFG_HOME_SNAPSHOT_LEN`, which used to be a hand-copied
 /// literal that could silently desync from this value.
-pub const HOME_SNAPSHOT_LEN: usize = OFF_CODEC_FALLBACK_REASON + 1;
+pub const HOME_SNAPSHOT_LEN: usize = OFF_RADIO_REV + 2;
 
 /// `flags` bit positions (design section 4).
 const FLAG_ADAPTIVE: u8 = 1 << 0;
@@ -384,6 +397,9 @@ pub(crate) struct HomeSnapshot {
     pub(crate) device_editor_effect_id: u16,
     pub(crate) presets_ready: bool,
     pub(crate) codec_fallback_reason: u8,
+    /// The `169..171` append (bead `pico-link-jyhk.27`) -- see
+    /// [`HomeSnapshotExtras::radio_rev`]'s doc comment.
+    pub(crate) radio_rev: u16,
 }
 
 /// The `163..169` append's inputs -- bead `pico-link-jyhk.18`, design
@@ -421,6 +437,11 @@ pub(crate) struct HomeSnapshotExtras {
     /// `0` = none. Ships `0` unconditionally today -- see this module's
     /// doc comment on the `163..169` append for why.
     pub(crate) codec_fallback_reason: u8,
+    /// [`super::radio`]'s `GET_RADIO` revision counter, at the moment this
+    /// poll ran -- the `169..171` append (bead `pico-link-jyhk.27`, design
+    /// sec 13.4), sourced by [`super::App::telemetry_snapshot`] the same
+    /// way [`Self::library_rev`] is sourced.
+    pub(crate) radio_rev: u16,
 }
 
 /// Builds the page-0 Home snapshot from a live `&BtModel` read plus the
@@ -537,6 +558,9 @@ pub(crate) fn encode_home_snapshot(model: &BtModel, presets: &PresetStore, now: 
     buf[OFF_DEVICE_EDITOR_EFFECT_ID..OFF_DEVICE_EDITOR_EFFECT_ID + 2].copy_from_slice(&extras.device_editor_effect_id.to_le_bytes());
     buf[OFF_CODEC_FALLBACK_REASON] = extras.codec_fallback_reason;
 
+    // Bead `pico-link-jyhk.27`, design sec 13.4: the `169..171` append.
+    buf[OFF_RADIO_REV..OFF_RADIO_REV + 2].copy_from_slice(&extras.radio_rev.to_le_bytes());
+
     buf
 }
 
@@ -596,6 +620,9 @@ pub(crate) fn decode_home_snapshot(bytes: &[u8]) -> Option<HomeSnapshot> {
     let device_editor_effect_id = u16::from_le_bytes(bytes[OFF_DEVICE_EDITOR_EFFECT_ID..OFF_DEVICE_EDITOR_EFFECT_ID + 2].try_into().ok()?);
     let codec_fallback_reason = bytes[OFF_CODEC_FALLBACK_REASON];
 
+    // Bead `pico-link-jyhk.27`, design sec 13.4: the `169..171` append.
+    let radio_rev = u16::from_le_bytes(bytes[OFF_RADIO_REV..OFF_RADIO_REV + 2].try_into().ok()?);
+
     Some(HomeSnapshot {
         uptime_ms,
         snap_seq,
@@ -623,6 +650,7 @@ pub(crate) fn decode_home_snapshot(bytes: &[u8]) -> Option<HomeSnapshot> {
         device_editor_effect_id,
         presets_ready: flags2 & FLAG2_PRESETS_READY != 0,
         codec_fallback_reason,
+        radio_rev,
     })
 }
 
@@ -663,7 +691,7 @@ mod tests {
     /// `pico-link-jyhk.18`) -- `telemetry_fixtures` has the same helper,
     /// under the same name, for the fixture side.
     fn no_extras() -> HomeSnapshotExtras {
-        HomeSnapshotExtras { library_rev: 0, host_preview_active: false, device_editor_open: false, device_editor_effect_id: 0, presets_ready: false, codec_fallback_reason: 0 }
+        HomeSnapshotExtras { library_rev: 0, host_preview_active: false, device_editor_open: false, device_editor_effect_id: 0, presets_ready: false, codec_fallback_reason: 0, radio_rev: 0 }
     }
 
     // --- Empty model: absent, not faked -------------------------------
@@ -951,12 +979,12 @@ mod tests {
         let bytes = encode_home_snapshot(&model, &presets, now, 0xDEAD_BEEF, &no_extras());
 
         assert_eq!(bytes.len(), HOME_SNAPSHOT_LEN);
-        assert_eq!(HOME_SNAPSHOT_LEN, 169, "the layout table in this module's doc comment states 169 (163 + the 6-byte pico-link-jyhk.18 append) -- a change here must update that table too");
+        assert_eq!(HOME_SNAPSHOT_LEN, 171, "the layout table in this module's doc comment states 171 (163 + the 6-byte pico-link-jyhk.18 append + the 2-byte pico-link-jyhk.27 append) -- a change here must update that table too");
 
         // Header.
         assert_eq!(bytes[0], 1, "proto");
         assert_eq!(bytes[1], 0, "page");
-        assert_eq!(&bytes[2..4], &169u16.to_le_bytes(), "len");
+        assert_eq!(&bytes[2..4], &171u16.to_le_bytes(), "len");
         assert_eq!(&bytes[4..8], &20_000u32.to_le_bytes(), "uptime_ms");
         assert_eq!(&bytes[8..12], &0xDEAD_BEEFu32.to_le_bytes(), "snap_seq");
 
@@ -1010,6 +1038,10 @@ mod tests {
         assert_eq!(bytes[165], 0, "flags2");
         assert_eq!(&bytes[166..168], &0u16.to_le_bytes(), "device_editor_effect_id");
         assert_eq!(bytes[168], 0, "codec_fallback_reason");
+
+        // The `169..171` append (bead `pico-link-jyhk.27`), at `no_extras()`:
+        // all-zero.
+        assert_eq!(&bytes[169..171], &0u16.to_le_bytes(), "radio_rev");
 
         // Full round trip against the same fixture.
         let snap = decode_home_snapshot(&bytes).unwrap();

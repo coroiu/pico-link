@@ -1,0 +1,17 @@
+{
+  "wire_len": 36,
+  "radio_rev": 8,
+  "discovering": false,
+  "connecting": false,
+  "device_wizard_open": false,
+  "paired_full": false,
+  "store_ready": false,
+  "scan_owner": "none",
+  "scan_seq": 0,
+  "attempt": null,
+  "last_outcome": {"seq": 22, "addr": "94:DB:56:54:7C:05", "result": "cancelled", "reason": null},
+  "scan_total_audio": 0,
+  "scan": [
+    
+  ]
+}

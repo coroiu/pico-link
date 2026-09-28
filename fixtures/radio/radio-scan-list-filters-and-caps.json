@@ -1,0 +1,28 @@
+{
+  "wire_len": 540,
+  "radio_rev": 3,
+  "discovering": true,
+  "connecting": false,
+  "device_wizard_open": false,
+  "paired_full": false,
+  "store_ready": false,
+  "scan_owner": "device",
+  "scan_seq": 0,
+  "attempt": null,
+  "last_outcome": null,
+  "scan_total_audio": 13,
+  "scan": [
+    {"addr": "94:DB:56:54:7C:20", "bars": 2, "already_paired": false, "name": "Cans 0"},
+    {"addr": "94:DB:56:54:7C:21", "bars": 2, "already_paired": false, "name": "Cans 1"},
+    {"addr": "94:DB:56:54:7C:22", "bars": 2, "already_paired": false, "name": "Cans 2"},
+    {"addr": "94:DB:56:54:7C:23", "bars": 2, "already_paired": false, "name": "Cans 3"},
+    {"addr": "94:DB:56:54:7C:24", "bars": 2, "already_paired": false, "name": "Cans 4"},
+    {"addr": "94:DB:56:54:7C:25", "bars": 2, "already_paired": false, "name": "Cans 5"},
+    {"addr": "94:DB:56:54:7C:26", "bars": 2, "already_paired": false, "name": "Cans 6"},
+    {"addr": "94:DB:56:54:7C:27", "bars": 2, "already_paired": false, "name": "Cans 7"},
+    {"addr": "94:DB:56:54:7C:28", "bars": 2, "already_paired": false, "name": "Cans 8"},
+    {"addr": "94:DB:56:54:7C:29", "bars": 2, "already_paired": false, "name": "Cans 9"},
+    {"addr": "94:DB:56:54:7C:2A", "bars": 2, "already_paired": false, "name": "Cans 10"},
+    {"addr": "94:DB:56:54:7C:2B", "bars": 2, "already_paired": false, "name": "Cans 11"}
+  ]
+}

@@ -244,6 +244,42 @@ impl ConnectFailureReason {
     pub fn retryable(self) -> bool {
         !matches!(self, Self::NoA2dpSink | Self::NeedsPin)
     }
+
+    /// The `GET_RADIO` (design sec 13.4) `reason` byte -- a stable,
+    /// core-owned wire code so a web client never has to keep its own copy
+    /// of this enum's variant order in sync with `core`'s (bead
+    /// `pico-link-jyhk.27`: "`ConnectFailureReason` gets a core-owned wire
+    /// code + retryable + text fixture table"). `0` is reserved for "no
+    /// failure" ([`super::model::BtModel::last_outcome`] being `None`, or a
+    /// non-`Failed` outcome) and is never returned here -- see
+    /// [`crate::app::radio::encode_radio_snapshot`]'s `reason` field for
+    /// where that `0` actually comes from.
+    #[must_use]
+    pub fn wire(self) -> u8 {
+        match self {
+            Self::Timeout => 1,
+            Self::Rejected => 2,
+            Self::NoA2dpSink => 3,
+            Self::NeedsPin => 4,
+            Self::RadioError => 5,
+        }
+    }
+
+    /// Short, user-facing text for this failure -- the same headline copy
+    /// `crate::render::wizard`'s `failure_text` shows on the device, so a
+    /// web client renders the identical message rather than inventing its
+    /// own for the same wire code (`pico-link-jyhk.27`'s `reasons.json`
+    /// fixture pins this down byte-for-byte per variant).
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Timeout => "No response",
+            Self::Rejected => "Pairing refused",
+            Self::NoA2dpSink => "Can't play audio",
+            Self::NeedsPin => "Needs a PIN",
+            Self::RadioError => "Bluetooth error",
+        }
+    }
 }
 
 /// One inbound Bluetooth-domain event, as reported by C over

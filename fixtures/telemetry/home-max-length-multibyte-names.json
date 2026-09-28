@@ -1,5 +1,5 @@
 {
-  "wire_len": 169,
+  "wire_len": 171,
   "uptime_ms": 6000,
   "snap_seq": 17,
   "link_connected": true,
@@ -32,5 +32,6 @@
   "device_editor_open": false,
   "device_editor_effect_id": 0,
   "presets_ready": false,
-  "codec_fallback_reason": 0
+  "codec_fallback_reason": 0,
+  "radio_rev": 0
 }

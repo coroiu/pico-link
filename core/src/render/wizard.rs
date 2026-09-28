@@ -46,7 +46,7 @@ use embedded_graphics::primitives::Rectangle;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use crate::app::{
-    cancel_connect, cancel_scan, connect, is_audio_sink, start_scan, truncate_device_name, Command, ConnectFailureReason, ConnectInitiator,
+    cancel_connect, cancel_scan, connect, scan_list_view, signal_bar_level, start_scan, truncate_device_name, Command, ConnectFailureReason, ConnectInitiator,
     ConnectStep,
     DeviceEntry, ModelHandle, ScanOwner, ScreenId, WizardPhase, MAX_SCAN_LIST_ITEMS,
 };
@@ -80,30 +80,12 @@ pub fn build_wizard_screen(phase: Rc<RefCell<WizardPhase>>, model: ModelHandle, 
     Screen::new(WIZARD_TITLE, vec![Box::new(view)]).with_id(ScreenId::PairingWizard)
 }
 
-/// Phase 2's 4-bar signal glyph (design section 9 rule 4: "signal as a
-/// 4-bar glyph here, dBm only in detail"; section 14 F10: "unconditional
-/// for the scan list"). Maps raw inquiry RSSI to a `0..=4` bar count,
-/// drawn as a real graphical glyph by [`super::theme::draw_signal_bars`]
-/// via [`ListItem::with_signal_bars`] -- pico-link-0r3 replaced the
-/// previous ASCII `#`/`.` stand-in (see that bead for why the stand-in
-/// existed and why four hash characters mattered enough to fix: this is
-/// the first screen a new user meets).
-///
-/// The thresholds themselves are an unchanged, unscientific coarse
-/// bucketing (not calibrated against real hardware RSSI distributions) --
-/// carried over from the stand-in this replaces. Good enough for "glance
-/// at four bars", not for anything quantitative; a real per-device dBm
-/// value stays available in phase-2's underlying `DeviceEntry`, this
-/// glyph never claims otherwise.
-fn signal_bar_level(rssi: i8) -> u8 {
-    match rssi {
-        r if r >= -50 => 4,
-        r if r >= -60 => 3,
-        r if r >= -70 => 2,
-        r if r >= -80 => 1,
-        _ => 0,
-    }
-}
+// Phase 2's 4-bar signal glyph (design section 9 rule 4: "signal as a
+// 4-bar glyph here, dBm only in detail"; section 14 F10: "unconditional
+// for the scan list") is [`signal_bar_level`], moved to
+// `crate::app::model` (bead `pico-link-jyhk.27`) so `GET_RADIO`'s scan
+// records use the exact same bar thresholds -- see that function's doc
+// comment for the rest of this history.
 
 /// The headline/subline pair for one of the five named failure causes
 /// (design section 9's table). Not `pub`: only [`PairingWizardView::render`]
@@ -278,18 +260,20 @@ impl PairingWizardView {
 /// own snapshot-and-rebuild shape.
 ///
 /// Filters `devices` (`BtModel::discovered`, unfiltered raw inquiry
-/// results) down to audio sinks via [`is_audio_sink`] -- design section 9
-/// phase 2 rule 3 -- then caps the result at [`MAX_SCAN_LIST_ITEMS`]
-/// (design section 21 Tier 1 row E9 / section 13's Class-of-Device row:
-/// built as a backstop regardless of whether the filter above is doing
-/// anything, since Class-of-Device is only *Expected*, not *Confirmed*).
-/// The filter runs here, at the render layer, rather than at
-/// `App::add_device` -- `BtModel::discovered` stays the complete raw
-/// inquiry feed either way (nothing else reads it today, but nothing here
-/// should force a future reader to reconstruct filtered-out devices from
-/// C's device-discovered events again), and this bead's own text calls out
-/// that the wizard must render a correct scan list whether or not this
-/// filter exists.
+/// results) down to audio sinks, then caps the result at
+/// [`MAX_SCAN_LIST_ITEMS`] (design section 21 Tier 1 row E9 / section 13's
+/// Class-of-Device row: built as a backstop regardless of whether the
+/// filter is doing anything, since Class-of-Device is only *Expected*, not
+/// *Confirmed*) -- via [`scan_list_view`], shared with
+/// [`crate::app::radio::encode_radio_snapshot`] (design sec 13.4: "The list
+/// is EXACTLY what the wizard shows ... factored into one core fn both
+/// call", bead `pico-link-jyhk.27`). The filter runs at the render layer
+/// (inside `scan_list_view`), rather than at `App::add_device` --
+/// `BtModel::discovered` stays the complete raw inquiry feed either way
+/// (nothing else reads it today, but nothing here should force a future
+/// reader to reconstruct filtered-out devices from C's device-discovered
+/// events again), and this bead's own text calls out that the wizard must
+/// render a correct scan list whether or not this filter exists.
 ///
 /// Stable first-seen order (design section 9 rule 1) falls out for free:
 /// `devices`' own order is never touched, only truncated. Row identity
@@ -305,9 +289,7 @@ fn build_scan_list(
     prev_key: Option<ListItemKey>,
     prev_index: usize,
 ) -> VerticalList {
-    let audio_devices: Vec<DeviceEntry> = devices.iter().filter(|d| is_audio_sink(d.class_of_device)).cloned().collect();
-    let total_audio = audio_devices.len();
-    let capped: Vec<DeviceEntry> = audio_devices.into_iter().take(MAX_SCAN_LIST_ITEMS).collect();
+    let (capped, total_audio) = scan_list_view(devices);
     let capped_len = capped.len();
 
     let mut items: Vec<ListItem> = capped
