@@ -18,8 +18,19 @@ const DEFAULT_INFO: DeviceInfoInput = {
   version: "dev",
 };
 
-/** Bits 5-7 of `op_mask` (`GET_LIBRARY`/`HOST_OP`/`GET_OP_STATUS`) -- what `enableLibrary: true` advertises via `GET_INFO` v2. */
-const LIBRARY_OP_MASK = (1 << 5) | (1 << 6) | (1 << 7);
+/**
+ * `op_mask` bits `enableLibrary: true` advertises via `GET_INFO` v2 --
+ * matches the real firmware's `PL_CFG_OP_MASK` (`usb_config_itf.h`): bit N
+ * is `HOST_OP` op N (SAVE_EFFECT=1 .. PARSE_APO=6), NOT the `GET_LIBRARY`/
+ * `HOST_OP`/`GET_OP_STATUS` control-request codes 5/6/7 -- those three are
+ * control requests every v2 device answers, not individual op_mask bits
+ * (design section 8). Bits 5-7 here were a copy of the wrong contract and
+ * masked `library.ts`'s `opsAvailable()` bug (bead pico-link-q28y): a fake
+ * that never encoded real hardware's bits couldn't catch a gate checking
+ * the wrong bits either.
+ */
+const LIBRARY_OP_MASK =
+  (1 << HOST_OP_SAVE_EFFECT) | (1 << HOST_OP_DELETE_EFFECT) | (1 << HOST_OP_ASSIGN) | (1 << HOST_OP_PREVIEW) | (1 << HOST_OP_PREVIEW_END) | (1 << HOST_OP_PARSE_APO);
 
 export interface FakeTransportOptions {
   /** Called each time GET_TELEMETRY page 0 is polled; return the live snapshot. */

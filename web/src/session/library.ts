@@ -18,7 +18,22 @@ import type { Store } from "./store";
 import { decodeLibrarySnapshot, encodePresetBlob } from "../proto/library";
 import type { LibrarySnapshot, Preset } from "../proto/library";
 import { opMaskSupports } from "../proto/info";
-import { decodeOpStatus, encodeAssignRequest, encodeDeleteEffectRequest, encodeParseApoRequest, encodePreviewEndRequest, encodePreviewRequest, encodeSaveEffectRequest, OpError } from "../proto/ops";
+import {
+  decodeOpStatus,
+  encodeAssignRequest,
+  encodeDeleteEffectRequest,
+  encodeParseApoRequest,
+  encodePreviewEndRequest,
+  encodePreviewRequest,
+  encodeSaveEffectRequest,
+  HOST_OP_ASSIGN,
+  HOST_OP_DELETE_EFFECT,
+  HOST_OP_PARSE_APO,
+  HOST_OP_PREVIEW,
+  HOST_OP_PREVIEW_END,
+  HOST_OP_SAVE_EFFECT,
+  OpError,
+} from "../proto/ops";
 import type { OpStatus } from "../proto/ops";
 import { PL_CFG_REQ_GET_LIBRARY, PL_CFG_REQ_GET_OP_STATUS, PL_CFG_REQ_HOST_OP } from "../transport/types";
 
@@ -71,10 +86,6 @@ const DEFAULTS: Required<Omit<LibraryControllerOptions, "now" | "visibilityDocum
   confirmPollMs: 100,
   previewKeepaliveMs: 800,
 };
-
-const OP_GET_LIBRARY_BIT = 5;
-const OP_HOST_OP_BIT = 6;
-const OP_GET_OP_STATUS_BIT = 7;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -149,12 +160,29 @@ export class LibraryController {
     }
   }
 
-  /** `true` once `GET_INFO` reports `info_ver >= 2` and every op this controller needs (`GET_LIBRARY`, `HOST_OP`, `GET_OP_STATUS`) is set in `op_mask`. */
+  /**
+   * `true` once `GET_INFO` reports `info_ver >= 2` (v2 fields -- `lib_proto`/
+   * `op_proto`/`op_mask` -- present). `GET_LIBRARY`/`HOST_OP`/`GET_OP_STATUS`
+   * are control requests every v2 device answers, not individual `op_mask`
+   * bits -- `op_mask`'s bit N is `HOST_OP` op N (design section 8: "u32
+   * op_mask (bit N = op N)"), so bits 5/6/7 don't correspond to anything a
+   * v2 firmware sets (firmware sets bits 1..6 for SAVE_EFFECT..PARSE_APO --
+   * `usb_config_itf.h`'s `PL_CFG_OP_MASK`) and gating overall availability on
+   * them made Effects permanently "needs newer firmware" on real hardware.
+   * Each Effects action still gates on its own `HOST_OP` op bit via
+   * `opAvailable()` below.
+   */
   opsAvailable(): boolean {
     const info = this.session.statusStore.getSnapshot().info;
     const v2 = info?.v2;
-    if (!v2) return false;
-    return opMaskSupports(v2.opMask, OP_GET_LIBRARY_BIT) && opMaskSupports(v2.opMask, OP_HOST_OP_BIT) && opMaskSupports(v2.opMask, OP_GET_OP_STATUS_BIT);
+    return !!v2 && v2.libProto > 0 && v2.opProto > 0;
+  }
+
+  /** `true` once `opsAvailable()` and this specific `HOST_OP` op is set in `op_mask` (design section 8). */
+  private opAvailable(op: number): boolean {
+    if (!this.opsAvailable()) return false;
+    const v2 = this.session.statusStore.getSnapshot().info?.v2;
+    return !!v2 && opMaskSupports(v2.opMask, op);
   }
 
   /**
@@ -211,7 +239,7 @@ export class LibraryController {
     const blob = encodePresetBlob(preset);
     const id = existing?.id ?? 0;
     const baseSeq = existing?.baseSeq ?? 0;
-    const outcome = await this.runOp((seq) => encodeSaveEffectRequest(seq, id, baseSeq, blob));
+    const outcome = await this.runOp(HOST_OP_SAVE_EFFECT, (seq) => encodeSaveEffectRequest(seq, id, baseSeq, blob));
     if (outcome.kind !== "done") return outcome;
 
     const effectId = outcome.status.effectId;
@@ -221,12 +249,12 @@ export class LibraryController {
   }
 
   async deleteEffect(id: number, baseSeq: number): Promise<OpOutcome> {
-    return this.runOp((seq) => encodeDeleteEffectRequest(seq, id, baseSeq));
+    return this.runOp(HOST_OP_DELETE_EFFECT, (seq) => encodeDeleteEffectRequest(seq, id, baseSeq));
   }
 
   /** `effectId: 0` unassigns (Off). No `base_seq` -- design section 4: "Last writer wins, no base_seq (a pick is idempotent)." */
   async assign(addr: string, effectId: number): Promise<OpOutcome> {
-    return this.runOp((seq) => encodeAssignRequest(seq, addr, effectId));
+    return this.runOp(HOST_OP_ASSIGN, (seq) => encodeAssignRequest(seq, addr, effectId));
   }
 
   /**
@@ -258,12 +286,12 @@ export class LibraryController {
   async previewEnd(): Promise<OpOutcome> {
     this.stopKeepalive();
     this.activePreview = null;
-    return this.runOp((seq) => encodePreviewEndRequest(seq));
+    return this.runOp(HOST_OP_PREVIEW_END, (seq) => encodePreviewEndRequest(seq));
   }
 
   /** `HOST_OP` `PARSE_APO` -- core does the parsing; this only round-trips the request/response (design section 4: "so JS implements neither the parser nor the suffix rule"). */
   async parseApo(name: string, apoText: string): Promise<OpOutcome> {
-    return this.runOp((seq) => encodeParseApoRequest(seq, name, apoText));
+    return this.runOp(HOST_OP_PARSE_APO, (seq) => encodeParseApoRequest(seq, name, apoText));
   }
 
   // --- Preview keepalive ---------------------------------------------
@@ -286,7 +314,7 @@ export class LibraryController {
     const preview = this.activePreview;
     if (!preview) return { kind: "unavailable" };
     const blob = encodePresetBlob(preview.preset);
-    return this.runOp((seq) => encodePreviewRequest(seq, preview.effectId, blob, preview.bypass));
+    return this.runOp(HOST_OP_PREVIEW, (seq) => encodePreviewRequest(seq, preview.effectId, blob, preview.bypass));
   }
 
   private onVisibilityChange(): void {
@@ -329,8 +357,8 @@ export class LibraryController {
     await this.seqInitPromise;
   }
 
-  private async runOp(buildRequest: (seq: number) => Uint8Array): Promise<OpOutcome> {
-    if (!this.opsAvailable()) return { kind: "unavailable" };
+  private async runOp(op: number, buildRequest: (seq: number) => Uint8Array): Promise<OpOutcome> {
+    if (!this.opAvailable(op)) return { kind: "unavailable" };
     await this.ensureSeqInitialized();
     const seq = this.nextSeq!;
     this.nextSeq = (seq + 1) & 0xff;
