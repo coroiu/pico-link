@@ -126,6 +126,7 @@
 #include <stdint.h>
 
 #include "device/usbd_pvt.h"
+#include "pico_link_ui.h"
 
 struct PlUi;
 
@@ -216,19 +217,30 @@ typedef struct __attribute__((packed)) {
 // returns 0 rather than overflow this buffer.
 #define PL_CONFIG_TELEMETRY_BUF_LEN 256
 
-// The full current wire length of a page-0 Home snapshot -- mirrors
-// `pico_link_core::app::telemetry::HOME_SNAPSHOT_LEN` (169 as of the
-// pico-link-jyhk.18 append; see that constant's own doc comment for the
-// byte-by-byte layout). Duplicated here (not exposed through cbindgen)
-// so `configd_init` (bead pico-link-s6hh) can synthesize a proto-1,
-// snap_seq-0 "not ready" header of the CORRECT length before the first
-// real snapshot is ever published, without calling into Rust from C
-// static-init. A drift between this and core's constant only changes the
-// not-ready reply's trailing zero-padding length, never its meaning
-// (`snap_seq == 0` is what the web session actually keys "not ready" on) --
-// see core/src/app/telemetry.rs's `golden_bytes_layout_is_stable` test for
-// the value that must stay in sync.
-#define PL_CFG_HOME_SNAPSHOT_LEN 169
+// The full current wire length of a page-0 Home snapshot -- bead
+// `pico-link-5adh`: was a hand-copied literal `169` here with no link back
+// to `core` at all; now an alias for cbindgen-generated
+// `PL_HOME_SNAPSHOT_LEN` (`pico_link_ui.h`, from `ui-ffi`'s
+// `PL_HOME_SNAPSHOT_LEN`, itself compile-time-asserted against
+// `pico_link_core::app::telemetry::HOME_SNAPSHOT_LEN` -- see that Rust
+// constant's doc comment for why it's a checked literal, not a direct
+// cross-crate reference). `configd_init` (bead pico-link-s6hh) uses this to
+// synthesize a proto-1, snap_seq-0 "not ready" header of the CORRECT length
+// before the first real snapshot is ever published, without calling into
+// Rust from C static-init. See core/src/app/telemetry.rs's
+// `golden_bytes_layout_is_stable` test for the value that must stay in
+// sync.
+#define PL_CFG_HOME_SNAPSHOT_LEN PL_HOME_SNAPSHOT_LEN
+
+// PL_CONFIG_TELEMETRY_BUF_LEN (above) is the shared publish buffer every
+// telemetry page copies into (`pl_ui_telemetry`'s `cap`); it must never be
+// smaller than the widest page's snapshot -- page 0's, `PL_CFG_
+// HOME_SNAPSHOT_LEN` -- or a future append could make `pl_ui_telemetry`
+// silently refuse to publish (it returns 0 rather than overflow the
+// buffer, per that function's own doc comment). Caught at compile time,
+// not by runtime observation of an always-zero telemetry reply.
+_Static_assert(PL_CONFIG_TELEMETRY_BUF_LEN >= PL_CFG_HOME_SNAPSHOT_LEN,
+               "PL_CONFIG_TELEMETRY_BUF_LEN must be >= PL_CFG_HOME_SNAPSHOT_LEN");
 
 // Byte offsets of the three header fields every telemetry page shares
 // (design section 4) -- mirrors core/src/app/telemetry.rs's

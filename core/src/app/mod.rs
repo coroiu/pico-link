@@ -67,6 +67,7 @@ mod ui_state;
 
 pub use events::{Command, ConnectFailureReason, ConnectStep, Event, StoreStatus, VolumeSource, VolumeState};
 pub use host_op::MAX_OP_STATUS_LEN;
+pub use telemetry::HOME_SNAPSHOT_LEN;
 pub use fault::{FaultEntry, FaultGlyphClass, FaultKey, FaultLog, FaultSeverity, FaultValue};
 pub use model::{
     BtModel, ConnectAttempt, ConnectInitiator, ConnectOutcome, ConnectOutcomeResult, ConnectedCodec, DeviceAddr, DeviceEntry, LinkState,

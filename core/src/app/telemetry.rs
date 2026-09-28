@@ -195,7 +195,13 @@ const OFF_CODEC_FALLBACK_REASON: usize = OFF_DEVICE_EDITOR_EFFECT_ID + 2;
 /// `pico-link-jyhk.18` append (`163` at proto 1's original shape, see
 /// [`HOME_SNAPSHOT_V1_LEN`], plus its 6-byte tail: this module's doc
 /// comment table has the full byte-by-byte layout).
-pub(crate) const HOME_SNAPSHOT_LEN: usize = OFF_CODEC_FALLBACK_REASON + 1;
+///
+/// `pub`, not `pub(crate)`, so `ui-ffi` (bead `pico-link-5adh`) can
+/// re-export it as `PlHomeSnapshotLen`/`PL_HOME_SNAPSHOT_LEN` for cbindgen
+/// to emit into `pico_link_ui.h` -- the single source of truth for the C
+/// side's `PL_CFG_HOME_SNAPSHOT_LEN`, which used to be a hand-copied
+/// literal that could silently desync from this value.
+pub const HOME_SNAPSHOT_LEN: usize = OFF_CODEC_FALLBACK_REASON + 1;
 
 /// `flags` bit positions (design section 4).
 const FLAG_ADAPTIVE: u8 = 1 << 0;
