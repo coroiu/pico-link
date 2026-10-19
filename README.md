@@ -54,6 +54,19 @@ dongle.
 
 Drop a `.txt` export from AutoEQ or Equalizer APO onto the page to import it.
 
+### Linux
+
+Needs a udev rule so the browser can claim the device without root:
+
+```sh
+sudo cp tools/udev/70-pico-link.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger
+```
+
+Replug the device, then open the web companion in Chrome or Edge. Linux is
+untested on real hardware so far — report back if you try it.
+
 ## Hardware
 
 Two off-the-shelf boards. The LCD plugs straight onto the Pico — no soldering.
