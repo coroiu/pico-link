@@ -278,6 +278,10 @@ add_executable(pico_link
     # Bead pico-link-ycm2.7.1, design sec 2b/7 step 1: the drain-rate PI
     # servo moved out of usb_audio.c -- see drain_servo.h's module doc.
     src/drain_servo.c
+    # Bead pico-link-ycm2.7.1.1: independent host-clock-offset reference,
+    # a second instrument that does not depend on the drain servo -- see
+    # host_clock_ref.h's module doc.
+    src/host_clock_ref.c
     src/pl_log_ring.c
     src/pl_prio.c
     src/pl_loop_prof.c

@@ -51,6 +51,9 @@
 // -- see that header's module doc for why the include graph stays
 // one-directional (main.c -> fault.c -> {a2dp,usb_audio,pcm_ring}).
 #include "fault.h"
+// Bead pico-link-ycm2.7.1.1: independent host-clock-offset reference --
+// see host_clock_ref.h's module doc.
+#include "host_clock_ref.h"
 #include "input.h"
 #include "media_keys.h"
 #include "ldac_bench.h"
@@ -1003,6 +1006,15 @@ int main(void) {
             // pico-link-ycm2.7.1) and must read it before pl_a2dp_report
             // needs the cached result.
             pl_fault_evaluate(ui, shared_now_us);
+
+            // Bead pico-link-ycm2.7.1.1: poll the independent host-clock
+            // reference at this SAME 1Hz point, BEFORE pl_a2dp_report --
+            // it internally gates itself to a coarser ~10s window (see
+            // host_clock_ref.c), and pl_a2dp_report below reads its cached
+            // ppm via pl_host_clock_ref_ppm() on the same line as
+            // servo_ppm/servo_learned_ppm so the two instruments are
+            // directly comparable.
+            pl_host_clock_ref_poll(shared_now_us, pl_usb_pump_sof_count());
 
             // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
             // report line. Thread context only (pl_a2dp_report does no

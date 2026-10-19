@@ -176,4 +176,16 @@ void pl_usb_pump_report(uint32_t report_dt_us);
 // non-Rust, non-firmware-src call site, the vendored SDK patch.
 void pl_usb_sof_isr_sample(uint32_t frame_count);
 
+// Bead pico-link-ycm2.7.1.1: read-only snapshot of s_sof_isr_count, the
+// real-ISR-context SOF counter pl_usb_sof_isr_sample increments. This is
+// the host-clock reference tap: SOF frames arrive paced by the HOST's own
+// crystal (one per 1ms on this full-speed-only controller), so counting
+// them against OUR OWN timer (time_us_64, a different crystal) over a
+// fixed window directly measures the host-vs-device clock offset --
+// independent of anything the drain servo (drain_servo.c) does, which is
+// the whole point (see host_clock_ref.h). A plain volatile uint32_t load
+// is safe here: single writer (the SOF ISR), single word, no
+// read-modify-write.
+uint32_t pl_usb_pump_sof_count(void);
+
 #endif // PICO_LINK_USB_PUMP_H

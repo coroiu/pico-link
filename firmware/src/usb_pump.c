@@ -14,6 +14,7 @@
 #include "tusb.h"
 
 #include "drain_servo.h" // pl_drain_servo_tick/_bus_reset -- bead pico-link-ycm2.7.1
+#include "host_clock_ref.h" // pl_host_clock_ref_bus_reset -- bead pico-link-ycm2.7.1.1
 #include "pcm_ring.h"
 #include "pl_log_ring.h"
 #include "usb_audio.h"
@@ -189,6 +190,14 @@ void pl_usb_sof_isr_sample(uint32_t frame_count) {
     }
 }
 
+// Bead pico-link-ycm2.7.1.1: s_sof_isr_count increments unconditionally
+// above (not gated on pl_usb_audio_streaming()), so this reads correctly
+// whether or not a stream is active -- host_clock_ref.c's window can start
+// counting as soon as the bus is enumerated.
+uint32_t pl_usb_pump_sof_count(void) {
+    return s_sof_isr_count;
+}
+
 // TU_ATTR_WEAK override -- fires from inside tud_task() right after
 // usbd.c's process_set_config() on a successful SET_CONFIGURATION
 // (usbd.c:793-809). Bead pico-link-1av: main.c's original
@@ -231,6 +240,11 @@ void tud_mount_cb(void) {
     // it here rather than let a stale learned_ppm bias a fresh host's
     // first stream.
     pl_drain_servo_bus_reset();
+    // Bead pico-link-ycm2.7.1.1: a new enumeration may be a different host
+    // with a different crystal -- restart the host-clock-ref window rather
+    // than let a stale pre-reset sof_count/time_us_64 pair span the
+    // boundary and blend two hosts' offsets into one bogus reading.
+    pl_host_clock_ref_bus_reset();
 }
 
 // Runs at PL_USB_PUMP_IRQ_PRIORITY (0xC0) as a claimed user IRQ, pended by

@@ -99,6 +99,7 @@
 #include "codec_sbc.h"
 #include "codec_table.h"
 #include "drain_servo.h" // pl_drain_servo_* -- bead pico-link-ycm2.7.1, the PI rate-matcher moved here from usb_audio.c
+#include "host_clock_ref.h" // pl_host_clock_ref_ppm -- bead pico-link-ycm2.7.1.1, the independent cross-check
 #include "dsp.h"
 #include "hardware/sync.h" // __dmb() -- tx ring cross-core barriers, see s_ctx.tx doc comment
 #include "media_keys.h"
@@ -5146,13 +5147,22 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
     // is the live correction pl_a2dp_accrue_credit is currently applying
     // (sign convention: positive = draining faster, ring running high);
     // servo_learned_ppm is the carried steady-state snapshot (design sec
-    // 2b's "Required details") -- the pass criterion compares servo_ppm
-    // against the independently measured host offset (delta_ppm from the
-    // console byte/ms sums), not servo_learned_ppm, which only answers
-    // "did the reseed-across-trims carry-over actually happen".
+    // 2b's "Required details").
+    //
+    // Bead pico-link-ycm2.7.1.1: host_ppm is the INDEPENDENT measurement --
+    // host SOF rate against this board's own timer, touching neither
+    // pcm_ring nor the servo (see host_clock_ref.h's module doc for the
+    // full reasoning). It reads PL_HOST_CLOCK_PPM_NOT_READY
+    // (INT32_MIN, prints as a conspicuously implausible large negative
+    // number) until the first ~10s window completes. Same sign
+    // convention as servo_ppm/servo_learned_ppm by construction -- a
+    // healthy servo's servo_learned_ppm should converge to approximately
+    // +host_ppm (design sec 6's +/-20ppm agreement bar), NOT -host_ppm;
+    // see host_clock_ref.h for why the signs line up directly instead of
+    // needing a flip.
     pl_log(
-        "a2dp: servo_ppm=%ld servo_learned_ppm=%ld\r\n",
-        (long)pl_drain_servo_ppm(), (long)pl_drain_servo_learned_ppm()
+        "a2dp: servo_ppm=%ld servo_learned_ppm=%ld host_ppm=%ld\r\n",
+        (long)pl_drain_servo_ppm(), (long)pl_drain_servo_learned_ppm(), (long)pl_host_clock_ref_ppm()
     );
     // Bead pico-link-7jol.3, design sec 7: the LDAC ABR controller's
     // observability line. quality_requested and quality_applied are
