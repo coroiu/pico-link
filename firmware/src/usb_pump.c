@@ -75,6 +75,17 @@ static volatile uint32_t s_ep_out_state_flipped_in_task; // D13: usbd_edpt_busy(
 // and 7-E2) for the full reasoning.
 static volatile uint32_t s_sof_isr_count; // D4: real SOF ISR count, now sampled in true ISR context (see below)
 
+// Bead pico-link-ycm2.7.1.1: the TIMESTAMP of the most recent real SOF
+// edge, read via time_us_64() from inside the true-ISR sample below --
+// NOT a thread-side poll instant. This is what lets host_clock_ref.c
+// measure sub-ppm: snapping a window's start/end to actual edges removes
+// the +/-1-SOF (~1ms) phase ambiguity that counting edges inside an
+// arbitrary externally-chosen time window has (that ambiguity, at ~10,000
+// edges per 10s window, is exactly the ~100ppm quantization floor the
+// first cut of this bead measured). time_us_64() is itself ISR-safe (a
+// plain hardware TIMER register read, no lock).
+static volatile uint64_t s_last_sof_time_us;
+
 // --- Bead pico-link-2ap: THE discriminator between "the host is sending
 // fewer ISO-OUT packets" and "we are failing to ingest what it sends".
 // Sampled inside pl_usb_sof_isr_sample (see below), called from the
@@ -170,6 +181,7 @@ volatile uint32_t pl_usb_fifo_shortfall_bytes;
 void pl_usb_sof_isr_sample(uint32_t frame_count) {
     (void)frame_count;
     s_sof_isr_count++;
+    s_last_sof_time_us = time_us_64();
 
     if (pl_usb_audio_streaming()) {
         s_sof_streaming++;
@@ -190,12 +202,33 @@ void pl_usb_sof_isr_sample(uint32_t frame_count) {
     }
 }
 
-// Bead pico-link-ycm2.7.1.1: s_sof_isr_count increments unconditionally
-// above (not gated on pl_usb_audio_streaming()), so this reads correctly
-// whether or not a stream is active -- host_clock_ref.c's window can start
-// counting as soon as the bus is enumerated.
+// Bead pico-link-ycm2.7.1.1: s_sof_isr_count/s_last_sof_time_us increment
+// unconditionally above (not gated on pl_usb_audio_streaming()), so this
+// reads correctly whether or not a stream is active -- host_clock_ref.c's
+// window can start counting as soon as the bus is enumerated.
+//
+// count and time_us are written together, but by a DIFFERENT priority
+// level (the 0xC0 SOF-sample context) than this accessor's caller (plain
+// thread context) -- a read here can be preempted between the two
+// volatile loads, pairing a NEW count with the OLD timestamp or vice
+// versa. Plain optimistic retry (re-read count, compare) is the standard
+// lock-free fix and is cheap here: at most one retry per call in
+// practice, since two SOF ISRs essentially never land inside the handful
+// of instructions between the two loads.
 uint32_t pl_usb_pump_sof_count(void) {
     return s_sof_isr_count;
+}
+
+void pl_usb_pump_sof_snapshot(uint32_t *count_out, uint64_t *time_us_out) {
+    uint32_t count_before, count_after;
+    uint64_t time_us;
+    do {
+        count_before = s_sof_isr_count;
+        time_us = s_last_sof_time_us;
+        count_after = s_sof_isr_count;
+    } while (count_before != count_after);
+    *count_out = count_after;
+    *time_us_out = time_us;
 }
 
 // TU_ATTR_WEAK override -- fires from inside tud_task() right after

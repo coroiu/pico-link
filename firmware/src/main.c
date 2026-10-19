@@ -1013,8 +1013,15 @@ int main(void) {
             // host_clock_ref.c), and pl_a2dp_report below reads its cached
             // ppm via pl_host_clock_ref_ppm() on the same line as
             // servo_ppm/servo_learned_ppm so the two instruments are
-            // directly comparable.
-            pl_host_clock_ref_poll(shared_now_us, pl_usb_pump_sof_count());
+            // directly comparable. Passes the SOF edge's OWN (count,
+            // timestamp) pair, not shared_now_us -- host_clock_ref.c must
+            // measure elapsed time between two real SOF edges, not
+            // between two arbitrary thread-poll instants (see its module
+            // doc for why that distinction is the whole fix).
+            uint32_t host_clock_sof_count;
+            uint64_t host_clock_sof_time_us;
+            pl_usb_pump_sof_snapshot(&host_clock_sof_count, &host_clock_sof_time_us);
+            pl_host_clock_ref_poll(host_clock_sof_time_us, host_clock_sof_count);
 
             // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
             // report line. Thread context only (pl_a2dp_report does no
