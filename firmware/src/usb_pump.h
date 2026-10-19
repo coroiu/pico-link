@@ -176,4 +176,31 @@ void pl_usb_pump_report(uint32_t report_dt_us);
 // non-Rust, non-firmware-src call site, the vendored SDK patch.
 void pl_usb_sof_isr_sample(uint32_t frame_count);
 
+// Bead pico-link-ycm2.7.1.1: read-only snapshot of s_sof_isr_count, the
+// real-ISR-context SOF counter pl_usb_sof_isr_sample increments. This is
+// the host-clock reference tap: SOF frames arrive paced by the HOST's own
+// crystal (one per 1ms on this full-speed-only controller), so counting
+// them against OUR OWN timer (time_us_64, a different crystal) directly
+// measures the host-vs-device clock offset -- independent of anything the
+// drain servo (drain_servo.c) does, which is the whole point (see
+// host_clock_ref.h). A plain volatile uint32_t load is safe here: single
+// writer (the SOF ISR), single word, no read-modify-write. Kept for
+// callers that only want the count; host_clock_ref.c uses
+// pl_usb_pump_sof_snapshot() below instead, because it also needs the
+// matching edge timestamp.
+uint32_t pl_usb_pump_sof_count(void);
+
+// Bead pico-link-ycm2.7.1.1: atomically-paired (count, timestamp) read --
+// count_out and time_us_out are set together, to s_sof_isr_count and
+// s_last_sof_time_us as of the SAME SOF edge (optimistic retry against
+// the SOF ISR landing between the two loads; see usb_pump.c). time_us_out
+// is that edge's OWN time_us_64() reading, taken inside the ISR -- NOT
+// the caller's own clock read. This is the pairing host_clock_ref.c
+// needs: snapping a measurement window's boundaries to actual SOF edges
+// (rather than an arbitrary externally-chosen instant) removes the
+// +/-1-SOF phase ambiguity a fixed-time-window edge count has -- see
+// host_clock_ref.h's module doc for why that ambiguity is exactly the
+// ~100ppm quantization floor the first cut of this bead measured.
+void pl_usb_pump_sof_snapshot(uint32_t *count_out, uint64_t *time_us_out);
+
 #endif // PICO_LINK_USB_PUMP_H

@@ -51,6 +51,9 @@
 // -- see that header's module doc for why the include graph stays
 // one-directional (main.c -> fault.c -> {a2dp,usb_audio,pcm_ring}).
 #include "fault.h"
+// Bead pico-link-ycm2.7.1.1: independent host-clock-offset reference --
+// see host_clock_ref.h's module doc.
+#include "host_clock_ref.h"
 #include "input.h"
 #include "media_keys.h"
 #include "ldac_bench.h"
@@ -998,10 +1001,27 @@ int main(void) {
 
             // Bead pico-link-9eq2.3.2, design sec 5.1/7.1: the fault
             // evaluator runs at this SAME 1Hz thread-context point, BEFORE
-            // pl_a2dp_report below -- it is usb_audio.c's pl_usb_audio_
-            // fill_min()'s sole caller (design sec 5.6.5) and must read it
-            // before pl_a2dp_report needs the cached result.
+            // pl_a2dp_report below -- it is drain_servo.c's pl_drain_servo_
+            // fill_min()'s sole caller (design sec 5.6.5, renamed by bead
+            // pico-link-ycm2.7.1) and must read it before pl_a2dp_report
+            // needs the cached result.
             pl_fault_evaluate(ui, shared_now_us);
+
+            // Bead pico-link-ycm2.7.1.1: poll the independent host-clock
+            // reference at this SAME 1Hz point, BEFORE pl_a2dp_report --
+            // it internally gates itself to a coarser ~10s window (see
+            // host_clock_ref.c), and pl_a2dp_report below reads its cached
+            // ppm via pl_host_clock_ref_ppm() on the same line as
+            // servo_ppm/servo_learned_ppm so the two instruments are
+            // directly comparable. Passes the SOF edge's OWN (count,
+            // timestamp) pair, not shared_now_us -- host_clock_ref.c must
+            // measure elapsed time between two real SOF edges, not
+            // between two arbitrary thread-poll instants (see its module
+            // doc for why that distinction is the whole fix).
+            uint32_t host_clock_sof_count;
+            uint64_t host_clock_sof_time_us;
+            pl_usb_pump_sof_snapshot(&host_clock_sof_count, &host_clock_sof_time_us);
+            pl_host_clock_ref_poll(host_clock_sof_time_us, host_clock_sof_count);
 
             // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
             // report line. Thread context only (pl_a2dp_report does no
@@ -1009,7 +1029,7 @@ int main(void) {
             //
             // Bead pico-link-9eq2.3.2: fill_min is now sourced from
             // pl_fault_last_fill_min() (fault.c's cache of this window's
-            // ONE pl_usb_audio_fill_min() read), not a second direct call
+            // ONE pl_drain_servo_fill_min() read), not a second direct call
             // -- see pl_a2dp_report's own doc comment (a2dp.h) for why.
             pl_a2dp_report(shared_report_dt_us, pl_fault_last_fill_min());
 

@@ -13,6 +13,8 @@
 #include "pico/time.h"
 #include "tusb.h"
 
+#include "drain_servo.h" // pl_drain_servo_tick/_bus_reset -- bead pico-link-ycm2.7.1
+#include "host_clock_ref.h" // pl_host_clock_ref_bus_reset -- bead pico-link-ycm2.7.1.1
 #include "pcm_ring.h"
 #include "pl_log_ring.h"
 #include "usb_audio.h"
@@ -72,6 +74,17 @@ static volatile uint32_t s_ep_out_state_flipped_in_task; // D13: usbd_edpt_busy(
 // See pico-link-2ap's design-of-record comment (Ada, 2026-08-31, sections 4
 // and 7-E2) for the full reasoning.
 static volatile uint32_t s_sof_isr_count; // D4: real SOF ISR count, now sampled in true ISR context (see below)
+
+// Bead pico-link-ycm2.7.1.1: the TIMESTAMP of the most recent real SOF
+// edge, read via time_us_64() from inside the true-ISR sample below --
+// NOT a thread-side poll instant. This is what lets host_clock_ref.c
+// measure sub-ppm: snapping a window's start/end to actual edges removes
+// the +/-1-SOF (~1ms) phase ambiguity that counting edges inside an
+// arbitrary externally-chosen time window has (that ambiguity, at ~10,000
+// edges per 10s window, is exactly the ~100ppm quantization floor the
+// first cut of this bead measured). time_us_64() is itself ISR-safe (a
+// plain hardware TIMER register read, no lock).
+static volatile uint64_t s_last_sof_time_us;
 
 // --- Bead pico-link-2ap: THE discriminator between "the host is sending
 // fewer ISO-OUT packets" and "we are failing to ingest what it sends".
@@ -168,6 +181,7 @@ volatile uint32_t pl_usb_fifo_shortfall_bytes;
 void pl_usb_sof_isr_sample(uint32_t frame_count) {
     (void)frame_count;
     s_sof_isr_count++;
+    s_last_sof_time_us = time_us_64();
 
     if (pl_usb_audio_streaming()) {
         s_sof_streaming++;
@@ -186,6 +200,35 @@ void pl_usb_sof_isr_sample(uint32_t frame_count) {
         }
         s_sof_last_pkt_count = pc;
     }
+}
+
+// Bead pico-link-ycm2.7.1.1: s_sof_isr_count/s_last_sof_time_us increment
+// unconditionally above (not gated on pl_usb_audio_streaming()), so this
+// reads correctly whether or not a stream is active -- host_clock_ref.c's
+// window can start counting as soon as the bus is enumerated.
+//
+// count and time_us are written together, but by a DIFFERENT priority
+// level (the 0xC0 SOF-sample context) than this accessor's caller (plain
+// thread context) -- a read here can be preempted between the two
+// volatile loads, pairing a NEW count with the OLD timestamp or vice
+// versa. Plain optimistic retry (re-read count, compare) is the standard
+// lock-free fix and is cheap here: at most one retry per call in
+// practice, since two SOF ISRs essentially never land inside the handful
+// of instructions between the two loads.
+uint32_t pl_usb_pump_sof_count(void) {
+    return s_sof_isr_count;
+}
+
+void pl_usb_pump_sof_snapshot(uint32_t *count_out, uint64_t *time_us_out) {
+    uint32_t count_before, count_after;
+    uint64_t time_us;
+    do {
+        count_before = s_sof_isr_count;
+        time_us = s_last_sof_time_us;
+        count_after = s_sof_isr_count;
+    } while (count_before != count_after);
+    *count_out = count_after;
+    *time_us_out = time_us;
 }
 
 // TU_ATTR_WEAK override -- fires from inside tud_task() right after
@@ -223,6 +266,18 @@ void pl_usb_sof_isr_sample(uint32_t frame_count) {
 // pl_usb_sof_isr_sample never runs, regardless of the usbd.c patch.
 void tud_mount_cb(void) {
     tud_sof_cb_enable(true);
+    // Bead pico-link-ycm2.7.1, design sec 2b: a real SET_CONFIGURATION/bus
+    // reset means a new enumeration, and possibly a different host with a
+    // different crystal -- the drain servo's learned offset from whatever
+    // host was previously connected says nothing about this one, so clear
+    // it here rather than let a stale learned_ppm bias a fresh host's
+    // first stream.
+    pl_drain_servo_bus_reset();
+    // Bead pico-link-ycm2.7.1.1: a new enumeration may be a different host
+    // with a different crystal -- restart the host-clock-ref window rather
+    // than let a stale pre-reset sof_count/time_us_64 pair span the
+    // boundary and blend two hosts' offsets into one bogus reading.
+    pl_host_clock_ref_bus_reset();
 }
 
 // Runs at PL_USB_PUMP_IRQ_PRIORITY (0xC0) as a claimed user IRQ, pended by
@@ -282,6 +337,10 @@ static void pl_usb_pump_worker_irq(void) {
     // only the call site moved.
     if (pl_usb_audio_streaming()) {
         pl_usb_audio_feedback_task();
+        // Bead pico-link-ycm2.7.1, design sec 2b: the actual rate-matching
+        // PI servo, same cadence/call site the old feedback-value
+        // computation had before it moved to drain_servo.c.
+        pl_drain_servo_tick();
     }
 #endif
 
@@ -365,6 +424,9 @@ static void pl_usb_pump_worker_irq(void) {
     // and ep_fb is a real endpoint.
     if (pl_usb_audio_streaming()) {
         pl_usb_audio_feedback_task();
+        // Bead pico-link-ycm2.7.1, design sec 2b: same cadence/call site as
+        // the ISO_XFER_ISR branch above, for the non-ISO_XFER_ISR build.
+        pl_drain_servo_tick();
     }
 #endif
 

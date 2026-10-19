@@ -98,6 +98,8 @@
 #include "codec_ldac.h"
 #include "codec_sbc.h"
 #include "codec_table.h"
+#include "drain_servo.h" // pl_drain_servo_* -- bead pico-link-ycm2.7.1, the PI rate-matcher moved here from usb_audio.c
+#include "host_clock_ref.h" // pl_host_clock_ref_ppm -- bead pico-link-ycm2.7.1.1, the independent cross-check
 #include "dsp.h"
 #include "hardware/sync.h" // __dmb() -- tx ring cross-core barriers, see s_ctx.tx doc comment
 #include "media_keys.h"
@@ -949,7 +951,7 @@ typedef struct {
     volatile uint32_t stall_gap_over_50ms;
     volatile uint32_t stall_gap_over_100ms;
 
-    // High-water mark of pl_usb_audio_fb_fill_ema() as read by
+    // High-water mark of pl_drain_servo_fill_ema() as read by
     // pl_a2dp_resync_decide -- design sec 5's "fill_ema peak". Signed in
     // the EMA's own units (bytes) but only ever compared/stored when
     // positive (a negative EMA reading is not a fill level -- see the
@@ -2156,8 +2158,21 @@ static void pl_a2dp_accrue_credit(uint32_t elapsed_us) {
     // size -- see the clamp's own comment) -- still needed here to
     // update samples_owed/samples_owed_rem_us.
     uint32_t accrued_this_tick = (uint32_t)(owed_us_hz / 1000000u);
-    s_ctx.samples_owed += accrued_this_tick;
     s_ctx.samples_owed_rem_us = (uint32_t)(owed_us_hz % 1000000u);
+
+    // Bead pico-link-ycm2.7.1, design sec 2b: the drain-rate servo's
+    // correction, applied here as accrual = sample_rate * (1 +
+    // servo_ppm/1e6) -- drain_servo.c carries its own fixed-point
+    // remainder across calls (see its doc comment on why that remainder
+    // MUST be carried: a realistic ppm correction is sub-sample-per-tick).
+    // Signed: clamp the combined accrual at 0, not negative -- a negative
+    // servo correction can only ever slow this tick's accrual to nothing,
+    // never make samples_owed go backwards.
+    int64_t total_accrued = (int64_t)accrued_this_tick + pl_drain_servo_accrue_extra_samples(elapsed_us, sample_rate);
+    if (total_accrued < 0) {
+        total_accrued = 0;
+    }
+    s_ctx.samples_owed += (uint32_t)total_accrued;
 
     // Bead pico-link-pbv ROUND 3 (R3-1) / bead pico-link-nzw: clamp the
     // credit to the largest backlog the drain can genuinely retire.
@@ -2226,7 +2241,8 @@ static void pl_a2dp_accrue_credit(uint32_t elapsed_us) {
 // Only the tail owner (core1 under ON, core0's own IRQ under OFF) ever
 // moves pcm_ring's s_tail via pl_pcm_trim_to -- the SPSC/single-writer
 // invariant pcm_ring.h's module doc requires. Only core0 ever touches
-// usb_audio state (pl_usb_audio_fb_fill_ema/_reset) and s_ctx's
+// usb_audio state (pl_usb_audio_streaming) and drain_servo state
+// (pl_drain_servo_fill_ema/_reset) and s_ctx's
 // resync_drops/resync_events/last_resync_us counters -- core1 must not
 // call into a module whose state it does not own (see s_enc_heartbeat's
 // doc comment). No lock: pico_cyw43_arch_threadsafe_background
@@ -2378,7 +2394,7 @@ static void pl_a2dp_resync_decide(uint64_t now_us, bool host_silent) {
         // (or, under ON, not even APPLYed yet). Wait.
         return;
     }
-    int32_t fill_ema = pl_usb_audio_fb_fill_ema();
+    int32_t fill_ema = pl_drain_servo_fill_ema();
     uint32_t target = pl_pcm_target_fill_bytes();
 
     // Bead pico-link-8pp1.1, design sec 5 instrumentation: fill_ema peak,
@@ -2473,7 +2489,7 @@ static void pl_a2dp_resync_complete(void) {
     if (s_trim_dropped > s_ctx.max_trim_frames) {
         s_ctx.max_trim_frames = s_trim_dropped;
     }
-    pl_usb_audio_fb_reset();
+    pl_drain_servo_reset();
 }
 
 #ifdef PL_ENCODER_ON_CORE1
@@ -4409,8 +4425,8 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.last_packet_change_us = time_us_64();
             // Bead pico-link-pbv round 2 (C2-9): seed the feedback loop's
             // EMA to the actual current fill and reset the windowed
-            // fill_min -- see pl_usb_audio_fb_reset's doc comment.
-            pl_usb_audio_fb_reset();
+            // fill_min -- see pl_drain_servo_reset's doc comment.
+            pl_drain_servo_reset();
             pl_log("a2dp: stream started\r\n");
             // Bead pico-link-4vb.2 (bug 2): ConnectSucceeded/LinkState
             // (Connected) moved to A2DP_SUBEVENT_STREAM_ESTABLISHED above
@@ -5125,7 +5141,28 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
         "resync_drops=%lu resync_events=%lu fill_ema=%ld fill_min=%lu\r\n",
         (unsigned long)s_ctx.frames_per_packet, (unsigned long)s_ctx.credit_clamped_samples,
         (unsigned long)s_ctx.credit_clamp_events, (unsigned long)s_ctx.flush_frames, (unsigned long)s_ctx.resync_drops,
-        (unsigned long)s_ctx.resync_events, (long)pl_usb_audio_fb_fill_ema(), (unsigned long)fault_fill_min_bytes
+        (unsigned long)s_ctx.resync_events, (long)pl_drain_servo_fill_ema(), (unsigned long)fault_fill_min_bytes
+    );
+    // Bead pico-link-ycm2.7.1, design sec 6's acceptance criteria: servo_ppm
+    // is the live correction pl_a2dp_accrue_credit is currently applying
+    // (sign convention: positive = draining faster, ring running high);
+    // servo_learned_ppm is the carried steady-state snapshot (design sec
+    // 2b's "Required details").
+    //
+    // Bead pico-link-ycm2.7.1.1: host_ppm is the INDEPENDENT measurement --
+    // host SOF rate against this board's own timer, touching neither
+    // pcm_ring nor the servo (see host_clock_ref.h's module doc for the
+    // full reasoning). It reads PL_HOST_CLOCK_PPM_NOT_READY
+    // (INT32_MIN, prints as a conspicuously implausible large negative
+    // number) until the first ~10s window completes. Same sign
+    // convention as servo_ppm/servo_learned_ppm by construction -- a
+    // healthy servo's servo_learned_ppm should converge to approximately
+    // +host_ppm (design sec 6's +/-20ppm agreement bar), NOT -host_ppm;
+    // see host_clock_ref.h for why the signs line up directly instead of
+    // needing a flip.
+    pl_log(
+        "a2dp: servo_ppm=%ld servo_learned_ppm=%ld host_ppm=%ld\r\n",
+        (long)pl_drain_servo_ppm(), (long)pl_drain_servo_learned_ppm(), (long)pl_host_clock_ref_ppm()
     );
     // Bead pico-link-7jol.3, design sec 7: the LDAC ABR controller's
     // observability line. quality_requested and quality_applied are
@@ -5178,7 +5215,7 @@ void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes) {
         "a2dp: stop_credit=%lu stop_queue_full=%lu stop_ring_empty=%lu stop_dwell=%lu fill_short_read=%lu "
         "fb_rail_ticks=%lu starved_us=%lu\r\n",
         (unsigned long)s_ctx.stop_credit, (unsigned long)s_ctx.stop_queue_full, (unsigned long)s_ctx.stop_ring_empty,
-        (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read, (unsigned long)pl_usb_audio_fb_rail_ticks(),
+        (unsigned long)s_ctx.stop_dwell, (unsigned long)s_ctx.fill_short_read, (unsigned long)pl_drain_servo_rail_ticks(),
         (unsigned long)s_ctx.starved_us
     );
     // Bead pico-link-quzf, design doc "Before CMakeLists.txt:322 flips
