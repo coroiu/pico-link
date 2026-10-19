@@ -1,19 +1,25 @@
 // Pico Link firmware -- M3: TinyUSB composite descriptor (CDC console + UAC2
-// speaker-with-feedback + pico-sdk's driverless-reset vendor interface).
+// speaker, adaptive, no feedback EP + pico-sdk's driverless-reset vendor
+// interface).
 //
 // PROVENANCE: this file combines pieces derived from THREE MIT/BSD-3-Clause
 // pico-sdk / TinyUSB sources (all already vendored in this tree, see
 // $PICO_SDK_PATH/lib/tinyusb -- nothing GPL, nothing from USBPods):
 //
-//   1. The UAC2_ENTITY_*, TUD_AUDIO_SPEAKER_STEREO_FB_DESC_LEN and
-//      TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR() macros are derived from
-//      lib/tinyusb/examples/device/uac2_speaker_fb/src/usb_descriptors.h
-//      (MIT, Copyright 2023 HiFiPhile). That example is the ASYNC-mode,
+//   1. The UAC2_ENTITY_*, TUD_AUDIO_SPEAKER_STEREO_ADAPTIVE_DESC_LEN and
+//      TUD_AUDIO_SPEAKER_STEREO_ADAPTIVE_DESCRIPTOR() macros are derived
+//      from lib/tinyusb/examples/device/uac2_speaker_fb/src/usb_descriptors.h
+//      (MIT, Copyright 2023 HiFiPhile), originally the ASYNC-mode,
 //      explicit-feedback-endpoint speaker -- the one place this bead flagged
-//      as having a high floor for getting subtly wrong, so it is copied
+//      as having a high floor for getting subtly wrong, so it was copied
 //      rather than reinvented. Trimmed to speaker-only, single fixed PCM
 //      format (no mic path, no multi-format switching -- M3's scope
 //      boundary is enumeration and a clean stream, not format negotiation).
+//      Bead pico-link-ycm2.7.2 (design comment on pico-link-ycm2.7) then
+//      dropped the feedback endpoint entirely and switched the ISO OUT
+//      endpoint attribute ASYNCHRONOUS -> ADAPTIVE: no feedback endpoint
+//      means no feedback-format byte-count disagreement between hosts
+//      (sec 1/4 of that design).
 //   2. TUD_RPI_RESET_DESC_LEN and TUD_RPI_RESET_DESCRIPTOR() are derived
 //      from pico-sdk's own
 //      src/rp2_common/pico_stdio_usb/stdio_usb_descriptors.c (MIT,
@@ -30,14 +36,12 @@
 //      macro (tusb.h) -- no local reproduction needed, it is a stable
 //      public macro.
 //
-// Endpoint map (see usb_descriptors.c for the numeric assignment): EP1 is
-// shared OUT (audio data) / IN (audio feedback) -- RP2040/RP2350's USB
-// controller allows a same-numbered EP pair with opposite directions (see
-// tusb_mcu.h: OPT_MCU_RP2040 does NOT define
-// TUD_ENDPOINT_ONE_DIRECTION_ONLY), so this is the same pattern TinyUSB's
-// own RP2040 example CMakeLists selects by default. EP2 IN is CDC's
-// notification endpoint; EP3 is CDC's data OUT/IN pair. The vendor reset
-// interface has no endpoints (control-transfer only).
+// Endpoint map (see usb_descriptors.c for the numeric assignment): EP1 OUT
+// carries audio data. Bead pico-link-ycm2.7.2 removed the feedback IN
+// endpoint that used to share EP1's number (0x81 stays unused, not
+// renumbered onto anything else). EP2 IN is CDC's notification endpoint;
+// EP3 is CDC's data OUT/IN pair. The vendor reset interface has no
+// endpoints (control-transfer only).
 
 #ifndef PICO_LINK_USB_DESCRIPTORS_H
 #define PICO_LINK_USB_DESCRIPTORS_H
@@ -92,18 +96,21 @@ enum {
 };
 
 // --- (1) Derived from uac2_speaker_fb/src/usb_descriptors.h (MIT) ---
-// Speaker-only (no mic path), ASYNC isochronous OUT with an explicit
-// feedback IN endpoint -- the correct pattern for a device whose sample
-// clock is NOT derived from the USB host's SOF (ours eventually comes from
-// the Bluetooth/LDAC side, out of scope for M3, but the endpoint topology
-// has to be right from the start since it can't change without breaking
-// host enumeration caches).
+// Speaker-only (no mic path), ADAPTIVE isochronous OUT with NO feedback
+// endpoint -- bead pico-link-ycm2.7.2 (design comment on pico-link-ycm2.7,
+// sec 1/3/4). The original async+explicit-feedback shape (the MIT
+// uac2_speaker_fb example this is still derived from) forced a 3-byte vs
+// 4-byte feedback-format disagreement between macOS and Windows with no
+// correct answer for both (pico-link-icb/ycm2.4/ycm2.5); dropping the
+// feedback endpoint removes the disagreement structurally -- one descriptor
+// set for every host. Rate matching moved to drain_servo.c servoing the
+// A2DP credit clock (pico-link-ycm2.7.1), not a USB-side feedback loop.
 // Bead pico-link-2ue (VT4a): + TUD_AUDIO_DESC_STD_AC_INT_EP_LEN for the AC
 // interrupt IN endpoint (see CFG_TUD_AUDIO_ENABLE_INTERRUPT_EP in
 // tusb_config.h). 7 bytes, TinyUSB's own fixed-size macro
 // (usbd.h:418-420) -- no local reproduction needed, unlike the two
 // PROVENANCE items at the top of this file.
-#define TUD_AUDIO_SPEAKER_STEREO_FB_DESC_LEN (TUD_AUDIO_DESC_IAD_LEN\
+#define TUD_AUDIO_SPEAKER_STEREO_ADAPTIVE_DESC_LEN (TUD_AUDIO_DESC_IAD_LEN\
     + TUD_AUDIO_DESC_STD_AC_LEN\
     + TUD_AUDIO_DESC_CS_AC_LEN\
     + TUD_AUDIO_DESC_CLK_SRC_LEN\
@@ -116,8 +123,7 @@ enum {
     + TUD_AUDIO_DESC_CS_AS_INT_LEN\
     + TUD_AUDIO_DESC_TYPE_I_FORMAT_LEN\
     + TUD_AUDIO_DESC_STD_AS_ISO_EP_LEN\
-    + TUD_AUDIO_DESC_CS_AS_ISO_EP_LEN\
-    + TUD_AUDIO_DESC_STD_AS_ISO_FB_EP_LEN)
+    + TUD_AUDIO_DESC_CS_AS_ISO_EP_LEN)
 
 // Bead pico-link-2ue (VT4a): _epint added. _nEPs on the AC interface goes
 // 0x00 -> 0x01 (audiod_open() requires exactly this: bNumEndpoints==1 iff
@@ -126,7 +132,10 @@ enum {
 // descriptor (Feature Unit), before the AS interfaces -- same position
 // TinyUSB's own uac2_headset example uses (the only upstream example that
 // enables this EP).
-#define TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR(_itfnum, _stridx, _nBytesPerSample, _nBitsUsedPerSample, _epout, _epoutsize, _epfb, _epfbsize, _epint) \
+//
+// Bead pico-link-ycm2.7.2: alt 1 bNumEndpoints 2 -> 1 (no feedback EP);
+// _epfb/_epfbsize params dropped.
+#define TUD_AUDIO_SPEAKER_STEREO_ADAPTIVE_DESCRIPTOR(_itfnum, _stridx, _nBytesPerSample, _nBitsUsedPerSample, _epout, _epoutsize, _epint) \
     /* Standard Interface Association Descriptor (IAD) */\
     TUD_AUDIO_DESC_IAD(/*_firstitf*/ _itfnum, /*_nitfs*/ 0x02, /*_stridx*/ 0x00),\
     /* Standard AC Interface Descriptor(4.7.1) */\
@@ -148,17 +157,17 @@ enum {
     TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ (uint8_t)((_itfnum) + 1), /*_altset*/ 0x00, /*_nEPs*/ 0x00, /*_stridx*/ 0x00),\
     /* Standard AS Interface Descriptor(4.9.1) */\
     /* Interface 1, Alternate 1 - alternate interface for data streaming */\
-    TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ (uint8_t)((_itfnum) + 1), /*_altset*/ 0x01, /*_nEPs*/ 0x02, /*_stridx*/ 0x00),\
+    /* Bead pico-link-ycm2.7.2: _nEPs 0x02 -> 0x01, no feedback EP. */\
+    TUD_AUDIO_DESC_STD_AS_INT(/*_itfnum*/ (uint8_t)((_itfnum) + 1), /*_altset*/ 0x01, /*_nEPs*/ 0x01, /*_stridx*/ 0x00),\
     /* Class-Specific AS Interface Descriptor(4.9.2) */\
     TUD_AUDIO_DESC_CS_AS_INT(/*_termid*/ UAC2_ENTITY_INPUT_TERMINAL, /*_ctrl*/ AUDIO_CTRL_NONE, /*_formattype*/ AUDIO_FORMAT_TYPE_I, /*_formats*/ AUDIO_DATA_FORMAT_TYPE_I_PCM, /*_nchannelsphysical*/ 0x02, /*_channelcfg*/ AUDIO_CHANNEL_CONFIG_NON_PREDEFINED, /*_stridx*/ 0x00),\
     /* Type I Format Type Descriptor(2.3.1.6 - Audio Formats) */\
     TUD_AUDIO_DESC_TYPE_I_FORMAT(_nBytesPerSample, _nBitsUsedPerSample),\
     /* Standard AS Isochronous Audio Data Endpoint Descriptor(4.10.1.1) */\
-    TUD_AUDIO_DESC_STD_AS_ISO_EP(/*_ep*/ _epout, /*_attr*/ (uint8_t) ((uint8_t)TUSB_XFER_ISOCHRONOUS | (uint8_t)TUSB_ISO_EP_ATT_ASYNCHRONOUS | (uint8_t)TUSB_ISO_EP_ATT_DATA), /*_maxEPsize*/ _epoutsize, /*_interval*/ 0x01),\
+    /* Bead pico-link-ycm2.7.2: ASYNCHRONOUS -> ADAPTIVE (design sec 1). */\
+    TUD_AUDIO_DESC_STD_AS_ISO_EP(/*_ep*/ _epout, /*_attr*/ (uint8_t) ((uint8_t)TUSB_XFER_ISOCHRONOUS | (uint8_t)TUSB_ISO_EP_ATT_ADAPTIVE | (uint8_t)TUSB_ISO_EP_ATT_DATA), /*_maxEPsize*/ _epoutsize, /*_interval*/ 0x01),\
     /* Class-Specific AS Isochronous Audio Data Endpoint Descriptor(4.10.1.2) */\
-    TUD_AUDIO_DESC_CS_AS_ISO_EP(/*_attr*/ AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, /*_ctrl*/ AUDIO_CTRL_NONE, /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, /*_lockdelay*/ 0x0001),\
-    /* Standard AS Isochronous Feedback Endpoint Descriptor(4.10.2.1) */\
-    TUD_AUDIO_DESC_STD_AS_ISO_FB_EP(/*_ep*/ _epfb, /*_epsize*/ _epfbsize, /*_interval*/ TUD_OPT_HIGH_SPEED ? 4 : 1)
+    TUD_AUDIO_DESC_CS_AS_ISO_EP(/*_attr*/ AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, /*_ctrl*/ AUDIO_CTRL_NONE, /*_lockdelayunit*/ AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, /*_lockdelay*/ 0x0001)
 
 // --- (2) Derived from pico_stdio_usb/stdio_usb_descriptors.c (MIT) ---
 // Just the interface descriptor bytes for the driverless-reset vendor

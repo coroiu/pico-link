@@ -75,17 +75,15 @@ static volatile uint32_t s_clock_set_calls;    // clock_set_request calls -- doe
 static volatile uint32_t s_clk_get_freq_cur;   // clock_get_request, AUDIO_CS_CTRL_SAM_FREQ / AUDIO_CS_REQ_CUR
 static volatile uint32_t s_clk_get_freq_range; // clock_get_request, AUDIO_CS_CTRL_SAM_FREQ / AUDIO_CS_REQ_RANGE
 static volatile uint32_t s_clk_get_valid;      // clock_get_request, AUDIO_CS_CTRL_CLK_VALID
-// Bead pico-link-pbv/pico-link-6vv (C2-8): s_fb_sends/tud_audio_feedback_interval_isr
-// is REMOVED here -- Ada found it structurally dead on this TinyUSB version.
-// tud_audio_feedback_interval_isr is reached only from audiod_sof_isr, and
-// audiod_set_interface disables the SOF consumer unless the feedback method
-// is one of the FREQUENCY_* ones (audio_device.c:2013-2025); this build uses
-// AUDIO_FEEDBACK_METHOD_DISABLED (see tud_audio_feedback_params_cb below),
-// so that ISR can only ever read 0. tud_audio_fb_done_cb (weak,
-// audio_device.c:505, invoked per completed feedback transfer at
-// audio_device.c:2239) is the only counter that actually answers "is the
-// host consuming our feedback" -- see the override below.
-static volatile uint32_t s_fb_done;
+// Bead pico-link-ycm2.7.2: s_fb_done/tud_audio_fb_done_cb/
+// tud_audio_feedback_params_cb are REMOVED here -- there is no feedback
+// endpoint at all any more (design comment on pico-link-ycm2.7, sec 3/4),
+// so there is nothing for a feedback-transfer-completed counter to count.
+// The prior history (s_fb_sends/tud_audio_feedback_interval_isr found
+// structurally dead by Ada, then tud_audio_fb_done_cb added as the
+// replacement "is the host consuming our feedback" signal -- bead
+// pico-link-pbv/pico-link-6vv C2-8) is moot now that the feedback mechanism
+// itself is gone.
 
 // --- Instrumentation (bead pico-link-okx D7/D9). Plain volatile increments
 // only, same rule as everything else in this file's callbacks (0xC0 worker
@@ -285,44 +283,17 @@ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const 
     return true;
 }
 
-// M4 S1 (bead pico-link-cz0.5.2), design sec 2/2.1 -- REPLACES M3's
-// AUDIO_FEEDBACK_METHOD_FIFO_COUNT. That method derived feedback from the
-// fill of TinyUSB's own 784-byte ISO-OUT software FIFO, but
-// pl_usb_audio_task() (below) drains that FIFO to empty every millisecond
-// -- TinyUSB therefore always saw a permanently-empty FIFO and commanded
-// the host toward maximum deviation, continuously. Harmless in M3 (nothing
-// downstream); fatal the moment a real consumer (a2dp.c's media timer)
-// exists, because the host then runs fast and the PCM ring overruns within
-// seconds. Confirmed on hardware before this change (bd pico-link-cz0.5.2's
-// dispatch comment): M3's `usb-audio: ... measured=194148 B/s` against a
-// 192000 nominal is exactly the signature of a host already reacting to
-// SOME feedback signal -- so the fix here is to make that signal correct
-// (computed from the PCM ring's own fill, design sec 2.1), not to prove
-// the endpoint is reachable at all.
-//
-// AUDIO_FEEDBACK_METHOD_DISABLED tells TinyUSB "the application computes
-// and calls tud_audio_fb_set() itself" -- see pl_usb_audio_feedback_task()
-// below, called from the 0xC0 worker (usb_pump.c) right after this file's
-// own pl_usb_audio_task() drain, per design sec 2.1's comment "we are
-// already there; ring fill is two loads and a mask".
-void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedback_params_t *feedback_param) {
-    (void)func_id;
-    (void)alt_itf;
-    feedback_param->method = AUDIO_FEEDBACK_METHOD_DISABLED;
-    feedback_param->sample_freq = current_sample_rate;
-}
-
-// Bead pico-link-pbv/pico-link-6vv (C2-8): replaces the dead
-// tud_audio_feedback_interval_isr override (see s_fb_done's doc comment
-// above). tud_audio_fb_done_cb fires once per completed feedback OUT
-// transfer -- the only signal that answers "is the host actually consuming
-// our feedback", and pbv's falsifier F4 (fb_done reads 0 while streaming)
-// depends on it. Called from inside the 0xC0 worker IRQ (TinyUSB's device
-// task); plain volatile increment only, no formatting here.
-void tud_audio_fb_done_cb(uint8_t func_id) {
-    (void)func_id;
-    s_fb_done++;
-}
+// Bead pico-link-ycm2.7.2: tud_audio_feedback_params_cb and
+// tud_audio_fb_done_cb are REMOVED -- there is no feedback endpoint (see
+// usb_descriptors.h) so TinyUSB never calls either; with
+// CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 0 they would not even compile (both are
+// behind that #if in audio_device.c/h). Their history: M3 shipped
+// AUDIO_FEEDBACK_METHOD_FIFO_COUNT, fatal once a real PCM consumer existed
+// (bead pico-link-cz0.5.2); that became AUDIO_FEEDBACK_METHOD_DISABLED plus
+// an application-computed tud_audio_fb_set() (design sec 2.1); step 1 of
+// this bead (pico-link-ycm2.7.1) moved the rate-matching math to
+// drain_servo.c and pinned the feedback value to a constant nominal rate;
+// step 2 (this bead) deletes the feedback mechanism entirely.
 
 // Fires once per received isochronous OUT packet, before this file's own
 // drain loop below reads the bytes out -- see usb_audio.h's doc comment
@@ -375,27 +346,14 @@ void pl_usb_audio_task(void) {
     }
 }
 
-// Bead pico-link-ycm2.7.1, design sec 2b/7 step 1: this used to be the
-// explicit-feedback PI control loop (nxf's PI controller, driving
-// tud_audio_fb_set from the ring's own fill). The PI MATH MOVED to
-// drain_servo.c -- a USB file must not own A2DP pacing (design sec 2b,
-// "Home") -- and the actuator moved from the host's send rate to the A2DP
-// credit clock (pl_a2dp_accrue_credit). This function is now trivial: it
-// pins the feedback value to the constant nominal rate (48.0
-// samples/frame) so pacing regressions show up on macOS separately from
-// enumeration (design sec 1's "FB PINNED to constant nominal" sequencing
-// note) -- the feedback ENDPOINT stays in today's descriptors (removing it
-// is step 2's job), it just no longer carries a computed value.
-//
-// PL_FB_NOMINAL_Q16 hardcodes 48.0 samples/frame (16.16 fixed point) --
-// correct because this build offers exactly one sample rate (48000Hz, see
-// sample_rates[] above); a future multi-rate build would need this
-// proportional to current_sample_rate/1000 instead.
-#define PL_FB_NOMINAL_Q16 (48u << 16)
-
-void pl_usb_audio_feedback_task(void) {
-    tud_audio_fb_set(PL_FB_NOMINAL_Q16);
-}
+// Bead pico-link-ycm2.7.2: pl_usb_audio_feedback_task and
+// PL_FB_NOMINAL_Q16 are REMOVED. Step 1 (pico-link-ycm2.7.1) had already
+// moved the real rate-matching math to drain_servo.c and left this function
+// pinning the feedback value to a constant nominal rate so pacing
+// regressions would show up separately from enumeration; now that the
+// feedback endpoint itself is gone (design sec 4), there is nothing left
+// for it to pin -- tud_audio_fb_set no longer exists with
+// CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 0. usb_pump.c no longer calls this.
 
 bool pl_usb_audio_streaming(void) {
     return streaming;
@@ -451,10 +409,6 @@ uint32_t pl_usb_audio_clk_get_freq_range(void) {
 
 uint32_t pl_usb_audio_clk_get_valid(void) {
     return s_clk_get_valid;
-}
-
-uint32_t pl_usb_audio_fb_done(void) {
-    return s_fb_done;
 }
 
 uint32_t pl_usb_audio_rx_bytes_total(void) {

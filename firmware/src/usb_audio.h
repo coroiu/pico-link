@@ -16,12 +16,11 @@
 // pl_usb_audio_pcm_bytes_total.
 void pl_usb_audio_task(void);
 
-// Bead pico-link-ycm2.7.1, design sec 2b/7 step 1: pins the feedback value
-// to a constant nominal rate -- the actual rate-matching PI loop moved to
-// drain_servo.h/.c and now steers the A2DP credit clock instead. MUST
-// still be called from the same 0xC0 worker IRQ as pl_usb_audio_task(),
-// after it (same call sites as before) -- see usb_audio.c's doc comment.
-void pl_usb_audio_feedback_task(void);
+// Bead pico-link-ycm2.7.2: pl_usb_audio_feedback_task (step 1's
+// pinned-nominal feedback value, pre-dating the feedback endpoint's
+// removal) is GONE -- there is no feedback endpoint to feed any more. The
+// rate-matching PI loop lives in drain_servo.h/.c, steering the A2DP credit
+// clock; usb_pump.c's 0xC0 worker calls pl_drain_servo_tick() directly.
 
 // True once the host has selected the streaming alternate setting (alt 1)
 // on the audio streaming interface -- i.e. audio is actually flowing, not
@@ -104,14 +103,11 @@ uint32_t pl_usb_audio_clk_get_freq_range(void);
 // specifically.
 uint32_t pl_usb_audio_clk_get_valid(void);
 
-// Bead pico-link-pbv/pico-link-6vv (C2-8): cumulative count of
-// tud_audio_fb_done_cb firings -- one per completed feedback OUT transfer.
-// REPLACES pl_usb_audio_fb_sends()/tud_audio_feedback_interval_isr, which
-// Ada found structurally dead on this TinyUSB version with
-// AUDIO_FEEDBACK_METHOD_DISABLED (see usb_audio.c's doc comment). This is
-// the only counter that answers "is the host actually consuming our
-// feedback" -- pbv's falsifier F4 (reads 0 while streaming) depends on it.
-uint32_t pl_usb_audio_fb_done(void);
+// Bead pico-link-ycm2.7.2: pl_usb_audio_fb_done (tud_audio_fb_done_cb's
+// counter, itself replacing pl_usb_audio_fb_sends()/
+// tud_audio_feedback_interval_isr -- pico-link-pbv/pico-link-6vv C2-8) is
+// REMOVED -- there is no feedback endpoint or feedback transfer to count
+// any more.
 
 // --- Instrumentation (bead pico-link-okx D7/D9) ---
 // rx_bytes_total: cumulative n_bytes_received summed over every completed

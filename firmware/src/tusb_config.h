@@ -105,9 +105,9 @@ extern "C" {
 #define CFG_TUD_HID_EP_BUFSIZE 16
 
 //--------------------------------------------------------------------+
-// Audio class (speaker, stereo, 16-bit, async + explicit feedback)
+// Audio class (speaker, stereo, 16-bit, adaptive, no feedback EP)
 //--------------------------------------------------------------------+
-#define CFG_TUD_AUDIO_FUNC_1_DESC_LEN TUD_AUDIO_SPEAKER_STEREO_FB_DESC_LEN
+#define CFG_TUD_AUDIO_FUNC_1_DESC_LEN TUD_AUDIO_SPEAKER_STEREO_ADAPTIVE_DESC_LEN
 
 // M3 scope boundary: a single fixed format/rate is enough to prove
 // enumeration and a clean, measurably-correct stream. Multi-rate switching
@@ -117,38 +117,11 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX 2
 #define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX 16
 
-// CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION is NOT the OS-guessing quirk
-// (quirk_os_guessing.c upstream, which needs a BOS descriptor to host-sniff
-// the OS and would collide with reset_interface.c's BOS ownership when
-// PICO_STDIO_USB_RESET_INTERFACE_SUPPORT_MS_OS_20_DESCRIPTOR is set -- it is
-// not, here, so that collision doesn't even apply). That reasoning is correct
-// about the *quirk* and was wrongly used to justify disabling this flag too.
-// This flag is a plain compile-time switch inside audiod_fb_send
-// (audio_device.c:1187-1214): it converts the feedback value to 10.14 and
-// sends 3 bytes instead of 4. It touches no BOS descriptor and nothing
-// reset_interface.c owns.
-//
-// Full-speed macOS REQUIRES the 3-byte 10.14 feedback format (USB 2.0
-// Sec.5.12.4.2) -- TinyUSB's own compatibility matrix at
-// audio_device.c:1200-1214 lists OSX only in the packetSize==3 rows, never in
-// the packetSize==4 (16.16) rows we were shipping. Confirmed empirically on
-// this device: with this flag at 0 (16.16/4 bytes, the Windows/Linux row),
-// macOS silently discarded the whole alt setting 1 that carries the feedback
-// endpoint and SET_INTERFACE(1, 1) was never issued -- see bead pico-link-icb.
-//
-// The trade this makes: TinyUSB's own uac2_speaker_fb example (see
-// usb_descriptors.c:162, "OS X needs 3 bytes feedback endpoint on FS") only
-// sends 3 bytes when CFG_QUIRK_OS_GUESSING detects OSX at runtime, and keeps
-// sending 4 bytes to Windows (whose UAC2 driver has a documented bug
-// requiring 16.16 -- audio_device.h:501-502). We have no Windows test rig and
-// macOS is the MVP host, so we hardcode 3 bytes unconditionally rather than
-// wire up the quirk sniffer. This is a known, deliberate Windows-compatibility
-// regression. The durable fix, if Windows support is ever needed, is exactly
-// CFG_QUIRK_OS_GUESSING -- an isolated swap in tud_descriptor_configuration_cb
-// that picks the descriptor variant per detected host, not a reason to revert
-// this flag.
-#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION 1
-
+// Bead pico-link-ycm2.7.2 (design comment on pico-link-ycm2.7, sec 1/3/4):
+// no feedback endpoint at all -- the 3-byte-vs-4-byte feedback-format fight
+// between macOS and Windows (pico-link-icb/ycm2.4) disappears structurally
+// because there is nothing to disagree on. Rate matching moved to
+// drain_servo.c servoing the A2DP credit clock (step 1, pico-link-ycm2.7.1).
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT 1
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX \
     TUD_AUDIO_EP_SIZE(CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
@@ -156,7 +129,7 @@ extern "C" {
 // 4x the max packet size gives ~4ms of slack between audio_task() drains.
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ (4 * CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX)
 
-#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 1
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 0
 
 // Bead pico-link-2ue (VT4a): the UAC2 feature-unit status interrupt
 // endpoint, OFF at the top of this bead and measured here. Adds the AC

@@ -6,13 +6,15 @@
 // lib/tinyusb/examples/device/cdc_uac2/src/usb_descriptors.c (MIT,
 // Copyright 2020 Jerzy Kasenberg / 2022 Angel Molina) for the CDC+audio
 // composite shape, with the speaker's own descriptor macro swapped for the
-// explicit-feedback one from uac2_speaker_fb (see usb_descriptors.h's
-// provenance note). The reset interface's serial-number-from-flash-ID
-// trick is pico-sdk's own (stdio_usb_descriptors.c). No USBPods code.
+// adaptive, no-feedback-EP one from uac2_speaker_fb, trimmed per bead
+// pico-link-ycm2.7.2 (see usb_descriptors.h's provenance note). The reset
+// interface's serial-number-from-flash-ID trick is pico-sdk's own
+// (stdio_usb_descriptors.c). No USBPods code.
 //
 // This file is the ONE thing this project's USB device topology is: audio
-// control + audio streaming (speaker, async + feedback) + CDC (console) +
-// vendor reset. See usb_descriptors.h for interface/string index layout.
+// control + audio streaming (speaker, adaptive, no feedback EP) + CDC
+// (console) + vendor reset. See usb_descriptors.h for interface/string
+// index layout.
 
 #include <string.h>
 
@@ -26,13 +28,13 @@
 //--------------------------------------------------------------------+
 // Endpoint numbers
 //--------------------------------------------------------------------+
-// EP1 is shared: OUT for audio data, IN for the explicit feedback value --
-// RP2040/RP2350's dcd allows a same-numbered EP pair with opposite
-// directions (tusb_mcu.h does NOT define TUD_ENDPOINT_ONE_DIRECTION_ONLY
-// for OPT_MCU_RP2040). EP2 IN is CDC's notification endpoint. EP3 is CDC's
-// data OUT/IN pair.
+// EP1 OUT carries audio data. Bead pico-link-ycm2.7.2: the feedback IN
+// endpoint that used to share EP1's number (0x81) is gone -- no feedback EP
+// at all, see usb_descriptors.h's macro doc comment. 0x81 stays unused
+// rather than being renumbered onto something else, per the design's
+// "do NOT renumber other EPs" instruction. EP2 IN is CDC's notification
+// endpoint. EP3 is CDC's data OUT/IN pair.
 #define EPNUM_AUDIO_OUT (0x01)
-#define EPNUM_AUDIO_FB  (0x81)
 #define EPNUM_CDC_NOTIF (0x82)
 #define EPNUM_CDC_OUT   (0x03)
 #define EPNUM_CDC_IN    (0x83)
@@ -78,9 +80,14 @@ static const tusb_desc_device_t usbd_desc_device = {
     // pico-link-ryw.12: "bump bcdDevice ... so hosts drop cached
     // descriptors"), then 0x0102 -> 0x0103 for the BOS/MS OS 2.0 addition
     // (bead pico-link-ycm2.3, same reasoning: a cached pre-BOS devnode must
-    // not be reused). PID deliberately NOT bumped -- see
+    // not be reused), then 0x0103 -> 0x0105 for the adaptive/no-feedback-EP
+    // descriptor shape (bead pico-link-ycm2.7.2). 0x0104 is deliberately
+    // SKIPPED: Windows holds an errored REV_0104 devnode cached from the
+    // ycm2.5 alt-enum test (and 0x01F0 from the ycm2.4 diagnostic build),
+    // and bumping past it avoids any chance of Windows reusing that
+    // confirmed-bad cache entry. PID deliberately NOT bumped -- see
     // .planning/design/2026-09-02-media-keys.md section 2.5.
-    .bcdDevice = 0x0103,
+    .bcdDevice = 0x0105,
     .iManufacturer = STRID_MANUFACTURER,
     .iProduct = STRID_PRODUCT,
     .iSerialNumber = STRID_SERIAL,
@@ -97,7 +104,7 @@ const uint8_t *tud_descriptor_device_cb(void) {
 #define USBD_MAX_POWER_MA (250)
 
 #define USBD_DESC_LEN (TUD_CONFIG_DESC_LEN \
-    + TUD_AUDIO_SPEAKER_STEREO_FB_DESC_LEN \
+    + TUD_AUDIO_SPEAKER_STEREO_ADAPTIVE_DESC_LEN \
     + TUD_CDC_DESC_LEN \
     + TUD_RPI_RESET_DESC_LEN \
     + TUD_HID_DESC_LEN \
@@ -122,26 +129,17 @@ static const uint8_t usbd_desc_cfg[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, STRID_LANGID, USBD_DESC_LEN, 0x00, USBD_MAX_POWER_MA),
 
-    // Interface number, string index, bytes/sample, bits/sample, EP out, EP out size, EP feedback, feedback EP size
+    // Interface number, string index, bytes/sample, bits/sample, EP out, EP out size, AC interrupt EP
     // 16-bit stereo @ up to 48kHz: TUD_AUDIO_EP_SIZE rounds up for rate
     // variance so the endpoint can carry a burst without dropping frames.
     //
-    // Feedback EP size: high-speed devices use 4-byte 16.16 fixed-point;
-    // full-speed devices must use 3-byte 10.14 (USB 2.0 Sec.5.12.4.2) -- macOS
-    // (AppleUSBAudio) rejects the whole alternate setting if a full-speed
-    // feedback endpoint claims 4 bytes, per TinyUSB's own compatibility
-    // matrix (audio_device.c:1200-1214, OSX only in the 3-byte rows) and its
-    // uac2_speaker_fb example (usb_descriptors.c:162, "OS X needs 3 bytes
-    // feedback endpoint on FS"). RP2350 has no high-speed PHY so
-    // TUD_OPT_HIGH_SPEED is always false here, but this is written
-    // speed-conditional to document why, and to match upstream's shape.
-    // Paired with CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION in
-    // tusb_config.h, which must be 1 for this 3-byte size to actually carry
-    // 10.14-converted values -- see bead pico-link-icb.
-    TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, STRID_AUDIO,
+    // Bead pico-link-ycm2.7.2: no feedback endpoint, no feedback-format
+    // byte-count question -- see usb_descriptors.h's macro doc comment for
+    // why (the 3-byte/4-byte macOS-vs-Windows disagreement this used to
+    // document disappears structurally once there is no feedback EP).
+    TUD_AUDIO_SPEAKER_STEREO_ADAPTIVE_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, STRID_AUDIO,
         CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX,
-        EPNUM_AUDIO_OUT, CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX, EPNUM_AUDIO_FB,
-        (TUD_OPT_HIGH_SPEED ? 4 : 3), EPNUM_AUDIO_INT),
+        EPNUM_AUDIO_OUT, CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX, EPNUM_AUDIO_INT),
 
     // CDC: interface number, string index, EP notif addr & size, EP data out/in addr & size.
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),

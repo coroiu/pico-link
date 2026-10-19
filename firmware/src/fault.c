@@ -108,12 +108,12 @@ static bool s_resync_drops_have_snapshot;
 // --- ord 2 (USB SUPPLY LOW) level state. Bead pico-link-47us. ---
 // The design's LEVEL half (sec 6.3), built at last. What shipped before was
 // the RATE half alone: raise on any ISO-OUT packet whose size differed from
-// 192 bytes. That is not an under-supply signal at all -- we run EXPLICIT
-// feedback (usb_audio.c's tud_audio_feedback_params_cb selects
-// AUDIO_FEEDBACK_METHOD_DISABLED and pl_usb_audio_feedback_task drives
-// tud_audio_fb_set), so the host varying its send size IS the control loop
-// working. One trimmed packet in 48000 raised the fault, and a 196-byte
-// packet (OVER-supply) raised "SUPPLY LOW" too.
+// 192 bytes. That is not an under-supply signal at all -- the device is
+// adaptive with no feedback endpoint (bead pico-link-ycm2.7.2; rate
+// matching is now drain_servo.c servoing the A2DP credit clock, not a USB
+// control loop), so the host varying its send size is ordinary USB jitter,
+// not a feedback response. One trimmed packet in 48000 raised the fault,
+// and a 196-byte packet (OVER-supply) raised "SUPPLY LOW" too.
 //
 // The level signal is delivered bytes over the 192 B/ms nominal for the
 // MEASURED window -- not an assumed 1s, because the superloop stretches.

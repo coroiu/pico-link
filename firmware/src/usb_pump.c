@@ -305,9 +305,11 @@ static void pl_usb_pump_worker_irq(void) {
     // TRUE USB ISR context, not from tud_task() -- so the audio data path no
     // longer needs pl_usb_mutex at all. tud_audio_available()/
     // tud_audio_read() are a single-consumer tu_fifo read against that
-    // single ISR producer, and pl_usb_audio_feedback_task() is a plain EMA
-    // plus tud_audio_fb_set(); neither touches anything tud_task() or the
-    // CDC calls mutate. Running this drain BEFORE AND REGARDLESS OF the
+    // single ISR producer, and pl_drain_servo_tick() (bead pico-link-ycm2.7,
+    // replacing the old feedback-value EMA plus tud_audio_fb_set() once
+    // there was no feedback endpoint left to call it for) touches nothing
+    // tud_task() or the CDC calls mutate either. Running this drain BEFORE
+    // AND REGARDLESS OF the
     // mutex_try_enter below is the actual fix: previously a thread-mode
     // pl_usb_mutex holder (the log drain, main.c's FU status push,
     // media_keys.c, debug_remote.c) preempted by the 0xFF BTstack/LDAC IRQ
@@ -336,10 +338,13 @@ static void pl_usb_pump_worker_irq(void) {
     // this is guarded on pl_usb_audio_streaming() -- unchanged reasoning,
     // only the call site moved.
     if (pl_usb_audio_streaming()) {
-        pl_usb_audio_feedback_task();
         // Bead pico-link-ycm2.7.1, design sec 2b: the actual rate-matching
         // PI servo, same cadence/call site the old feedback-value
-        // computation had before it moved to drain_servo.c.
+        // computation had before it moved to drain_servo.c. Bead
+        // pico-link-ycm2.7.2: the feedback-value computation itself
+        // (pl_usb_audio_feedback_task, pinned to a constant nominal rate
+        // since step 1) is gone along with the feedback endpoint -- there is
+        // no tud_audio_fb_set to call any more.
         pl_drain_servo_tick();
     }
 #endif
@@ -406,24 +411,15 @@ static void pl_usb_pump_worker_irq(void) {
     // after the drain (we are already there; ring fill is two loads and a
     // mask)".
     //
-    // Bead pico-link-pbv/pico-link-6vv (C2-7), guarded on
-    // pl_usb_audio_streaming(): Ada found that on this TinyUSB (pico-sdk
-    // 2.1.1), tud_audio_fb_set() does NOT merely store a value for the SOF
-    // ISR (design sec 2.1's original claim was wrong for this version, now
-    // corrected there too) -- tud_audio_n_fb_set only guards on p_desc !=
-    // NULL (true from SET_CONFIGURATION onward) and then unconditionally
-    // calls usbd_edpt_claim()/usbd_edpt_xfer() on audio->ep_fb. That field
-    // is 0 while alt 0 is selected (explicitly reset to 0 on alt 0,
-    // audio_device.c:1837), and neither usbd_edpt_claim nor usbd_edpt_xfer
-    // guards epnum != 0 -- so calling this unconditionally claims EP0-OUT
-    // and queues a 3-byte OUT transfer on the CONTROL endpoint about a
-    // thousand times a second whenever the streaming alt-setting isn't
-    // selected. That is a plausible mechanism for the "EP0 half-open, board
-    // goes deaf" wedge this project already spent a session chasing. Only
-    // call it once the streaming alt-setting (alt 1) is actually selected
-    // and ep_fb is a real endpoint.
+    // Bead pico-link-ycm2.7.2: this used to be guarded on
+    // pl_usb_audio_streaming() to avoid calling tud_audio_fb_set() outside
+    // the streaming alt-setting (a mechanism Ada traced to the "EP0
+    // half-open, board goes deaf" wedge this project once spent a session
+    // chasing -- see pico-link-pbv/pico-link-6vv history). There is no
+    // feedback endpoint any more, so that hazard is gone structurally; the
+    // streaming guard stays because pl_drain_servo_tick() still has nothing
+    // useful to steer while the host isn't sending audio.
     if (pl_usb_audio_streaming()) {
-        pl_usb_audio_feedback_task();
         // Bead pico-link-ycm2.7.1, design sec 2b: same cadence/call site as
         // the ISO_XFER_ISR branch above, for the non-ISO_XFER_ISR build.
         pl_drain_servo_tick();
@@ -591,12 +587,10 @@ void pl_usb_pump_report(uint32_t report_dt_us) {
         (unsigned long)s_sof_hw_unavail, (unsigned long)s_sof_pkts
     );
 
-    // Bead pico-link-pbv/pico-link-6vv (C2-8) acceptance criterion A6
-    // ("feedback alive"): fb_done climbing at ~1000/s while streaming.
-    pl_log(
-        "usb-audio-fix: fb_done=%lu\r\n",
-        (unsigned long)pl_usb_audio_fb_done()
-    );
+    // Bead pico-link-ycm2.7.2: the "usb-audio-fix: fb_done=..." line
+    // (pico-link-pbv/pico-link-6vv acceptance criterion A6, "feedback
+    // alive") is REMOVED along with the feedback endpoint it measured --
+    // there is no feedback transfer to complete any more.
 
     // Bead pico-link-okx D7: rx_bytes_total/rx_short_packets -- distinguish
     // "the host genuinely sends less" (rx_short_packets/s ~ 0, whole
