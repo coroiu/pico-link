@@ -13,6 +13,7 @@
 #include "pico/time.h"
 #include "tusb.h"
 
+#include "drain_servo.h" // pl_drain_servo_tick/_bus_reset -- bead pico-link-ycm2.7.1
 #include "pcm_ring.h"
 #include "pl_log_ring.h"
 #include "usb_audio.h"
@@ -223,6 +224,13 @@ void pl_usb_sof_isr_sample(uint32_t frame_count) {
 // pl_usb_sof_isr_sample never runs, regardless of the usbd.c patch.
 void tud_mount_cb(void) {
     tud_sof_cb_enable(true);
+    // Bead pico-link-ycm2.7.1, design sec 2b: a real SET_CONFIGURATION/bus
+    // reset means a new enumeration, and possibly a different host with a
+    // different crystal -- the drain servo's learned offset from whatever
+    // host was previously connected says nothing about this one, so clear
+    // it here rather than let a stale learned_ppm bias a fresh host's
+    // first stream.
+    pl_drain_servo_bus_reset();
 }
 
 // Runs at PL_USB_PUMP_IRQ_PRIORITY (0xC0) as a claimed user IRQ, pended by
@@ -282,6 +290,10 @@ static void pl_usb_pump_worker_irq(void) {
     // only the call site moved.
     if (pl_usb_audio_streaming()) {
         pl_usb_audio_feedback_task();
+        // Bead pico-link-ycm2.7.1, design sec 2b: the actual rate-matching
+        // PI servo, same cadence/call site the old feedback-value
+        // computation had before it moved to drain_servo.c.
+        pl_drain_servo_tick();
     }
 #endif
 
@@ -365,6 +377,9 @@ static void pl_usb_pump_worker_irq(void) {
     // and ep_fb is a real endpoint.
     if (pl_usb_audio_streaming()) {
         pl_usb_audio_feedback_task();
+        // Bead pico-link-ycm2.7.1, design sec 2b: same cadence/call site as
+        // the ISO_XFER_ISR branch above, for the non-ISO_XFER_ISR build.
+        pl_drain_servo_tick();
     }
 #endif
 

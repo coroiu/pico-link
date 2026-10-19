@@ -375,178 +375,26 @@ void pl_usb_audio_task(void) {
     }
 }
 
-// M4 S1, design sec 2.1: the explicit-feedback control loop. Called from
-// the 0xC0 worker IRQ (usb_pump.c), right after pl_usb_audio_task()'s
-// drain, once per ~1ms tick.
-//
-// P-only, deliberately (design sec 2.1's rationale): the plant (ring fill)
-// is a pure integrator of rate error, so a proportional controller is
-// stable with no anti-windup needed. +/-500ppm authority is ~10x a
-// realistic crystal mismatch (two decent crystals differ by well under
-// +/-100ppm) -- enough to correct sustained drift, deliberately too slow
-// to react to a transient (a 4.6KB fill error at full authority takes
-// ~48s to correct): transients are absorbed by the ring's capacity
-// (design sec 3.3), sustained drift by this loop. Conflating the two jobs
-// would give an oscillating buffer.
-//
-// The EMA exists because the consumer (a2dp.c's media timer, ~13ms
-// cadence once ring-fed) drains in bursts, so raw fill sawtooths by
-// roughly one tick's worth -- comparable to the target itself. Feeding raw
-// fill into a P controller would inject ~100Hz ripple into the feedback
-// value; the ~64ms EMA (>>6 each ~1ms tick) filters that out while still
-// tracking real drift within a couple of tick periods.
+// Bead pico-link-ycm2.7.1, design sec 2b/7 step 1: this used to be the
+// explicit-feedback PI control loop (nxf's PI controller, driving
+// tud_audio_fb_set from the ring's own fill). The PI MATH MOVED to
+// drain_servo.c -- a USB file must not own A2DP pacing (design sec 2b,
+// "Home") -- and the actuator moved from the host's send rate to the A2DP
+// credit clock (pl_a2dp_accrue_credit). This function is now trivial: it
+// pins the feedback value to the constant nominal rate (48.0
+// samples/frame) so pacing regressions show up on macOS separately from
+// enumeration (design sec 1's "FB PINNED to constant nominal" sequencing
+// note) -- the feedback ENDPOINT stays in today's descriptors (removing it
+// is step 2's job), it just no longer carries a computed value.
 //
 // PL_FB_NOMINAL_Q16 hardcodes 48.0 samples/frame (16.16 fixed point) --
 // correct because this build offers exactly one sample rate (48000Hz, see
 // sample_rates[] above); a future multi-rate build would need this
 // proportional to current_sample_rate/1000 instead.
 #define PL_FB_NOMINAL_Q16 (48u << 16)
-#define PL_FB_MAX_PPM 500
-
-// Bead pico-link-nxf: PROPORTIONAL GAIN, previously conflated with the
-// output clamp. It was PL_FB_MAX_PPM, which made the two impossible to
-// tune independently -- they are different quantities that happened to
-// share a number.
-#define PL_FB_KP_PPM 500
-
-// Integral scale: s_fb_i_accum sums -err_bytes once per ~1ms tick, and
-// this divides it down to ppm. At a steady 222ppm crystal offset the loop
-// converges in roughly 11s from a cold start, which is slow enough not to
-// fight the EMA (~64ms) or the ~11ms media-timer sawtooth, and fast
-// enough that a listener never reaches the dry-ring regime.
-#define PL_FB_KI_DIV 100000
-
-// Anti-windup bound on the integral term alone, in the accumulator's own
-// units, so the I contribution can never exceed the total output clamp.
-#define PL_FB_I_ACCUM_MAX ((int32_t)PL_FB_MAX_PPM * PL_FB_KI_DIV)
-
-static int32_t s_fb_fill_ema;
-// Bead pico-link-nxf: the integral term. WHY IT IS REQUIRED, not a
-// refinement: a pure P controller parks at whatever error produces the
-// correction it needs, so it CANNOT null a constant offset. The RP2350
-// and the host crystal differ by a fixed ~200-270ppm, and with
-// ppm = -(err * 500) / 4608 commanding +222ppm demands err = -2046, i.e.
-// the ring settles ~2050 bytes BELOW target and stays there by design.
-// Measured on hardware over 94s (.research/captures/2026-08-31-ldac-dwell-fix/
-// residual.log): fill_ema fell 5664 -> 1764 against a 4608 setpoint,
-// fill_min reached 740 bytes (3.9ms of audio, less than one tick's drain),
-// stop_ring_empty went 0 -> 7 and credit_clamp_events climbed by 113.
-// That dry-ring regime is the residual crackle Andreas reported after the
-// dwell-cap fix. The integral term drives the steady-state error to zero
-// so the ring sits AT target instead of parked below it.
-static int32_t s_fb_i_accum;
-// Bead pico-link-pbv (C6): running minimum of the raw (non-EMA'd) fill
-// level, sampled at this function's own ~1ms cadence -- the finest-grained
-// sampling of pl_pcm_fill_bytes() anywhere in this firmware, so the true
-// sawtooth trough is far more likely to be caught here than at a2dp.c's
-// coarser ~11ms media-timer cadence. UINT32_MAX sentinel means "never
-// sampled yet" (link not up / no streaming started).
-static uint32_t s_fill_min = 0xFFFFFFFFu;
-
-// Bead pico-link-9eq2.3.2, design §6.1: "the single most valuable missing
-// counter in the firmware" -- counts ticks on which this function's
-// output was clamped at PL_FB_MAX_PPM, OR the integral accumulator was
-// clamped at PL_FB_I_ACCUM_MAX (the anti-windup bound below). Answers "does
-// the feedback loop still have authority to correct drift?" -- pico-link-
-// 0gtk is precisely the case where the answer was no and nothing said so.
-// Justified independently of the fault strip: belongs in pl_a2dp_report's
-// output regardless (backs the quiet `FB RAIL` key, design §3.3).
-static volatile uint32_t s_fb_rail_ticks;
 
 void pl_usb_audio_feedback_task(void) {
-    uint32_t fill_now = pl_pcm_fill_bytes();
-    if (fill_now < s_fill_min) {
-        s_fill_min = fill_now;
-    }
-    s_fb_fill_ema += ((int32_t)fill_now - s_fb_fill_ema) >> 6;
-    // Bead pico-link-fhf: read the runtime setpoint (pcm_ring), not the
-    // bare macro -- a2dp.c sets this from the priming-derived cushion at
-    // STREAM_ESTABLISHED, and this feedback loop must regulate against the
-    // same value PRIMING actually landed the ring on, or it spends ~15s
-    // silently walking the ring back down to the macro's smaller value.
-    int32_t target_bytes = (int32_t)pl_pcm_target_fill_bytes();
-    int32_t err_bytes = s_fb_fill_ema - target_bytes;
-    int32_t p_ppm = -(err_bytes * PL_FB_KP_PPM) / target_bytes;
-
-    // Integrate, then clamp the accumulator itself (not just the output) --
-    // clamping only the output is the classic windup bug: the accumulator
-    // keeps growing while saturated and then has to unwind before the loop
-    // responds at all.
-    s_fb_i_accum -= err_bytes;
-    // Bead pico-link-9eq2.3.2 (design §6.1): one tick counts as "rail" at
-    // most once, even if both clamps below fire on it -- a bool, checked
-    // once at the end, not two independent increments.
-    bool rail_this_tick = false;
-    if (s_fb_i_accum > PL_FB_I_ACCUM_MAX) {
-        s_fb_i_accum = PL_FB_I_ACCUM_MAX;
-        rail_this_tick = true;
-    }
-    if (s_fb_i_accum < -PL_FB_I_ACCUM_MAX) {
-        s_fb_i_accum = -PL_FB_I_ACCUM_MAX;
-        rail_this_tick = true;
-    }
-    int32_t ppm = p_ppm + (s_fb_i_accum / PL_FB_KI_DIV);
-    if (ppm > PL_FB_MAX_PPM) {
-        ppm = PL_FB_MAX_PPM;
-        rail_this_tick = true;
-    }
-    if (ppm < -PL_FB_MAX_PPM) {
-        ppm = -PL_FB_MAX_PPM;
-        rail_this_tick = true;
-    }
-    if (rail_this_tick) {
-        s_fb_rail_ticks++;
-    }
-    tud_audio_fb_set((uint32_t)((int32_t)PL_FB_NOMINAL_Q16 + (int32_t)((int64_t)PL_FB_NOMINAL_Q16 * ppm / 1000000)));
-}
-
-// Bead pico-link-9eq2.3.2, design §6.1. See s_fb_rail_ticks's doc comment
-// above. Thread-context safe (plain aligned read, same convention as every
-// other counter this file exposes).
-uint32_t pl_usb_audio_fb_rail_ticks(void) {
-    return s_fb_rail_ticks;
-}
-
-// Bead pico-link-pbv (C6): exposes the EMA pl_usb_audio_feedback_task
-// already computes every ~1ms, for pl_a2dp_report (thread context) to
-// print -- see design sec 2.1's doc comment on why the EMA, not raw fill,
-// is the correct thing to evaluate the closed-loop pass criterion against
-// (raw fill sawtooths by roughly one tick's worth, comparable to the
-// target itself).
-int32_t pl_usb_audio_fb_fill_ema(void) {
-    return s_fb_fill_ema;
-}
-
-// Bead pico-link-pbv round 2 (C2-9): s_fill_min is now a WINDOWED minimum,
-// reset every time it is read -- round 1's lifetime minimum was guaranteed
-// to latch at 0 the first time pl_pcm_reset() ran (a2dp.c's STREAM_ESTABLISHED/
-// SUSPENDED/RELEASED handlers all call it) and stay there forever,
-// regardless of how the loop actually behaved afterward, which is why
-// "fill_min hit 0" falsified nothing in round 1. Each read (pl_a2dp_report,
-// ~1s cadence) now returns the true minimum fill seen only since the
-// previous read, then starts a fresh window. Same benign-race convention as
-// every other plain counter here -- see this file's module doc.
-uint32_t pl_usb_audio_fill_min(void) {
-    uint32_t result = s_fill_min;
-    s_fill_min = 0xFFFFFFFFu;
-    return result;
-}
-
-// Bead pico-link-pbv round 2 (C2-9): called from a2dp.c's STREAM_STARTED
-// handler. Seeds the EMA to the CURRENT ring fill (rather than letting it
-// coast in from whatever it read during priming/idle) so the P controller
-// starts streaming at its actual operating point instead of commanding a
-// large one-shot ppm correction through the priming transient, and resets
-// the windowed fill_min so a stale reading from a previous stream (or from
-// before this one started) never gets attributed to this run.
-void pl_usb_audio_fb_reset(void) {
-    s_fb_fill_ema = (int32_t)pl_pcm_fill_bytes();
-    s_fill_min = 0xFFFFFFFFu;
-    // Bead pico-link-nxf: the integral term MUST be cleared here too.
-    // Carrying an old stream's accumulated correction into a fresh one
-    // starts the loop mid-windup against a ring that was just re-primed,
-    // which is exactly the transient this reset exists to prevent.
-    s_fb_i_accum = 0;
+    tud_audio_fb_set(PL_FB_NOMINAL_Q16);
 }
 
 bool pl_usb_audio_streaming(void) {

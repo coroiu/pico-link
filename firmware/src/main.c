@@ -998,9 +998,10 @@ int main(void) {
 
             // Bead pico-link-9eq2.3.2, design sec 5.1/7.1: the fault
             // evaluator runs at this SAME 1Hz thread-context point, BEFORE
-            // pl_a2dp_report below -- it is usb_audio.c's pl_usb_audio_
-            // fill_min()'s sole caller (design sec 5.6.5) and must read it
-            // before pl_a2dp_report needs the cached result.
+            // pl_a2dp_report below -- it is drain_servo.c's pl_drain_servo_
+            // fill_min()'s sole caller (design sec 5.6.5, renamed by bead
+            // pico-link-ycm2.7.1) and must read it before pl_a2dp_report
+            // needs the cached result.
             pl_fault_evaluate(ui, shared_now_us);
 
             // M4 S1 (bead pico-link-cz0.5.2), design sec 7 -- the a2dp:
@@ -1009,7 +1010,7 @@ int main(void) {
             //
             // Bead pico-link-9eq2.3.2: fill_min is now sourced from
             // pl_fault_last_fill_min() (fault.c's cache of this window's
-            // ONE pl_usb_audio_fill_min() read), not a second direct call
+            // ONE pl_drain_servo_fill_min() read), not a second direct call
             // -- see pl_a2dp_report's own doc comment (a2dp.h) for why.
             pl_a2dp_report(shared_report_dt_us, pl_fault_last_fill_min());
 

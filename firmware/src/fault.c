@@ -7,14 +7,17 @@
 // truth"): every fault below is derived from a monotonic counter or a
 // sticky witness some OTHER module already maintains -- this file adds no
 // new IRQ-context state of its own besides the two counters design sec 6
-// asks for (fb_rail_ticks in usb_audio.c, link_lost_events in a2dp.c, both
-// added by this same bead but owned by those files, not this one).
+// asks for (fb_rail_ticks, now drain_servo.c's pl_drain_servo_rail_ticks()
+// since bead pico-link-ycm2.7.1 moved the PI controller that owns it;
+// link_lost_events in a2dp.c; both added by this same bead but owned by
+// those files, not this one).
 
 #include "fault.h"
 
 #include <stdbool.h>
 
 #include "a2dp.h"
+#include "drain_servo.h"
 #include "pcm_ring.h"
 #include "usb_audio.h"
 
@@ -243,13 +246,15 @@ static void pl_fault_emit_if_due(
 }
 
 void pl_fault_evaluate(struct PlUi *ui, uint64_t now_us) {
-    // Design sec 5.6.5: this file is usb_audio.c's pl_usb_audio_fill_min()
-    // SOLE caller. Read unconditionally, every call, regardless of A2DP
-    // stream state below -- pl_a2dp_report's own report line used to call
-    // this directly, every second, unconditionally, and this keeps that
-    // behaviour identical from its point of view (it now reads the cached
-    // value via pl_fault_last_fill_min() instead).
-    s_cached_fill_min_bytes = pl_usb_audio_fill_min();
+    // Design sec 5.6.5: this file is drain_servo.c's pl_drain_servo_
+    // fill_min() SOLE caller (renamed from usb_audio.c's
+    // pl_usb_audio_fill_min() by bead pico-link-ycm2.7.1). Read
+    // unconditionally, every call, regardless of A2DP stream state below --
+    // pl_a2dp_report's own report line used to call this directly, every
+    // second, unconditionally, and this keeps that behaviour identical
+    // from its point of view (it now reads the cached value via
+    // pl_fault_last_fill_min() instead).
+    s_cached_fill_min_bytes = pl_drain_servo_fill_min();
 
     // Design sec 5.6.1/5.6.2: evaluate (and therefore raise) only while
     // genuinely streaming and the host is not silent -- see

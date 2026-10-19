@@ -187,14 +187,16 @@ bool pl_a2dp_streaming(void);
 // isn't cosmetic.
 //
 // Bead pico-link-9eq2.3.2, design §5.6.5: fault_fill_min_bytes is fault.c's
-// CACHED value of usb_audio.c's destructive-on-read pl_usb_audio_fill_min()
-// -- fault.c is now that accessor's sole caller (a second reader would
-// steal windows from the first, producing garbage for both), so this
-// function's own former direct call is replaced by this parameter. Call
-// site: main.c, which reads pl_fault_last_fill_min() (fault.c calls
-// pl_usb_audio_fill_min() itself, once, earlier in the same 1Hz block) and
-// passes the result straight through -- see fault.h's module doc for why
-// fault.h itself is not included here.
+// CACHED value of drain_servo.c's destructive-on-read
+// pl_drain_servo_fill_min() (renamed from usb_audio.c's pl_usb_audio_
+// fill_min() by bead pico-link-ycm2.7.1, which moved the PI controller
+// that maintains it) -- fault.c is now that accessor's sole caller (a
+// second reader would steal windows from the first, producing garbage for
+// both), so this function's own former direct call is replaced by this
+// parameter. Call site: main.c, which reads pl_fault_last_fill_min()
+// (fault.c calls pl_drain_servo_fill_min() itself, once, earlier in the
+// same 1Hz block) and passes the result straight through -- see fault.h's
+// module doc for why fault.h itself is not included here.
 void pl_a2dp_report(uint32_t report_dt_us, uint32_t fault_fill_min_bytes);
 
 // Bead pico-link-auh, section 1: publishes slot 0 ("ctr") of the

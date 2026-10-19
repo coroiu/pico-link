@@ -16,15 +16,11 @@
 // pl_usb_audio_pcm_bytes_total.
 void pl_usb_audio_task(void);
 
-// M4 S1 (bead pico-link-cz0.5.2), design sec 2.1: computes and applies the
-// explicit USB audio feedback value from the PCM ring's own fill level.
-// MUST be called from the same 0xC0 worker IRQ as pl_usb_audio_task(),
-// after it -- see usb_audio.c's doc comment on this function and on
-// tud_audio_feedback_params_cb (AUDIO_FEEDBACK_METHOD_DISABLED tells
-// TinyUSB the application supplies this, not the class driver). This is a
-// hard dependency of M4, not optional instrumentation: without it, the
-// host runs the ISO OUT stream at an uncontrolled rate and the PCM ring
-// overruns within seconds once a consumer (a2dp.c) exists (design sec 2).
+// Bead pico-link-ycm2.7.1, design sec 2b/7 step 1: pins the feedback value
+// to a constant nominal rate -- the actual rate-matching PI loop moved to
+// drain_servo.h/.c and now steers the A2DP credit clock instead. MUST
+// still be called from the same 0xC0 worker IRQ as pl_usb_audio_task(),
+// after it (same call sites as before) -- see usb_audio.c's doc comment.
 void pl_usb_audio_feedback_task(void);
 
 // True once the host has selected the streaming alternate setting (alt 1)
@@ -126,13 +122,6 @@ uint32_t pl_usb_audio_fb_done(void);
 uint32_t pl_usb_audio_rx_bytes_total(void);
 uint32_t pl_usb_audio_rx_short_packets(void);
 
-// Bead pico-link-9eq2.3.2, design `.planning/design/2026-09-07-audio-fault-
-// model.md` §6.1: cumulative count of pl_usb_audio_feedback_task ticks on
-// which its output was clamped at PL_FB_MAX_PPM or the integral
-// accumulator was clamped at PL_FB_I_ACCUM_MAX -- "does the feedback loop
-// still have authority to correct drift?" (backs the quiet `FB RAIL` key,
-// fault.c). Thread-context safe, same convention as the rest of this file.
-uint32_t pl_usb_audio_fb_rail_ticks(void);
 // Cumulative count of SET_INTERFACE(streaming, alt=1) calls that found
 // usbd_edpt_busy(EP1 OUT) already true -- the precondition for the
 // EP1-OUT double-arm panic (rp2040_usb.c:108), captured non-fatally at the
@@ -140,31 +129,11 @@ uint32_t pl_usb_audio_fb_rail_ticks(void);
 // is attempted.
 uint32_t pl_usb_audio_ep_out_busy_at_alt1_entry(void);
 
-// --- Instrumentation (bead pico-link-pbv, C6) ---
-// Both read the state pl_usb_audio_feedback_task() already maintains at
-// its own ~1ms cadence -- the finest-grained sampling of ring fill
-// anywhere in this firmware. Safe to call from thread context
-// (pl_a2dp_report); plain aligned reads, no locking needed.
-
-// The EMA fill level pl_usb_audio_feedback_task's P controller already
-// computes (design sec 2.1) -- the correct value to evaluate the
-// closed-loop pass criterion against, not the raw/instantaneous fill.
-int32_t pl_usb_audio_fb_fill_ema(void);
-
-// Bead pico-link-pbv round 2 (C2-9): WINDOWED minimum fill level -- reading
-// this resets the window, so it answers "what was the true minimum fill
-// since the last read" (~1s, pl_a2dp_report's cadence), not "since boot".
-// Round 1's lifetime-minimum version was guaranteed to latch at 0 forever
-// after the first pl_pcm_reset() and falsified nothing -- see usb_audio.c's
-// doc comment.
-uint32_t pl_usb_audio_fill_min(void);
-
-// Bead pico-link-pbv round 2 (C2-9): call from a2dp.c's STREAM_STARTED
-// handler. Seeds the fill EMA to the current ring fill (so the controller
-// starts streaming at its real operating point rather than coasting in
-// from priming) and resets the windowed fill_min so a stale reading can't
-// be attributed to the stream that's about to start.
-void pl_usb_audio_fb_reset(void);
+// Bead pico-link-ycm2.7.1: the fill-EMA/fill-min/reset accessors that used
+// to live here (pl_usb_audio_fb_fill_ema/_fill_min/_fb_reset/_fb_rail_ticks)
+// moved to drain_servo.h as pl_drain_servo_fill_ema/_fill_min/_reset/
+// _rail_ticks -- the PI controller that produced them moved there too (see
+// usb_audio.c's doc comment on pl_usb_audio_feedback_task).
 
 // --- Bead pico-link-4v2.1 (VT1, volume-sync risk gate) ---
 // debug_remote.c's "VOL GET"/"VOL WATCH" console commands read these to
