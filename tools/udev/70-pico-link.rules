@@ -1,0 +1,14 @@
+# Pico Link USB permissions for Linux.
+#
+# Grants non-root access to the device (so the web companion and pyusb
+# tools can claim interfaces without sudo) and tells ModemManager to
+# leave the CDC serial interface alone.
+#
+# Install:
+#   sudo cp tools/udev/70-pico-link.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger
+#   (replug the device)
+
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="000c", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000c", ENV{ID_MM_DEVICE_IGNORE}="1"

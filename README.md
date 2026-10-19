@@ -54,6 +54,19 @@ dongle.
 
 Drop a `.txt` export from AutoEQ or Equalizer APO onto the page to import it.
 
+### Linux
+
+Needs a udev rule so the browser can claim the device without root:
+
+```sh
+sudo cp tools/udev/70-pico-link.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger
+```
+
+Replug the device, then open the web companion in Chrome or Edge. Linux is
+untested on real hardware so far — report back if you try it.
+
 ## Hardware
 
 Two off-the-shelf boards. The LCD plugs straight onto the Pico — no soldering.
@@ -73,9 +86,13 @@ CYW43439 radio has both.
 ## Status
 
 Working and in daily use: LDAC streaming, adaptive bitrate, on-device pairing
-and device management, EQ and crossfeed, and the web companion. No tagged
-release yet — build from source, or grab `pico_link.uf2` from the latest
-[firmware workflow run](../../actions/workflows/firmware.yml) on `main`.
+and device management, EQ and crossfeed, and the web companion. Tested on
+macOS; Windows and Linux support is in progress.
+
+**Get the firmware:** download `pico_link.uf2` from the
+[latest release](https://github.com/coroiu/pico-link/releases/latest), hold
+**BOOTSEL** while plugging the board in, and copy the file onto the `RP2350`
+drive.
 
 Hands-free (HFP) is not supported: the CYW43439 can't route SCO audio the way
 it would need. Pico Link is a listening device.
