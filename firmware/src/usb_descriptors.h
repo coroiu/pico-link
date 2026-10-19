@@ -42,6 +42,20 @@
 #ifndef PICO_LINK_USB_DESCRIPTORS_H
 #define PICO_LINK_USB_DESCRIPTORS_H
 
+#include <stdbool.h>
+
+// Bead pico-link-ycm2.5: true once this boot has seen a host send
+// MS_OS_20_SET_ALT_ENUMERATION (usb_descriptors.c's tud_vendor_control_xfer_cb
+// override) -- set only by Windows, since bAltEnumCode's nonzero value in
+// the BOS/MS-OS-2.0 descriptor is what invites the request, and only
+// Windows's usbaudio2.sys acts on it. Read by usb_descriptors.c's own
+// tud_descriptor_configuration_cb (picks the 4-byte-feedback config
+// descriptor variant) and usb_audio.c's tud_audio_feedback_format_correction_cb
+// override (picks the matching 16.16/4-byte wire format). Never cleared
+// except by a power-on reset -- see usb_descriptors.c's s_win_alt_enum_active
+// for why a same-session USB bus reset must not clear it.
+bool pl_usb_win_alt_enum_active(void);
+
 // Unit numbers are arbitrarily selected, matching the upstream example.
 #define UAC2_ENTITY_CLOCK           0x04
 #define UAC2_ENTITY_INPUT_TERMINAL  0x01

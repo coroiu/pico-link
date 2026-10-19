@@ -117,36 +117,40 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX 2
 #define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX 16
 
-// CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION is NOT the OS-guessing quirk
-// (quirk_os_guessing.c upstream, which needs a BOS descriptor to host-sniff
-// the OS and would collide with reset_interface.c's BOS ownership when
-// PICO_STDIO_USB_RESET_INTERFACE_SUPPORT_MS_OS_20_DESCRIPTOR is set -- it is
-// not, here, so that collision doesn't even apply). That reasoning is correct
-// about the *quirk* and was wrongly used to justify disabling this flag too.
-// This flag is a plain compile-time switch inside audiod_fb_send
-// (audio_device.c:1187-1214): it converts the feedback value to 10.14 and
-// sends 3 bytes instead of 4. It touches no BOS descriptor and nothing
-// reset_interface.c owns.
+// SUPERSEDED by bead pico-link-ycm2.5 -- this comment used to document a
+// "known, deliberate Windows-compatibility regression" (hardcoding 3
+// bytes unconditionally, since this flag is only a compile-time, build-
+// wide default). That is fixed now: Windows' in-box usbaudio2.sys was
+// proven (hardware, bead pico-link-ycm2.4) to refuse to START a
+// full-speed UAC2 function whose feedback endpoint claims wMaxPacketSize
+// 3 at all -- not a wire-format mismatch, a descriptor-field bug in that
+// driver -- so a compile-time flag plus the OS-guessing quirk this
+// comment used to point to as "the durable fix" would still have been
+// wrong: CFG_QUIRK_OS_GUESSING sniffs the OS from descriptor-request
+// ORDER, a heuristic this project's epic (pico-link-ycm2) explicitly
+// rules out.
 //
-// Full-speed macOS REQUIRES the 3-byte 10.14 feedback format (USB 2.0
-// Sec.5.12.4.2) -- TinyUSB's own compatibility matrix at
-// audio_device.c:1200-1214 lists OSX only in the packetSize==3 rows, never in
-// the packetSize==4 (16.16) rows we were shipping. Confirmed empirically on
-// this device: with this flag at 0 (16.16/4 bytes, the Windows/Linux row),
-// macOS silently discarded the whole alt setting 1 that carries the feedback
-// endpoint and SET_INTERFACE(1, 1) was never issued -- see bead pico-link-icb.
+// The durable, spec-standard fix actually implemented is MS OS 2.0
+// "alternate enumeration": a nonzero bAltEnumCode in the BOS/MS-OS-2.0
+// platform capability (usb_descriptors.c) invites Windows to send
+// MS_OS_20_SET_ALT_ENUMERATION, which that file's tud_vendor_control_xfer_cb
+// latches into pl_usb_win_alt_enum_active() (usb_descriptors.h). Two
+// things then key off that flag at RUNTIME, per enumeration, instead of
+// at compile time: usb_descriptors.c's tud_descriptor_configuration_cb
+// serves a config descriptor variant with feedback wMaxPacketSize 4
+// instead of 3, and this file's strong tud_audio_feedback_format_correction_cb
+// (usb_audio.c) returns false instead of this macro's compile-time
+// default, so audiod_fb_send (audio_device.c:1264-1293) sends the raw
+// 16.16/4-byte value Windows requires instead of converting to 10.14/3
+// bytes. macOS and Linux never send that vendor request and always get
+// this macro's value below -- unchanged, byte-identical to every build
+// before this bead.
 //
-// The trade this makes: TinyUSB's own uac2_speaker_fb example (see
-// usb_descriptors.c:162, "OS X needs 3 bytes feedback endpoint on FS") only
-// sends 3 bytes when CFG_QUIRK_OS_GUESSING detects OSX at runtime, and keeps
-// sending 4 bytes to Windows (whose UAC2 driver has a documented bug
-// requiring 16.16 -- audio_device.h:501-502). We have no Windows test rig and
-// macOS is the MVP host, so we hardcode 3 bytes unconditionally rather than
-// wire up the quirk sniffer. This is a known, deliberate Windows-compatibility
-// regression. The durable fix, if Windows support is ever needed, is exactly
-// CFG_QUIRK_OS_GUESSING -- an isolated swap in tud_descriptor_configuration_cb
-// that picks the descriptor variant per detected host, not a reason to revert
-// this flag.
+// This macro itself is now DEAD except as the weak callback's own
+// compile-time fallback (audio_device.c:515-517) -- unreachable once the
+// strong override above is linked in, kept at 1 (the macOS/Linux-correct
+// 10.14/3-byte default) purely so the value documented here matches what
+// every host except an alt-enumerated Windows actually gets.
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION 1
 
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT 1

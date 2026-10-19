@@ -312,6 +312,26 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedba
     feedback_param->sample_freq = current_sample_rate;
 }
 
+// Bead pico-link-ycm2.5: strong override of the weak
+// tud_audio_feedback_format_correction_cb (audio_device.c:515-517 in
+// pico-sdk's vendored TinyUSB; invoked once per full-speed streaming
+// alt-setting entry, audio_device.c:2039-2040). The weak default just
+// returns tusb_config.h's CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION
+// compile-time constant -- a single build-wide choice that can't serve
+// both hosts (see that macro's rewritten comment). This override makes
+// the choice PER ENUMERATION instead: true (the default, matching the
+// macro's own value) converts tud_audio_fb_set()'s 16.16 value to the
+// spec-correct 10.14/3-byte full-speed feedback format macOS and Linux
+// both accept; false sends the raw 16.16 value as 4 bytes, which is what
+// Windows' in-box usbaudio2.sys requires (bead pico-link-ycm2.4's Code
+// 10 root cause) and gets ONLY on the one enumeration that sent
+// MS_OS_20_SET_ALT_ENUMERATION (usb_descriptors.c), which also served it
+// the matching 4-byte feedback endpoint size in the config descriptor.
+bool tud_audio_feedback_format_correction_cb(uint8_t func_id) {
+    (void)func_id;
+    return !pl_usb_win_alt_enum_active();
+}
+
 // Bead pico-link-pbv/pico-link-6vv (C2-8): replaces the dead
 // tud_audio_feedback_interval_isr override (see s_fb_done's doc comment
 // above). tud_audio_fb_done_cb fires once per completed feedback OUT

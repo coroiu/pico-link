@@ -78,9 +78,12 @@ static const tusb_desc_device_t usbd_desc_device = {
     // pico-link-ryw.12: "bump bcdDevice ... so hosts drop cached
     // descriptors"), then 0x0102 -> 0x0103 for the BOS/MS OS 2.0 addition
     // (bead pico-link-ycm2.3, same reasoning: a cached pre-BOS devnode must
-    // not be reused). PID deliberately NOT bumped -- see
-    // .planning/design/2026-09-02-media-keys.md section 2.5.
-    .bcdDevice = 0x0103,
+    // not be reused), then 0x0103 -> 0x0104 for the MS OS 2.0 alternate
+    // enumeration support below (bead pico-link-ycm2.5: bAltEnumCode goes
+    // from 0 to nonzero in the BOS capability, a cached devnode from
+    // before that must not be reused either). PID deliberately NOT bumped
+    // -- see .planning/design/2026-09-02-media-keys.md section 2.5.
+    .bcdDevice = 0x0104,
     .iManufacturer = STRID_MANUFACTURER,
     .iProduct = STRID_PRODUCT,
     .iSerialNumber = STRID_SERIAL,
@@ -171,9 +174,60 @@ static const uint8_t usbd_desc_cfg[] = {
 _Static_assert(sizeof(usbd_desc_cfg) == USBD_DESC_LEN,
     "usbd_desc_cfg's actual byte count does not match USBD_DESC_LEN's macro arithmetic");
 
+// Windows-only variant of the config descriptor above -- bead
+// pico-link-ycm2.5 (root cause proven on hardware in pico-link-ycm2.4):
+// Windows' in-box usbaudio2.sys refuses to START a full-speed UAC2
+// function whose feedback endpoint claims wMaxPacketSize 3 (an
+// undocumented driver bug, not a USB-transport error -- see that bead's
+// DESIGN comment for the decode of the Code 10 / 0xC0440025 status and
+// the Microsoft driver source citation). macOS requires the opposite:
+// it silently drops the whole alternate setting if that same endpoint
+// claims 4 bytes (bead pico-link-icb). No single descriptor satisfies
+// both hosts, so this is the SAME macro call as usbd_desc_cfg above with
+// only _epfbsize changed from 3 to the literal 4 Windows needs --
+// identical total length (TUD_AUDIO_DESC_STD_AS_ISO_FB_EP's size field is
+// fixed-width regardless of the value it carries, so USBD_DESC_LEN is
+// unchanged) -- served only to a host that opted in by sending
+// MS_OS_20_SET_ALT_ENUMERATION (see tud_vendor_control_xfer_cb below);
+// macOS and Linux never send that request and always get usbd_desc_cfg
+// above, byte-for-byte unchanged.
+static const uint8_t usbd_desc_cfg_win[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, STRID_LANGID, USBD_DESC_LEN, 0x00, USBD_MAX_POWER_MA),
+
+    TUD_AUDIO_SPEAKER_STEREO_FB_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, STRID_AUDIO,
+        CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX,
+        EPNUM_AUDIO_OUT, CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX, EPNUM_AUDIO_FB,
+        4, EPNUM_AUDIO_INT),
+
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+
+    TUD_RPI_RESET_DESCRIPTOR(ITF_NUM_RESET, STRID_RESET)
+
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, STRID_HID, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID_IN, 8, 10),
+
+    TUD_PL_CONFIG_DESCRIPTOR(ITF_NUM_CONFIG, STRID_CONFIG)
+};
+
+_Static_assert(sizeof(usbd_desc_cfg_win) == USBD_DESC_LEN,
+    "usbd_desc_cfg_win's actual byte count does not match USBD_DESC_LEN's macro arithmetic -- "
+    "the two config descriptor variants must stay byte-length-identical");
+
+// Set once by tud_vendor_control_xfer_cb's MS_OS_20_SET_ALT_ENUMERATION
+// handler below, read here AND by usb_audio.c's
+// tud_audio_feedback_format_correction_cb override (see
+// pl_usb_win_alt_enum_active, usb_descriptors.h). Cleared ONLY by a
+// power-on reset (a plain static initializer): see that handler's own
+// comment for why a same-session USB bus reset must NOT clear it, and why
+// "plug into a different host" is covered anyway.
+static volatile bool s_win_alt_enum_active = false;
+
 const uint8_t *tud_descriptor_configuration_cb(uint8_t index) {
     (void)index;
-    return usbd_desc_cfg;
+    return s_win_alt_enum_active ? usbd_desc_cfg_win : usbd_desc_cfg;
+}
+
+bool pl_usb_win_alt_enum_active(void) {
+    return s_win_alt_enum_active;
 }
 
 //--------------------------------------------------------------------+
@@ -202,6 +256,32 @@ const uint8_t *tud_descriptor_configuration_cb(uint8_t index) {
 // on type==CLASS so a genuine VENDOR request never reaches them; see their
 // own provenance notes), so there is no collision.
 #define PL_MS_VENDOR_CODE 0x01
+
+// Bead pico-link-ycm2.5: nonzero bAltEnumCode in the MS OS 2.0 platform
+// capability below (bos descriptor) is how a device OPTS IN to the MS OS
+// 2.0 "alternate enumeration" mechanism -- the stock TUD_BOS_MS_OS_20_DESCRIPTOR
+// macro (usbd.h:207-208) hardcodes this field to 0 (no alternate
+// enumeration), so this project defines its own expansion below
+// (PL_BOS_MS_OS_20_DESCRIPTOR) rather than patch the vendored macro.
+// Value is otherwise arbitrary (any nonzero byte) -- it is not looked up
+// against anything, it only gates whether Windows considers sending
+// MS_OS_20_SET_ALT_ENUMERATION (tud_vendor_control_xfer_cb below) at all.
+#define PL_MS_ALT_ENUM_CODE 0x01
+
+// wIndex value this project's vendor code, 0x0008, means on a VENDOR
+// control request: Microsoft's "Set Alternate Enumeration" command (the
+// MS OS 2.0 spec's other defined use of bMS_VendorCode, alongside 0x0007
+// for the descriptor-set read above). PROVENANCE CAVEAT: Microsoft's own
+// MS_OS_2_0_desc.docx (gated behind a click-through license, not
+// reproducible here) is the only normative source for this constant; no
+// open-source USB stack this project checked (TinyUSB, Zephyr, libusbk)
+// implements the DEVICE side of this request, only the same bare
+// constant value -- real-world adoption of alternate enumeration is thin
+// (see pico-link-ycm2's DESIGN comment, section 2). This project treats
+// it as host-to-device with wLength 0 (a bare command, no data stage,
+// ack'd with a status-stage ZLP via tud_control_status) and does not gate
+// on wValue's documented bPageNumber -- this device has exactly one page.
+#define PL_MS_OS_20_SET_ALT_ENUMERATION 0x0008
 
 #define PL_MS_OS_20_COMPATID_LEN      0x0014 // header(4) + "WINUSB"(8) + sub-compatible(8)
 #define PL_MS_OS_20_REGPROP_LEN       0x0084 // header(8) + name "DeviceInterfaceGUIDs\0"(42) + datalen(2) + data(80)
@@ -281,6 +361,15 @@ _Static_assert(sizeof(desc_ms_os_20) == PL_MS_OS_20_DESC_LEN,
 
 #define USBD_BOS_TOTAL_LEN (TUD_BOS_DESC_LEN + PL_BOS_USB2_EXT_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
 
+// Hand-written variant of TUD_BOS_MS_OS_20_DESCRIPTOR (usbd.h:207-208) --
+// that stock macro's last field (bAltEnumCode) is hardcoded 0, so a
+// device that wants alternate enumeration needs its own expansion of the
+// same TUD_BOS_PLATFORM_DESCRIPTOR fields the stock macro uses: the
+// MS OS 2.0 UUID, dwWindowsVersion, wMSOSDescriptorSetTotalLength,
+// bMS_VendorCode, bAltEnumCode.
+#define PL_BOS_MS_OS_20_DESCRIPTOR(_desc_set_len, _vendor_code, _alt_enum_code) \
+    TUD_BOS_PLATFORM_DESCRIPTOR(TUD_BOS_MS_OS_20_UUID, U32_TO_U8S_LE(0x06030000), U16_TO_U8S_LE(_desc_set_len), _vendor_code, _alt_enum_code)
+
 static const uint8_t desc_bos[] = {
     // Total length, number of device capabilities
     TUD_BOS_DESCRIPTOR(USBD_BOS_TOTAL_LEN, 2),
@@ -288,8 +377,10 @@ static const uint8_t desc_bos[] = {
     // USB 2.0 Extension Capability -- bmAttributes = 0 (no LPM)
     PL_BOS_USB2_EXT_LEN, TUSB_DESC_DEVICE_CAPABILITY, DEVICE_CAPABILITY_USB20_EXTENSION, 0x00, 0x00, 0x00, 0x00,
 
-    // Microsoft OS 2.0 Platform Capability: descriptor-set total length, vendor code
-    TUD_BOS_MS_OS_20_DESCRIPTOR(PL_MS_OS_20_DESC_LEN, PL_MS_VENDOR_CODE),
+    // Microsoft OS 2.0 Platform Capability: descriptor-set total length,
+    // vendor code, alt-enum code (bead pico-link-ycm2.5: was
+    // TUD_BOS_MS_OS_20_DESCRIPTOR's hardcoded 0, now PL_MS_ALT_ENUM_CODE)
+    PL_BOS_MS_OS_20_DESCRIPTOR(PL_MS_OS_20_DESC_LEN, PL_MS_VENDOR_CODE, PL_MS_ALT_ENUM_CODE),
 };
 
 _Static_assert(sizeof(desc_bos) == USBD_BOS_TOTAL_LEN,
@@ -320,6 +411,17 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 
     if (request->bRequest == PL_MS_VENDOR_CODE && request->wIndex == 0x0007) {
         return tud_control_xfer(rhport, request, (void *)(uintptr_t)desc_ms_os_20, PL_MS_OS_20_DESC_LEN);
+    }
+
+    // MS OS 2.0 "Set Alternate Enumeration" (bead pico-link-ycm2.5) -- see
+    // PL_MS_OS_20_SET_ALT_ENUMERATION's own comment above for what this
+    // constant is and the provenance caveat on its exact wire shape. No
+    // data stage (wLength 0): ack immediately with a status-stage ZLP and
+    // latch the flag tud_descriptor_configuration_cb and usb_audio.c's
+    // tud_audio_feedback_format_correction_cb both read.
+    if (request->bRequest == PL_MS_VENDOR_CODE && request->wIndex == PL_MS_OS_20_SET_ALT_ENUMERATION) {
+        s_win_alt_enum_active = true;
+        return tud_control_status(rhport, request);
     }
 
     return false;
