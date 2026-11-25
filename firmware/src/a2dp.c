@@ -3434,9 +3434,9 @@ void pl_a2dp_prepare_switch(void) {
 }
 
 bool pl_a2dp_attempt_in_flight(void) {
-    // An attempt with neither a cid nor a retry armed is dead (its session
-    // was released before any terminal event) and nothing will conclude it.
-    return s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT && (s_ctx.a2dp_cid != 0 || s_ctx.reconnect_retry_armed);
+    // Live only while the current cid is its own, or its 0x0b retry is armed.
+    return s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT &&
+        (s_ctx.reconnect_retry_armed || (s_ctx.attempt.cid != 0 && s_ctx.a2dp_cid == s_ctx.attempt.cid));
 }
 
 // Bead pico-link-drqr -- see a2dp.h's doc comment.
@@ -3690,6 +3690,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             if (s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT &&
                 (cid == s_ctx.attempt.cid || memcmp(s_ctx.connect_addr, s_ctx.attempt.addr, 6) == 0)) {
                 s_ctx.session_seq = s_ctx.attempt.seq;
+                s_ctx.attempt.cid = cid;
             } else {
                 s_ctx.session_seq = 0;
                 s_ctx.remote_sessions++;
@@ -4540,6 +4541,10 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_enc_state = PL_ENC_STATE_IDLE;
 #endif
             pl_log("a2dp: signaling connection released\r\n");
+            // Bead pico-link-drqr: released mid-setup, no other event will
+            // conclude this attempt. Read before session_seq is cleared.
+            bool ended_attempt = s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT &&
+                (released_cid == s_ctx.attempt.cid || s_ctx.session_seq == s_ctx.attempt.seq);
             // Bead pico-link-648: belt-and-suspenders -- if a retry was
             // still armed when the signaling connection went away some
             // other way, don't let it fire into whatever comes next.
@@ -4594,6 +4599,11 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // bug: an unrelated session releasing must not complete it).
             if (s_ctx.cancel_cid != 0 && released_cid == s_ctx.cancel_cid) {
                 pl_a2dp_cancel_teardown_done(false);
+            }
+            if (ended_attempt) {
+                pl_a2dp_emit_connect_failed(
+                    s_ctx.attempt.addr, PL_FAILURE_REASON_REJECTED, released_cid, s_ctx.attempt.seq
+                );
             }
             break;
         }

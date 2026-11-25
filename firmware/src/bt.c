@@ -141,11 +141,19 @@ typedef enum {
     PL_BT_SWITCH_PAGING,
 } pl_bt_switch_state_t;
 
+// Bead pico-link-drqr: BTstack defaults to 0x6000 (15.36s); pl_bt_init
+// shortens it. In 0.625ms baseband slots: 0x2000 = 5.12s.
+#define PL_BT_PAGE_TIMEOUT_SLOTS 0x2000u
+
 // Andreas's ruling (bead comments): B failing must leave the device fully
-// disconnected, never reconnect A. Must exceed the 5.12s page timeout a
-// preempted attempt may still have to run out, with margin for the teardown
-// behind it, against a slot that somehow never frees.
+// disconnected, never reconnect A. Must exceed the page timeout a preempted
+// attempt may still have to run out, with margin for the teardown behind it,
+// against a slot that somehow never frees.
 #define PL_BT_SWITCH_DEADLINE_US 10000000ull
+_Static_assert(
+    PL_BT_SWITCH_DEADLINE_US >= PL_BT_PAGE_TIMEOUT_SLOTS * 625ull + 3000000ull,
+    "switch deadline must outlast the page timeout"
+);
 
 static pl_bt_switch_state_t s_switch_state;
 // Meaningful in WAIT_IDLE: false means drain only (a cancel, nothing to page).
@@ -983,6 +991,13 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                 // pointer arithmetic (event + 5).
                 pl_bt_handle_read_local_version_complete(params, (uint16_t)(size - 5));
             }
+            // Bead pico-link-drqr: on-device proof the controller took it.
+            if (hci_event_command_complete_get_command_opcode(packet) == hci_write_page_timeout.opcode) {
+                pl_log(
+                    "BT: page timeout 0x%04x written, status=0x%02x\r\n", PL_BT_PAGE_TIMEOUT_SLOTS,
+                    hci_event_command_complete_get_return_parameters(packet)[0]
+                );
+            }
             break;
 
         case GAP_EVENT_INQUIRY_RESULT:
@@ -1337,7 +1352,7 @@ static void pl_bt_connect_or_switch(const uint8_t *addr, uint16_t seq) {
         if (pl_a2dp_adopt_if_connected(addr, seq)) {
             return;
         }
-        if (!pl_a2dp_attempt_in_flight() && pl_a2dp_session_idle() && !pl_bt_any_acl_up()) {
+        if (!pl_a2dp_attempt_in_flight() && pl_a2dp_session_idle() && !pl_bt_hci_connection_exists()) {
             s_switch_state = PL_BT_SWITCH_NONE;
             pl_bt_update_scan_mode();
             pl_a2dp_connect(addr, seq);
@@ -1468,6 +1483,12 @@ static void pl_bt_pending_service(void) {
                 pl_bt_connect_or_switch(entry.addr, entry.seq);
                 break;
             case PL_BT_PENDING_DISCONNECT:
+                // Bead pico-link-drqr: a Disconnect also drops a connect still
+                // waiting for the radio, which then needs its terminal event.
+                if (s_switch_state == PL_BT_SWITCH_WAIT_IDLE && s_switch_has_target) {
+                    s_switch_has_target = false;
+                    pl_bt_push_connect_failed(s_switch_target, PL_FAILURE_REASON_RADIO_ERROR, s_switch_target_seq);
+                }
                 // Bead pico-link-sfw6, design sec 6: pl_a2dp_disconnect
                 // alone is AVDTP-only and can leave AVRCP's channel (and
                 // therefore the ACL) up -- fold in the same full-ACL
@@ -1653,6 +1674,11 @@ void pl_bt_init(struct PlUi *ui) {
 
     hci_event_callback_registration.callback = &pl_bt_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
+
+    // Bead pico-link-drqr: must come after hci_init (run by cyw43_arch_init),
+    // which sets the default. BTstack writes the stored value to the
+    // controller once it reaches HCI_STATE_WORKING.
+    gap_set_page_timeout(PL_BT_PAGE_TIMEOUT_SLOTS);
 
     // M4 S1 (bead pico-link-cz0.5.2): A2DP Source + AVRCP + SDP + class of
     // device registration MUST happen before hci_power_control(HCI_POWER_ON)

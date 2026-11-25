@@ -500,9 +500,14 @@ Supersedes v2 rules 1, 6 and 7 where they conflict.
   seq, no re-page.
 - One place holds a waiting connect: bt.c's switch state `WAIT_IDLE`, which
   pages once no HCI connection exists and a2dp.c reports idle (deadline 10 s,
-  longer than the unabortable 5.12 s page). `ATT_HELD` is gone: it reissued
-  from inside BTstack's event emit, before the dying AVDTP connection (pool of
-  one) was freed.
+  longer than the unabortable page). `ATT_HELD` is gone: it reissued from
+  inside BTstack's event emit, before the dying AVDTP connection (pool of one)
+  was freed.
+- The page timeout is 5.12 s only because `pl_bt_init` sets it
+  (`gap_set_page_timeout(0x2000)`). BTstack's default is 0x6000 (15.36 s), so
+  the "<=5.12s" figures earlier in this document were wrong until then.
+- A signaling release during setup reports `ConnectFailed` for that attempt. A
+  `Disconnect` while a connect is waiting drops it and reports `ConnectFailed`.
 - A cancel that matched something enters the same wait with no target, and
   disconnects any ACL the abandoned page brings up (D3).
 - A pairing scan cancels an auto-reconnect attempt (core, `start_scan`); C
