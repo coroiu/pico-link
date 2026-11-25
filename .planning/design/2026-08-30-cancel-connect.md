@@ -488,3 +488,28 @@ a2dp.h's `PL_A2DP_DEBUG_SEQ_MIN..=PL_A2DP_DEBUG_SEQ_MAX` C-only range
 which is what actually exercises the stale-cancel path H4 is meant to prove.
 `--cancel-connect` with no `--seq` is unchanged (`PL_SEQ_ANY`) and remains
 the right tool for H1-H3's HELD/IN_FLIGHT cases.
+
+---
+
+## v3 (2026-11-25) -- last choice wins (bead `pico-link-drqr`)
+
+Supersedes v2 rules 1, 6 and 7 where they conflict.
+
+- A `Connect` preempts an in-flight attempt for another address (cancelled as
+  in rule 6). Same address: the in-flight attempt is re-tagged with the new
+  seq, no re-page.
+- One place holds a waiting connect: bt.c's switch state `WAIT_IDLE`, which
+  pages once no HCI connection exists and a2dp.c reports idle (deadline 10 s,
+  longer than the unabortable page). `ATT_HELD` is gone: it reissued from
+  inside BTstack's event emit, before the dying AVDTP connection (pool of one)
+  was freed.
+- The page timeout is 5.12 s only because `pl_bt_init` sets it
+  (`gap_set_page_timeout(0x2000)`). BTstack's default is 0x6000 (15.36 s), so
+  the "<=5.12s" figures earlier in this document were wrong until then.
+- A signaling release during setup reports `ConnectFailed` for that attempt. A
+  `Disconnect` while a connect is waiting drops it and reports `ConnectFailed`.
+- A cancel that matched something enters the same wait with no target, and
+  disconnects any ACL the abandoned page brings up (D3).
+- A pairing scan cancels an auto-reconnect attempt (core, `start_scan`); C
+  defers the inquiry while an outbound page is outstanding. Whether the
+  CYW43439 would accept an inquiry mid-page is unmeasured.

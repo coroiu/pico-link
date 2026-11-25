@@ -26,6 +26,9 @@
 //! "The person holding the dongle wins": [`wizard_open`] or a device-/
 //! auto-reconnect-initiated [`ConnectAttempt`] in flight makes every radio
 //! op [`OpError::DeviceBusy`], **except**:
+//! - `CONNECT` and `SCAN_START`, which preempt an auto-reconnect attempt
+//!   (nobody asked for it, so an explicit choice wins -- bead
+//!   `pico-link-drqr`). The wizard and device-initiated attempts still win.
 //! - `CONNECT`'s `addr == connected_addr` no-op (design sec 13.3: checked
 //!   *before* the busy gate -- asking to connect to the device you're
 //!   already on is never contentious, even mid-wizard).
@@ -91,12 +94,17 @@ impl App {
         self.wizard_open() || self.model.borrow().attempt.as_ref().is_some_and(|a| a.initiator != ConnectInitiator::Host)
     }
 
+    /// [`Self::device_busy`] for the two ops that express a new choice
+    /// (`CONNECT`, `SCAN_START`): an auto-reconnect attempt does not block
+    /// them, they preempt it.
+    fn device_busy_for_new_choice(&self) -> bool {
+        self.wizard_open() || self.model.borrow().attempt.as_ref().is_some_and(|a| a.initiator == ConnectInitiator::Device)
+    }
+
     /// Design sec 13.7's narrower `RADIO_BUSY`: a `Host`-initiated attempt
-    /// is already in flight. Only ever reached once [`Self::device_busy`]
-    /// has already returned `false` -- a device-owned attempt is
-    /// `DEVICE_BUSY`, not this.
+    /// is already in flight.
     fn radio_busy(&self) -> bool {
-        self.model.borrow().attempt.is_some()
+        self.model.borrow().attempt.as_ref().is_some_and(|a| a.initiator == ConnectInitiator::Host)
     }
 
     /// Design sec 13.6's generalised host lease: "Sec 7's 2 s SETUP-recency
@@ -134,7 +142,7 @@ impl App {
         if self.model.borrow().paired.len() >= MAX_PAIRED_DEVICES {
             return HostOpStatus::rejected(seq, op, OpError::PairedFull);
         }
-        if self.device_busy() {
+        if self.device_busy_for_new_choice() {
             return HostOpStatus::rejected(seq, op, OpError::DeviceBusy);
         }
         if self.radio_busy() {
@@ -180,7 +188,7 @@ impl App {
             // module's doc comment.
             return HostOpStatus::done_word(seq, op, 0);
         }
-        if self.device_busy() {
+        if self.device_busy_for_new_choice() {
             return HostOpStatus::rejected(seq, op, OpError::DeviceBusy);
         }
         if self.radio_busy() {
@@ -322,7 +330,8 @@ mod tests {
 
     use super::*;
     use crate::app::model::{DeviceEntry, PairedDevice};
-    use crate::app::test_support::open_wizard;
+    use crate::app::test_support::{open_devices, open_wizard};
+    use crate::input::NavIntent;
     use crate::app::{App, Event, StoreStatus};
     use crate::app::host_op::OP_PROTO;
 
@@ -449,6 +458,80 @@ mod tests {
         let (_, state, error, _) = run(&mut app, &req(7, 2, &[]));
         assert_eq!(state, 2);
         assert_eq!(error, OpError::RadioBusy as u8);
+    }
+
+    // --- auto-reconnect preemption (bead pico-link-drqr) -----------------
+
+    /// A boot auto-reconnect to `ADDR_A` in flight, its `Connect` drained.
+    fn auto_reconnecting() -> (App, u16) {
+        let mut app = App::new(240, 240);
+        upsert(&mut app, ADDR_B, "Other", 1);
+        upsert(&mut app, ADDR_A, "Headphones", 2);
+        ready(&mut app);
+        let seq = app.model().attempt.expect("auto-reconnect in flight").seq;
+        assert!(matches!(app.poll_command(), Some(Command::Connect { addr: ADDR_A, .. })));
+        (app, seq)
+    }
+
+    #[test]
+    fn connect_preempts_an_auto_reconnect() {
+        let (mut app, auto_seq) = auto_reconnecting();
+        let (_, state, error, attempt_seq) = run(&mut app, &req(9, 1, &ADDR_B));
+        assert_eq!(state, 1, "done: {error}");
+        assert_ne!(attempt_seq, auto_seq);
+        let attempt = app.model().attempt.expect("host attempt recorded");
+        assert_eq!((attempt.addr, attempt.initiator, attempt.seq), (ADDR_B, ConnectInitiator::Host, attempt_seq));
+        assert!(matches!(app.poll_command(), Some(Command::Connect { addr: ADDR_B, .. })));
+    }
+
+    #[test]
+    fn scan_start_preempts_an_auto_reconnect() {
+        let (mut app, auto_seq) = auto_reconnecting();
+        let (_, state, error, _) = run(&mut app, &req(7, 1, &[]));
+        assert_eq!(state, 1, "done: {error}");
+        assert_eq!(app.poll_command(), Some(Command::CancelConnect { addr: ADDR_A, seq: auto_seq }));
+        assert_eq!(app.poll_command(), Some(Command::StartScan));
+        assert_eq!(app.model().attempt, None);
+    }
+
+    #[test]
+    fn a_rejected_connect_leaves_the_auto_reconnect_running() {
+        let (mut app, auto_seq) = auto_reconnecting();
+        let (_, state, error, _) = run(&mut app, &req(9, 1, &[7; 6]));
+        assert_eq!((state, error), (2, OpError::UnknownDevice as u8));
+        assert_eq!(app.model().attempt.map(|a| a.seq), Some(auto_seq));
+        assert!(app.poll_command().is_none());
+    }
+
+    #[test]
+    fn the_wizard_still_wins_over_the_web_during_an_auto_reconnect() {
+        let (mut app, auto_seq) = auto_reconnecting();
+        open_devices(&mut app);
+        // Two paired rows, then "Pair new headphones".
+        app.handle_input(vec![NavIntent::Down, NavIntent::Down, NavIntent::Select]);
+        assert!(app.wizard_open());
+        assert_ne!(app.model().attempt.map(|a| a.seq), Some(auto_seq), "the wizard's scan cancelled the auto attempt");
+        let (_, state, error, _) = run(&mut app, &req(9, 1, &ADDR_B));
+        assert_eq!((state, error), (2, OpError::DeviceBusy as u8));
+    }
+
+    #[test]
+    fn a_device_initiated_attempt_still_wins_over_the_web() {
+        let mut app = App::new(240, 240);
+        ready(&mut app);
+        upsert(&mut app, ADDR_B, "Other", 1);
+        let _ = app.seed_connect_attempt_for_test(ADDR_A);
+        for (op, body) in [(9, &ADDR_B[..]), (7, &[][..])] {
+            let (_, state, error, _) = run(&mut app, &req(op, op, body));
+            assert_eq!((state, error), (2, OpError::DeviceBusy as u8));
+        }
+    }
+
+    #[test]
+    fn disconnect_does_not_preempt_an_auto_reconnect() {
+        let (mut app, _) = auto_reconnecting();
+        let (_, state, error, _) = run(&mut app, &req(10, 1, &ADDR_A));
+        assert_eq!((state, error), (2, OpError::DeviceBusy as u8));
     }
 
     // --- SCAN_STOP (op 8) -----------------------------------------------

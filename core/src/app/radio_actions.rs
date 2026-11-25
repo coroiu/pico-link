@@ -47,7 +47,15 @@ use super::{DeviceAddr, ModelHandle};
 /// that, nor does it check "already scanning" -- a caller that wants
 /// SCAN_START's idempotent "already discovering with owner Host: no-op"
 /// rule implements that check itself before calling.
+///
+/// The one exception: an in-flight [`ConnectInitiator::AutoReconnect`]
+/// attempt is cancelled first (bead `pico-link-drqr`) -- asking to scan is
+/// an explicit choice, and it wins over the unasked-for boot reconnect.
 pub(crate) fn start_scan(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Command>>>, origin: ScanOwner) {
+    let auto_reconnect = model.borrow().attempt.filter(|a| a.initiator == ConnectInitiator::AutoReconnect);
+    if let Some(attempt) = auto_reconnect {
+        cancel_connect(model, commands, attempt.addr);
+    }
     {
         let mut model = model.borrow_mut();
         model.discovered.clear();
@@ -80,6 +88,11 @@ pub(crate) fn cancel_scan(commands: &Rc<RefCell<VecDeque<Command>>>) {
 /// `addr` against `paired`/the scan list rather than trusting a caller-
 /// supplied name -- design sec 13.3's CONNECT semantics), same division of
 /// responsibility as [`start_scan`]'s doc comment describes.
+///
+/// Last choice wins: replacing an in-flight attempt needs no
+/// `CancelConnect` from here. The old attempt's echoes are dropped by seq,
+/// and C preempts its radio work when this `Connect` arrives (and, for the
+/// same address, adopts it under the new seq).
 pub(crate) fn connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque<Command>>>, addr: DeviceAddr, name: String, initiator: ConnectInitiator) {
     let seq = {
         let mut model = model.borrow_mut();
@@ -125,6 +138,9 @@ pub(crate) fn cancel_connect(model: &ModelHandle, commands: &Rc<RefCell<VecDeque
     let seq = {
         let mut model = model.borrow_mut();
         if let Some(attempt) = model.attempt.take() {
+            // `LinkStateChanged(Idle)`, C's only echo, deliberately leaves
+            // this flag alone.
+            model.connecting = false;
             model.last_outcome =
                 Some(ConnectOutcome { seq: attempt.seq, addr: attempt.addr, result: ConnectOutcomeResult::Cancelled, reason: None });
             attempt.seq
