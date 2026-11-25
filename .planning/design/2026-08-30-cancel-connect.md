@@ -508,4 +508,3 @@ Supersedes v2 rules 1, 6 and 7 where they conflict.
 - A pairing scan cancels an auto-reconnect attempt (core, `start_scan`); C
   defers the inquiry while an outbound page is outstanding. Whether the
   CYW43439 would accept an inquiry mid-page is unmeasured.
-
