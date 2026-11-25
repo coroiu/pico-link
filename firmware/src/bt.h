@@ -262,7 +262,7 @@ void pl_bt_debug_disconnect(void);
 // wizard screen entirely, so NAV BACK right after a debug CONNECT is a
 // no-op -- see this bead's own hardware-round comment on the board). No
 // address needed: mirrors the real PL_COMMAND_TAG_CANCEL_CONNECT handler's
-// own addr (ignored by pl_a2dp_cancel_connect -- see its doc comment), and
+// own addr (unused -- the target is identified by seq), and
 // pl_bt_debug_disconnect's "there is only ever one" convention. Same
 // context discipline as pl_bt_debug_connect/pl_bt_debug_disconnect above.
 // Compiled only when PL_DEBUG_REMOTE is set; entirely absent from a
@@ -275,11 +275,11 @@ void pl_bt_debug_cancel_connect(void);
 // (see pl_bt_debug_connect above) was allocated, so H4 (a stale cancel
 // against an already-live session, S5's late-success race) can be driven
 // headlessly: `--cancel-connect --seq N` targets a specific debug session's
-// `session_seq` via `pl_a2dp_cancel_connect`'s Match 3, instead of `PL_SEQ_
+// `session_seq` via `pl_a2dp_cancel_connect`'s Match 2, instead of `PL_SEQ_
 // ANY` (which deliberately never matches a live session -- see that
 // function's doc comment). `pl_bt_debug_cancel_connect()` above (no seq,
 // PL_SEQ_ANY) is unchanged and still the right tool for "cancel whatever is
-// HELD/IN_FLIGHT" with no live session in play. Same context discipline as
+// IN_FLIGHT" with no live session in play. Same context discipline as
 // every other debug entry point in this block. Compiled only when
 // PL_DEBUG_REMOTE is set; entirely absent from a shipping build.
 void pl_bt_debug_cancel_connect_seq(uint16_t seq);

@@ -255,9 +255,9 @@ _Static_assert(
 // enough that Andreas isn't left waiting on a screen he's done with.
 #define PL_A2DP_WIZARD_DISMISS_DELAY_MS 2000
 
-// Bead pico-link-chc3, review fix-first: bounded fallback for a
-// cancel-then-immediate-retry's held connect (see cancel_teardown_armed's
-// doc comment on pl_a2dp_ctx_t). Comfortably longer than a real
+// Bead pico-link-chc3, review fix-first: bounded fallback for a cancel's
+// teardown (see cancel_teardown_armed's doc comment on pl_a2dp_ctx_t).
+// Comfortably longer than a real
 // a2dp_source_disconnect -> SIGNALING_CONNECTION_RELEASED round trip ever
 // takes on hardware (that's normally sub-second), short enough that a user
 // who reconnects into a genuinely wedged teardown isn't left staring at a
@@ -355,9 +355,9 @@ typedef struct {
     // incoming, headset-initiated session is always accepted and reported,
     // never gated by a local attempt at all; see F1/F6 in the design's v2
     // "Findings"). `phase` replaces the old boolean pair: ATT_NONE (no
-    // local attempt live), ATT_HELD (queued behind an outstanding cancel
-    // teardown, replacing v1's `held_connect_pending/addr`), ATT_IN_FLIGHT
-    // (a real establish_stream is out). `cid` is the a2dp_cid this attempt
+    // local attempt live), ATT_IN_FLIGHT (a real establish_stream is out, or
+    // its 0x0b retry is armed). A connect that has to wait for the radio is
+    // held by bt.c's switch state, never here. `cid` is the a2dp_cid this attempt
     // owns once known (0 before signaling establishes). `attempt_epoch` is
     // unchanged: hardware-verification instrumentation only, never crosses
     // the FFI, nothing branches on its value.
@@ -365,7 +365,7 @@ typedef struct {
         uint16_t seq;
         bd_addr_t addr;
         uint16_t cid;
-        enum { PL_A2DP_ATT_NONE, PL_A2DP_ATT_HELD, PL_A2DP_ATT_IN_FLIGHT } phase;
+        enum { PL_A2DP_ATT_NONE, PL_A2DP_ATT_IN_FLIGHT } phase;
     } attempt;
     uint32_t attempt_epoch;
     // `session_seq`: the seq owning whatever `a2dp_cid` is currently live.
@@ -376,6 +376,11 @@ typedef struct {
     // as it stays up, so a later cancel targeting `session_seq` -- the S5
     // late-success race core hasn't seen yet -- can still find it).
     uint16_t session_seq;
+    // True from a SIGNALING_CONNECTION_ESTABLISHED success to its release,
+    // i.e. exactly while `connect_addr` describes the live `a2dp_cid`.
+    // `a2dp_cid` alone is also set for a still-paging attempt, whose peer is
+    // `attempt.addr` and may differ from a stale `connect_addr`.
+    bool session_established;
     // `cancel_cid`: sticky (survives past the teardown it caused) until the
     // NEXT cancel overwrites it; 0 = no cancel armed. An emitted event is
     // suppressed / D3-torn-down iff `cancel_cid != 0 && event_cid ==
@@ -410,7 +415,7 @@ typedef struct {
     // connection -- ADA DESIGN v2 F3). If neither arrives (a wedged stack,
     // or a session that was already dead at the HCI layer when
     // a2dp_source_disconnect was issued), this fires once and forces
-    // recovery instead of holding a connect forever -- see
+    // recovery (pl_a2dp_session_idle stops reporting busy) -- see
     // pl_a2dp_cancel_teardown_timeout_handler. cancel_teardown_timeouts is a
     // falsifiable counter in pl_a2dp_report, same discipline as
     // cancels_requested/cancels_late_success above: it should stay 0 on
@@ -3344,20 +3349,6 @@ static void pl_a2dp_establish_stream_now(const uint8_t *addr) {
     pl_persist_request_urgent_flush();
 
     uint8_t status = a2dp_source_establish_stream(local_addr, &s_ctx.a2dp_cid);
-    if (status == ERROR_CODE_COMMAND_DISALLOWED) {
-        // Bead pico-link-chc3 (C5), ADA DESIGN v2 rule 1: a cancel's own
-        // deferred teardown (pl_a2dp_service_cancel) is still outstanding --
-        // BTstack's a2dp_source layer refuses a new establish_stream while
-        // its prior session hasn't fully released (a2dp_source.c:171). Hold
-        // this attempt (ATT_HELD, replacing v1's held_connect_pending/addr)
-        // and reissue it via pl_a2dp_cancel_teardown_done once the teardown
-        // actually completes, instead of reporting a spurious RadioError for
-        // a press that arrived one cycle too soon. `attempt.addr`/`.seq`
-        // were already set by the caller (pl_a2dp_connect) before this call.
-        pl_log("a2dp: establish_stream disallowed (teardown outstanding), holding connect\r\n");
-        s_ctx.attempt.phase = PL_A2DP_ATT_HELD;
-        return;
-    }
     if (status != ERROR_CODE_SUCCESS) {
         pl_log("a2dp: establish_stream rejected, status=0x%02x\r\n", status);
         pl_a2dp_emit_connect_failed(addr, PL_FAILURE_REASON_RADIO_ERROR, s_ctx.attempt.cid, s_ctx.attempt.seq);
@@ -3430,21 +3421,45 @@ static void pl_a2dp_wizard_dismiss_timer_cancel(void) {
 
 // Bead pico-link-sfw6, design `.planning/design/2026-09-25-device-switch-
 // break-before-make.md` sec 2: bt.c calls this the instant a switch starts
-// (before gap_disconnect on A's ACL), so neither of A's own in-flight
-// timers can fire into B's session -- the 0x0b retry would reissue
-// establish_stream against A's stale pending_addr, and the wizard-dismiss
-// timer would auto-pop Home mid-switch. Same two calls pl_a2dp_connect
-// makes for a fresh top-level attempt; a switch is just a connect attempt
-// that happens to be preceded by a teardown.
+// (before gap_disconnect on A's ACL). Bead pico-link-drqr: any attempt still
+// in flight is preempted -- cancelled exactly as a user cancel would, so its
+// late events are suppressed and a late success is torn down (D3). Neither of
+// A's own timers may fire into B's session either.
 void pl_a2dp_prepare_switch(void) {
+    if (s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT) {
+        pl_a2dp_cancel_connect(PL_SEQ_ANY);
+    }
     pl_a2dp_reconnect_retry_cancel();
     pl_a2dp_wizard_dismiss_timer_cancel();
+}
+
+bool pl_a2dp_attempt_in_flight(void) {
+    // An attempt with neither a cid nor a retry armed is dead (its session
+    // was released before any terminal event) and nothing will conclude it.
+    return s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT && (s_ctx.a2dp_cid != 0 || s_ctx.reconnect_retry_armed);
+}
+
+// Bead pico-link-drqr -- see a2dp.h's doc comment.
+bool pl_a2dp_adopt_in_flight(const uint8_t *addr, uint16_t seq) {
+    if (!pl_a2dp_attempt_in_flight() || memcmp(s_ctx.attempt.addr, addr, 6) != 0) {
+        return false;
+    }
+    pl_log("a2dp: connect to the device already being connected -- adopting attempt, seq=%u\r\n", (unsigned)seq);
+    bool signaling_up = s_ctx.session_established && s_ctx.session_seq == s_ctx.attempt.seq;
+    if (signaling_up) {
+        s_ctx.session_seq = seq;
+    }
+    s_ctx.attempt.seq = seq;
+    pl_a2dp_emit_connect_step(
+        signaling_up ? PL_CONNECT_STEP_NEGOTIATING_CODEC : PL_CONNECT_STEP_SETTING_UP_AUDIO, s_ctx.attempt.cid, seq
+    );
+    return true;
 }
 
 // Bead pico-link-chc3, ADA DESIGN v2 rule 2 -- see a2dp.h's doc comment for
 // the full contract.
 bool pl_a2dp_adopt_if_connected(const uint8_t *addr, uint16_t seq) {
-    if (s_ctx.a2dp_cid == 0 || memcmp(s_ctx.connect_addr, addr, 6) != 0) {
+    if (!s_ctx.session_established || pl_a2dp_cid_is_cancelled(s_ctx.a2dp_cid) || memcmp(s_ctx.connect_addr, addr, 6) != 0) {
         return false;
     }
     pl_log("a2dp: connect to already-connected device -- adopting session, seq=%u\r\n", (unsigned)seq);
@@ -3467,12 +3482,12 @@ bool pl_a2dp_adopt_if_connected(const uint8_t *addr, uint16_t seq) {
 
 // Bead pico-link-sfw6: true once the AVDTP/AVRCP session has fully
 // quiesced (a2dp_cid cleared by STREAM_RELEASED/SIGNALING_CONNECTION_
-// RELEASED, design sec 2) -- bt.c's switch heartbeat pages B only once
-// this AND pl_bt_any_acl_up() are both false, so a slot that's merely
-// free at the HCI layer but still mid-AVDTP-teardown can't race a fresh
-// establish_stream.
+// RELEASED, design sec 2) and no cancel is still waiting to be serviced --
+// bt.c's switch heartbeat pages B only once this holds AND no HCI connection
+// is left, so a slot that's merely free at the HCI layer but still
+// mid-AVDTP-teardown can't race a fresh establish_stream.
 bool pl_a2dp_session_idle(void) {
-    return s_ctx.a2dp_cid == 0;
+    return s_ctx.a2dp_cid == 0 && !s_ctx.cancel_disconnect_pending;
 }
 
 static void pl_a2dp_wizard_dismiss_timer_handler(btstack_timer_source_t *ts) {
@@ -3512,14 +3527,13 @@ static void pl_a2dp_cancel_teardown_timer_cancel(void) {
 // Bead pico-link-chc3, review fix-first: fires only if neither the RELEASED
 // nor the ESTABLISHED-failure completion path (pl_a2dp_cancel_teardown_done
 // below) showed up within PL_A2DP_CANCEL_TEARDOWN_TIMEOUT_MS of a cancel's
-// own deferred a2dp_source_disconnect (pl_a2dp_service_cancel). Forces
-// cancel_disconnect_pending closed (best-effort recovery -- the alternative
-// is holding a connect forever) and reissues whatever attempt was HELD
-// while waiting. Kept as ITS OWN counter (cancel_teardown_timeouts) rather
-// than folded into pl_a2dp_cancel_teardown_done's cancel_done_released/
-// _prefail -- it staying 0 is what proves this fallback is never actually
-// needed on healthy hardware, a claim the ADA DESIGN v2 hardware plan reads
-// directly.
+// own deferred a2dp_source_disconnect (pl_a2dp_service_cancel). Closes
+// cancel_disconnect_pending (best-effort recovery); a connect waiting on a
+// session that never goes away is failed by bt.c's switch deadline. Kept as
+// ITS OWN counter (cancel_teardown_timeouts) rather than folded into
+// cancel_done_released/_prefail -- it staying 0 is what proves this fallback
+// is never actually needed on healthy hardware, a claim the ADA DESIGN v2
+// hardware plan reads directly.
 static void pl_a2dp_cancel_teardown_timeout_handler(btstack_timer_source_t *ts) {
     (void)ts;
     s_ctx.cancel_teardown_armed = false;
@@ -3529,14 +3543,6 @@ static void pl_a2dp_cancel_teardown_timeout_handler(btstack_timer_source_t *ts) 
         (unsigned)s_ctx.cancel_cid
     );
     s_ctx.cancel_disconnect_pending = false;
-    if (s_ctx.attempt.phase == PL_A2DP_ATT_HELD) {
-        s_ctx.attempt.phase = PL_A2DP_ATT_NONE;
-        bd_addr_t held_addr;
-        uint16_t held_seq = s_ctx.attempt.seq;
-        memcpy(held_addr, s_ctx.attempt.addr, 6);
-        pl_log("a2dp: teardown timeout, issuing held connect anyway\r\n");
-        pl_a2dp_connect(held_addr, held_seq);
-    }
 }
 
 // Bead pico-link-chc3, review fix-first: arms the one-shot bounded fallback
@@ -3552,19 +3558,19 @@ static void pl_a2dp_cancel_teardown_timer_arm(void) {
 }
 
 // Bead pico-link-chc3, ADA DESIGN v2 rule 7: the shared teardown-completion
-// path -- disarms the bounded fallback above and reissues a HELD attempt,
-// exactly like the old RELEASED-only path did, but now called from THREE
-// places: A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED (the normal case,
+// path -- disarms the bounded fallback above. Called from THREE places:
+// A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED (the normal case,
 // `prefail=false`), the A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED
 // failure branch when `cid == cancel_cid` (F3's fix -- a pre-OPEN
 // avdtp_disconnect never emits RELEASED at all, so this is the ONLY
 // completion signal that case ever gets, `prefail=true`), and from
 // pl_a2dp_service_cancel when a2dp_source_disconnect itself reports the
 // connection was already gone (`prefail=true`, same "no RELEASED coming"
-// reasoning). `cancel_cid` is deliberately left untouched -- it is sticky
-// by design (see pl_a2dp_ctx_t's doc comment) so a still-in-flight cancel
-// match against `session_seq` (cancel rule 6, S5 race) keeps working after
-// this call.
+// reasoning). Must not start a new connect: the first two callers are inside
+// BTstack's own event emit, before it has freed the dying AVDTP connection
+// (pool of one). bt.c's switch heartbeat does that. `cancel_cid` is
+// deliberately left untouched -- it is sticky by design (see pl_a2dp_ctx_t's
+// doc comment).
 static void pl_a2dp_cancel_teardown_done(bool prefail) {
     s_ctx.cancel_disconnect_pending = false;
     pl_a2dp_cancel_teardown_timer_cancel();
@@ -3572,14 +3578,6 @@ static void pl_a2dp_cancel_teardown_done(bool prefail) {
         s_ctx.cancel_done_prefail++;
     } else {
         s_ctx.cancel_done_released++;
-    }
-    if (s_ctx.attempt.phase == PL_A2DP_ATT_HELD) {
-        s_ctx.attempt.phase = PL_A2DP_ATT_NONE;
-        bd_addr_t held_addr;
-        uint16_t held_seq = s_ctx.attempt.seq;
-        memcpy(held_addr, s_ctx.attempt.addr, 6);
-        pl_log("a2dp: teardown complete, issuing held connect\r\n");
-        pl_a2dp_connect(held_addr, held_seq);
     }
 }
 
@@ -3600,6 +3598,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             if (status != ERROR_CODE_SUCCESS) {
                 pl_log("a2dp: signaling connection FAILED status=0x%02x\r\n", status);
                 s_ctx.a2dp_cid = 0;
+                s_ctx.session_established = false;
                 // Bead pico-link-chc3, ADA DESIGN v2 F3/rule 7: this is the
                 // teardown-completion point for a pre-OPEN cancel -- BTstack
                 // never emits SIGNALING_CONNECTION_RELEASED for a connection
@@ -3609,8 +3608,12 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 // this call the cancel's 3s bounded timer was the only path
                 // that ever disarmed, which is F3's whole "3/3 cancels hit
                 // cid=0x0000 after a 3s timeout" bug.
-                if (s_ctx.cancel_cid != 0 && cid == s_ctx.cancel_cid) {
+                if (pl_a2dp_cid_is_cancelled(cid)) {
                     pl_a2dp_cancel_teardown_done(true);
+                    // Nothing else may act on a cancelled attempt's failure,
+                    // the 0x0b retry below included.
+                    s_ctx.events_suppressed++;
+                    break;
                 }
                 // Bead pico-link-648: 0x0b means the stale ACL from before
                 // a reboot is still up on the headset's side -- see this
@@ -3635,12 +3638,12 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 //
                 // Code review, bead `pico-link-chc3`: `s_ctx.attempt.seq`
                 // is only meaningful while the attempt is actually
-                // IN_FLIGHT -- once concluded (ATT_NONE) or requeued
-                // behind a cancel (ATT_HELD), the field is stale and can
+                // IN_FLIGHT -- once concluded (ATT_NONE), the field is
+                // stale and can
                 // still hold a nonzero seq from whichever attempt last
                 // occupied it. Emitting that stale seq risks tagging an
                 // unrelated failure as belonging to a since-concluded (or
-                // not-yet-reissued) attempt, which core's `attempt_seq_
+                // unrelated) attempt, which core's `attempt_seq_
                 // matches` would then wrongly accept or reject. Emit the
                 // real seq only while this failure's cid could plausibly
                 // BE that attempt (IN_FLIGHT); otherwise 0, core's
@@ -3700,6 +3703,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 a2dp_source_disconnect(cid);
                 break;
             }
+            s_ctx.session_established = true;
             // Fresh discovery pass starting -- clear any capability bits
             // left over from a previous connection attempt.
             memset(&s_ctx.discovered, 0, sizeof(s_ctx.discovered));
@@ -4034,7 +4038,13 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     pl_log("a2dp: suppressing UI failure push -- 0x0b retry already armed for this attempt\r\n");
                     break;
                 }
-                pl_a2dp_emit_connect_failed(s_ctx.connect_addr, PL_FAILURE_REASON_REJECTED, s_ctx.a2dp_cid, s_ctx.session_seq);
+                // The event's own cid, not `s_ctx.a2dp_cid`: BTstack
+                // cascades a cancelled pre-OPEN attempt into here after the
+                // failure branch above has already zeroed that field.
+                pl_a2dp_emit_connect_failed(
+                    s_ctx.connect_addr, PL_FAILURE_REASON_REJECTED,
+                    a2dp_subevent_stream_established_get_a2dp_cid(packet), s_ctx.session_seq
+                );
                 break;
             }
             // Bead pico-link-chc3, design C2 (D3): a STREAM_ESTABLISHED
@@ -4562,6 +4572,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             s_ctx.connect_succeeded_pushed = false;
             s_ctx.a2dp_cid = 0;
             s_ctx.session_seq = 0;
+            s_ctx.session_established = false;
             s_ctx.codec = NULL;
             s_ctx.state = PL_A2DP_MEDIA_IDLE;
             // Bead pico-link-85v (D6): this handler flushed NOTHING before
@@ -4580,10 +4591,7 @@ static void pl_a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             // Bead pico-link-chc3, ADA DESIGN v2 rule 7: only if THIS
             // RELEASED belongs to the cid a cancel is tearing down --
             // cid-scoped, not "any RELEASED clears the pending cancel" (v1's
-            // bug: an unrelated session releasing must not reissue a HELD
-            // attempt that has nothing to do with it). Reissues any HELD
-            // attempt (design C5) now that the ACL state can actually accept
-            // a fresh establish_stream call.
+            // bug: an unrelated session releasing must not complete it).
             if (s_ctx.cancel_cid != 0 && released_cid == s_ctx.cancel_cid) {
                 pl_a2dp_cancel_teardown_done(false);
             }
@@ -4813,26 +4821,6 @@ void pl_a2dp_poll_ldac_bitrate(struct PlUi *ui) {
 }
 
 void pl_a2dp_connect(const uint8_t *addr, uint16_t seq) {
-    // Bead pico-link-chc3, ADA DESIGN v2 rule 1: a cancel's own deferred
-    // teardown (pl_a2dp_service_cancel, called once per heartbeat AFTER
-    // pl_bt_pending_service) may still be outstanding when this fires --
-    // bt.c's PL_BT_PENDING_CANCEL_CONNECT and PL_BT_PENDING_CONNECT can land
-    // in the SAME heartbeat tick (cancel-then-immediate-retry). Hold this as
-    // the new HELD attempt (last press wins, replacing any older held
-    // attempt) rather than clearing cancel_disconnect_pending -- that used
-    // to drop the deferred a2dp_source_disconnect on the prior still-live
-    // cid entirely (D1 violated). The held attempt is reissued by
-    // pl_a2dp_cancel_teardown_done once that teardown actually completes,
-    // or by pl_a2dp_cancel_teardown_timeout_handler's bounded fallback if
-    // it never does.
-    if (s_ctx.cancel_disconnect_pending) {
-        pl_log("a2dp: connect requested while cancel teardown outstanding, holding until it completes\r\n");
-        s_ctx.attempt.phase = PL_A2DP_ATT_HELD;
-        memcpy(s_ctx.attempt.addr, addr, 6);
-        s_ctx.attempt.seq = seq;
-        s_ctx.attempt.cid = 0;
-        return;
-    }
     // Bead pico-link-648: a fresh top-level connect attempt gets its own
     // single retry budget, and supersedes any retry still armed from a
     // previous attempt (e.g. the user backed out and reconnected inside
@@ -4853,44 +4841,23 @@ void pl_a2dp_connect(const uint8_t *addr, uint16_t seq) {
     pl_a2dp_establish_stream_now(addr);
 }
 
-// Bead pico-link-chc3, design C3, ADA DESIGN v2 rule 6: user-initiated
-// abort -- see a2dp.h's doc comment for the full contract. Bookkeeping only
-// (D4): no BTstack call here except arming the deferred teardown for
-// pl_a2dp_service_cancel to act on next heartbeat. `addr` is accepted for
-// the FFI's own symmetry with every other addr-carrying command but not
-// compared against anything -- v2 identifies the target attempt/session by
-// `seq`, not address (see a2dp.h's doc comment on why). `seq == 0` means
-// core had no attempt to cancel (should not happen -- core never emits
-// CancelConnect without one -- but a defensive no-op, not a crash).
-// Debug-only `PL_SEQ_ANY` matches whatever is HELD/IN_FLIGHT, used by
-// bt.c's PL_DEBUG_REMOTE CANCELCONNECT bypass; it never matches
-// `session_seq` (H4's note in the design doc) -- a concluded/live session
-// can only be cancelled by its own real seq.
-void pl_a2dp_cancel_connect(const uint8_t *addr, uint16_t seq) {
-    (void)addr;
+// Bead pico-link-chc3, design C3, ADA DESIGN v2 rule 6: abort -- see
+// a2dp.h's doc comment for the full contract. Bookkeeping only (D4): no
+// BTstack call here except arming the deferred teardown for
+// pl_a2dp_service_cancel to act on next heartbeat. The target is identified
+// by `seq`, not address. `seq == 0` means core had no attempt to cancel
+// (should not happen -- core never emits CancelConnect without one -- but a
+// defensive no-op, not a crash). `PL_SEQ_ANY` (bt.c's debug bypass, and
+// pl_a2dp_prepare_switch's preemption) matches whatever is IN_FLIGHT; it
+// never matches `session_seq` (H4's note in the design doc) -- a
+// concluded/live session can only be cancelled by its own real seq.
+bool pl_a2dp_cancel_connect(uint16_t seq) {
     if (seq == 0) {
         pl_log("a2dp: cancel_connect with seq=0, ignoring\r\n");
-        return;
-    }
-    if (s_ctx.attempt.phase == PL_A2DP_ATT_HELD && (seq == PL_SEQ_ANY || seq == s_ctx.attempt.seq)) {
-        // Match 1 (fixes F4): a HELD attempt is queued behind a cancel's own
-        // teardown, not yet re-issued -- drop it outright, nothing to tear
-        // down on the radio for it.
-        pl_log("a2dp: cancel_connect -- dropping HELD attempt seq=%u\r\n", (unsigned)s_ctx.attempt.seq);
-        s_ctx.attempt.phase = PL_A2DP_ATT_NONE;
-        s_ctx.cancels_requested++;
-        s_ctx.attempt_epoch++;
-        // A retry has a2dp_cid == 0 by construction (no signaling has
-        // succeeded yet) -- cancel a matching one so it can't fire into
-        // whatever comes after this abort.
-        if (s_ctx.a2dp_cid == 0) {
-            pl_a2dp_reconnect_retry_cancel();
-        }
-        pl_a2dp_wizard_dismiss_timer_cancel();
-        return;
+        return false;
     }
     if (s_ctx.attempt.phase == PL_A2DP_ATT_IN_FLIGHT && (seq == PL_SEQ_ANY || seq == s_ctx.attempt.seq)) {
-        // Match 2: the normal case -- a real attempt is out, arm its
+        // Match 1: the normal case -- a real attempt is out, arm its
         // teardown scoped to the cid it owns.
         pl_log(
             "a2dp: cancel_connect -- attempt_epoch=%lu cid=0x%04x seq=%u\r\n", (unsigned long)s_ctx.attempt_epoch,
@@ -4905,10 +4872,10 @@ void pl_a2dp_cancel_connect(const uint8_t *addr, uint16_t seq) {
         }
         pl_a2dp_reconnect_retry_cancel();
         pl_a2dp_wizard_dismiss_timer_cancel();
-        return;
+        return true;
     }
     if (s_ctx.a2dp_cid != 0 && s_ctx.session_seq != 0 && seq == s_ctx.session_seq) {
-        // Match 3: the S5 late-success race core hasn't seen yet -- a
+        // Match 2: the S5 late-success race core hasn't seen yet -- a
         // session already reached ESTABLISHED (owned by `seq`) before this
         // cancel arrived. PL_SEQ_ANY deliberately does NOT match here (see
         // this function's own doc comment) -- only the session's own real
@@ -4921,11 +4888,12 @@ void pl_a2dp_cancel_connect(const uint8_t *addr, uint16_t seq) {
         s_ctx.cancels_requested++;
         s_ctx.cancel_disconnect_pending = true;
         pl_a2dp_cancel_teardown_timer_arm();
-        return;
+        return true;
     }
-    // Match 4: stale/duplicate -- nothing live matches this seq.
+    // Neither matched: stale/duplicate -- nothing live matches this seq.
     s_ctx.cancels_stale++;
     pl_log("a2dp: cancel_connect stale/no-op, seq=%u\r\n", (unsigned)seq);
+    return false;
 }
 
 // Bead pico-link-chc3, design C4: services a cancel armed by
@@ -4948,8 +4916,8 @@ void pl_a2dp_service_cancel(void) {
         pl_a2dp_cancel_teardown_timer_cancel();
         return;
     }
-    pl_log("a2dp: servicing pending cancel, disconnecting cid=0x%04x\r\n", s_ctx.a2dp_cid);
-    uint8_t status = a2dp_source_disconnect(s_ctx.a2dp_cid);
+    pl_log("a2dp: servicing pending cancel, disconnecting cid=0x%04x\r\n", s_ctx.cancel_cid);
+    uint8_t status = a2dp_source_disconnect(s_ctx.cancel_cid);
     s_ctx.cancel_disconnect_pending = false;
     if (status != ERROR_CODE_SUCCESS) {
         // ADA DESIGN v2 rule 7: a2dp_source_disconnect itself reported the

@@ -55,8 +55,9 @@ uint32_t pl_a2dp_encoder_quiesce_timeouts(void);
 // ADA DESIGN v2 (bead pico-link-chc3): the debug-only sentinel core never
 // produces (core's own attempt-seq counter, `bump_attempt_seq`, skips both
 // 0 and this value on wrap). Used only by bt.c's PL_DEBUG_REMOTE
-// CANCELCONNECT bypass to mean "cancel whatever is HELD/IN_FLIGHT" when
-// there is no real core-allocated seq to target -- see
+// CANCELCONNECT bypass (and a2dp.c's own preemption) to mean "cancel
+// whatever is IN_FLIGHT" when there is no real core-allocated seq to
+// target -- see
 // pl_a2dp_cancel_connect's doc comment for the match rules, including why
 // this deliberately never matches a live `session_seq`.
 #define PL_SEQ_ANY ((uint16_t)0xFFFFu)
@@ -66,7 +67,7 @@ uint32_t pl_a2dp_encoder_quiesce_timeouts(void);
 // into, reserved for bt.c's PL_DEBUG_REMOTE CONNECT bypass so it can tag its
 // attempt with a real, distinct seq instead of colliding with `PL_SEQ_ANY`
 // (the collision that made H4 -- a stale CANCELCONNECT against an
-// already-live debug session -- untestable: both were 0xFFFF, so Match 3's
+// already-live debug session -- untestable: both were 0xFFFF, so Match 2's
 // `seq == session_seq` legitimately fired ANY==ANY). `bump_attempt_seq`
 // additionally skips this whole range on wrap so a real core-driven attempt
 // can never land here either. `..MAX` is exclusive of `PL_SEQ_ANY` itself.
@@ -103,24 +104,19 @@ void pl_a2dp_disconnect(void);
 
 // Bead pico-link-chc3, ADA DESIGN v2, design
 // `.planning/design/2026-08-30-cancel-connect.md` "v2" section, rule 6:
-// user-initiated abort, identified by `seq` (the `ConnectAttempt::seq` core
-// wants cancelled), not address -- v1 identified the target by a global
-// flag, which F1/F6/F4 in the design's "Findings" showed silently killed
-// unrelated (incoming/remote) sessions and left a cancelled HELD attempt
-// reissuable. Plain bookkeeping only, no BTstack call here (D4) except
-// arming the deferred teardown for pl_a2dp_service_cancel (below) to act on
-// next heartbeat. Match order (see the .c file's doc comment for the full
-// rationale): a HELD attempt with this seq is dropped outright (fixes F4);
-// an IN_FLIGHT attempt with this seq arms a cid-scoped teardown; a live
-// session (`session_seq`) with this exact seq (never `PL_SEQ_ANY`) is the
-// S5 late-success race; anything else is stale/duplicate, counted, not a
-// bug. `seq == 0` is a defensive no-op -- core never emits this without a
-// real attempt. `addr` is accepted for the FFI's own symmetry with every
-// other addr-carrying command but not compared against anything. Called
-// from bt.c's PL_BT_PENDING_CANCEL_CONNECT case (pl_bt_pending_service,
-// run-loop/IRQ context) -- never from thread context, matching every other
+// abort, identified by `seq` (the `ConnectAttempt::seq` core wants
+// cancelled), not address -- v1 identified the target by a global flag, which
+// F1/F6 in the design's "Findings" showed silently killed unrelated
+// (incoming/remote) sessions. Plain bookkeeping only, no BTstack call here
+// (D4) except arming the deferred teardown for pl_a2dp_service_cancel
+// (below) to act on next heartbeat. Match order: an IN_FLIGHT attempt with
+// this seq arms a cid-scoped teardown; a live session (`session_seq`) with
+// this exact seq (never `PL_SEQ_ANY`) is the S5 late-success race; anything
+// else is stale/duplicate, counted, not a bug. `seq == 0` is a defensive
+// no-op -- core never emits this without a real attempt. Returns true iff
+// something was cancelled. Run-loop/IRQ context only, matching every other
 // pl_a2dp_* mutator in this header.
-void pl_a2dp_cancel_connect(const uint8_t *addr, uint16_t seq);
+bool pl_a2dp_cancel_connect(uint16_t seq);
 
 // Bead pico-link-chc3 (C4): services a pending cancel armed by
 // pl_a2dp_cancel_connect above -- if one is outstanding and there is still a
@@ -133,15 +129,24 @@ void pl_a2dp_cancel_connect(const uint8_t *addr, uint16_t seq);
 // same idiom as pl_bt_switch_service).
 void pl_a2dp_service_cancel(void);
 
-// Bead pico-link-sfw6, design sec 2: cancels A's in-flight 0x0b retry and
-// wizard-dismiss timers so neither can fire into the switch attempt that's
-// about to start. Called from bt.c's pl_bt_connect_or_switch, run-loop/IRQ
-// context (same as pl_a2dp_connect/pl_a2dp_disconnect above), right before
-// gap_disconnect tears down A's ACL.
+// Bead pico-link-sfw6, design sec 2: cancels any in-flight connect attempt
+// (bead pico-link-drqr: last choice wins) and the 0x0b retry and
+// wizard-dismiss timers, so nothing of A's can reach the switch attempt
+// that's about to start. Called from bt.c's pl_bt_connect_or_switch,
+// run-loop/IRQ context, right before gap_disconnect tears down A's ACL.
 void pl_a2dp_prepare_switch(void);
 
+// True while a connect attempt is paging/negotiating (or waiting on its one
+// 0x0b retry). Run-loop/IRQ context.
+bool pl_a2dp_attempt_in_flight(void);
+
+// Bead pico-link-drqr: if the in-flight attempt already targets `addr`,
+// re-tags it with `seq` and re-announces its step instead of aborting a page
+// only to repeat it. Returns true iff it adopted. Run-loop/IRQ context.
+bool pl_a2dp_adopt_in_flight(const uint8_t *addr, uint16_t seq);
+
 // Bead pico-link-chc3, ADA DESIGN v2 rule 2 (fixes F6): if a session to
-// `addr` is already up (a2dp_cid != 0 && connect_addr == addr), adopts it --
+// `addr` is already up (signaling established, not being cancelled), adopts it --
 // sets `session_seq = seq` and, if the stream already reached
 // STREAM_ESTABLISHED (connect_succeeded_pushed), immediately re-emits
 // ConnectSucceeded{seq} so core's new attempt gets its own terminal event;
@@ -157,11 +162,9 @@ void pl_a2dp_prepare_switch(void);
 bool pl_a2dp_adopt_if_connected(const uint8_t *addr, uint16_t seq);
 
 // Bead pico-link-sfw6: true once the AVDTP/AVRCP session has fully
-// quiesced (a2dp_cid == 0). Called from bt.c's switch heartbeat, alongside
-// pl_bt_any_acl_up(), to decide when it's safe to page the switch target.
-// Thread-context safe to call (reads one field, no BTstack call), but in
-// practice only ever called from run-loop/IRQ context alongside its sibling
-// check.
+// quiesced (a2dp_cid == 0) and no cancel is waiting to be serviced. Called
+// from bt.c's switch heartbeat, alongside its HCI-connection check, to decide
+// when it's safe to page the switch target. Run-loop/IRQ context.
 bool pl_a2dp_session_idle(void);
 
 // Bead pico-link-cz0.6 (M5 persistence): true whenever the media pipeline is

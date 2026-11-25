@@ -129,31 +129,39 @@ static btstack_timer_source_t s_wdt_heartbeat_timer;
 // means disconnecting A's ACL, waiting for BTstack to actually free the
 // HCI slot (hci.c frees it only AFTER DISCONNECTION_COMPLETE is emitted to
 // every handler, well after core sees LinkStateChanged(Idle)), then paging
-// B. Run-loop/IRQ context only, same as everything else pico-link-ouw
-// already gates: pl_bt_connect_or_switch runs from pl_bt_pending_service,
-// pl_bt_switch_service runs from the heartbeat right after it.
+// B. Bead pico-link-drqr: the same wait also covers preempting a connect
+// attempt still in flight, and draining the radio after a cancel (then with
+// no target). An ACL page cannot be aborted, so the wait can last a full
+// page timeout. Run-loop/IRQ context only, same as everything else
+// pico-link-ouw already gates: pl_bt_connect_or_switch runs from
+// pl_bt_pending_service, pl_bt_switch_service runs from the heartbeat.
 typedef enum {
     PL_BT_SWITCH_NONE,
-    PL_BT_SWITCH_WAIT_ACL_DOWN,
+    PL_BT_SWITCH_WAIT_IDLE,
     PL_BT_SWITCH_PAGING,
 } pl_bt_switch_state_t;
 
 // Andreas's ruling (bead comments): B failing must leave the device fully
-// disconnected, never reconnect A. 5s covers a real page timeout
-// (~5.1s, a2dp.c:3287's SIGNALING_CONNECTION_ESTABLISHED status path) with
-// margin against a slot that somehow never frees.
-#define PL_BT_SWITCH_DEADLINE_US 5000000ull
+// disconnected, never reconnect A. Must exceed the 5.12s page timeout a
+// preempted attempt may still have to run out, with margin for the teardown
+// behind it, against a slot that somehow never frees.
+#define PL_BT_SWITCH_DEADLINE_US 10000000ull
 
 static pl_bt_switch_state_t s_switch_state;
+// Meaningful in WAIT_IDLE: false means drain only (a cancel, nothing to page).
+static bool s_switch_has_target;
 static bd_addr_t s_switch_target;
 // Bead pico-link-chc3, ADA DESIGN v2: the seq of the Connect command that
 // started (or last overwrote) this switch attempt -- threaded into every
 // connect-lifecycle event bt.c itself pushes for the switch's pre-signaling
-// steps (PL_CONNECT_STEP_DISCONNECTING/_CONNECTING, and the ACL-down
-// deadline's own ConnectFailed). 0 for the PL_DEBUG_REMOTE bypass, same
-// convention as everywhere else in this design.
+// steps (PL_CONNECT_STEP_DISCONNECTING/_CONNECTING, and the wait deadline's
+// own ConnectFailed).
 static uint16_t s_switch_target_seq;
 static uint64_t s_switch_deadline_us;
+
+// Bead pico-link-drqr: a scan requested while an outbound page is still
+// outstanding, started by the heartbeat once the page resolves.
+static bool s_scan_deferred;
 
 // Forward declarations: pl_bt_push_connect_succeeded/_failed (below) hook
 // the switch state machine's terminal-outcome edge, but pl_bt_any_acl_up/
@@ -428,9 +436,8 @@ void pl_bt_push_connect_failed(const uint8_t *addr, uint32_t reason, uint16_t se
     // Bead pico-link-sfw6: see pl_bt_push_connect_succeeded's doc comment
     // above -- same hook, same reasoning. Covers every B-failure path
     // (a2dp.c:3168/3287/3503/3579/3644) with no a2dp.c edits. The
-    // WAIT_ACL_DOWN deadline-timeout path (pl_bt_switch_service) clears
-    // state and updates scan mode itself instead, since it's not PAGING
-    // when it fires.
+    // WAIT_IDLE deadline-timeout path (pl_bt_switch_service) clears state and
+    // updates scan mode itself instead, since it's not PAGING when it fires.
     if (s_switch_state == PL_BT_SWITCH_PAGING) {
         s_switch_state = PL_BT_SWITCH_NONE;
         pl_bt_update_scan_mode();
@@ -984,6 +991,11 @@ static void pl_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 
         case GAP_EVENT_INQUIRY_COMPLETE:
             pl_log("BT: inquiry complete\r\n");
+            // An older inquiry ending must not end the scan core is waiting
+            // for, which has not started yet.
+            if (s_scan_deferred) {
+                break;
+            }
             // Bead pico-link-88xs: was pl_bt_push_link_state(PL_LINK_STATE_IDLE),
             // which wiped a live, connected model's codec/addr/level/bitrate
             // whenever an inquiry ended while the A2DP link was still up
@@ -1157,10 +1169,9 @@ typedef enum {
     // avoids a thread-vs-IRQ race on that state, same reason every other
     // a2dp.c mutator in this table is deferred rather than called inline
     // from pl_bt_poll_commands. Carries the target addr, same as
-    // PL_BT_PENDING_CONNECT/PL_BT_PENDING_FORGET_DEVICE (unused today --
-    // see a2dp.h's doc comment on pl_a2dp_cancel_connect for why -- but
-    // carried for symmetry and in case a future address-scoped cancel needs
-    // it).
+    // PL_BT_PENDING_CONNECT/PL_BT_PENDING_FORGET_DEVICE (unused today -- the
+    // target is identified by seq -- but carried for symmetry and in case a
+    // future address-scoped cancel needs it).
     PL_BT_PENDING_CANCEL_CONNECT,
 } pl_bt_pending_tag_t;
 
@@ -1271,70 +1282,120 @@ static bool pl_bt_pending_push(pl_bt_pending_tag_t tag, const uint8_t *addr) {
     return pl_bt_pending_push_seq(tag, addr, 0);
 }
 
-// Bead pico-link-sfw6, design sec 2: turns a Connect that arrives while an
-// ACL is up into a break-before-make switch. Called from
+static bool pl_bt_hci_connection_exists(void) {
+    btstack_linked_list_iterator_t it;
+    hci_connections_get_iterator(&it);
+    return btstack_linked_list_iterator_has_next(&it);
+}
+
+static bool pl_bt_outbound_page_pending(void) {
+    btstack_linked_list_iterator_t it;
+    hci_connections_get_iterator(&it);
+    while (btstack_linked_list_iterator_has_next(&it)) {
+        hci_connection_t *connection = (hci_connection_t *)btstack_linked_list_iterator_next(&it);
+        if (connection->state == SEND_CREATE_CONNECTION || connection->state == SENT_CREATE_CONNECTION) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void pl_bt_switch_begin_wait(void) {
+    s_switch_state = PL_BT_SWITCH_WAIT_IDLE;
+    s_switch_deadline_us = time_us_64() + PL_BT_SWITCH_DEADLINE_US;
+    pl_bt_update_scan_mode();
+    pl_bt_disconnect_all_open_acl();
+}
+
+// Bead pico-link-sfw6, design sec 2: turns a Connect that arrives while the
+// radio is occupied into a break-before-make switch. Called from
 // pl_bt_pending_service's PL_BT_PENDING_CONNECT case below (run-loop/IRQ
 // context) instead of calling pl_a2dp_connect directly -- state, the
 // prepare-switch cancels, pl_bt_update_scan_mode and gap_disconnect all
 // require that context (pico-link-ouw). `seq` (ADA DESIGN v2, bead
 // pico-link-chc3) is the core-allocated attempt seq riding this Connect.
+//
+// Bead pico-link-drqr: the last choice wins. "Occupied" includes an attempt
+// still in flight, which is preempted unless it already targets `addr`.
 static void pl_bt_connect_or_switch(const uint8_t *addr, uint16_t seq) {
-    // ADA DESIGN v2 rule 2 (fixes F6): a Connect to the device we're
-    // ALREADY connected to must adopt the live session, not tear it down
-    // and re-page it -- pl_bt_connect_or_switch used to treat any ACL-up as
-    // a switch unconditionally, which is what disconnected and re-paged a
-    // headset that paged US first (cold boot, before core's own
-    // auto-reconnect ran). No disconnect, no switch state touched.
-    if (pl_a2dp_adopt_if_connected(addr, seq)) {
-        return;
+    if (s_scan_deferred) {
+        s_scan_deferred = false;
+        pl_bt_push_discovery_state(PL_DISCOVERY_STATE_IDLE);
     }
-    if (s_switch_state == PL_BT_SWITCH_WAIT_ACL_DOWN) {
-        // A second Connect while still waiting for A's slot to free:
-        // last press wins, same attempt otherwise unchanged.
-        memcpy(s_switch_target, addr, sizeof(bd_addr_t));
-        s_switch_target_seq = seq;
-        pl_log(
-            "BT: switch target overwritten target=%02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2],
-            addr[3], addr[4], addr[5]
-        );
-        return;
-    }
-    if (pl_bt_any_acl_up()) {
-        // No ACL up but state == PAGING (an attempt already in flight, no
-        // slot occupied yet) falls through to the plain pl_a2dp_connect
-        // below, same as state == NONE -- both keep today's behaviour
-        // (today's instant 0x56 failure for the in-flight case).
-        memcpy(s_switch_target, addr, sizeof(bd_addr_t));
-        s_switch_target_seq = seq;
-        s_switch_state = PL_BT_SWITCH_WAIT_ACL_DOWN;
-        s_switch_deadline_us = time_us_64() + PL_BT_SWITCH_DEADLINE_US;
-        pl_log(
-            "BT: switch start target=%02x:%02x:%02x:%02x:%02x:%02x\r\n", addr[0], addr[1], addr[2], addr[3], addr[4],
-            addr[5]
-        );
-        pl_bt_push_connect_step(PL_CONNECT_STEP_DISCONNECTING, seq);
+    if (s_switch_state != PL_BT_SWITCH_WAIT_IDLE) {
+        if (pl_a2dp_adopt_in_flight(addr, seq)) {
+            if (s_switch_state == PL_BT_SWITCH_PAGING) {
+                s_switch_target_seq = seq;
+            }
+            return;
+        }
+        // ADA DESIGN v2 rule 2 (fixes F6): a Connect to the device we're
+        // ALREADY connected to must adopt the live session, not tear it down
+        // and re-page it (which is what disconnected and re-paged a headset
+        // that paged US first, on cold boot). Not while waiting: that session
+        // is on its way down.
+        if (pl_a2dp_adopt_if_connected(addr, seq)) {
+            return;
+        }
+        if (!pl_a2dp_attempt_in_flight() && pl_a2dp_session_idle() && !pl_bt_any_acl_up()) {
+            s_switch_state = PL_BT_SWITCH_NONE;
+            pl_bt_update_scan_mode();
+            pl_a2dp_connect(addr, seq);
+            return;
+        }
         pl_a2dp_prepare_switch();
-        pl_bt_update_scan_mode();
-        pl_bt_disconnect_all_open_acl();
-        return;
     }
-    pl_a2dp_connect(addr, seq);
+    // A second Connect while still waiting overwrites the target: last press
+    // wins.
+    memcpy(s_switch_target, addr, sizeof(bd_addr_t));
+    s_switch_target_seq = seq;
+    s_switch_has_target = true;
+    pl_log(
+        "BT: switch target=%02x:%02x:%02x:%02x:%02x:%02x seq=%u\r\n", addr[0], addr[1], addr[2], addr[3], addr[4],
+        addr[5], (unsigned)seq
+    );
+    pl_bt_push_connect_step(PL_CONNECT_STEP_DISCONNECTING, seq);
+    pl_bt_switch_begin_wait();
+}
+
+// Bead pico-link-drqr: the cancel half of the switch state machine. Run-loop/
+// IRQ context.
+static void pl_bt_cancel_connect(uint16_t seq) {
+    bool cancelled = pl_a2dp_cancel_connect(seq);
+    if (s_switch_state == PL_BT_SWITCH_WAIT_IDLE) {
+        // The target has not been paged yet: dropping it is the whole cancel.
+        // The wait carries on draining.
+        if (seq == PL_SEQ_ANY || seq == s_switch_target_seq) {
+            s_switch_has_target = false;
+        }
+    } else if (cancelled) {
+        // Drain: the page behind a cancelled attempt runs on, and if it
+        // succeeds the link it brings up must be torn down (D3). A stale
+        // cancel (nothing matched) must not touch the radio. This also
+        // replaces a PAGING state whose terminal hooks will now never fire.
+        s_switch_has_target = false;
+        pl_bt_switch_begin_wait();
+    }
 }
 
 // Bead pico-link-sfw6, design sec 2: the switch state machine's other
-// half. Called from pl_bt_wdt_heartbeat_handler right after
-// pl_bt_pending_service, same 100ms period and IRQ/run-loop context -- a
-// switch that started this same tick is only serviced starting next tick,
-// which is harmless (gap_disconnect just fired; the ACL cannot be down
-// yet regardless).
+// half. Called from pl_bt_wdt_heartbeat_handler after pl_bt_pending_service
+// and pl_a2dp_service_cancel, same 100ms period and IRQ/run-loop context.
 static void pl_bt_switch_service(void) {
-    if (s_switch_state != PL_BT_SWITCH_WAIT_ACL_DOWN) {
+    if (s_switch_state != PL_BT_SWITCH_WAIT_IDLE) {
         return;
     }
-    if (!pl_bt_any_acl_up() && pl_a2dp_session_idle()) {
+    // A preempted page can still succeed, well after the wait began.
+    pl_bt_disconnect_all_open_acl();
+    if (!pl_bt_hci_connection_exists() && pl_a2dp_session_idle()) {
+        if (!s_switch_has_target) {
+            s_switch_state = PL_BT_SWITCH_NONE;
+            pl_bt_update_scan_mode();
+            return;
+        }
         s_switch_state = PL_BT_SWITCH_PAGING;
         pl_log(
-            "BT: switch ACL down, paging %02x:%02x:%02x:%02x:%02x:%02x\r\n", s_switch_target[0], s_switch_target[1],
+            "BT: switch radio idle, paging %02x:%02x:%02x:%02x:%02x:%02x\r\n", s_switch_target[0], s_switch_target[1],
             s_switch_target[2], s_switch_target[3], s_switch_target[4], s_switch_target[5]
         );
         pl_bt_push_connect_step(PL_CONNECT_STEP_CONNECTING, s_switch_target_seq);
@@ -1342,8 +1403,10 @@ static void pl_bt_switch_service(void) {
         return;
     }
     if (time_us_64() >= s_switch_deadline_us) {
-        pl_log("BT: switch timeout waiting for ACL down\r\n");
-        pl_bt_push_connect_failed(s_switch_target, PL_FAILURE_REASON_RADIO_ERROR, s_switch_target_seq);
+        pl_log("BT: switch timeout waiting for radio idle\r\n");
+        if (s_switch_has_target) {
+            pl_bt_push_connect_failed(s_switch_target, PL_FAILURE_REASON_RADIO_ERROR, s_switch_target_seq);
+        }
         // Andreas's ruling: B failing leaves the device disconnected, no
         // reconnect-A fallback. state = NONE here (not PAGING) is exactly
         // why pl_bt_push_connect_failed's own hook doesn't already do this
@@ -1352,6 +1415,15 @@ static void pl_bt_switch_service(void) {
         s_switch_state = PL_BT_SWITCH_NONE;
         pl_bt_update_scan_mode();
     }
+}
+
+static void pl_bt_scan_service(void) {
+    if (!s_scan_deferred || pl_bt_outbound_page_pending()) {
+        return;
+    }
+    s_scan_deferred = false;
+    pl_bt_push_discovery_state(PL_DISCOVERY_STATE_SCANNING);
+    pl_bt_start_scan_radio();
 }
 
 // Drains every request currently queued and makes the real BTstack call for
@@ -1370,9 +1442,22 @@ static void pl_bt_pending_service(void) {
         );
         switch (entry.tag) {
             case PL_BT_PENDING_START_SCAN:
-                pl_bt_start_scan_radio();
+                // Bead pico-link-drqr: a scan that preempted an
+                // auto-reconnect arrives while its page is still running.
+                // Wait it out rather than depend on the controller accepting
+                // an inquiry mid-page (BTstack drops a rejected one silently).
+                s_scan_deferred = pl_bt_outbound_page_pending();
+                if (s_scan_deferred) {
+                    pl_log("BT: page outstanding, deferring inquiry\r\n");
+                } else {
+                    pl_bt_start_scan_radio();
+                }
                 break;
             case PL_BT_PENDING_CANCEL_SCAN:
+                if (s_scan_deferred) {
+                    s_scan_deferred = false;
+                    pl_bt_push_discovery_state(PL_DISCOVERY_STATE_IDLE);
+                }
                 pl_bt_cancel_scan_radio();
                 break;
             case PL_BT_PENDING_CONNECT:
@@ -1442,31 +1527,11 @@ static void pl_bt_pending_service(void) {
                 pl_persist_execute_pending_abr_floor_write();
                 break;
             case PL_BT_PENDING_CANCEL_CONNECT:
-                // Bead pico-link-chc3, design C3, ADA DESIGN v2: bookkeeping-
-                // only (D4) -- pl_a2dp_cancel_connect makes no BTstack call
-                // itself, it just flips a2dp.c's attempt state from the
-                // same IRQ/run-loop context every other a2dp.c mutator in
-                // this table runs from.
-                pl_a2dp_cancel_connect(entry.addr, entry.seq);
-                // Bead pico-link-chc3, ADA DESIGN v2: if this cancel landed
-                // mid-switch (design sec 2's break-before-make -- B during
-                // the DISCONNECTING/PAGING steps of a device switch, not
-                // just a plain from-idle connect) AND targets this switch's
-                // own attempt (seq match, or PL_SEQ_ANY) -- the switch state
-                // machine's own terminal hooks
-                // (pl_bt_push_connect_succeeded/_failed) will never fire for
-                // this attempt now that a2dp.c has concluded it, so without
-                // this reset s_switch_state would stay PAGING/WAIT_ACL_DOWN
-                // forever and wedge every future switch/connect behind a
-                // dead in-flight marker. Same reset pl_bt_switch_service's
-                // own timeout path already does. Seq-scoped (v1 reset
-                // unconditionally on ANY cancel, which could reset a switch
-                // a stale/unrelated cancel had nothing to do with).
-                if ((s_switch_state == PL_BT_SWITCH_PAGING || s_switch_state == PL_BT_SWITCH_WAIT_ACL_DOWN) &&
-                    (entry.seq == PL_SEQ_ANY || entry.seq == s_switch_target_seq)) {
-                    s_switch_state = PL_BT_SWITCH_NONE;
-                    pl_bt_update_scan_mode();
-                }
+                // Bead pico-link-chc3, design C3, ADA DESIGN v2: serviced
+                // here so a2dp.c's attempt state is only ever mutated from
+                // the same IRQ/run-loop context as everything else in this
+                // table.
+                pl_bt_cancel_connect(entry.seq);
                 break;
         }
     }
@@ -1527,16 +1592,15 @@ static void pl_bt_wdt_heartbeat_handler(btstack_timer_source_t *ts) {
     btstack_run_loop_add_timer(ts);
     pl_wdt_kick(PL_WDT_BTSTACK);
     pl_bt_pending_service();
-    // Bead pico-link-sfw6: the switch state machine's WAIT_ACL_DOWN ->
-    // PAGING advance and 5s deadline check -- right after
-    // pl_bt_pending_service so a switch that just started this same tick
-    // (via PL_BT_PENDING_CONNECT above) is observed starting next tick.
-    pl_bt_switch_service();
     // Bead pico-link-chc3, design C4: services any cancel armed this tick
-    // (or an earlier one) by PL_BT_PENDING_CANCEL_CONNECT's servicing below
-    // -- same "no BTstack call from thread context" reasoning as
-    // pl_bt_switch_service, same 100ms period.
+    // (or an earlier one) by pl_bt_pending_service above -- same "no BTstack
+    // call from thread context" reasoning, same 100ms period. Before the
+    // switch service, which waits for it.
     pl_a2dp_service_cancel();
+    // Bead pico-link-sfw6: the switch state machine's WAIT_IDLE -> PAGING
+    // advance and deadline check.
+    pl_bt_switch_service();
+    pl_bt_scan_service();
     // T3 (pico-link-4v2.3), design sec 9: the "-> pl_bt_wdt_heartbeat_handler
     // (0xFF) -> avrcp_controller_set_absolute_volume" hop. Same context as
     // pl_bt_pending_service above, so it's safe to call a2dp.c's AVRCP API
@@ -1980,11 +2044,11 @@ void pl_bt_debug_disconnect(void) {
 // queue), minus the PlCommand indirection -- same relationship
 // pl_bt_debug_connect has to PL_COMMAND_TAG_CONNECT. Passes `PL_SEQ_ANY`
 // (there is no real core-allocated seq to target from this bypass) --
-// matches whatever is HELD/IN_FLIGHT (a2dp.h's pl_a2dp_cancel_connect match
+// matches whatever is IN_FLIGHT (a2dp.h's pl_a2dp_cancel_connect match
 // rules), never a live `session_seq` (H4's note in the design doc). The
 // pending-queue entry needs SOME addr buffer (pl_bt_pending_push_seq's
-// memcpy for this tag), but pl_a2dp_cancel_connect ignores it (see its own
-// doc comment on why), so an all-zero placeholder is fine -- unlike
+// memcpy for this tag), but the cancel is identified by seq alone, so an
+// all-zero placeholder is fine -- unlike
 // pl_bt_debug_connect's addr, this one is never a real BD_ADDR and is never
 // compared against one.
 void pl_bt_debug_cancel_connect(void) {
@@ -1998,8 +2062,8 @@ void pl_bt_debug_cancel_connect(void) {
 // bt.h's doc comment. Identical to pl_bt_debug_cancel_connect above except
 // for the seq it targets: the caller supplies it explicitly (from
 // cdc_sender.py's --cancel-connect --seq N, echoing the seq a prior debug
-// CONNECT logged), so this can hit Match 3 in pl_a2dp_cancel_connect (a live
-// session via `session_seq`) instead of only ever matching HELD/IN_FLIGHT
+// CONNECT logged), so this can hit Match 2 in pl_a2dp_cancel_connect (a live
+// session via `session_seq`) instead of only ever matching IN_FLIGHT
 // via PL_SEQ_ANY.
 void pl_bt_debug_cancel_connect_seq(uint16_t seq) {
     static const bd_addr_t zero_addr = {0, 0, 0, 0, 0, 0};

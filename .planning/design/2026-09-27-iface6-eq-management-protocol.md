@@ -420,6 +420,9 @@ Rescan button).
 Rule (same as preview precedence, sec 7): the person holding the dongle wins.
 - Device wizard open, or a device/auto-reconnect attempt in flight: every
   radio op returns DEVICE_BUSY; the page shows "in use on the device".
+  Exception (bead pico-link-drqr): CONNECT and SCAN_START preempt an
+  AUTO-RECONNECT attempt instead -- nobody asked for it. The wizard and a
+  device-initiated attempt still win; a host attempt is still RADIO_BUSY.
 - Host scan running and the device user opens Pair new: device StartScan
   proceeds (C restarts the inquiry, bt.c:1559-1571), scan_owner flips to
   Device, the page sees it via radio_rev and becomes read-only on the list.

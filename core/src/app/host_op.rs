@@ -235,14 +235,14 @@ pub(crate) enum OpError {
     ApoTooLarge = 19,
     /// Design sec 13.3: the device wizard is open, or a device-/
     /// auto-reconnect-initiated attempt is in flight -- "the person
-    /// holding the dongle wins" (sec 13.7). Also `FORGET`'s guard against
+    /// holding the dongle wins" (sec 13.7); `CONNECT`/`SCAN_START` preempt
+    /// an auto-reconnect instead. Also `FORGET`'s guard against
     /// forgetting a device with a connect attempt in flight for it.
     DeviceBusy = 20,
-    /// Design sec 13.3: `CONNECT`/`SCAN_START` while a connect attempt is
-    /// already in flight (distinct from [`Self::DeviceBusy`]'s "someone
-    /// else has the radio" -- this is "the radio itself is busy
-    /// connecting", which blocks a fresh scan or connect regardless of who
-    /// owns the in-flight attempt).
+    /// Design sec 13.3: `CONNECT`/`SCAN_START` while a `Host` connect
+    /// attempt is already in flight (distinct from [`Self::DeviceBusy`]'s
+    /// "someone else has the radio" -- this is "the radio itself is busy
+    /// connecting").
     RadioBusy = 21,
     /// A `DISCONNECT` whose `addr` doesn't equal [`super::model::BtModel::connected_addr`].
     NotConnected = 22,

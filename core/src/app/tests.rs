@@ -1876,3 +1876,80 @@ fn boot_auto_reconnect_records_an_auto_reconnect_initiated_attempt() {
     assert_eq!(attempt.initiator, ConnectInitiator::AutoReconnect);
     app.expect_connect_command_for_test(addr, "Cans");
 }
+
+// --- Bead `pico-link-drqr`: an explicit choice preempts the boot
+// auto-reconnect ---
+
+const AUTO_ADDR: DeviceAddr = [30; 6];
+const CHOSEN_ADDR: DeviceAddr = [31; 6];
+
+/// Boots with `AUTO_ADDR` as the most recent device, so an auto-reconnect is
+/// in flight (its `Connect` drained, its `Connecting` echo folded). Returns
+/// that attempt's seq.
+fn boot_into_auto_reconnect(app: &mut App) -> u16 {
+    app.handle_event(upsert(CHOSEN_ADDR, "Chosen", 1));
+    app.handle_event(upsert(AUTO_ADDR, "Auto", 2));
+    app.handle_event(Event::StoreLoaded { status: StoreStatus::Loaded });
+    app.handle_event(Event::ConnectAttemptStarted);
+    let attempt = app.model().attempt.expect("auto-reconnect must be in flight");
+    assert_eq!(attempt.initiator, ConnectInitiator::AutoReconnect);
+    app.expect_connect_command_for_test(AUTO_ADDR, "Auto");
+    attempt.seq
+}
+
+#[test]
+fn choosing_another_device_replaces_the_auto_reconnect_and_drops_its_late_events() {
+    let mut app = App::new(240, 240);
+    let auto_seq = boot_into_auto_reconnect(&mut app);
+    open_devices(&mut app);
+    // MRU-descending rows: the auto-reconnect target first, then the other.
+    app.handle_input(vec![NavIntent::Down, NavIntent::Select]);
+
+    let chosen = app.model().attempt.expect("the choice must be recorded");
+    assert_eq!(chosen.addr, CHOSEN_ADDR);
+    assert_eq!(chosen.initiator, ConnectInitiator::Device);
+    assert_ne!(chosen.seq, auto_seq);
+    app.expect_connect_command_for_test(CHOSEN_ADDR, "Chosen");
+    let phase = app.wizard_phase_for_test();
+
+    app.handle_event(Event::ConnectFailed { addr: AUTO_ADDR, reason: ConnectFailureReason::Timeout, seq: auto_seq });
+    app.handle_event(Event::ConnectSucceeded { addr: AUTO_ADDR, degraded: false, seq: auto_seq });
+
+    assert_eq!(app.model().attempt.map(|a| a.seq), Some(chosen.seq), "late auto events must not conclude the choice");
+    assert_eq!(app.model().connected_addr, None);
+    assert!(app.model().connecting);
+    assert_eq!(app.wizard_phase_for_test(), phase);
+    assert_eq!(app.poll_command(), None);
+}
+
+#[test]
+fn starting_a_pairing_scan_cancels_the_auto_reconnect_first() {
+    let mut app = App::new(240, 240);
+    let auto_seq = boot_into_auto_reconnect(&mut app);
+
+    open_devices(&mut app);
+    app.handle_input(vec![NavIntent::Down, NavIntent::Down, NavIntent::Select]); // "Pair new headphones"
+
+    assert_eq!(app.poll_command(), Some(Command::CancelConnect { addr: AUTO_ADDR, seq: auto_seq }));
+    assert_eq!(app.poll_command(), Some(Command::StartScan));
+    assert_eq!(app.model().attempt, None);
+    assert!(!app.model().connecting, "the cancelled attempt must not leave the busy flag set");
+    let outcome = app.model().last_outcome.expect("the cancel must be recorded");
+    assert_eq!((outcome.seq, outcome.result), (auto_seq, ConnectOutcomeResult::Cancelled));
+
+    app.handle_event(Event::ConnectSucceeded { addr: AUTO_ADDR, degraded: false, seq: auto_seq });
+    assert_eq!(app.model().connected_addr, None, "a late auto success must be dropped");
+}
+
+#[test]
+fn starting_a_scan_leaves_a_device_initiated_attempt_alone() {
+    let mut app = App::new(240, 240);
+    let seq = app.seed_connect_attempt_for_test(CHOSEN_ADDR);
+    while app.poll_command().is_some() {}
+
+    open_wizard(&mut app);
+
+    assert_eq!(app.poll_command(), Some(Command::StartScan));
+    assert_eq!(app.poll_command(), None);
+    assert_eq!(app.model().attempt.map(|a| a.seq), Some(seq));
+}
